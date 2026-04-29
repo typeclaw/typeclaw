@@ -43,6 +43,8 @@ type LiveSession = {
   sessionId: string
   unsubscribe: () => void
   pendingAssistantText: string
+  promptQueue: string[]
+  draining: boolean
 }
 
 export type CreateSessionForChannel = (key: ChannelKey) => Promise<{ session: AgentSession; sessionId: string }>
@@ -83,13 +85,25 @@ export function createChannelRouter({
 }: CreateChannelRouterOptions): ChannelRouter {
   const mappings = new Map<string, ChannelSessionMapping>()
   const liveSessions = new Map<string, LiveSession>()
+  // Concurrent route() calls for the same key share one creation promise so
+  // createSessionForChannel runs at most once per key. Without this, two
+  // inbounds racing on a cold channel each spawn a full AgentSession.
+  const creating = new Map<string, Promise<LiveSession>>()
   const outboundCallbacks = new Map<AdapterId, Set<OutboundCallback>>()
   const path = join(agentDir, SESSIONS_FILE)
-  let loaded = false
+  // load() may be invoked concurrently from many route() calls. Cache the
+  // first invocation's promise so all callers share it; this also pins
+  // before/after relationships in the microtask queue so route() resumption
+  // order tracks call order rather than load() arrival order.
+  let loadPromise: Promise<void> | null = null
 
-  async function load(): Promise<void> {
-    if (loaded) return
-    loaded = true
+  function load(): Promise<void> {
+    if (loadPromise) return loadPromise
+    loadPromise = doLoad()
+    return loadPromise
+  }
+
+  async function doLoad(): Promise<void> {
     if (!existsSync(path)) return
     let raw: string
     try {
@@ -125,12 +139,25 @@ export function createChannelRouter({
     const existingLive = liveSessions.get(keyStr)
     if (existingLive) return existingLive
 
+    const inFlight = creating.get(keyStr)
+    if (inFlight) return inFlight
+
+    const promise = doCreate(event, keyStr).finally(() => {
+      creating.delete(keyStr)
+    })
+    creating.set(keyStr, promise)
+    return promise
+  }
+
+  async function doCreate(event: InboundMessage, keyStr: string): Promise<LiveSession> {
     const created = await createSessionForChannel(event)
     const live: LiveSession = {
       session: created.session,
       sessionId: created.sessionId,
       pendingAssistantText: '',
       unsubscribe: () => {},
+      promptQueue: [],
+      draining: false,
     }
     live.unsubscribe = created.session.subscribe((sessionEvent) => {
       if (sessionEvent.type === 'message_update' && sessionEvent.assistantMessageEvent.type === 'text_delta') {
@@ -155,8 +182,6 @@ export function createChannelRouter({
       }
     })
 
-    liveSessions.set(keyStr, live)
-
     const existingMapping = mappings.get(keyStr)
     if (existingMapping === undefined || existingMapping.sessionId !== created.sessionId) {
       mappings.set(keyStr, {
@@ -169,8 +194,20 @@ export function createChannelRouter({
         createdAt: existingMapping?.createdAt ?? Date.now(),
         lastInboundTs: Date.now(),
       })
-      await persist()
+      // Best-effort persistence. A disk failure must not drop the user's
+      // message — the session is functional in memory; the only cost is a
+      // duplicate session on next process restart.
+      try {
+        await persist()
+      } catch (err) {
+        logger.error(`[channels] persist failed for ${keyStr}: ${errMsg(err)}`)
+      }
     }
+
+    // Expose the live session only after the mapping is durable (or has
+    // best-effort failed). A second concurrent route() that finds this in
+    // liveSessions can safely call session.prompt() — the mapping is on disk.
+    liveSessions.set(keyStr, live)
     return live
   }
 
@@ -180,7 +217,10 @@ export function createChannelRouter({
       logger.warn(`[channels] no outbound callback for adapter=${reply.adapter}; dropping reply`)
       return
     }
-    for (const cb of callbacks) {
+    // Snapshot to avoid surprising skip/add behavior if a callback mutates the
+    // set while iterating.
+    const snapshot = [...callbacks]
+    for (const cb of snapshot) {
       try {
         await cb(reply)
       } catch (err) {
@@ -189,21 +229,36 @@ export function createChannelRouter({
     }
   }
 
+  async function drainPromptQueue(live: LiveSession): Promise<void> {
+    if (live.draining) return
+    live.draining = true
+    try {
+      while (live.promptQueue.length > 0) {
+        const text = live.promptQueue.shift()
+        if (text === undefined) break
+        try {
+          await live.session.prompt(text)
+        } catch (err) {
+          logger.error(`[channels] session ${live.sessionId} prompt failed: ${errMsg(err)}`)
+        }
+      }
+    } finally {
+      live.draining = false
+    }
+  }
+
   return {
     load,
     async route(event) {
-      if (!loaded) await load()
+      await load()
       const live = await ensureLive(event)
       const keyStr = serializeKey(event)
       const mapping = mappings.get(keyStr)
       if (mapping !== undefined) {
         mapping.lastInboundTs = Date.now()
       }
-      try {
-        await live.session.prompt(event.text)
-      } catch (err) {
-        logger.error(`[channels] session ${live.sessionId} prompt failed: ${errMsg(err)}`)
-      }
+      live.promptQueue.push(event.text)
+      await drainPromptQueue(live)
     },
     bindOutbound(adapter, callback) {
       let set = outboundCallbacks.get(adapter)

@@ -313,4 +313,83 @@ describe('ChannelRouter', () => {
 
     expect(warnings.some((w) => w.includes('no outbound callback'))).toBe(true)
   })
+
+  test('concurrent route() for the same key creates only one session', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    const fakes = createFakeSession()
+    let createCount = 0
+    const createSessionForChannel: CreateSessionForChannel = async () => {
+      createCount++
+      await new Promise((r) => setTimeout(r, 20))
+      return { session: fakes.session, sessionId: 'sess-1' }
+    }
+    const router = createChannelRouter({ agentDir: dir, createSessionForChannel })
+
+    await Promise.all([
+      router.route({ ...baseEvent, text: 'first', externalMessageId: 'x1' }),
+      router.route({ ...baseEvent, text: 'second', externalMessageId: 'x2' }),
+      router.route({ ...baseEvent, text: 'third', externalMessageId: 'x3' }),
+    ])
+
+    expect(createCount).toBe(1)
+    expect(router.liveSessionCount()).toBe(1)
+    expect(router.knownMappings()).toHaveLength(1)
+  })
+
+  test('concurrent route() for the same key serializes session.prompt() FIFO', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    const promptOrder: string[] = []
+    const inFlight: { current: number } = { current: 0 }
+    let maxConcurrent = 0
+    const session = {
+      subscribe: () => () => {},
+      async prompt(text: string) {
+        inFlight.current++
+        if (inFlight.current > maxConcurrent) maxConcurrent = inFlight.current
+        await new Promise((r) => setTimeout(r, 10))
+        promptOrder.push(text)
+        inFlight.current--
+      },
+      async abort() {},
+    }
+    const router = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
+    })
+
+    await Promise.all([
+      router.route({ ...baseEvent, text: 'a', externalMessageId: 'x1' }),
+      router.route({ ...baseEvent, text: 'b', externalMessageId: 'x2' }),
+      router.route({ ...baseEvent, text: 'c', externalMessageId: 'x3' }),
+    ])
+
+    expect(promptOrder).toEqual(['a', 'b', 'c'])
+    expect(maxConcurrent).toBe(1)
+  })
+
+  test('mapping is persisted to disk before any prompt runs', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    const observed: { persisted: boolean | null } = { persisted: null }
+    const session = {
+      subscribe: () => () => {},
+      async prompt() {
+        try {
+          const raw = await readFile(join(dir, 'channels/sessions.json'), 'utf8')
+          const parsed = JSON.parse(raw) as { mappings: { sessionId: string }[] }
+          observed.persisted = parsed.mappings.some((m) => m.sessionId === 'sess-1')
+        } catch {
+          observed.persisted = false
+        }
+      },
+      async abort() {},
+    }
+    const router = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
+    })
+
+    await router.route(baseEvent)
+
+    expect(observed.persisted).toBe(true)
+  })
 })
