@@ -5,7 +5,7 @@ import type { Model } from '@mariozechner/pi-ai'
 import { CronExpressionParser } from 'cron-parser'
 import { z } from 'zod'
 
-import { channelsArraySchema } from '@/channels/schema'
+import { channelsSchema } from '@/channels/schema'
 
 import { KNOWN_PROVIDERS, listKnownModelRefs, type KnownModelRef, type KnownProviderId } from './providers'
 
@@ -59,7 +59,7 @@ export const configSchema = z.object({
   // writes `"mounts": []` explicitly, but a missing field is treated the same
   // way (no host paths exposed) rather than failing the whole config load.
   mounts: z.array(mountSchema).default([]),
-  channels: channelsArraySchema.default([]),
+  channels: channelsSchema,
 })
 
 function isValidCronExpression(schedule: string): boolean {

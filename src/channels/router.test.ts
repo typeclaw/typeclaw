@@ -51,7 +51,6 @@ function emitMessageEnd(
 
 const baseEvent: InboundMessage = {
   adapter: 'discord-bot',
-  bot: 'main',
   workspace: 'W1',
   chat: 'C1',
   thread: null,
@@ -89,7 +88,6 @@ describe('ChannelRouter', () => {
     expect(mappings).toHaveLength(1)
     expect(mappings[0]).toMatchObject({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -97,7 +95,7 @@ describe('ChannelRouter', () => {
     })
 
     const persisted = JSON.parse(await readFile(join(dir, 'channels/sessions.json'), 'utf8'))
-    expect(persisted.version).toBe(1)
+    expect(persisted.version).toBe(2)
     expect(persisted.mappings).toHaveLength(1)
   })
 
@@ -118,13 +116,11 @@ describe('ChannelRouter', () => {
     expect(router.liveSessionCount()).toBe(1)
   })
 
-  test('different (workspace, chat) tuples each get their own session', async () => {
+  test('different (workspace, chat, thread) tuples each get their own session', async () => {
     let n = 0
-    const fakesByCall: ReturnType<typeof createFakeSession>[] = []
     const createSessionForChannel: CreateSessionForChannel = async () => {
       n++
       const f = createFakeSession()
-      fakesByCall.push(f)
       return { session: f.session, sessionId: `sess-${n}` }
     }
     const router = createChannelRouter({ cwd: dir, createSessionForChannel })
@@ -139,7 +135,7 @@ describe('ChannelRouter', () => {
     expect(router.knownMappings()).toHaveLength(4)
   })
 
-  test('reload from disk: on construction, an existing sessions.json is loaded', async () => {
+  test('reload from disk: an existing v2 sessions.json is loaded', async () => {
     const fakes1 = createFakeSession()
     const router1 = createChannelRouter({
       cwd: dir,
@@ -186,7 +182,6 @@ describe('ChannelRouter', () => {
     expect(replies).toHaveLength(1)
     expect(replies[0]).toMatchObject({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -295,6 +290,24 @@ describe('ChannelRouter', () => {
     expect(router.knownMappings()).toEqual([])
   })
 
+  test('older sessions.json (v1) is ignored with a warning', async () => {
+    await Bun.write(
+      join(dir, 'channels/sessions.json'),
+      JSON.stringify({ version: 1, mappings: [{ adapter: 'discord-bot' }] }),
+    )
+    const fakes = createFakeSession()
+    const warnings: string[] = []
+    const router = createChannelRouter({
+      cwd: dir,
+      createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
+      logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
+    })
+    await router.load()
+
+    expect(warnings.some((w) => w.includes('not version 2'))).toBe(true)
+    expect(router.knownMappings()).toEqual([])
+  })
+
   test('unknown adapter outbound is dropped with a warning, no throw', async () => {
     const fakes = createFakeSession()
     const warnings: string[] = []
@@ -368,11 +381,10 @@ describe('ChannelRouter', () => {
     await Bun.write(
       join(dir, 'channels/sessions.json'),
       JSON.stringify({
-        version: 1,
+        version: 2,
         mappings: [
           {
             adapter: 'discord-bot',
-            bot: 'main',
             workspace: 'W1',
             chat: 'C1',
             thread: null,

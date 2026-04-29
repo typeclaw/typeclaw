@@ -1,74 +1,75 @@
 import { z } from 'zod'
 
-// Four discriminated forms: "*" (any), bare string (chat in any workspace),
-// "<workspace>/<chat>" (workspace-qualified), or a structured object that
-// future-proofs additional fields (threads, senders) without re-parsing.
-const chatRuleSchema = z.union([
+// Allow-rule grammar:
+//   "*"                      — all guilds + all DMs (FIXME: too broad as a single
+//                              token; consider splitting into "guild:*" + "dm:*"
+//                              before v0.1 ships, since accidental "*" sweeps in
+//                              private 1:1 conversations).
+//   "guild:*"                — every channel of every guild the bot is in.
+//   "guild:GUILD_ID"         — every channel of that one guild.
+//   "guild:GUILD_ID/CHANNEL_ID" — one specific channel inside that guild.
+//   "channel:CHANNEL_ID"     — that channel id in any guild it appears in.
+//                              Works because Discord channel IDs are globally
+//                              unique snowflakes.
+//   "dm:*"                   — every DM channel the bot has open.
+//   "dm:CHANNEL_ID"          — one specific DM channel.
+const idPattern = String.raw`\d+`
+const allowRuleSchema = z.union([
   z.literal('*'),
-  z.string().regex(/^[^/]+$/, 'bare chat rule must not contain "/"'),
-  z.string().regex(/^[^/]+\/[^/]+$/, 'qualified chat rule must be "<workspace>/<chat>"'),
-  z.object({
-    workspace: z.string().min(1).optional(),
-    chat: z.union([z.string().min(1), z.literal('*')]),
-  }),
+  z
+    .string()
+    .regex(
+      new RegExp(`^guild:(\\*|${idPattern}(/${idPattern})?)$`),
+      'guild rule must be "guild:*", "guild:<id>", or "guild:<id>/<id>"',
+    ),
+  z.string().regex(new RegExp(`^channel:${idPattern}$`), 'channel rule must be "channel:<id>"'),
+  z.string().regex(new RegExp(`^dm:(\\*|${idPattern})$`), 'dm rule must be "dm:*" or "dm:<id>"'),
 ])
 
-export type ChatRule = z.infer<typeof chatRuleSchema>
+export type AllowRule = z.infer<typeof allowRuleSchema>
 
-// Discord bot channel. v0.1 is discord-bot-only; other adapters land later.
-// `bot` is the agent-messenger bot identifier (e.g. "main", "deploy") that
-// resolves to a stored credential set. Workspaces (Discord servers/guilds)
-// are discovered at runtime — one bot can be installed in N servers.
-const discordBotChannelSchema = z.object({
-  adapter: z.literal('discord-bot'),
-  bot: z.string().min(1),
-  chats: z.array(chatRuleSchema).default(['*']),
+const discordBotConfigSchema = z.object({
+  allow: z.array(allowRuleSchema).default([]),
   enabled: z.boolean().default(true),
 })
 
-export type DiscordBotChannel = z.infer<typeof discordBotChannelSchema>
+export type DiscordBotConfig = z.infer<typeof discordBotConfigSchema>
 
-export const channelSchema = z.discriminatedUnion('adapter', [discordBotChannelSchema])
+export const channelsSchema = z
+  .object({
+    'discord-bot': discordBotConfigSchema.optional(),
+  })
+  .strict()
+  .default({})
 
-export type Channel = z.infer<typeof channelSchema>
+export type Channels = z.infer<typeof channelsSchema>
 
-export const channelsArraySchema = z.array(channelSchema).superRefine((channels, ctx) => {
-  const seen = new Set<string>()
-  for (let i = 0; i < channels.length; i++) {
-    const channel = channels[i]
-    if (channel === undefined) continue
-    const key = `${channel.adapter}|${channel.bot}`
-    if (seen.has(key)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: [i, 'bot'],
-        message: `duplicate channel for ${channel.adapter} bot "${channel.bot}"; each (adapter, bot) pair must appear at most once`,
-      })
-    }
-    seen.add(key)
-  }
-})
-
-// Match a (workspace, chat) tuple against a list of rules. At least one rule
-// must match for the event to be admitted. Used at inbound time by the
-// adapter, so a `chats: ["*"]` channel auto-subscribes to every workspace
-// the bot is in (including ones added at runtime via GUILD_CREATE).
-export function matchesAnyChatRule(rules: ChatRule[], workspace: string, chat: string): boolean {
+// Match an inbound event against an allow list. The event is described by the
+// (guildId, channelId) pair from the SDK; guildId is null for DMs.
+export function isAllowed(rules: AllowRule[], guildId: string | null, channelId: string): boolean {
   for (const rule of rules) {
-    if (matchesChatRule(rule, workspace, chat)) return true
+    if (matchesRule(rule, guildId, channelId)) return true
   }
   return false
 }
 
-function matchesChatRule(rule: ChatRule, workspace: string, chat: string): boolean {
+function matchesRule(rule: AllowRule, guildId: string | null, channelId: string): boolean {
   if (rule === '*') return true
-  if (typeof rule === 'string') {
-    if (rule.includes('/')) {
-      const [ruleWorkspace, ruleChat] = rule.split('/', 2)
-      return ruleWorkspace === workspace && ruleChat === chat
-    }
-    return rule === chat
+  if (rule.startsWith('guild:')) {
+    if (guildId === null) return false
+    const tail = rule.slice('guild:'.length)
+    if (tail === '*') return true
+    const slash = tail.indexOf('/')
+    if (slash === -1) return tail === guildId
+    return tail.slice(0, slash) === guildId && tail.slice(slash + 1) === channelId
   }
-  if (rule.workspace !== undefined && rule.workspace !== workspace) return false
-  return rule.chat === '*' || rule.chat === chat
+  if (rule.startsWith('channel:')) {
+    return rule.slice('channel:'.length) === channelId
+  }
+  if (rule.startsWith('dm:')) {
+    if (guildId !== null) return false
+    const tail = rule.slice('dm:'.length)
+    return tail === '*' || tail === channelId
+  }
+  return false
 }

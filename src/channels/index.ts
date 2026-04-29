@@ -1,4 +1,4 @@
-export { channelSchema, matchesAnyChatRule, type Channel, type ChatRule, type DiscordBotChannel } from './schema'
+export { channelsSchema, isAllowed, type AllowRule, type Channels, type DiscordBotConfig } from './schema'
 
 export {
   createChannelRouter,
@@ -9,6 +9,7 @@ export {
   type ChannelSessionMapping,
   type CreateChannelRouterOptions,
   type CreateSessionForChannel,
+  type CreateSessionForChannelOptions,
   type InboundMessage,
   type OutboundCallback,
   type OutboundReply,

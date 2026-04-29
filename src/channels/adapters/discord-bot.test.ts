@@ -110,8 +110,7 @@ describe('DiscordBotAdapter', () => {
     const listenerFakes = createFakeListener()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: clientFakes.client,
       listener: listenerFakes.listener,
@@ -128,8 +127,7 @@ describe('DiscordBotAdapter', () => {
   test('inbound: matching message routes through and prompts the session', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
@@ -142,7 +140,6 @@ describe('DiscordBotAdapter', () => {
     expect(router.knownMappings()).toHaveLength(1)
     expect(router.knownMappings()[0]).toMatchObject({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -152,8 +149,7 @@ describe('DiscordBotAdapter', () => {
   test('inbound: bot-authored messages are dropped (no echo loop)', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
@@ -171,8 +167,7 @@ describe('DiscordBotAdapter', () => {
   test('inbound: empty-content messages are dropped (privileged-intent fallback)', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
@@ -184,11 +179,10 @@ describe('DiscordBotAdapter', () => {
     expect(fakes.promptCalls).toEqual([])
   })
 
-  test('inbound: missing guild_id maps to the @dm sentinel', async () => {
+  test('inbound: missing guild_id maps to the @dm sentinel and matches dm rules', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['dm:*'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
@@ -201,29 +195,26 @@ describe('DiscordBotAdapter', () => {
     expect(router.knownMappings()[0]?.workspace).toBe('@dm')
   })
 
-  test('inbound: chats allowlist with bare chat id admits any workspace', async () => {
+  test('inbound: "guild:*" admits guild messages but not DMs', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['C1'],
+      allow: ['guild:*'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     })
 
-    await adapter.handleInbound(makeMessageEvent({ guild_id: 'W1', channel_id: 'C1' }))
-    await adapter.handleInbound(makeMessageEvent({ guild_id: 'W2', channel_id: 'C1' }))
-    await adapter.handleInbound(makeMessageEvent({ guild_id: 'W1', channel_id: 'OTHER' }))
+    await adapter.handleInbound(makeMessageEvent({ guild_id: 'W1' }))
+    await adapter.handleInbound(makeMessageEvent({ guild_id: undefined, content: 'dm' }))
 
-    expect(fakes.promptCalls).toHaveLength(2)
+    expect(fakes.promptCalls).toEqual(['hello'])
   })
 
   test('inbound: workspace-qualified rule restricts to (workspace, chat)', async () => {
     const { router, fakes } = await makeRouter()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['W1/C1'],
+      allow: ['guild:W1/C1'],
       router,
       client: createFakeClient().client,
       listener: createFakeListener().listener,
@@ -236,12 +227,27 @@ describe('DiscordBotAdapter', () => {
     expect(fakes.promptCalls).toHaveLength(1)
   })
 
-  test('outbound: callback for the same bot sends via client', async () => {
+  test('inbound: empty allow list admits nothing', async () => {
+    const { router, fakes } = await makeRouter()
+    const adapter = createDiscordBotAdapter({
+      allow: [],
+      router,
+      client: createFakeClient().client,
+      listener: createFakeListener().listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await adapter.handleInbound(makeMessageEvent({ guild_id: 'W1' }))
+    await adapter.handleInbound(makeMessageEvent({ guild_id: undefined, content: 'dm' }))
+
+    expect(fakes.promptCalls).toEqual([])
+  })
+
+  test('outbound: callback for the same adapter sends via client', async () => {
     const { router } = await makeRouter()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: clientFakes.client,
       listener: createFakeListener().listener,
@@ -250,7 +256,6 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -261,12 +266,11 @@ describe('DiscordBotAdapter', () => {
     expect(clientFakes.sends).toEqual([{ channel: 'C1', content: 'hello back' }])
   })
 
-  test('outbound: callback drops replies whose (workspace, chat) is not in the chats allowlist', async () => {
+  test('outbound: callback drops replies whose (workspace, chat) is not in allow', async () => {
     const { router } = await makeRouter()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['W1/C1'],
+      allow: ['guild:W1/C1'],
       router,
       client: clientFakes.client,
       listener: createFakeListener().listener,
@@ -275,7 +279,6 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -285,7 +288,6 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W2',
       chat: 'C1',
       thread: null,
@@ -296,12 +298,11 @@ describe('DiscordBotAdapter', () => {
     expect(clientFakes.sends).toEqual([{ channel: 'C1', content: 'allowed' }])
   })
 
-  test('outbound: callback for a different bot is ignored (multi-bot deployments)', async () => {
+  test('outbound: DM workspace sentinel routes through dm rules', async () => {
     const { router } = await makeRouter()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['dm:*'],
       router,
       client: clientFakes.client,
       listener: createFakeListener().listener,
@@ -310,23 +311,21 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'alert',
-      workspace: 'W1',
-      chat: 'C1',
+      workspace: '@dm',
+      chat: 'D1',
       thread: null,
-      text: 'wrong bot',
+      text: 'dm reply',
       turnId: 't1',
     })
 
-    expect(clientFakes.sends).toEqual([])
+    expect(clientFakes.sends).toEqual([{ channel: 'D1', content: 'dm reply' }])
   })
 
   test('outbound: thread is forwarded as thread_id', async () => {
     const { router } = await makeRouter()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: clientFakes.client,
       listener: createFakeListener().listener,
@@ -335,7 +334,6 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: 'T9',
@@ -350,8 +348,7 @@ describe('DiscordBotAdapter', () => {
     const { router } = await makeRouter()
     const errors: string[] = []
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: {
         async sendMessage() {
@@ -364,7 +361,6 @@ describe('DiscordBotAdapter', () => {
 
     await adapter.outboundCallback({
       adapter: 'discord-bot',
-      bot: 'main',
       workspace: 'W1',
       chat: 'C1',
       thread: null,
@@ -375,50 +371,11 @@ describe('DiscordBotAdapter', () => {
     expect(errors.some((e) => e.includes('rate limit'))).toBe(true)
   })
 
-  test('stop() awaits in-flight handleInbound before returning', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-adapter-'))
-    tempDirs.push(dir)
-    const fakes = createFakeSession()
-    let releaseRouter: () => void = () => {}
-    const slowRouter = createChannelRouter({
-      cwd: dir,
-      createSessionForChannel: async () => {
-        await new Promise<void>((r) => {
-          releaseRouter = r
-        })
-        return { session: fakes.session, sessionId: 'sess-1' }
-      },
-    })
-    const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
-      router: slowRouter,
-      client: createFakeClient().client,
-      listener: createFakeListener().listener,
-      logger: { info: () => {}, warn: () => {}, error: () => {} },
-    })
-
-    const inboundPromise = adapter.handleInbound(makeMessageEvent({ content: 'hi' }))
-    let stopResolved = false
-    const stopPromise = adapter.stop().then(() => {
-      stopResolved = true
-    })
-    await new Promise((r) => setTimeout(r, 30))
-    expect(stopResolved).toBe(false)
-
-    releaseRouter()
-    await inboundPromise
-    await stopPromise
-
-    expect(stopResolved).toBe(true)
-  })
-
   test('end-to-end: inbound → session.prompt → text_delta → message_end → outbound send', async () => {
     const { router, fakes } = await makeRouter()
     const clientFakes = createFakeClient()
     const adapter = createDiscordBotAdapter({
-      bot: 'main',
-      chats: ['*'],
+      allow: ['*'],
       router,
       client: clientFakes.client,
       listener: createFakeListener().listener,
@@ -440,5 +397,42 @@ describe('DiscordBotAdapter', () => {
     await Promise.resolve()
 
     expect(clientFakes.sends).toEqual([{ channel: 'C1', content: 'pong' }])
+  })
+
+  test('stop() awaits in-flight handleInbound before returning', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-adapter-'))
+    tempDirs.push(dir)
+    const fakes = createFakeSession()
+    let releaseRouter: () => void = () => {}
+    const slowRouter = createChannelRouter({
+      cwd: dir,
+      createSessionForChannel: async () => {
+        await new Promise<void>((r) => {
+          releaseRouter = r
+        })
+        return { session: fakes.session, sessionId: 'sess-1' }
+      },
+    })
+    const adapter = createDiscordBotAdapter({
+      allow: ['*'],
+      router: slowRouter,
+      client: createFakeClient().client,
+      listener: createFakeListener().listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    const inboundPromise = adapter.handleInbound(makeMessageEvent({ content: 'hi' }))
+    let stopResolved = false
+    const stopPromise = adapter.stop().then(() => {
+      stopResolved = true
+    })
+    await new Promise((r) => setTimeout(r, 30))
+    expect(stopResolved).toBe(false)
+
+    releaseRouter()
+    await inboundPromise
+    await stopPromise
+
+    expect(stopResolved).toBe(true)
   })
 })

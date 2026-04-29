@@ -11,7 +11,7 @@ import {
   createChannelRouter,
   createChannelsReloadable,
   createDefaultDiscordBotFactory,
-  type DiscordBotChannel,
+  type DiscordBotConfig,
   type DiscordBotFactory,
   type DiscordBotListenerLike,
 } from '@/channels'
@@ -226,7 +226,7 @@ function openOrCreateSession(cwd: string, sessionDir: string, existingSessionId:
   return SessionManager.create(cwd, sessionDir)
 }
 
-async function createRealDiscordBotClientAndListener(_channel: DiscordBotChannel) {
+async function createRealDiscordBotClientAndListener(_config: DiscordBotConfig) {
   const { DiscordBotClient, DiscordBotListener, DiscordIntent } = await import('agent-messenger/discordbot')
   const client = await new DiscordBotClient().login()
   const listener = new DiscordBotListener(client, {

@@ -1,92 +1,122 @@
 import { describe, expect, test } from 'bun:test'
 
-import { channelSchema, channelsArraySchema, matchesAnyChatRule } from './schema'
+import { channelsSchema, isAllowed } from './schema'
 
-describe('channelSchema', () => {
-  test('parses a discord-bot channel with default chats and enabled', () => {
-    const parsed = channelSchema.parse({ adapter: 'discord-bot', bot: 'main' })
-    expect(parsed).toEqual({ adapter: 'discord-bot', bot: 'main', chats: ['*'], enabled: true })
+describe('channelsSchema', () => {
+  test('empty object is the default', () => {
+    expect(channelsSchema.parse({})).toEqual({})
+    expect(channelsSchema.parse(undefined)).toEqual({})
   })
 
-  test('accepts the four chat-rule shapes', () => {
-    const parsed = channelSchema.parse({
-      adapter: 'discord-bot',
-      bot: 'main',
-      chats: ['*', 'C012ABC', 'T0ABC1234/C012ABC', { workspace: 'W', chat: '*' }, { chat: 'X' }],
+  test('discord-bot with explicit allow list parses cleanly', () => {
+    expect(channelsSchema.parse({ 'discord-bot': { allow: ['*'] } })).toEqual({
+      'discord-bot': { allow: ['*'], enabled: true },
     })
-    expect(parsed.chats).toHaveLength(5)
   })
 
-  test('rejects a bare chat rule containing "/"', () => {
-    expect(() => channelSchema.parse({ adapter: 'discord-bot', bot: 'main', chats: ['a/b/c'] })).toThrow()
+  test('discord-bot with no allow list defaults to empty (admit nothing)', () => {
+    expect(channelsSchema.parse({ 'discord-bot': {} })).toEqual({
+      'discord-bot': { allow: [], enabled: true },
+    })
   })
 
-  test('rejects unknown adapter', () => {
-    expect(() => channelSchema.parse({ adapter: 'slack-bot', bot: 'main' })).toThrow()
+  test('discord-bot with enabled: false', () => {
+    expect(channelsSchema.parse({ 'discord-bot': { enabled: false } })).toEqual({
+      'discord-bot': { allow: [], enabled: false },
+    })
   })
 
-  test('rejects empty bot id', () => {
-    expect(() => channelSchema.parse({ adapter: 'discord-bot', bot: '' })).toThrow()
+  test('accepts every supported rule shape', () => {
+    const parsed = channelsSchema.parse({
+      'discord-bot': {
+        allow: [
+          '*',
+          'guild:*',
+          'guild:1234567890',
+          'guild:1234567890/9876543210',
+          'channel:9876543210',
+          'dm:*',
+          'dm:5555555555',
+        ],
+      },
+    })
+    expect(parsed['discord-bot']?.allow).toHaveLength(7)
+  })
+
+  test('rejects malformed rules', () => {
+    const cases = [
+      'guild:',
+      'guild:foo',
+      'guild:1234/foo',
+      'channel:',
+      'channel:abc',
+      'dm:',
+      'dm:abc',
+      'thread:1234',
+      'random',
+    ]
+    for (const rule of cases) {
+      expect(() => channelsSchema.parse({ 'discord-bot': { allow: [rule] } })).toThrow()
+    }
+  })
+
+  test('rejects unknown adapter keys', () => {
+    expect(() => channelsSchema.parse({ 'slack-bot': { allow: [] } })).toThrow()
   })
 })
 
-describe('channelsArraySchema', () => {
-  test('accepts distinct (adapter, bot) entries', () => {
-    const parsed = channelsArraySchema.parse([
-      { adapter: 'discord-bot', bot: 'main' },
-      { adapter: 'discord-bot', bot: 'alert' },
-    ])
-    expect(parsed).toHaveLength(2)
+describe('isAllowed', () => {
+  test('"*" admits everything (guilds and DMs)', () => {
+    expect(isAllowed(['*'], 'G1', 'C1')).toBe(true)
+    expect(isAllowed(['*'], null, 'D1')).toBe(true)
   })
 
-  test('rejects duplicate (adapter, bot) entries', () => {
-    expect(() =>
-      channelsArraySchema.parse([
-        { adapter: 'discord-bot', bot: 'main' },
-        { adapter: 'discord-bot', bot: 'main', chats: ['C1'] },
-      ]),
-    ).toThrow(/duplicate channel for discord-bot bot/)
+  test('"guild:*" admits any guild channel but no DMs', () => {
+    expect(isAllowed(['guild:*'], 'G1', 'C1')).toBe(true)
+    expect(isAllowed(['guild:*'], 'G2', 'C2')).toBe(true)
+    expect(isAllowed(['guild:*'], null, 'D1')).toBe(false)
   })
 
-  test('empty array is fine', () => {
-    expect(channelsArraySchema.parse([])).toEqual([])
-  })
-})
-
-describe('matchesAnyChatRule', () => {
-  test('"*" matches any (workspace, chat)', () => {
-    expect(matchesAnyChatRule(['*'], 'W1', 'C1')).toBe(true)
-    expect(matchesAnyChatRule(['*'], 'W2', 'C2')).toBe(true)
+  test('"guild:G1" admits any channel of that guild only', () => {
+    expect(isAllowed(['guild:G1'], 'G1', 'C1')).toBe(true)
+    expect(isAllowed(['guild:G1'], 'G1', 'C2')).toBe(true)
+    expect(isAllowed(['guild:G1'], 'G2', 'C1')).toBe(false)
+    expect(isAllowed(['guild:G1'], null, 'D1')).toBe(false)
   })
 
-  test('bare string matches the chat in any workspace', () => {
-    expect(matchesAnyChatRule(['C012ABC'], 'W1', 'C012ABC')).toBe(true)
-    expect(matchesAnyChatRule(['C012ABC'], 'W2', 'C012ABC')).toBe(true)
-    expect(matchesAnyChatRule(['C012ABC'], 'W1', 'OTHER')).toBe(false)
+  test('"guild:G1/C1" admits only that pair', () => {
+    expect(isAllowed(['guild:G1/C1'], 'G1', 'C1')).toBe(true)
+    expect(isAllowed(['guild:G1/C1'], 'G1', 'C2')).toBe(false)
+    expect(isAllowed(['guild:G1/C1'], 'G2', 'C1')).toBe(false)
   })
 
-  test('"<workspace>/<chat>" matches only that workspace+chat pair', () => {
-    expect(matchesAnyChatRule(['W1/C1'], 'W1', 'C1')).toBe(true)
-    expect(matchesAnyChatRule(['W1/C1'], 'W2', 'C1')).toBe(false)
-    expect(matchesAnyChatRule(['W1/C1'], 'W1', 'C2')).toBe(false)
+  test('"channel:C1" admits that channel id regardless of guild', () => {
+    expect(isAllowed(['channel:C1'], 'G1', 'C1')).toBe(true)
+    expect(isAllowed(['channel:C1'], 'G2', 'C1')).toBe(true)
+    expect(isAllowed(['channel:C1'], 'G1', 'C2')).toBe(false)
   })
 
-  test('structured form with workspace restricts; without workspace matches any', () => {
-    expect(matchesAnyChatRule([{ workspace: 'W1', chat: 'C1' }], 'W1', 'C1')).toBe(true)
-    expect(matchesAnyChatRule([{ workspace: 'W1', chat: 'C1' }], 'W2', 'C1')).toBe(false)
-    expect(matchesAnyChatRule([{ chat: 'C1' }], 'W2', 'C1')).toBe(true)
-    expect(matchesAnyChatRule([{ workspace: 'W1', chat: '*' }], 'W1', 'whatever')).toBe(true)
-    expect(matchesAnyChatRule([{ workspace: 'W1', chat: '*' }], 'W2', 'whatever')).toBe(false)
+  test('"dm:*" admits any DM but no guild channels', () => {
+    expect(isAllowed(['dm:*'], null, 'D1')).toBe(true)
+    expect(isAllowed(['dm:*'], null, 'D2')).toBe(true)
+    expect(isAllowed(['dm:*'], 'G1', 'C1')).toBe(false)
+  })
+
+  test('"dm:D1" admits only that DM channel', () => {
+    expect(isAllowed(['dm:D1'], null, 'D1')).toBe(true)
+    expect(isAllowed(['dm:D1'], null, 'D2')).toBe(false)
+    expect(isAllowed(['dm:D1'], 'G1', 'D1')).toBe(false)
   })
 
   test('rule list is OR — any match admits', () => {
-    const rules = ['W1/C1', 'C99']
-    expect(matchesAnyChatRule(rules, 'W1', 'C1')).toBe(true)
-    expect(matchesAnyChatRule(rules, 'W3', 'C99')).toBe(true)
-    expect(matchesAnyChatRule(rules, 'W2', 'OTHER')).toBe(false)
+    const rules = ['guild:G1', 'dm:*']
+    expect(isAllowed(rules, 'G1', 'C1')).toBe(true)
+    expect(isAllowed(rules, null, 'D1')).toBe(true)
+    expect(isAllowed(rules, 'G2', 'C1')).toBe(false)
   })
 
   test('empty rule list admits nothing', () => {
-    expect(matchesAnyChatRule([], 'W1', 'C1')).toBe(false)
+    expect(isAllowed([], 'G1', 'C1')).toBe(false)
+    expect(isAllowed([], null, 'D1')).toBe(false)
   })
 })

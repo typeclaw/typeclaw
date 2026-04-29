@@ -506,21 +506,21 @@ describe('startAgent session persistence wiring', () => {
 
     expect(running.channelRouter).toBeDefined()
     expect(running.channelManager).toBeDefined()
-    expect(running.channelManager.activeKeys()).toEqual([])
+    expect(running.channelManager.activeAdapters()).toEqual([])
   })
 
-  test('channels reload: applyChannels picks up new entries from typeclaw.json', async () => {
+  test('channels reload: applyChannels picks up a new discord-bot from typeclaw.json', async () => {
     const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-channels-'))
 
-    const startCalls: string[] = []
-    const stopCalls: string[] = []
-    const fakeFactory: import('@/channels').DiscordBotFactory = async (channel) => ({
+    let started = 0
+    let stopped = 0
+    const fakeFactory: import('@/channels').DiscordBotFactory = async () => ({
       adapter: {
         async start() {
-          startCalls.push(channel.bot)
+          started++
         },
         async stop() {
-          stopCalls.push(channel.bot)
+          stopped++
         },
         async handleInbound() {},
         outboundCallback: async () => {},
@@ -536,19 +536,19 @@ describe('startAgent session persistence wiring', () => {
       discordBotFactory: fakeFactory,
     })
 
-    expect(startCalls).toEqual([])
-    expect(running.channelManager.activeKeys()).toEqual([])
+    expect(started).toBe(0)
+    expect(running.channelManager.activeAdapters()).toEqual([])
 
-    const diff = await running.channelManager.applyChannels([
-      { adapter: 'discord-bot', bot: 'main', chats: ['*'], enabled: true },
-    ])
-    expect(diff.added.map((c) => c.bot)).toEqual(['main'])
-    expect(running.channelManager.activeKeys()).toEqual(['discord-bot|main'])
-    expect(startCalls).toEqual(['main'])
+    const diff = await running.channelManager.applyChannels({
+      'discord-bot': { allow: ['*'], enabled: true },
+    })
+    expect(diff.added).toEqual(['discord-bot'])
+    expect(running.channelManager.activeAdapters()).toEqual(['discord-bot'])
+    expect(started).toBe(1)
 
     running.stop()
     await new Promise((r) => setTimeout(r, 50))
-    expect(stopCalls).toEqual(['main'])
+    expect(stopped).toBe(1)
 
     await rm(agentDir, { recursive: true, force: true })
   })

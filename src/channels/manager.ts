@@ -1,10 +1,10 @@
 import type { Reloadable, ReloadResult } from '@/reload'
 
 import { createDiscordBotAdapter, type DiscordBotAdapter, type DiscordBotListenerLike } from './adapters/discord-bot'
-import type { ChannelRouter } from './router'
-import type { Channel, DiscordBotChannel } from './schema'
+import type { AdapterId, ChannelRouter } from './router'
+import type { Channels, DiscordBotConfig } from './schema'
 
-export type DiscordBotFactory = (channel: DiscordBotChannel) => Promise<{
+export type DiscordBotFactory = (config: DiscordBotConfig) => Promise<{
   adapter: DiscordBotAdapter
   close: () => Promise<void>
 }>
@@ -17,7 +17,7 @@ export type ChannelManagerLogger = {
 
 export type CreateChannelManagerOptions = {
   router: ChannelRouter
-  channels: Channel[]
+  channels: Channels
   discordBotFactory: DiscordBotFactory
   logger?: ChannelManagerLogger
 }
@@ -25,15 +25,15 @@ export type CreateChannelManagerOptions = {
 export type ChannelManager = {
   start: () => Promise<void>
   stop: () => Promise<void>
-  applyChannels: (next: Channel[]) => Promise<ChannelDiff>
-  activeKeys: () => string[]
+  applyChannels: (next: Channels) => Promise<ChannelDiff>
+  activeAdapters: () => AdapterId[]
 }
 
 export type ChannelDiff = {
-  added: Channel[]
-  removed: Channel[]
-  updated: Channel[]
-  unchanged: Channel[]
+  added: AdapterId[]
+  removed: AdapterId[]
+  updated: AdapterId[]
+  unchanged: AdapterId[]
 }
 
 const consoleLogger: ChannelManagerLogger = {
@@ -43,7 +43,7 @@ const consoleLogger: ChannelManagerLogger = {
 }
 
 type ActiveAdapter = {
-  channel: Channel
+  config: DiscordBotConfig
   adapter: DiscordBotAdapter
   close: () => Promise<void>
 }
@@ -54,17 +54,18 @@ export function createChannelManager({
   discordBotFactory,
   logger = consoleLogger,
 }: CreateChannelManagerOptions): ChannelManager {
-  const active = new Map<string, ActiveAdapter>()
+  const active = new Map<AdapterId, ActiveAdapter>()
   let started = false
+  let current: Channels = initial
 
   return {
     async start() {
       if (started) return
       started = true
       await router.load()
-      for (const channel of initial) {
-        if (!channel.enabled) continue
-        await startOne(channel)
+      const discord = current['discord-bot']
+      if (discord !== undefined && discord.enabled) {
+        await startDiscord(discord)
       }
     },
     async stop() {
@@ -77,72 +78,71 @@ export function createChannelManager({
       await router.stop()
     },
     async applyChannels(next) {
-      const diff = computeDiff(
-        [...active.values()].map((a) => a.channel),
-        next,
-      )
+      const diff = computeDiff(current, next)
+      current = next
 
-      for (const removed of diff.removed) {
-        const key = channelKey(removed)
-        const entry = active.get(key)
+      for (const adapterId of diff.removed) {
+        const entry = active.get(adapterId)
         if (!entry) continue
         await entry.adapter.stop()
         await entry.close()
-        active.delete(key)
+        active.delete(adapterId)
       }
 
-      for (const updated of diff.updated) {
-        const key = channelKey(updated)
-        const entry = active.get(key)
+      for (const adapterId of diff.updated) {
+        const entry = active.get(adapterId)
         if (entry) {
           await entry.adapter.stop()
           await entry.close()
-          active.delete(key)
+          active.delete(adapterId)
         }
-        if (updated.enabled) await startOne(updated)
+        await startIfEnabled(adapterId, next)
       }
 
-      for (const added of diff.added) {
-        if (added.enabled) await startOne(added)
+      for (const adapterId of diff.added) {
+        await startIfEnabled(adapterId, next)
       }
 
       return diff
     },
-    activeKeys() {
+    activeAdapters() {
       return [...active.keys()]
     },
   }
 
-  async function startOne(channel: Channel): Promise<void> {
-    if (channel.adapter !== 'discord-bot') {
-      logger.warn(`[channels] adapter ${channel.adapter} is not supported in v0.1; skipping`)
-      return
+  async function startIfEnabled(adapterId: AdapterId, channels: Channels): Promise<void> {
+    if (adapterId === 'discord-bot') {
+      const config = channels['discord-bot']
+      if (config === undefined || !config.enabled) return
+      await startDiscord(config)
     }
+  }
+
+  async function startDiscord(config: DiscordBotConfig): Promise<void> {
     try {
-      const { adapter, close } = await discordBotFactory(channel)
+      const { adapter, close } = await discordBotFactory(config)
       await adapter.start()
-      active.set(channelKey(channel), { channel, adapter, close })
-      logger.info(`[channels] started discord-bot/${channel.bot}`)
+      active.set('discord-bot', { config, adapter, close })
+      logger.info(`[channels] started discord-bot`)
     } catch (err) {
-      logger.error(`[channels] failed to start discord-bot/${channel.bot}: ${errMsg(err)}`)
+      logger.error(`[channels] failed to start discord-bot: ${errMsg(err)}`)
     }
   }
 }
 
 export function createDefaultDiscordBotFactory(opts: {
   router: ChannelRouter
-  createDiscordBotClientAndListener: (channel: DiscordBotChannel) => Promise<{
+  createDiscordBotClientAndListener: (config: DiscordBotConfig) => Promise<{
     client: Parameters<typeof createDiscordBotAdapter>[0]['client']
     listener: DiscordBotListenerLike
     close: () => Promise<void>
   }>
   logger?: ChannelManagerLogger
 }): DiscordBotFactory {
-  return async (channel) => {
-    const built = await opts.createDiscordBotClientAndListener(channel)
+  return async (config) => {
+    const built = await opts.createDiscordBotClientAndListener(config)
     const adapter = createDiscordBotAdapter({
-      bot: channel.bot,
-      chats: channel.chats,
+      allow: config.allow,
       router: opts.router,
       client: built.client,
       listener: built.listener,
@@ -154,7 +154,7 @@ export function createDefaultDiscordBotFactory(opts: {
 
 export type CreateChannelsReloadableOptions = {
   manager: ChannelManager
-  loadChannels: () => Channel[]
+  loadChannels: () => Channels
 }
 
 export function createChannelsReloadable({ manager, loadChannels }: CreateChannelsReloadableOptions): Reloadable {
@@ -168,7 +168,7 @@ export function createChannelsReloadable({ manager, loadChannels }: CreateChanne
         return {
           scope: 'channels',
           ok: true,
-          summary: `${next.length} channels (added ${diff.added.length}, removed ${diff.removed.length}, updated ${diff.updated.length}, unchanged ${diff.unchanged.length})`,
+          summary: `${diff.added.length} added, ${diff.removed.length} removed, ${diff.updated.length} updated, ${diff.unchanged.length} unchanged`,
           details: diff,
         }
       } catch (err) {
@@ -178,42 +178,26 @@ export function createChannelsReloadable({ manager, loadChannels }: CreateChanne
   }
 }
 
-function channelKey(channel: Channel): string {
-  return `${channel.adapter}|${channel.bot}`
+function discordFingerprint(config: DiscordBotConfig | undefined): string | null {
+  if (config === undefined) return null
+  return JSON.stringify({ allow: config.allow, enabled: config.enabled })
 }
 
-function fingerprint(channel: Channel): string {
-  return JSON.stringify({ adapter: channel.adapter, bot: channel.bot, chats: channel.chats, enabled: channel.enabled })
-}
+function computeDiff(before: Channels, next: Channels): ChannelDiff {
+  const result: ChannelDiff = { added: [], removed: [], updated: [], unchanged: [] }
 
-function computeDiff(before: Channel[], next: Channel[]): ChannelDiff {
-  const added: Channel[] = []
-  const removed: Channel[] = []
-  const updated: Channel[] = []
-  const unchanged: Channel[] = []
-
-  const beforeByKey = new Map<string, Channel>()
-  for (const c of before) beforeByKey.set(channelKey(c), c)
-  const nextByKey = new Map<string, Channel>()
-  for (const c of next) nextByKey.set(channelKey(c), c)
-
-  for (const [key, beforeC] of beforeByKey) {
-    const nextC = nextByKey.get(key)
-    if (!nextC) {
-      removed.push(beforeC)
-      continue
-    }
-    if (fingerprint(beforeC) === fingerprint(nextC)) {
-      unchanged.push(nextC)
-    } else {
-      updated.push(nextC)
+  for (const adapterId of ['discord-bot'] as const) {
+    const beforeFp = discordFingerprint(before[adapterId])
+    const nextFp = discordFingerprint(next[adapterId])
+    if (beforeFp === null && nextFp !== null) result.added.push(adapterId)
+    else if (beforeFp !== null && nextFp === null) result.removed.push(adapterId)
+    else if (beforeFp !== null && nextFp !== null) {
+      if (beforeFp === nextFp) result.unchanged.push(adapterId)
+      else result.updated.push(adapterId)
     }
   }
-  for (const [key, nextC] of nextByKey) {
-    if (!beforeByKey.has(key)) added.push(nextC)
-  }
 
-  return { added, removed, updated, unchanged }
+  return result
 }
 
 function errMsg(err: unknown): string {

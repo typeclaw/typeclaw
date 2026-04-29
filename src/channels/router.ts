@@ -8,7 +8,6 @@ export type AdapterId = 'discord-bot'
 
 export type ChannelKey = {
   adapter: AdapterId
-  bot: string
   workspace: string
   chat: string
   thread: string | null
@@ -33,8 +32,10 @@ export type ChannelSessionMapping = ChannelKey & {
   lastInboundTs: number
 }
 
+const SESSIONS_FILE_VERSION = 2
+
 type SessionsFile = {
-  version: 1
+  version: typeof SESSIONS_FILE_VERSION
   mappings: ChannelSessionMapping[]
 }
 
@@ -126,8 +127,10 @@ export function createChannelRouter({
       logger.error(`[channels] ${SESSIONS_FILE} is not valid JSON: ${errMsg(err)}`)
       return
     }
-    if (parsed.version !== 1 || !Array.isArray(parsed.mappings)) {
-      logger.error(`[channels] ${SESSIONS_FILE} has unsupported version or shape; ignoring`)
+    if (parsed.version !== SESSIONS_FILE_VERSION || !Array.isArray(parsed.mappings)) {
+      logger.warn(
+        `[channels] ${SESSIONS_FILE} is not version ${SESSIONS_FILE_VERSION}; ignoring (will be regenerated on first inbound)`,
+      )
       return
     }
     for (const m of parsed.mappings) {
@@ -136,7 +139,7 @@ export function createChannelRouter({
   }
 
   async function persist(): Promise<void> {
-    const file: SessionsFile = { version: 1, mappings: [...mappings.values()] }
+    const file: SessionsFile = { version: SESSIONS_FILE_VERSION, mappings: [...mappings.values()] }
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, JSON.stringify(file, null, 2), 'utf8')
   }
@@ -182,7 +185,6 @@ export function createChannelRouter({
         const turnSuffix = sessionEvent.message.responseId ?? `t${sessionEvent.message.timestamp ?? Date.now()}`
         const reply: OutboundReply = {
           adapter: event.adapter,
-          bot: event.bot,
           workspace: event.workspace,
           chat: event.chat,
           thread: event.thread,
@@ -196,7 +198,6 @@ export function createChannelRouter({
     if (existingMapping === undefined || existingMapping.sessionId !== created.sessionId) {
       mappings.set(keyStr, {
         adapter: event.adapter,
-        bot: event.bot,
         workspace: event.workspace,
         chat: event.chat,
         thread: event.thread,
@@ -308,7 +309,7 @@ export function createChannelRouter({
 }
 
 function serializeKey(key: ChannelKey): string {
-  return `${key.adapter}|${key.bot}|${key.workspace}|${key.chat}|${key.thread ?? ''}`
+  return `${key.adapter}|${key.workspace}|${key.chat}|${key.thread ?? ''}`
 }
 
 function errMsg(err: unknown): string {

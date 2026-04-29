@@ -5,7 +5,7 @@ import type {
 } from 'agent-messenger/discordbot'
 
 import type { ChannelRouter, InboundMessage, OutboundCallback, OutboundReply } from '../router'
-import { matchesAnyChatRule, type ChatRule } from '../schema'
+import { type AllowRule, isAllowed } from '../schema'
 
 export type DiscordBotListenerLike = {
   on<K extends keyof DiscordBotListenerEventMap>(
@@ -32,8 +32,7 @@ export type DiscordBotAdapter = {
 }
 
 export type CreateDiscordBotAdapterOptions = {
-  bot: string
-  chats: ChatRule[]
+  allow: AllowRule[]
   router: ChannelRouter
   client: Pick<DiscordBotClient, 'sendMessage'>
   listener: DiscordBotListenerLike
@@ -47,8 +46,7 @@ const consoleLogger: DiscordBotAdapterLogger = {
 }
 
 export function createDiscordBotAdapter({
-  bot,
-  chats,
+  allow,
   router,
   client,
   listener,
@@ -74,15 +72,14 @@ export function createDiscordBotAdapter({
   async function doHandle(event: DiscordGatewayMessageCreateEvent): Promise<void> {
     if (event.author.bot === true) return
 
-    const workspace = event.guild_id ?? DM_WORKSPACE_SENTINEL
-    if (!matchesAnyChatRule(chats, workspace, event.channel_id)) return
+    const guildId = event.guild_id ?? null
+    if (!isAllowed(allow, guildId, event.channel_id)) return
 
     if (event.content.length === 0) return
 
     const inbound: InboundMessage = {
       adapter: 'discord-bot',
-      bot,
-      workspace,
+      workspace: guildId ?? DM_WORKSPACE_SENTINEL,
       chat: event.channel_id,
       thread: null,
       text: event.content,
@@ -98,12 +95,13 @@ export function createDiscordBotAdapter({
   }
 
   async function outboundCallback(reply: OutboundReply): Promise<void> {
-    if (reply.bot !== bot) return
-    // Re-check chats on every outbound. A reload that narrows the allowlist
-    // doesn't terminate already-live sessions in still-allowed chats; without
-    // this guard, those sessions would keep replying into chats the user
-    // just removed from config.
-    if (!matchesAnyChatRule(chats, reply.workspace, reply.chat)) return
+    if (reply.adapter !== 'discord-bot') return
+    // Re-check allow on every outbound. A reload that narrows the rules
+    // doesn't terminate already-live sessions; without this guard, those
+    // sessions would keep replying into chats the user just removed from
+    // config.
+    const guildId = reply.workspace === DM_WORKSPACE_SENTINEL ? null : reply.workspace
+    if (!isAllowed(allow, guildId, reply.chat)) return
     try {
       await client.sendMessage(reply.chat, reply.text, reply.thread !== null ? { thread_id: reply.thread } : undefined)
     } catch (err) {
