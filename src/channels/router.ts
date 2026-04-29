@@ -282,10 +282,21 @@ export function createChannelRouter({
       }
     },
     async stop() {
-      for (const live of liveSessions.values()) {
-        live.unsubscribe()
-      }
+      const lives = [...liveSessions.values()]
       liveSessions.clear()
+      // Abort in-flight LLM turns AND unsubscribe from events. Without abort(),
+      // the session keeps streaming and may still execute tool calls after the
+      // container is told to stop, burning tokens and producing side effects.
+      await Promise.all(
+        lives.map(async (live) => {
+          live.unsubscribe()
+          try {
+            await live.session.abort()
+          } catch (err) {
+            logger.error(`[channels] abort failed for ${live.sessionId}: ${errMsg(err)}`)
+          }
+        }),
+      )
     },
     knownMappings() {
       return [...mappings.values()]

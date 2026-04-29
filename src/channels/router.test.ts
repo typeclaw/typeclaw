@@ -420,6 +420,36 @@ describe('ChannelRouter', () => {
     expect(seen[0]?.existingSessionId).toBeUndefined()
   })
 
+  test('stop() aborts in-flight session prompts', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    const abortCalls: string[] = []
+    let resolvePrompt: () => void = () => {}
+    const session = {
+      subscribe: () => () => {},
+      async prompt() {
+        await new Promise<void>((r) => {
+          resolvePrompt = r
+        })
+      },
+      async abort() {
+        abortCalls.push('abort')
+        resolvePrompt()
+      },
+    }
+    const router = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
+    })
+
+    const routePromise = router.route(baseEvent)
+    await new Promise((r) => setTimeout(r, 20))
+    await router.stop()
+    await routePromise
+
+    expect(abortCalls).toEqual(['abort'])
+    expect(router.liveSessionCount()).toBe(0)
+  })
+
   test('mapping is persisted to disk before any prompt runs', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const observed: { persisted: boolean | null } = { persisted: null }
