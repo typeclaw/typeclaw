@@ -55,8 +55,23 @@ export function createDiscordBotAdapter({
   logger = consoleLogger,
 }: CreateDiscordBotAdapterOptions): DiscordBotAdapter {
   let unbindOutbound: (() => void) | null = null
+  // Tracks every handleInbound() promise so stop() can await them. Without
+  // this, applyChannels() (and shutdown) can rip the listener away while a
+  // route() is mid-await, leaking partial work and double-creating sessions
+  // when a replacement adapter starts immediately.
+  const inFlight = new Set<Promise<void>>()
 
   async function handleInbound(event: DiscordGatewayMessageCreateEvent): Promise<void> {
+    const promise = doHandle(event)
+    inFlight.add(promise)
+    try {
+      await promise
+    } finally {
+      inFlight.delete(promise)
+    }
+  }
+
+  async function doHandle(event: DiscordGatewayMessageCreateEvent): Promise<void> {
     if (event.author.bot === true) return
 
     const workspace = event.guild_id ?? DM_WORKSPACE_SENTINEL
@@ -112,6 +127,7 @@ export function createDiscordBotAdapter({
       unbindOutbound?.()
       unbindOutbound = null
       listener.stop()
+      await Promise.all([...inFlight])
     },
     handleInbound,
     outboundCallback,

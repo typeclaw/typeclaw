@@ -329,6 +329,43 @@ describe('DiscordBotAdapter', () => {
     expect(errors.some((e) => e.includes('rate limit'))).toBe(true)
   })
 
+  test('stop() awaits in-flight handleInbound before returning', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-adapter-'))
+    const fakes = createFakeSession()
+    let releaseRouter: () => void = () => {}
+    const slowRouter = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async () => {
+        await new Promise<void>((r) => {
+          releaseRouter = r
+        })
+        return { session: fakes.session, sessionId: 'sess-1' }
+      },
+    })
+    const adapter = createDiscordBotAdapter({
+      bot: 'main',
+      chats: ['*'],
+      router: slowRouter,
+      client: createFakeClient().client,
+      listener: createFakeListener().listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    const inboundPromise = adapter.handleInbound(makeMessageEvent({ content: 'hi' }))
+    let stopResolved = false
+    const stopPromise = adapter.stop().then(() => {
+      stopResolved = true
+    })
+    await new Promise((r) => setTimeout(r, 30))
+    expect(stopResolved).toBe(false)
+
+    releaseRouter()
+    await inboundPromise
+    await stopPromise
+
+    expect(stopResolved).toBe(true)
+  })
+
   test('end-to-end: inbound → session.prompt → text_delta → message_end → outbound send', async () => {
     const { router, fakes } = await makeRouter()
     const clientFakes = createFakeClient()
