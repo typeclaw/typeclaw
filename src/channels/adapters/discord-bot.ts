@@ -132,7 +132,7 @@ export function createDiscordBotAdapter({
       unbindOutbound?.()
       unbindOutbound = null
       listener.stop()
-      await Promise.all([...inFlight])
+      await Promise.all(inFlight)
     },
     handleInbound,
     outboundCallback,
