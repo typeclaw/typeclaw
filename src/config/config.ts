@@ -5,6 +5,8 @@ import type { Model } from '@mariozechner/pi-ai'
 import { CronExpressionParser } from 'cron-parser'
 import { z } from 'zod'
 
+import { channelSchema } from '@/channels/schema'
+
 import { KNOWN_PROVIDERS, listKnownModelRefs, type KnownModelRef, type KnownProviderId } from './providers'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -57,6 +59,7 @@ export const configSchema = z.object({
   // writes `"mounts": []` explicitly, but a missing field is treated the same
   // way (no host paths exposed) rather than failing the whole config load.
   mounts: z.array(mountSchema).default([]),
+  channels: z.array(channelSchema).default([]),
 })
 
 function isValidCronExpression(schedule: string): boolean {
@@ -140,6 +143,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   mounts: 'restart-required',
   'memory.idleMs': 'restart-required',
   'memory.dreaming': 'applied',
+  channels: 'applied',
 }
 
 // Stable JSON for value comparison. Fields are small JSON-shaped objects, so
