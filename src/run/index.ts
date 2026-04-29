@@ -1,6 +1,17 @@
 import { SessionManager } from '@mariozechner/pi-coding-agent'
 
 import { createSession } from '@/agent'
+import {
+  type ChannelManager,
+  type ChannelRouter,
+  createChannelManager,
+  createChannelRouter,
+  createChannelsReloadable,
+  createDefaultDiscordBotFactory,
+  type DiscordBotChannel,
+  type DiscordBotFactory,
+  type DiscordBotListenerLike,
+} from '@/channels'
 import { config, type Config, createConfigReloadable, getConfig } from '@/config'
 import {
   type CronConsumer,
@@ -41,6 +52,7 @@ export type StartAgentOptions = {
   createSchedulerFor?: SchedulerFactory
   sessionFactory?: SessionFactory
   stream?: Stream
+  discordBotFactory?: DiscordBotFactory
 }
 
 export type StartAgentResult = {
@@ -49,6 +61,8 @@ export type StartAgentResult = {
   scheduler: Scheduler | null
   cronConsumer: CronConsumer | null
   subagentConsumer: SubagentConsumer
+  channelRouter: ChannelRouter
+  channelManager: ChannelManager
   reloadRegistry: ReloadRegistry
   stream: Stream
   stop: () => void
@@ -64,6 +78,7 @@ export async function startAgent({
   createSchedulerFor,
   sessionFactory = createSessionFactory({ agentDir: cwd }),
   stream = createStream(),
+  discordBotFactory,
 }: StartAgentOptions): Promise<StartAgentResult> {
   const reloadRegistry = new ReloadRegistry()
   reloadRegistry.register(createConfigReloadable({ cwd }))
@@ -78,6 +93,33 @@ export async function startAgent({
         stream,
       }),
   })
+
+  const channelRouter = createChannelRouter({
+    agentDir: cwd,
+    createSessionForChannel: async () => {
+      const sessionManager = SessionManager.create(cwd, sessionFactory.sessionDir())
+      const session = await createSession({ reloadRegistry, sessionManager, stream })
+      return { session, sessionId: sessionManager.getSessionId() }
+    },
+  })
+  const resolvedDiscordBotFactory =
+    discordBotFactory ??
+    createDefaultDiscordBotFactory({
+      router: channelRouter,
+      createDiscordBotClientAndListener: createRealDiscordBotClientAndListener,
+    })
+  const channelManager = createChannelManager({
+    router: channelRouter,
+    channels: getConfig().channels,
+    discordBotFactory: resolvedDiscordBotFactory,
+  })
+  await channelManager.start()
+  reloadRegistry.register(
+    createChannelsReloadable({
+      manager: channelManager,
+      loadChannels: () => getConfig().channels,
+    }),
+  )
 
   const subagentConsumer = createSubagentConsumer({
     stream,
@@ -129,6 +171,7 @@ export async function startAgent({
     scheduler?.stop()
     cronConsumer.stop()
     subagentConsumer.stop()
+    void channelManager.stop().catch((err) => console.error(`[channels] stop failed: ${errMessage(err)}`))
     server.stop(true)
   }
 
@@ -139,6 +182,8 @@ export async function startAgent({
       scheduler,
       cronConsumer: scheduler ? cronConsumer : null,
       subagentConsumer,
+      channelRouter,
+      channelManager,
       reloadRegistry,
       stream,
       stop,
@@ -154,10 +199,37 @@ export async function startAgent({
     scheduler,
     cronConsumer: scheduler ? cronConsumer : null,
     subagentConsumer,
+    channelRouter,
+    channelManager,
     reloadRegistry,
     stream,
     stop,
   }
+}
+
+async function createRealDiscordBotClientAndListener(_channel: DiscordBotChannel) {
+  const { DiscordBotClient, DiscordBotListener, DiscordIntent } = await import('agent-messenger/discordbot')
+  const client = await new DiscordBotClient().login()
+  const listener = new DiscordBotListener(client, {
+    intents:
+      DiscordIntent.Guilds |
+      DiscordIntent.GuildMessages |
+      DiscordIntent.GuildMessageReactions |
+      DiscordIntent.DirectMessages |
+      DiscordIntent.MessageContent,
+  })
+  const listenerLike: DiscordBotListenerLike = listener
+  return {
+    client,
+    listener: listenerLike,
+    close: async () => {
+      listener.stop()
+    },
+  }
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 async function startScheduler({

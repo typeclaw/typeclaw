@@ -500,4 +500,56 @@ describe('startAgent session persistence wiring', () => {
     expect(existsSync(join(agentDir, 'sessions'))).toBe(false)
     expect(dirCalls + createCalls).toBe(0)
   })
+
+  test('startAgent exposes a channelRouter and channelManager', async () => {
+    running = await startAgent({ port: 0, attachTui: false, loadCron: noCron })
+
+    expect(running.channelRouter).toBeDefined()
+    expect(running.channelManager).toBeDefined()
+    expect(running.channelManager.activeKeys()).toEqual([])
+  })
+
+  test('channels reload: applyChannels picks up new entries from typeclaw.json', async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-channels-'))
+
+    const startCalls: string[] = []
+    const stopCalls: string[] = []
+    const fakeFactory: import('@/channels').DiscordBotFactory = async (channel) => ({
+      adapter: {
+        async start() {
+          startCalls.push(channel.bot)
+        },
+        async stop() {
+          stopCalls.push(channel.bot)
+        },
+        async handleInbound() {},
+        outboundCallback: async () => {},
+      },
+      close: async () => {},
+    })
+
+    running = await startAgent({
+      port: 0,
+      attachTui: false,
+      cwd: agentDir,
+      loadCron: noCron,
+      discordBotFactory: fakeFactory,
+    })
+
+    expect(startCalls).toEqual([])
+    expect(running.channelManager.activeKeys()).toEqual([])
+
+    const diff = await running.channelManager.applyChannels([
+      { adapter: 'discord-bot', bot: 'main', chats: ['*'], enabled: true },
+    ])
+    expect(diff.added.map((c) => c.bot)).toEqual(['main'])
+    expect(running.channelManager.activeKeys()).toEqual(['discord-bot|main'])
+    expect(startCalls).toEqual(['main'])
+
+    running.stop()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(stopCalls).toEqual(['main'])
+
+    await rm(agentDir, { recursive: true, force: true })
+  })
 })
