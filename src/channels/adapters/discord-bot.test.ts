@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdtemp } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -83,11 +83,22 @@ function makeMessageEvent(over: Partial<DiscordGatewayMessageCreateEvent> = {}):
   } as DiscordGatewayMessageCreateEvent
 }
 
+const tempDirs: string[] = []
+
+beforeEach(() => {
+  tempDirs.length = 0
+})
+
+afterEach(async () => {
+  await Promise.all(tempDirs.map((d) => rm(d, { recursive: true, force: true })))
+})
+
 async function makeRouter(createSession?: CreateSessionForChannel) {
   const dir = await mkdtemp(join(tmpdir(), 'channels-adapter-'))
+  tempDirs.push(dir)
   const fakes = createFakeSession()
   const router = createChannelRouter({
-    agentDir: dir,
+    cwd: dir,
     createSessionForChannel: createSession ?? (async () => ({ session: fakes.session, sessionId: 'sess-1' })),
   })
   return { router, fakes, dir }
@@ -366,10 +377,11 @@ describe('DiscordBotAdapter', () => {
 
   test('stop() awaits in-flight handleInbound before returning', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'channels-adapter-'))
+    tempDirs.push(dir)
     const fakes = createFakeSession()
     let releaseRouter: () => void = () => {}
     const slowRouter = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => {
         await new Promise<void>((r) => {
           releaseRouter = r

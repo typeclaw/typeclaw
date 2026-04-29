@@ -1,11 +1,21 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdtemp } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createChannelManager, type DiscordBotFactory } from './manager'
 import { createChannelRouter } from './router'
 import type { Channel } from './schema'
+
+const tempDirs: string[] = []
+
+beforeEach(() => {
+  tempDirs.length = 0
+})
+
+afterEach(async () => {
+  await Promise.all(tempDirs.map((d) => rm(d, { recursive: true, force: true })))
+})
 
 function fakeAdapter() {
   const events: string[] = []
@@ -26,8 +36,9 @@ function fakeAdapter() {
 
 async function makeRouter() {
   const dir = await mkdtemp(join(tmpdir(), 'channels-mgr-'))
+  tempDirs.push(dir)
   return createChannelRouter({
-    agentDir: dir,
+    cwd: dir,
     createSessionForChannel: async () => ({
       session: { subscribe: () => () => {}, async prompt() {}, async abort() {} } as any,
       sessionId: 'sess',

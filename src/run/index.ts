@@ -98,7 +98,7 @@ export async function startAgent({
   })
 
   const channelRouter = createChannelRouter({
-    agentDir: cwd,
+    cwd,
     createSessionForChannel: async (_key, options) => {
       const sessionManager = openOrCreateSession(cwd, sessionFactory.sessionDir(), options?.existingSessionId)
       const session = await createSession({ reloadRegistry, sessionManager, stream })

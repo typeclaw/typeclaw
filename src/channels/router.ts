@@ -63,7 +63,7 @@ export type ChannelRouterLogger = {
 }
 
 export type CreateChannelRouterOptions = {
-  agentDir: string
+  cwd: string
   createSessionForChannel: CreateSessionForChannel
   logger?: ChannelRouterLogger
 }
@@ -86,7 +86,7 @@ const consoleLogger: ChannelRouterLogger = {
 }
 
 export function createChannelRouter({
-  agentDir,
+  cwd,
   createSessionForChannel,
   logger = consoleLogger,
 }: CreateChannelRouterOptions): ChannelRouter {
@@ -97,7 +97,7 @@ export function createChannelRouter({
   // inbounds racing on a cold channel each spawn a full AgentSession.
   const creating = new Map<string, Promise<LiveSession>>()
   const outboundCallbacks = new Map<AdapterId, Set<OutboundCallback>>()
-  const path = join(agentDir, SESSIONS_FILE)
+  const path = join(cwd, SESSIONS_FILE)
   // load() may be invoked concurrently from many route() calls. Cache the
   // first invocation's promise so all callers share it; this also pins
   // before/after relationships in the microtask queue so route() resumption

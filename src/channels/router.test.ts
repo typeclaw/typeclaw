@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -60,9 +60,18 @@ const baseEvent: InboundMessage = {
   authorId: 'u1',
 }
 
+let dir: string
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+})
+
+afterEach(async () => {
+  await rm(dir, { recursive: true, force: true })
+})
+
 describe('ChannelRouter', () => {
   test('first inbound creates a session, persists mapping, and prompts the session', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     let createCount = 0
     const createSessionForChannel: CreateSessionForChannel = async () => {
@@ -70,7 +79,7 @@ describe('ChannelRouter', () => {
       return { session: fakes.session, sessionId: 'sess-1' }
     }
 
-    const router = createChannelRouter({ agentDir: dir, createSessionForChannel })
+    const router = createChannelRouter({ cwd: dir, createSessionForChannel })
     await router.route(baseEvent)
 
     expect(createCount).toBe(1)
@@ -93,14 +102,13 @@ describe('ChannelRouter', () => {
   })
 
   test('subsequent inbound for same key reuses the session (no second create)', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     let createCount = 0
     const createSessionForChannel: CreateSessionForChannel = async () => {
       createCount++
       return { session: fakes.session, sessionId: 'sess-1' }
     }
-    const router = createChannelRouter({ agentDir: dir, createSessionForChannel })
+    const router = createChannelRouter({ cwd: dir, createSessionForChannel })
 
     await router.route(baseEvent)
     await router.route({ ...baseEvent, text: 'second', externalMessageId: 'xm2' })
@@ -111,7 +119,6 @@ describe('ChannelRouter', () => {
   })
 
   test('different (workspace, chat) tuples each get their own session', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     let n = 0
     const fakesByCall: ReturnType<typeof createFakeSession>[] = []
     const createSessionForChannel: CreateSessionForChannel = async () => {
@@ -120,7 +127,7 @@ describe('ChannelRouter', () => {
       fakesByCall.push(f)
       return { session: f.session, sessionId: `sess-${n}` }
     }
-    const router = createChannelRouter({ agentDir: dir, createSessionForChannel })
+    const router = createChannelRouter({ cwd: dir, createSessionForChannel })
 
     await router.route(baseEvent)
     await router.route({ ...baseEvent, workspace: 'W2' })
@@ -133,10 +140,9 @@ describe('ChannelRouter', () => {
   })
 
   test('reload from disk: on construction, an existing sessions.json is loaded', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes1 = createFakeSession()
     const router1 = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes1.session, sessionId: 'sess-A' }),
     })
     await router1.route(baseEvent)
@@ -145,7 +151,7 @@ describe('ChannelRouter', () => {
     const fakes2 = createFakeSession()
     let createCount = 0
     const router2 = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => {
         createCount++
         return { session: fakes2.session, sessionId: 'sess-B' }
@@ -159,10 +165,9 @@ describe('ChannelRouter', () => {
   })
 
   test('outbound: assistant message_end posts accumulated text to the bound callback', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
     })
 
@@ -191,10 +196,9 @@ describe('ChannelRouter', () => {
   })
 
   test('outbound: user message_end does not trigger a reply', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
     })
 
@@ -211,10 +215,9 @@ describe('ChannelRouter', () => {
   })
 
   test('outbound: assistant message with no accumulated text does not post', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
     })
     const replies: OutboundReply[] = []
@@ -229,10 +232,9 @@ describe('ChannelRouter', () => {
   })
 
   test('bindOutbound returns an unsubscribe that removes the callback', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
     })
     const replies: OutboundReply[] = []
@@ -255,10 +257,9 @@ describe('ChannelRouter', () => {
   })
 
   test('multiple text_delta accumulate per turn and reset across turns', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
     })
     const replies: OutboundReply[] = []
@@ -280,12 +281,11 @@ describe('ChannelRouter', () => {
   })
 
   test('corrupt sessions.json: logs and continues with empty mappings', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     await Bun.write(join(dir, 'channels/sessions.json'), '{not json')
     const fakes = createFakeSession()
     const errors: string[] = []
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
       logger: { info: () => {}, warn: () => {}, error: (m) => errors.push(m) },
     })
@@ -296,11 +296,10 @@ describe('ChannelRouter', () => {
   })
 
   test('unknown adapter outbound is dropped with a warning, no throw', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     const warnings: string[] = []
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: fakes.session, sessionId: 'sess-1' }),
       logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
     })
@@ -315,7 +314,6 @@ describe('ChannelRouter', () => {
   })
 
   test('concurrent route() for the same key creates only one session', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const fakes = createFakeSession()
     let createCount = 0
     const createSessionForChannel: CreateSessionForChannel = async () => {
@@ -323,7 +321,7 @@ describe('ChannelRouter', () => {
       await new Promise((r) => setTimeout(r, 20))
       return { session: fakes.session, sessionId: 'sess-1' }
     }
-    const router = createChannelRouter({ agentDir: dir, createSessionForChannel })
+    const router = createChannelRouter({ cwd: dir, createSessionForChannel })
 
     await Promise.all([
       router.route({ ...baseEvent, text: 'first', externalMessageId: 'x1' }),
@@ -337,7 +335,6 @@ describe('ChannelRouter', () => {
   })
 
   test('concurrent route() for the same key serializes session.prompt() FIFO', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const promptOrder: string[] = []
     const inFlight: { current: number } = { current: 0 }
     let maxConcurrent = 0
@@ -353,7 +350,7 @@ describe('ChannelRouter', () => {
       async abort() {},
     }
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
     })
 
@@ -368,7 +365,6 @@ describe('ChannelRouter', () => {
   })
 
   test('rehydrate: passes existingSessionId from sessions.json to createSessionForChannel', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     await Bun.write(
       join(dir, 'channels/sessions.json'),
       JSON.stringify({
@@ -391,7 +387,7 @@ describe('ChannelRouter', () => {
     const seen: { existingSessionId: string | undefined }[] = []
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async (_key, opts) => {
         seen.push({ existingSessionId: opts?.existingSessionId })
         return { session: fakes.session, sessionId: opts?.existingSessionId ?? 'sess-fresh' }
@@ -405,11 +401,10 @@ describe('ChannelRouter', () => {
   })
 
   test('rehydrate: cold channel passes undefined existingSessionId', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const seen: { existingSessionId: string | undefined }[] = []
     const fakes = createFakeSession()
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async (_key, opts) => {
         seen.push({ existingSessionId: opts?.existingSessionId })
         return { session: fakes.session, sessionId: 'sess-fresh' }
@@ -421,7 +416,6 @@ describe('ChannelRouter', () => {
   })
 
   test('stop() aborts in-flight session prompts', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const abortCalls: string[] = []
     let resolvePrompt: () => void = () => {}
     const session = {
@@ -437,7 +431,7 @@ describe('ChannelRouter', () => {
       },
     }
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
     })
 
@@ -451,7 +445,6 @@ describe('ChannelRouter', () => {
   })
 
   test('mapping is persisted to disk before any prompt runs', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const observed: { persisted: boolean | null } = { persisted: null }
     const session = {
       subscribe: () => () => {},
@@ -467,7 +460,7 @@ describe('ChannelRouter', () => {
       async abort() {},
     }
     const router = createChannelRouter({
-      agentDir: dir,
+      cwd: dir,
       createSessionForChannel: async () => ({ session: session as any, sessionId: 'sess-1' }),
     })
 
