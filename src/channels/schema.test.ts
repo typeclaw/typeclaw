@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { channelSchema, matchesAnyChatRule } from './schema'
+import { channelSchema, channelsArraySchema, matchesAnyChatRule } from './schema'
 
 describe('channelSchema', () => {
   test('parses a discord-bot channel with default chats and enabled', () => {
@@ -27,6 +27,29 @@ describe('channelSchema', () => {
 
   test('rejects empty bot id', () => {
     expect(() => channelSchema.parse({ adapter: 'discord-bot', bot: '' })).toThrow()
+  })
+})
+
+describe('channelsArraySchema', () => {
+  test('accepts distinct (adapter, bot) entries', () => {
+    const parsed = channelsArraySchema.parse([
+      { adapter: 'discord-bot', bot: 'main' },
+      { adapter: 'discord-bot', bot: 'alert' },
+    ])
+    expect(parsed).toHaveLength(2)
+  })
+
+  test('rejects duplicate (adapter, bot) entries', () => {
+    expect(() =>
+      channelsArraySchema.parse([
+        { adapter: 'discord-bot', bot: 'main' },
+        { adapter: 'discord-bot', bot: 'main', chats: ['C1'] },
+      ]),
+    ).toThrow(/duplicate channel for discord-bot bot/)
+  })
+
+  test('empty array is fine', () => {
+    expect(channelsArraySchema.parse([])).toEqual([])
   })
 })
 

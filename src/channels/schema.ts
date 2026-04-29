@@ -32,6 +32,23 @@ export const channelSchema = z.discriminatedUnion('adapter', [discordBotChannelS
 
 export type Channel = z.infer<typeof channelSchema>
 
+export const channelsArraySchema = z.array(channelSchema).superRefine((channels, ctx) => {
+  const seen = new Set<string>()
+  for (let i = 0; i < channels.length; i++) {
+    const channel = channels[i]
+    if (channel === undefined) continue
+    const key = `${channel.adapter}|${channel.bot}`
+    if (seen.has(key)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [i, 'bot'],
+        message: `duplicate channel for ${channel.adapter} bot "${channel.bot}"; each (adapter, bot) pair must appear at most once`,
+      })
+    }
+    seen.add(key)
+  }
+})
+
 // Match a (workspace, chat) tuple against a list of rules. At least one rule
 // must match for the event to be admitted. Used at inbound time by the
 // adapter, so a `chats: ["*"]` channel auto-subscribes to every workspace
