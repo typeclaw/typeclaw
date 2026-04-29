@@ -47,7 +47,14 @@ type LiveSession = {
   draining: boolean
 }
 
-export type CreateSessionForChannel = (key: ChannelKey) => Promise<{ session: AgentSession; sessionId: string }>
+export type CreateSessionForChannelOptions = {
+  existingSessionId?: string
+}
+
+export type CreateSessionForChannel = (
+  key: ChannelKey,
+  options?: CreateSessionForChannelOptions,
+) => Promise<{ session: AgentSession; sessionId: string }>
 
 export type ChannelRouterLogger = {
   info: (msg: string) => void
@@ -150,7 +157,11 @@ export function createChannelRouter({
   }
 
   async function doCreate(event: InboundMessage, keyStr: string): Promise<LiveSession> {
-    const created = await createSessionForChannel(event)
+    const existingMapping = mappings.get(keyStr)
+    const created = await createSessionForChannel(
+      event,
+      existingMapping !== undefined ? { existingSessionId: existingMapping.sessionId } : undefined,
+    )
     const live: LiveSession = {
       session: created.session,
       sessionId: created.sessionId,
@@ -182,7 +193,6 @@ export function createChannelRouter({
       }
     })
 
-    const existingMapping = mappings.get(keyStr)
     if (existingMapping === undefined || existingMapping.sessionId !== created.sessionId) {
       mappings.set(keyStr, {
         adapter: event.adapter,

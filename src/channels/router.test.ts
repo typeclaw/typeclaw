@@ -367,6 +367,59 @@ describe('ChannelRouter', () => {
     expect(maxConcurrent).toBe(1)
   })
 
+  test('rehydrate: passes existingSessionId from sessions.json to createSessionForChannel', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    await Bun.write(
+      join(dir, 'channels/sessions.json'),
+      JSON.stringify({
+        version: 1,
+        mappings: [
+          {
+            adapter: 'discord-bot',
+            bot: 'main',
+            workspace: 'W1',
+            chat: 'C1',
+            thread: null,
+            sessionId: 'sess-existing',
+            createdAt: 1,
+            lastInboundTs: 2,
+          },
+        ],
+      }),
+    )
+
+    const seen: { existingSessionId: string | undefined }[] = []
+    const fakes = createFakeSession()
+    const router = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async (_key, opts) => {
+        seen.push({ existingSessionId: opts?.existingSessionId })
+        return { session: fakes.session, sessionId: opts?.existingSessionId ?? 'sess-fresh' }
+      },
+    })
+    await router.route(baseEvent)
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]?.existingSessionId).toBe('sess-existing')
+    expect(router.knownMappings()[0]?.sessionId).toBe('sess-existing')
+  })
+
+  test('rehydrate: cold channel passes undefined existingSessionId', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
+    const seen: { existingSessionId: string | undefined }[] = []
+    const fakes = createFakeSession()
+    const router = createChannelRouter({
+      agentDir: dir,
+      createSessionForChannel: async (_key, opts) => {
+        seen.push({ existingSessionId: opts?.existingSessionId })
+        return { session: fakes.session, sessionId: 'sess-fresh' }
+      },
+    })
+    await router.route(baseEvent)
+
+    expect(seen[0]?.existingSessionId).toBeUndefined()
+  })
+
   test('mapping is persisted to disk before any prompt runs', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'channels-router-'))
     const observed: { persisted: boolean | null } = { persisted: null }

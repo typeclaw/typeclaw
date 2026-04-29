@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+
 import { SessionManager } from '@mariozechner/pi-coding-agent'
 
 import { createSession } from '@/agent'
@@ -96,8 +99,8 @@ export async function startAgent({
 
   const channelRouter = createChannelRouter({
     agentDir: cwd,
-    createSessionForChannel: async () => {
-      const sessionManager = SessionManager.create(cwd, sessionFactory.sessionDir())
+    createSessionForChannel: async (_key, options) => {
+      const sessionManager = openOrCreateSession(cwd, sessionFactory.sessionDir(), options?.existingSessionId)
       const session = await createSession({ reloadRegistry, sessionManager, stream })
       return { session, sessionId: sessionManager.getSessionId() }
     },
@@ -205,6 +208,22 @@ export async function startAgent({
     stream,
     stop,
   }
+}
+
+function openOrCreateSession(cwd: string, sessionDir: string, existingSessionId: string | undefined): SessionManager {
+  if (existingSessionId !== undefined) {
+    const path = join(sessionDir, `${existingSessionId}.jsonl`)
+    if (existsSync(path)) {
+      try {
+        return SessionManager.open(path, sessionDir, cwd)
+      } catch (err) {
+        console.warn(
+          `[channels] failed to rehydrate session ${existingSessionId} (${errMessage(err)}); creating fresh session`,
+        )
+      }
+    }
+  }
+  return SessionManager.create(cwd, sessionDir)
 }
 
 async function createRealDiscordBotClientAndListener(_channel: DiscordBotChannel) {
