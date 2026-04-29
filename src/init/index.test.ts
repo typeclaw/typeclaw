@@ -432,6 +432,8 @@ describe('scaffold', () => {
     expect(gitignore).toContain('memory/')
     expect(gitignore).toMatch(/^workspace\/$/m)
     expect(gitignore).toContain('mounts/')
+    expect(gitignore).toMatch(/^channels\/state\/$/m)
+    expect(gitignore).toMatch(/^channels\/sessions\.json$/m)
   })
 
   test('preserves existing markdown files instead of overwriting', async () => {
