@@ -2,6 +2,7 @@ export {
   config,
   getConfig,
   mountSchema,
+  pluginEntrySchema,
   reloadConfig,
   resolveModel,
   validateConfig,
@@ -9,6 +10,7 @@ export {
   type ConfigChange,
   type ConfigReloadDiff,
   type Mount,
+  type PluginEntry,
   type ValidateConfigResult,
 } from './config'
 export { type KnownModelRef, type KnownProviderId } from './providers'

@@ -43,6 +43,14 @@ const dreamingSchema = z
   })
   .default({ schedule: DEFAULT_DREAMING_SCHEDULE })
 
+export const pluginEntrySchema = z.union([
+  z.string().min(1),
+  z.tuple([z.string().min(1), z.unknown()]),
+  z.object({ source: z.string().min(1), options: z.unknown().optional() }),
+])
+
+export type PluginEntry = z.infer<typeof pluginEntrySchema>
+
 export const configSchema = z.object({
   $schema: z.string().optional(),
   port: z.number().int().min(1).max(65535).default(DEFAULT_PORT),
@@ -57,6 +65,7 @@ export const configSchema = z.object({
   // writes `"mounts": []` explicitly, but a missing field is treated the same
   // way (no host paths exposed) rather than failing the whole config load.
   mounts: z.array(mountSchema).default([]),
+  plugins: z.array(pluginEntrySchema).default([]),
 })
 
 function isValidCronExpression(schedule: string): boolean {
@@ -140,6 +149,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   mounts: 'restart-required',
   'memory.idleMs': 'restart-required',
   'memory.dreaming': 'applied',
+  plugins: 'restart-required',
 }
 
 // Stable JSON for value comparison. Fields are small JSON-shaped objects, so

@@ -20,7 +20,7 @@ afterEach(async () => {
 describe('createResourceLoader', () => {
   test('starts the system prompt with the typeclaw default instead of pi default', async () => {
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -33,7 +33,7 @@ describe('createResourceLoader', () => {
     // from pi's discovery should leak in.
 
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     expect(loader.getAppendSystemPrompt()).toEqual([])
@@ -45,7 +45,7 @@ describe('createResourceLoader', () => {
     await writeFile(join(agentDir, 'SOUL.md'), 'Pedantic and kind.')
 
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -55,7 +55,7 @@ describe('createResourceLoader', () => {
 
   test('signals missing identity files so the model can see they should exist', async () => {
     // when (no files written)
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -69,7 +69,7 @@ describe('createResourceLoader', () => {
     await writeFile(join(agentDir, 'MEMORY.md'), 'Neo prefers terse replies.')
 
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -83,7 +83,7 @@ describe('createResourceLoader', () => {
     await writeFile(join(agentDir, 'memory', '2026-04-27.md'), 'fragment from tuesday')
 
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -97,7 +97,7 @@ describe('createResourceLoader', () => {
     await writeFile(join(agentDir, 'MEMORY.md'), 'remembered fact')
 
     // when
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
@@ -105,7 +105,7 @@ describe('createResourceLoader', () => {
   })
 
   test('exposes the typeclaw-cron bundled skill to the agent', async () => {
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     const { skills } = loader.getSkills()
     const cronSkill = skills.find((s) => s.name === 'typeclaw-cron')
@@ -114,7 +114,7 @@ describe('createResourceLoader', () => {
   })
 
   test('exposes the typeclaw-config bundled skill to the agent', async () => {
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     const { skills } = loader.getSkills()
     const configSkill = skills.find((s) => s.name === 'typeclaw-config')
@@ -123,7 +123,7 @@ describe('createResourceLoader', () => {
   })
 
   test('exposes the agent-browser bundled skill to the agent', async () => {
-    const loader = await createResourceLoader({ agentDir })
+    const { loader } = await createResourceLoader({ agentDir })
 
     const { skills } = loader.getSkills()
     const browserSkill = skills.find((s) => s.name === 'agent-browser')

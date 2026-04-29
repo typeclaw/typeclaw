@@ -26,6 +26,7 @@ export function createIdleDetector({ idleMs, onIdle }: CreateIdleDetectorOptions
       clear()
       timer = setTimeout(() => {
         timer = null
+        if (disposed) return
         onIdle()
       }, idleMs)
     },

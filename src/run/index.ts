@@ -15,11 +15,12 @@ import {
   type SubagentJob,
 } from '@/cron'
 import { createDreamingSpawner, createMemoryLoggerSpawner, isDreamingPayload, isMemoryLoggerPayload } from '@/memory'
+import { loadPlugins, PluginManager } from '@/plugin'
 import { ReloadRegistry } from '@/reload'
 import { createServer, type Server } from '@/server'
 import { createSessionFactory, type SessionFactory } from '@/sessions'
 import { createStream, type Stream } from '@/stream'
-import { createSubagentConsumer, type SubagentConsumer } from '@/subagent'
+import { createSubagentConsumer, type SubagentConsumer, type SubagentSpawner } from '@/subagent'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 
 const DREAMING_JOB_ID = '__internal_dreaming'
@@ -41,6 +42,7 @@ export type StartAgentOptions = {
   createSchedulerFor?: SchedulerFactory
   sessionFactory?: SessionFactory
   stream?: Stream
+  pluginManager?: PluginManager
 }
 
 export type StartAgentResult = {
@@ -51,7 +53,8 @@ export type StartAgentResult = {
   subagentConsumer: SubagentConsumer
   reloadRegistry: ReloadRegistry
   stream: Stream
-  stop: () => void
+  pluginManager: PluginManager
+  stop: () => Promise<void>
 }
 
 export async function startAgent({
@@ -64,27 +67,63 @@ export async function startAgent({
   createSchedulerFor,
   sessionFactory = createSessionFactory({ agentDir: cwd }),
   stream = createStream(),
+  pluginManager,
 }: StartAgentOptions): Promise<StartAgentResult> {
   const reloadRegistry = new ReloadRegistry()
   reloadRegistry.register(createConfigReloadable({ cwd }))
 
+  const manager = pluginManager ?? new PluginManager({ agentDir: cwd, stream })
+  if (pluginManager && config.plugins.length > 0) {
+    console.warn(
+      `[plugin] startAgent received an explicit pluginManager; the ${config.plugins.length} plugin(s) listed in typeclaw.json are ignored. Pre-load them into the provided manager if you want them.`,
+    )
+  }
+  if (!pluginManager) {
+    const entries = config.plugins
+    if (entries.length > 0) {
+      try {
+        const resolved = await loadPlugins(entries, { agentDir: cwd })
+        await manager.loadAll(resolved.map((r) => ({ plugin: r.plugin, source: r.ref.source, options: r.ref.options })))
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        throw new Error(`plugin loading failed: ${message}`)
+      }
+    }
+  }
+  manager.markBooted()
+  logRegistrationAudit(manager)
+
+  const coreSpawners: Record<string, SubagentSpawner> = {
+    'memory-logger': createMemoryLoggerSpawner(),
+    dreaming: createDreamingSpawner(),
+  }
+  const spawners = mergeSpawners(coreSpawners, manager.getSubagentSpawners())
+
   const cronConsumer = createCronConsumer({
     stream,
     cwd,
-    createSessionForCron: () =>
-      createSession({
+    createSessionForCron: async () => {
+      const { session, dispose } = await createSession({
         reloadRegistry,
         sessionManager: SessionManager.create(cwd, sessionFactory.sessionDir()),
         stream,
-      }),
+        pluginManager: manager,
+      })
+      return {
+        prompt: async (text) => {
+          try {
+            await session.prompt(text)
+          } finally {
+            await dispose()
+          }
+        },
+      }
+    },
   })
 
   const subagentConsumer = createSubagentConsumer({
     stream,
-    spawners: {
-      'memory-logger': createMemoryLoggerSpawner(),
-      dreaming: createDreamingSpawner(),
-    },
+    spawners,
     inFlightKey: (subagent, payload) => {
       if (subagent === 'memory-logger' && isMemoryLoggerPayload(payload)) {
         return `${subagent}:${payload.parentSessionId}`
@@ -97,7 +136,7 @@ export async function startAgent({
   })
   subagentConsumer.start()
 
-  const internalJobs = () => buildInternalJobs(cwd, getConfig())
+  const internalJobs = () => buildInternalJobs(cwd, getConfig(), manager)
   const factory = createSchedulerFor ?? makeDefaultSchedulerFactory(internalJobs)
   const scheduler = await startScheduler({
     cwd,
@@ -120,16 +159,18 @@ export async function startAgent({
     stream,
     memoryIdleMs: config.memory.idleMs,
     agentDir: cwd,
+    pluginManager: manager,
   }).start()
 
   let stopped = false
-  const stop = () => {
+  const stop = async () => {
     if (stopped) return
     stopped = true
     scheduler?.stop()
     cronConsumer.stop()
     subagentConsumer.stop()
     server.stop(true)
+    await manager.shutdown()
   }
 
   if (!attachTui) {
@@ -141,6 +182,7 @@ export async function startAgent({
       subagentConsumer,
       reloadRegistry,
       stream,
+      pluginManager: manager,
       stop,
     }
   }
@@ -156,8 +198,23 @@ export async function startAgent({
     subagentConsumer,
     reloadRegistry,
     stream,
+    pluginManager: manager,
     stop,
   }
+}
+
+function mergeSpawners(
+  core: Record<string, SubagentSpawner>,
+  plugin: Record<string, SubagentSpawner>,
+): Record<string, SubagentSpawner> {
+  const merged: Record<string, SubagentSpawner> = { ...core }
+  for (const [name, spawner] of Object.entries(plugin)) {
+    if (merged[name] !== undefined) {
+      throw new Error(`subagent name conflict: '${name}' is registered by both core and a plugin`)
+    }
+    merged[name] = spawner
+  }
+  return merged
 }
 
 async function startScheduler({
@@ -198,10 +255,27 @@ async function startScheduler({
 }
 
 function makeDefaultSchedulerFactory(internalJobs: () => CronJob[]): SchedulerFactory {
-  return ({ file, onFire }) => createScheduler({ jobs: [...file.jobs, ...internalJobs()], onFire })
+  return ({ file, onFire }) => {
+    const jobs = [...file.jobs, ...internalJobs()]
+    assertNoDuplicateIds(jobs, file)
+    return createScheduler({ jobs, onFire })
+  }
 }
 
-function buildInternalJobs(cwd: string, cfg: Config): CronJob[] {
+function assertNoDuplicateIds(jobs: CronJob[], file: CronFile): void {
+  const seen = new Map<string, CronJob>()
+  const userIds = new Set(file.jobs.map((j) => j.id))
+  for (const job of jobs) {
+    const prior = seen.get(job.id)
+    if (prior) {
+      const owner = userIds.has(job.id) ? 'cron.json' : 'plugin or internal job'
+      throw new Error(`cron job id '${job.id}' is registered twice (${owner} conflict)`)
+    }
+    seen.set(job.id, job)
+  }
+}
+
+function buildInternalJobs(cwd: string, cfg: Config, manager: PluginManager): CronJob[] {
   const jobs: CronJob[] = []
   const dreaming = cfg.memory.dreaming
   if (dreaming) {
@@ -215,5 +289,30 @@ function buildInternalJobs(cwd: string, cfg: Config): CronJob[] {
     }
     jobs.push(job)
   }
+  for (const job of manager.getCronJobs()) {
+    jobs.push(job)
+  }
   return jobs
+}
+
+function logRegistrationAudit(manager: PluginManager): void {
+  const registered = manager.registeredPlugins()
+  if (registered.length === 0) return
+  const audit = manager.describeRegistrations()
+  const summary = registered.map((r) => {
+    const versionPart = r.manifest.version ? ` v${r.manifest.version}` : ''
+    return `${r.manifest.name}${versionPart}`
+  })
+  console.log(`[plugin] loaded ${registered.length} plugin(s): ${summary.join(', ')}`)
+  const counts = [
+    audit.tools.length > 0 && `tools=${audit.tools.length}`,
+    audit.subagents.length > 0 && `subagents=${audit.subagents.length}`,
+    audit.cronJobs.length > 0 && `cronJobs=${audit.cronJobs.length}`,
+    audit.skillDirs.length > 0 && `skillDirs=${audit.skillDirs.length}`,
+    audit.inMemorySkills.length > 0 && `inMemorySkills=${audit.inMemorySkills.length}`,
+    audit.systemPromptSections.length > 0 && `systemPromptSections=${audit.systemPromptSections.length}`,
+    audit.eventHandlers.length > 0 && `eventHandlers=${audit.eventHandlers.length}`,
+    audit.shutdownHandlers.length > 0 && `shutdownHandlers=${audit.shutdownHandlers.length}`,
+  ].filter((v): v is string => typeof v === 'string')
+  if (counts.length > 0) console.log(`[plugin] registrations: ${counts.join(' ')}`)
 }

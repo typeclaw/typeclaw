@@ -36,7 +36,7 @@ async function startTestAgent(scheduler: Scheduler): Promise<{ url: string }> {
     port: 0,
     reloadAll: () => reloadRegistry.reloadAll(),
     reloadRegistry,
-    createSession: async () => stubSession,
+    createSession: async () => ({ session: stubSession, dispose: async () => {} }),
   }).start()
   server = built
   return { url: `ws://localhost:${built.port}` }

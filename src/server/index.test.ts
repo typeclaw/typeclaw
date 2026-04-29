@@ -65,15 +65,17 @@ async function startWithSession(
     sessionFactory?: SessionFactory
     memoryIdleMs?: number
     agentDir?: string
+    pluginManager?: import('@/plugin').PluginManager
   } = {},
 ): Promise<{ url: string }> {
   const built = createServer({
     port: 0,
-    createSession: async () => session,
+    createSession: async () => ({ session, dispose: async () => {} }),
     ...(extra.stream ? { stream: extra.stream } : {}),
     ...(extra.sessionFactory ? { sessionFactory: extra.sessionFactory } : {}),
     ...(extra.memoryIdleMs !== undefined ? { memoryIdleMs: extra.memoryIdleMs } : {}),
     ...(extra.agentDir !== undefined ? { agentDir: extra.agentDir } : {}),
+    ...(extra.pluginManager !== undefined ? { pluginManager: extra.pluginManager } : {}),
   }).start()
   server = built
   return { url: `ws://localhost:${built.port}` }
@@ -218,7 +220,7 @@ describe('createServer session persistence wiring', () => {
       sessionFactory: factory,
       createSession: async (options = {}) => {
         observed.push(options)
-        return session
+        return { session, dispose: async () => {} }
       },
     }).start()
     server = built
@@ -242,7 +244,7 @@ describe('createServer session persistence wiring', () => {
     const built = createServer({
       port: 0,
       sessionFactory: factory,
-      createSession: async () => session,
+      createSession: async () => ({ session, dispose: async () => {} }),
     }).start()
     server = built
     const url = `ws://localhost:${built.port}`
@@ -269,7 +271,7 @@ describe('createServer session persistence wiring', () => {
       port: 0,
       createSession: async (options = {}) => {
         observed.push(options)
-        return session
+        return { session, dispose: async () => {} }
       },
     }).start()
     server = built
@@ -605,6 +607,57 @@ describe('createServer memory idle detector', () => {
     await new Promise((r) => setTimeout(r, 60))
 
     expect(newSessionMessages).toHaveLength(0)
+    ws.close()
+  })
+
+  test('dispatches session.idle to plugin handlers after the idle window', async () => {
+    const { definePlugin, PluginManager } = await import('@/plugin')
+
+    const pm = new PluginManager({ agentDir: '/tmp/agent-dir' })
+    const captured: Array<{ sessionId: string; parentTranscriptPath: string; idleMs: number }> = []
+    await pm.loadOne(
+      definePlugin({ name: 'p' }, (ctx) =>
+        ctx.on('session.idle', (event) => {
+          captured.push({
+            sessionId: event.sessionId,
+            parentTranscriptPath: event.parentTranscriptPath,
+            idleMs: event.idleMs,
+          })
+        }),
+      ),
+    )
+    pm.markBooted()
+
+    const session = createFakeSession()
+    const stream = createStream()
+
+    const { url } = await startWithSession(session, {
+      stream,
+      sessionFactory: stubSessionFactory({ transcriptPath: '/tmp/test-sessions/ses_fake.jsonl' }),
+      memoryIdleMs: 30,
+      agentDir: '/tmp/agent-dir',
+      pluginManager: pm,
+    })
+    const { ws, waitFor } = await connect(url)
+    await waitFor((m) => m.type === 'connected')
+
+    stream.publish({
+      target: { kind: 'session', sessionId: 'ses_fake' },
+      payload: { kind: 'prompt', text: 'hi', delivery: 'queue' },
+    })
+    await new Promise((r) => setTimeout(r, 10))
+    session.resolvePrompt()
+    await waitFor((m) => m.type === 'done')
+
+    await new Promise((r) => setTimeout(r, 60))
+
+    expect(captured).toEqual([
+      {
+        sessionId: 'ses_fake',
+        parentTranscriptPath: '/tmp/test-sessions/ses_fake.jsonl',
+        idleMs: 30,
+      },
+    ])
     ws.close()
   })
 

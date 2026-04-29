@@ -1,14 +1,20 @@
 import type { Server as BunServer, ServerWebSocket } from 'bun'
 
-import { createSession as defaultCreateSession, type AgentSession, type CreateSessionOptions } from '@/agent'
+import {
+  createSession as defaultCreateSession,
+  type AgentSession,
+  type CreateSessionOptions,
+  type CreateSessionResult,
+} from '@/agent'
 import { createIdleDetector, type IdleDetector } from '@/memory'
+import type { PluginManager } from '@/plugin'
 import type { ReloadAllResult, ReloadRegistry } from '@/reload'
 import type { SessionFactory } from '@/sessions'
 import type { ClientMessage, PromptDelivery, QueueStateItem, ReloadResultPayload, ServerMessage } from '@/shared'
 import type { Stream, StreamMessage, StreamMessageId, Unsubscribe } from '@/stream'
 
 export type ReloadAllFn = () => Promise<ReloadAllResult>
-export type CreateSessionFn = (options?: CreateSessionOptions) => Promise<AgentSession>
+export type CreateSessionFn = (options?: CreateSessionOptions) => Promise<CreateSessionResult>
 
 export type ServerOptions = {
   port: number
@@ -19,6 +25,7 @@ export type ServerOptions = {
   stream?: Stream
   memoryIdleMs?: number
   agentDir?: string
+  pluginManager?: PluginManager
 }
 
 export type Server = ReturnType<typeof createServer>
@@ -42,6 +49,7 @@ type SessionState = {
   unsubBroadcast: Unsubscribe | null
   unsubPrompts: Unsubscribe | null
   idleDetector: IdleDetector | null
+  disposeSession: () => Promise<void>
 }
 
 function send(ws: Ws, msg: ServerMessage) {
@@ -57,6 +65,7 @@ export function createServer({
   stream,
   memoryIdleMs,
   agentDir,
+  pluginManager,
 }: ServerOptions) {
   const sessionStates = new WeakMap<Ws, SessionState>()
 
@@ -71,8 +80,14 @@ export function createServer({
       websocket: {
         async open(ws) {
           const sessionManager = sessionFactory?.createPersisted()
-          const session = await createSession({ reloadRegistry, sessionManager, ...(stream ? { stream } : {}) })
           const sessionFileId = sessionManager?.getSessionId() ?? ws.data.sessionId
+          const { session, dispose } = await createSession({
+            reloadRegistry,
+            sessionManager,
+            sessionId: sessionFileId,
+            ...(stream ? { stream } : {}),
+            ...(pluginManager ? { pluginManager } : {}),
+          })
 
           const state: SessionState = {
             session,
@@ -83,13 +98,27 @@ export function createServer({
             unsubBroadcast: null,
             unsubPrompts: null,
             idleDetector: null,
+            disposeSession: dispose,
           }
           sessionStates.set(ws, state)
 
           if (stream && memoryIdleMs !== undefined && agentDir !== undefined) {
+            const idleMs = memoryIdleMs
             state.idleDetector = createIdleDetector({
-              idleMs: memoryIdleMs,
-              onIdle: () => publishMemoryLoggerSpawn(state, stream, agentDir),
+              idleMs,
+              onIdle: () => {
+                publishMemoryLoggerSpawn(state, stream, agentDir)
+                if (pluginManager) {
+                  const transcriptPath = state.sessionManager?.getSessionFile()
+                  if (transcriptPath !== undefined) {
+                    void pluginManager.dispatchEvent('session.idle', {
+                      sessionId: state.sessionFileId,
+                      parentTranscriptPath: transcriptPath,
+                      idleMs,
+                    })
+                  }
+                }
+              },
             })
           }
 
@@ -157,12 +186,21 @@ export function createServer({
             return
           }
         },
-        close(ws) {
+        async close(ws) {
           const state = sessionStates.get(ws)
           state?.unsubBroadcast?.()
           state?.unsubPrompts?.()
           state?.idleDetector?.dispose()
           sessionStates.delete(ws)
+          if (state) {
+            try {
+              await state.disposeSession()
+            } catch (err) {
+              console.warn(
+                `session ${state.sessionFileId}: disposeSession failed: ${err instanceof Error ? err.message : err}`,
+              )
+            }
+          }
           console.log(`session ${ws.data.sessionId}: close`)
         },
       },

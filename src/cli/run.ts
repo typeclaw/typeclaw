@@ -47,8 +47,8 @@ export const run = defineCommand({
       initialPrompt: args.prompt,
     })
 
-    const onSignal = () => {
-      stop()
+    const onSignal = async () => {
+      await stop()
       process.exit(0)
     }
     process.once('SIGINT', onSignal)
@@ -56,7 +56,7 @@ export const run = defineCommand({
 
     if (tuiPromise) {
       await tuiPromise
-      stop()
+      await stop()
       process.exit(0)
     }
   },

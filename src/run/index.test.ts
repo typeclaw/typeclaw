@@ -25,7 +25,7 @@ let running: Awaited<ReturnType<typeof startAgent>> | null = null
 
 afterEach(async () => {
   if (!running) return
-  running.server.stop(true)
+  await running.stop()
   running.tuiPromise?.catch(() => {})
   running = null
 })
@@ -82,7 +82,7 @@ describe('startAgent', () => {
     const before = await fetch(`http://localhost:${port}`)
     expect(before.status).toBe(200)
 
-    running.stop()
+    await running.stop()
 
     await expect(fetch(`http://localhost:${port}`)).rejects.toThrow()
   })
@@ -137,7 +137,7 @@ describe('startAgent', () => {
     expect(running.scheduler).toBe(fakeScheduler)
     expect(started).toBe(true)
 
-    running.stop()
+    await running.stop()
     expect(stopped).toBe(true)
   })
 
@@ -237,7 +237,7 @@ describe('startAgent', () => {
     running = await startAgent({ port: 0, attachTui: false, loadCron: noCron })
 
     const subConsumer = running.subagentConsumer
-    running.stop()
+    await running.stop()
 
     let gotIt = 0
     running.stream.publish({
