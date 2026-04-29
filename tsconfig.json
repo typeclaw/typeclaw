@@ -23,8 +23,10 @@
     "noPropertyAccessFromIndexSignature": false,
 
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "agent-messenger/discordbot": ["./src/channels/adapters/agent-messenger-shim.d.ts"]
     }
   },
-  "include": ["src", "scripts"]
+  "include": ["src", "scripts"],
+  "exclude": ["node_modules"]
 }
