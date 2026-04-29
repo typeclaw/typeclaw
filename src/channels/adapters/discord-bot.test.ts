@@ -250,6 +250,41 @@ describe('DiscordBotAdapter', () => {
     expect(clientFakes.sends).toEqual([{ channel: 'C1', content: 'hello back' }])
   })
 
+  test('outbound: callback drops replies whose (workspace, chat) is not in the chats allowlist', async () => {
+    const { router } = await makeRouter()
+    const clientFakes = createFakeClient()
+    const adapter = createDiscordBotAdapter({
+      bot: 'main',
+      chats: ['W1/C1'],
+      router,
+      client: clientFakes.client,
+      listener: createFakeListener().listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await adapter.outboundCallback({
+      adapter: 'discord-bot',
+      bot: 'main',
+      workspace: 'W1',
+      chat: 'C1',
+      thread: null,
+      text: 'allowed',
+      turnId: 't1',
+    })
+
+    await adapter.outboundCallback({
+      adapter: 'discord-bot',
+      bot: 'main',
+      workspace: 'W2',
+      chat: 'C1',
+      thread: null,
+      text: 'denied',
+      turnId: 't2',
+    })
+
+    expect(clientFakes.sends).toEqual([{ channel: 'C1', content: 'allowed' }])
+  })
+
   test('outbound: callback for a different bot is ignored (multi-bot deployments)', async () => {
     const { router } = await makeRouter()
     const clientFakes = createFakeClient()

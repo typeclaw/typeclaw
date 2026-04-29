@@ -99,6 +99,11 @@ export function createDiscordBotAdapter({
 
   async function outboundCallback(reply: OutboundReply): Promise<void> {
     if (reply.bot !== bot) return
+    // Re-check chats on every outbound. A reload that narrows the allowlist
+    // doesn't terminate already-live sessions in still-allowed chats; without
+    // this guard, those sessions would keep replying into chats the user
+    // just removed from config.
+    if (!matchesAnyChatRule(chats, reply.workspace, reply.chat)) return
     try {
       await client.sendMessage(reply.chat, reply.text, reply.thread !== null ? { thread_id: reply.thread } : undefined)
     } catch (err) {
