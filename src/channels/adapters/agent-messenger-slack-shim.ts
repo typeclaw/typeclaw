@@ -38,6 +38,12 @@ export type SlackSocketMessageEvent = {
   event_ts?: string
   edited?: { user: string; ts: string }
   hidden?: boolean
+  // Client-generated UUID present on user-authored messages. Stable across
+  // network retries of the same user gesture (the Slack client reuses it
+  // when a send fails and is retried), so it is a reliable secondary dedup
+  // key for the case where one user action surfaces as two events with
+  // different `ts` values. Absent on bot messages and most system events.
+  client_msg_id?: string
   [key: string]: unknown
 }
 
@@ -49,6 +55,11 @@ export type SlackSocketAppMentionEvent = {
   ts: string
   thread_ts?: string
   event_ts?: string
+  // Carried verbatim into the promoted message event when present so the
+  // dedupe ring can use it. Slack's `app_mention` envelope does not always
+  // populate this in practice, but typing it keeps the promotion lossless
+  // if Slack starts sending it.
+  client_msg_id?: string
   [key: string]: unknown
 }
 

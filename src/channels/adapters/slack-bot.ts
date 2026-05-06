@@ -29,14 +29,8 @@ import {
 import { createSlackAuthorResolver } from './slack-bot-author-resolver'
 import { createSlackChannelResolver } from './slack-bot-channel-resolver'
 import { classifyInbound, type InboundDropReason } from './slack-bot-classify'
+import { createSlackDedupe } from './slack-bot-dedupe'
 import { slackTsToMillis } from './slack-bot-time'
-
-// Bound on the dedupe ring buffer. Slack's Events API may deliver the same
-// channel mention twice — once as `message` (when the bot has channel
-// history scope and is a member) and once as `app_mention` — and the two
-// envelopes share the same `ts`. The buffer only needs to cover the gap
-// between the two deliveries; a few hundred is generous.
-const SEEN_TS_CAPACITY = 256
 
 // Resolvers fall back to the raw id on failure, so a name equal to the id
 // means resolution failed; we render the bare id rather than `id(id)`. The
@@ -62,6 +56,7 @@ export function promoteAppMentionToMessage(event: SlackSocketAppMentionEvent): S
     ts: event.ts,
     ...(event.thread_ts !== undefined ? { thread_ts: event.thread_ts } : {}),
     ...(event.event_ts !== undefined ? { event_ts: event.event_ts } : {}),
+    ...(event.client_msg_id !== undefined ? { client_msg_id: event.client_msg_id } : {}),
   }
 }
 
@@ -555,18 +550,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     formatChannelTag,
   })
 
-  // Bounded set of "channel:ts" keys we've already routed, used to dedupe
-  // the message/app_mention double-delivery. Insertion-ordered Set lets us
-  // evict the oldest entry when we hit the cap.
-  const seenTs = new Set<string>()
-  const markSeen = (key: string): void => {
-    if (seenTs.has(key)) return
-    if (seenTs.size >= SEEN_TS_CAPACITY) {
-      const oldest = seenTs.values().next().value
-      if (oldest !== undefined) seenTs.delete(oldest)
-    }
-    seenTs.add(key)
-  }
+  const dedupe = createSlackDedupe()
 
   const handleMessageEvent = async (
     event: SlackSocketMessageEvent,
@@ -575,7 +559,6 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     inflightInbounds++
     try {
       const text = event.text ?? ''
-      const dedupeKey = `${event.channel}:${event.ts}`
       const userId = event.user ?? 'unknown'
       const inboundWorkspace = event.channel_type === 'im' ? '@dm' : (teamId ?? 'unknown')
       const [resolvedUserName, inboundTag] = await Promise.all([
@@ -591,8 +574,11 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         return
       }
 
-      if (seenTs.has(dedupeKey)) {
-        logger.info(`[slack-bot] dropped ts=${event.ts} reason=duplicate_delivery (source=${source})`)
+      const dedupeMatch = dedupe.check(event)
+      if (dedupeMatch !== null) {
+        logger.info(
+          `[slack-bot] dropped ts=${event.ts} reason=duplicate_delivery (source=${source}, matched=${dedupeMatch})`,
+        )
         return
       }
 
@@ -602,7 +588,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         return
       }
 
-      markSeen(dedupeKey)
+      dedupe.mark(event)
       const enriched = { ...verdict.payload, authorName: resolvedUserName }
       const routedTag = await formatChannelTag(enriched.workspace, enriched.chat)
       logger.info(
