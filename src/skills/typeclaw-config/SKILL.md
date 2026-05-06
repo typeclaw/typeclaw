@@ -1,13 +1,70 @@
 ---
 name: typeclaw-config
-description: "Read or edit typeclaw.json: model, port, mounts, plugins, channels (Discord allow rules + engagement), portForward (auto port forwarding policy), dockerfile (tmux/gh/python/ffmpeg toggles + append), gitignore.append. Also: any question about a default value or whether a behavior is already on by default — port forwarding, channel visibility, model choice, container packages (tmux/gh/python on by default; ffmpeg off), anything ending in 'by default', 'automatically', 'out of the box', 'do I need to configure', 'is X on', 'what does X default to', '기본값', '기본적으로', '자동으로', '디폴트'. MUST load before saying you do not know what X defaults to, or proposing to add a field whose default the user is asking about — most fields already default to the behavior the user expects (portForward defaults to forwarding every container LISTEN; tmux/gh/python are pre-installed in the container; no edit needed). Read it before touching typeclaw.json — strict schema, mix of live-reloadable and restart-required fields."
+description: "Read or edit typeclaw.json: model, port, mounts, plugins, alias (names you answer to), channels (Discord allow rules + engagement), portForward (auto port forwarding policy), dockerfile (tmux/gh/python/ffmpeg toggles + append), gitignore.append. Also: any question about a default value or whether a behavior is already on by default — port forwarding, channel visibility, model choice, container packages (tmux/gh/python on by default; ffmpeg off), anything ending in 'by default', 'automatically', 'out of the box', 'do I need to configure', 'is X on', 'what does X default to', '기본값', '기본적으로', '자동으로', '디폴트'. MUST load whenever the user asks you to change a fact about yourself — your name, alias, nickname, what they should call you, your model, your schedule. Trigger phrases include 'register an alias', 'add an alias', 'call you X', 'answer to X', 'respond to X', 'change your name', 'rename you', 'add this nickname', 'set your alias to', '별칭', '별명', '닉네임', '이름 추가', '이름 등록', '이름 바꿔', '~라고 불러', '~라고 부르면', '~로 불러줘', '~으로 불러줘', '나한테는 X로', 'aliases', 'nicknames'. Self-config questions almost always resolve to typeclaw.json — never deflect to platform-side settings (Slack profile display name, Discord nickname, OS keychain, etc.). MUST load before saying you do not know what X defaults to, or proposing to add a field whose default the user is asking about — most fields already default to the behavior the user expects (portForward defaults to forwarding every container LISTEN; tmux/gh/python are pre-installed in the container; no edit needed). Read it before touching typeclaw.json — strict schema, mix of live-reloadable and restart-required fields."
 ---
 
 # typeclaw-config
 
 You have a runtime config file at `./typeclaw.json` in your agent folder. It tells the typeclaw runtime which model powers you, which port the websocket server listens on, which host directories are bind-mounted into your container, which plugins to load, and which external messenger channels you can read from and post to. This skill exists so you do not corrupt the file, do not promise behavior the runtime cannot deliver, and do not surprise the user.
 
-This file is **not** about who you are — that is `IDENTITY.md`, `SOUL.md`, etc. This file is about the machine you run on.
+This file is **not** about who you are — that is `IDENTITY.md`, `SOUL.md`, etc. This file is about the machine you run on. The one identity-adjacent setting that **does** live here is `alias` — the names you answer to in chat. See **Self-config requests** below.
+
+## Self-config requests (read this first when the user asks you to change a fact about yourself)
+
+When a user asks you to change something about yourself — your name, what they should call you, your nickname, your model, your schedule — the answer is almost always `typeclaw.json` in the agent folder. **Edit the file. Do not deflect to platform-side settings.**
+
+The most common failure mode is mistaking a typeclaw config request for a Slack/Discord/OS-level setting:
+
+- ❌ "I don't have permission to register a Slack alias — please edit your Slack profile display name."
+- ❌ "Set your Discord server nickname under server settings."
+- ❌ "Ask your workspace admin to add an alias for you."
+- ✅ "On it — adding `Foo` and `푸` to my `alias` array in `typeclaw.json` and reloading."
+
+If the user uses the word "alias", "별칭", "별명", "닉네임", "nickname", "이름 등록", or any phrase asking you to **answer to** a name, **respond to** a name, or **be called** something, this is `typeclaw.json#alias`. Period. Slack display names and Discord server nicknames are entirely separate and irrelevant to whether you wake up when someone writes that name.
+
+### Anti-fabrication rule for `alias`
+
+The `alias` schema is exactly this — a flat top-level array of strings:
+
+```json
+{ "alias": ["Foo", "푸"] }
+```
+
+**Negative examples — every one of these is wrong and the runtime will silently ignore them:**
+
+```yaml
+# ❌ WRONG: typeclaw.json is JSON, not YAML
+aliases:
+  slack-bot:
+    <USER_ID>: ['Foo', '푸']
+```
+
+```json
+// ❌ WRONG: field name is singular `alias`, not plural `aliases`
+{ "aliases": ["Foo", "푸"] }
+```
+
+```json
+// ❌ WRONG: not nested under any adapter — `alias` is top-level and applies to every channel
+{ "channels": { "slack-bot": { "alias": ["Foo", "푸"] } } }
+```
+
+```json
+// ❌ WRONG: not keyed by user ID — `alias` is the names YOU answer to, not a per-user mapping
+{ "alias": { "<USER_ID>": ["Foo", "푸"] } }
+```
+
+If you find yourself about to render any of those shapes, stop. **Read `typeclaw.json` first.** Confirm the actual current shape. Then write the flat `alias: string[]` form.
+
+### Do the write before claiming completion
+
+Never say "등록 완료", "registered", "added", "saved", "done", or any past-tense confirmation for a self-config edit until **after** you have:
+
+1. Actually called the `read` tool on `typeclaw.json` (so you saw its real current shape).
+2. Actually called the `write` tool with the new contents.
+3. Actually committed the change (`typeclaw-git` skill).
+
+Showing the user a code block of "what you would write" is **not** writing. Telling the user the new aliases work without having edited the file is a lie they will discover the moment they try to use the alias and you don't engage. If you ran out of room to do the write in this turn, say so explicitly: "I haven't actually edited `typeclaw.json` yet — doing it now."
 
 ## What `typeclaw.json` actually controls
 
@@ -263,14 +320,18 @@ There's also a symmetric **peer-name suppressor**: if the message contains a pee
 
 The agent in folder `봉봉/` already answers to `"봉봉"` from the dir name. This adds the Latin transliteration so users can also write `"Hey bongbong, deploy?"`.
 
-### When the user asks "respond to my casual nickname for you" / "I want to call you X"
+### When the user asks "respond to my casual nickname for you" / "I want to call you X" / "register an alias" / "별칭 등록해줘" / "X라고 불러줘"
 
-1. **Read `typeclaw.json`.**
-2. **If `alias` exists**, append the new name (preserve existing entries; dedupe trivially — the runtime also dedupes).
-3. **If `alias` is absent**, create it as `["<new name>"]`.
+This is **always** `typeclaw.json#alias`. Not a Slack profile setting, not a Discord nickname, not a workspace admin task. See **Self-config requests** at the top of this skill — especially the anti-fabrication rule (the field is singular `alias`, top-level, flat `string[]`; not `aliases`, not nested under an adapter, not keyed by user ID) and the write-before-claim rule (no past-tense confirmation until the `write` and commit actually happened).
+
+1. **Read `typeclaw.json` first** with the `read` tool. Do not guess the current shape; the user may have customized it. If `alias` is present, you need to see the existing entries to dedupe.
+2. **If `alias` exists**, append the new name(s) (preserve existing entries; dedupe trivially — the runtime also dedupes).
+3. **If `alias` is absent**, create it as `["<new name>"]` (or `["<name1>", "<name2>"]` for multiple).
 4. **You don't need to add the dir name** unless the new name IS a variation of the dir name itself (e.g. dir is `bongbong` and the user wants `Bongbong` casing — the implicit dir alias matches case-insensitively, so this isn't needed either).
 5. **Trim whitespace** before adding. The schema rejects empty/whitespace-only entries; the runtime trims surrounding whitespace from valid entries.
-6. **Write, commit**: "Edited `alias` — live-reloadable. Run `reload` to pick up the change without restart."
+6. **Write the file back** with the `write` tool — pretty-printed (2-space indent), trailing newline, alphabetical field order. The shape is `{ "alias": ["X", "Y"] }` at the top level. **Do not nest under `channels`, do not pluralize to `aliases`, do not key by user ID.** See the negative examples in **Self-config requests**.
+7. **Commit** the change (`typeclaw-git` skill).
+8. **Only now** tell the user: "Added `<X>`, `<Y>` to `alias` — live-reloadable. Run `reload` to pick up the change without restart." If you skipped step 6 or 7, say so honestly instead of claiming completion.
 
 ### When the user asks "stop responding to <name>"
 
@@ -579,6 +640,9 @@ Never echo, log, or commit values from `.env`. `.env` is gitignored by default �
 ## Things you must not do
 
 - **Do not invent fields the schema doesn't support** (no `provider`, `apiKey`, `temperature`, `maxTokens`, `systemPrompt`, `tools`, `timeout`, `retry`, etc.). They will be silently dropped or, worse, mistaken for a plugin config block. Lying to the user that "I added a temperature field" when the runtime ignores it is a worse failure than refusing.
+- **Do not invent the shape of an existing field.** The `alias` field in particular has a single correct shape — top-level, singular `alias`, flat array of strings. Plural `aliases`, nesting under `channels.<adapter>`, keying by user ID, or rendering it as YAML are all wrong; the runtime ignores them and the user gets a silent failure. If you are not sure of a field's shape, **read `typeclaw.json` first** and consult the schema table above.
+- **Do not deflect a self-config request to platform settings.** When the user asks you to register an alias, change your nickname, or otherwise change a fact about yourself, the answer is `typeclaw.json` in the agent folder — not the Slack profile display name, not the Discord server nickname, not the OS keychain, not the workspace admin. See **Self-config requests** at the top of this skill.
+- **Do not say "registered" / "등록 완료" / "added" / "saved" / "done" before the `write` and commit actually ran.** Showing the user a code block of "what you would write" is not writing. If the edit didn't happen this turn, say so honestly.
 - **Do not move secrets into `typeclaw.json`.** It is committed to git. API keys belong in `.env`.
 - **Do not change `port` casually.** The host-stage `typeclaw start` launcher publishes a port mapping it learned at `start` time. Changing the port in `typeclaw.json` without re-running `typeclaw start` (which re-reads it) means the TUI will connect to the wrong port and silently fail. If you change `port`, tell the user explicitly that the next `typeclaw start` will pick the new mapping.
 - **Do not change `model` to something not in the registry.** The schema enum will reject the file at load, and the runtime will refuse to boot the agent process. If the user wants a model that isn't there, this is a typeclaw-side change, not a config edit.
