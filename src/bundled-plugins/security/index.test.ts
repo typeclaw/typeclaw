@@ -81,6 +81,35 @@ describe('security plugin wiring', () => {
     expect(result).toBeUndefined()
   })
 
+  test('tool.before blocks the home-router agent-browser scenario', async () => {
+    const hook = await toolBeforeHook()
+    const result = await hook(
+      toolEvent('bash', { command: 'agent-browser navigate http://192.168.0.1' }),
+      hookContext('/agent'),
+    )
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('agentBrowserSsrf')
+  })
+
+  test('tool.before blocks agent-browser invoked via bunx with a bare LAN IP', async () => {
+    const hook = await toolBeforeHook()
+    const result = await hook(
+      toolEvent('bash', { command: 'bunx agent-browser navigate 10.0.0.1' }),
+      hookContext('/agent'),
+    )
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('agentBrowserSsrf')
+  })
+
+  test('tool.before allows agent-browser navigation to a public site', async () => {
+    const hook = await toolBeforeHook()
+    const result = await hook(
+      toolEvent('bash', { command: 'agent-browser navigate https://example.com/login' }),
+      hookContext('/agent'),
+    )
+    expect(result).toBeUndefined()
+  })
+
   test('tool.before blocks channel_send carrying GitHub PAT', async () => {
     const hook = await toolBeforeHook()
     const fixture = 'gh' + 'p' + '_' + 'X'.repeat(36)
@@ -199,6 +228,15 @@ describe('security plugin wiring', () => {
     expect(
       await hook(
         toolEvent('webfetch', { url: 'http://127.0.0.1/dev', acknowledgeGuards: { ssrf: true } }),
+        hookContext('/agent'),
+      ),
+    ).toBeUndefined()
+    expect(
+      await hook(
+        toolEvent('bash', {
+          command: 'agent-browser navigate http://192.168.0.1',
+          acknowledgeGuards: { agentBrowserSsrf: true },
+        }),
         hookContext('/agent'),
       ),
     ).toBeUndefined()

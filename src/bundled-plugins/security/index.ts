@@ -1,5 +1,6 @@
 import { definePlugin } from '@/plugin'
 
+import { checkAgentBrowserSsrfGuard } from './policies/agent-browser-ssrf'
 import { checkGitExfilGuard } from './policies/git-exfil'
 import { checkOutboundSecretGuard } from './policies/outbound-secret-scan'
 import { applyPromptInjectionDefense } from './policies/prompt-injection'
@@ -22,6 +23,7 @@ export default definePlugin({
           checkGitExfilGuard({ tool: event.tool, args: event.args, sessionId: event.sessionId }),
           checkSecretExfilReadGuard({ tool: event.tool, args: event.args }),
           checkSsrfGuard({ tool: event.tool, args: event.args }),
+          checkAgentBrowserSsrfGuard({ tool: event.tool, args: event.args }),
           checkSessionSearchSecretsGuard({ tool: event.tool, args: event.args }),
           checkSystemPromptLeakGuard({ tool: event.tool, args: event.args }),
           checkOutboundSecretGuard({ tool: event.tool, args: event.args }),
