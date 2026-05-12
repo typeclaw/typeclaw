@@ -62,10 +62,9 @@ jobs:
           git config --global user.name "TypeClaw CI"
 
       - name: Test
-        # Bump per-test timeout from the 5s default: a handful of runInit tests
-        # shell out to a real `bun install` and run 4-5s on local hardware,
-        # which crosses 5s on the slower GitHub Actions runners.
-        run: bun test --timeout 30000
+        # See ci.yml for the rationale on the 60000ms timeout — same network-
+        # bound `runInit` tests; keep both workflows in sync.
+        run: bun test --timeout 60000
 
       - uses: actions/setup-node@v4
         with:

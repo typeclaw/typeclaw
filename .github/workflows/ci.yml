@@ -45,6 +45,10 @@ jobs:
 
       - name: Test
         # Bump per-test timeout from the 5s default: a handful of runInit tests
-        # shell out to a real `bun install` and run 4-5s on local hardware,
-        # which crosses 5s on the slower GitHub Actions runners.
-        run: bun test --timeout 30000
+        # shell out to a real `bun install` against a freshly-scaffolded agent
+        # folder with no lockfile, so each test pays full dependency resolution
+        # cost over the network. Locally that's 2-4s; on GHA runners it's
+        # usually 3-5s but spikes past 30s when the runner's network path to
+        # npm is congested (observed in run 25727348353). 60s leaves enough
+        # headroom for those spikes without hiding genuinely-stuck tests.
+        run: bun test --timeout 60000
