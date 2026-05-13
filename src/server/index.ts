@@ -41,7 +41,8 @@ export type ServerOptions = {
 export type Server = ReturnType<typeof createServer>
 
 type TuiWsData = { kind: 'tui'; sessionId: string }
-type WsData = TuiWsData | BrokerWsData
+type DoctorWsData = { kind: 'doctor' }
+type WsData = TuiWsData | DoctorWsData | BrokerWsData
 type Ws = ServerWebSocket<TuiWsData>
 
 type QueuedPrompt = {
@@ -97,6 +98,11 @@ export function createServer({
           if (server.upgrade(req, { data })) return
           return new Response('upgrade failed', { status: 400 })
         }
+        if (url.pathname === '/doctor') {
+          const data: DoctorWsData = { kind: 'doctor' }
+          if (server.upgrade(req, { data })) return
+          return new Response('upgrade failed', { status: 400 })
+        }
         const sessionId = crypto.randomUUID()
         const data: TuiWsData = { kind: 'tui', sessionId }
         if (server.upgrade(req, { data })) return
@@ -106,6 +112,9 @@ export function createServer({
         async open(rawWs) {
           if (rawWs.data.kind === 'portbroker') {
             containerBroker?.open(rawWs as ServerWebSocket<BrokerWsData>)
+            return
+          }
+          if (rawWs.data.kind === 'doctor') {
             return
           }
           const ws = rawWs as Ws
@@ -182,22 +191,19 @@ export function createServer({
             await containerBroker?.message(rawWs as ServerWebSocket<BrokerWsData>, raw as string | Buffer)
             return
           }
+          if (rawWs.data.kind === 'doctor') {
+            await handleDoctorMessage(rawWs as ServerWebSocket<DoctorWsData>, raw as string | Buffer, {
+              pluginRuntime,
+              agentDir,
+            })
+            return
+          }
           const ws = rawWs as Ws
           const msg = JSON.parse(String(raw)) as ClientMessage
           const state = sessionStates.get(ws)
 
           if (msg.type === 'reload') {
             await handleReload(ws, reloadAll, reloadRegistry, msg.scope)
-            return
-          }
-
-          if (msg.type === 'doctor') {
-            await handleDoctor(ws, msg.requestId, pluginRuntime, agentDir)
-            return
-          }
-
-          if (msg.type === 'doctor_fix') {
-            await handleDoctorFix(ws, msg.requestId, msg.checkId, pluginRuntime, agentDir)
             return
           }
 
@@ -246,6 +252,9 @@ export function createServer({
         async close(rawWs) {
           if (rawWs.data.kind === 'portbroker') {
             containerBroker?.close(rawWs as ServerWebSocket<BrokerWsData>)
+            return
+          }
+          if (rawWs.data.kind === 'doctor') {
             return
           }
           const ws = rawWs as Ws
@@ -404,38 +413,66 @@ function pushQueueState(ws: Ws, state: SessionState): void {
   send(ws, { type: 'queue_state', pending })
 }
 
-async function handleDoctor(
-  ws: Ws,
-  requestId: string,
-  pluginRuntime: PluginRuntime | undefined,
-  agentDir: string | undefined,
-): Promise<void> {
+type DoctorWs = ServerWebSocket<DoctorWsData>
+type DoctorMessageDeps = { pluginRuntime: PluginRuntime | undefined; agentDir: string | undefined }
+
+function sendDoctor(ws: DoctorWs, msg: ServerMessage): void {
+  ws.send(JSON.stringify(msg))
+}
+
+async function handleDoctorMessage(ws: DoctorWs, raw: string | Buffer, deps: DoctorMessageDeps): Promise<void> {
+  let msg: ClientMessage
+  try {
+    msg = JSON.parse(String(raw)) as ClientMessage
+  } catch (err) {
+    sendDoctor(ws, { type: 'error', message: err instanceof Error ? err.message : String(err) })
+    return
+  }
+
+  if (msg.type === 'doctor') {
+    await runDoctorRequest(ws, msg.requestId, deps)
+    return
+  }
+  if (msg.type === 'doctor_fix') {
+    await runDoctorFixRequest(ws, msg.requestId, msg.checkId, deps)
+    return
+  }
+  sendDoctor(ws, { type: 'error', message: `doctor channel: unsupported message type ${msg.type}` })
+}
+
+async function runDoctorRequest(ws: DoctorWs, requestId: string, deps: DoctorMessageDeps): Promise<void> {
+  const { pluginRuntime, agentDir } = deps
   if (pluginRuntime === undefined || agentDir === undefined) {
-    send(ws, { type: 'doctor_result', requestId, checks: [] })
+    sendDoctor(ws, { type: 'doctor_result', requestId, checks: [] })
     return
   }
   const snapshot = pluginRuntime.get()
   if (snapshot === undefined) {
-    send(ws, { type: 'doctor_result', requestId, checks: [] })
+    sendDoctor(ws, { type: 'doctor_result', requestId, checks: [] })
     return
   }
   try {
     const checks = await runPluginDoctorChecks({ registry: snapshot.registry, agentDir })
-    send(ws, { type: 'doctor_result', requestId, checks })
+    sendDoctor(ws, { type: 'doctor_result', requestId, checks })
   } catch (err) {
-    send(ws, { type: 'error', message: err instanceof Error ? err.message : String(err) })
+    sendDoctor(ws, {
+      type: 'doctor_result',
+      requestId,
+      checks: [],
+      error: err instanceof Error ? err.message : String(err),
+    })
   }
 }
 
-async function handleDoctorFix(
-  ws: Ws,
+async function runDoctorFixRequest(
+  ws: DoctorWs,
   requestId: string,
   checkId: string,
-  pluginRuntime: PluginRuntime | undefined,
-  agentDir: string | undefined,
+  deps: DoctorMessageDeps,
 ): Promise<void> {
+  const { pluginRuntime, agentDir } = deps
   if (pluginRuntime === undefined || agentDir === undefined) {
-    send(ws, {
+    sendDoctor(ws, {
       type: 'doctor_fix_result',
       requestId,
       result: { ok: false, checkId, error: 'plugin runtime not configured' },
@@ -444,7 +481,7 @@ async function handleDoctorFix(
   }
   const snapshot = pluginRuntime.get()
   if (snapshot === undefined) {
-    send(ws, {
+    sendDoctor(ws, {
       type: 'doctor_fix_result',
       requestId,
       result: { ok: false, checkId, error: 'plugin runtime not configured' },
@@ -456,7 +493,7 @@ async function handleDoctorFix(
     outcome.ok === true
       ? { ok: true as const, checkId, summary: outcome.summary, changedPaths: outcome.changedPaths }
       : { ok: false as const, checkId, error: outcome.error }
-  send(ws, { type: 'doctor_fix_result', requestId, result })
+  sendDoctor(ws, { type: 'doctor_fix_result', requestId, result })
 }
 
 async function handleReload(

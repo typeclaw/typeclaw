@@ -36,6 +36,7 @@ export async function fetchPluginDoctorChecks(opts: PluginBridgeOptions): Promis
       requestId,
       (msg) => {
         if (msg.type === 'doctor_result' && msg.requestId === requestId) {
+          if (msg.error !== undefined) return { kind: 'error', reason: msg.error }
           return { kind: 'ok', checks: msg.checks }
         }
         return null
@@ -76,15 +77,16 @@ type DialResult = { kind: 'ok'; ws: WebSocket; timeoutMs: number } | { kind: 'un
 
 async function dial(opts: PluginBridgeOptions): Promise<DialResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  let url = opts.url
-  if (url === undefined) {
+  let baseUrl = opts.url
+  if (baseUrl === undefined) {
     try {
       const port = await resolveHostPort({ cwd: opts.cwd })
-      url = `ws://localhost:${port}`
+      baseUrl = `ws://localhost:${port}`
     } catch (err) {
       return { kind: 'unreachable', reason: err instanceof Error ? err.message : String(err) }
     }
   }
+  const url = `${baseUrl.replace(/\/$/, '')}/doctor`
   const ws = new WebSocket(url)
   try {
     await new Promise<void>((resolve, reject) => {
@@ -118,27 +120,31 @@ async function withRequest<R extends { kind: string }>(
 ): Promise<R | { kind: 'timeout' } | { kind: 'error'; reason: string }> {
   ws.send(JSON.stringify(outgoing))
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+    const settle = (value: R | { kind: 'timeout' } | { kind: 'error'; reason: string }): void => {
+      clearTimeout(timer)
       ws.removeEventListener('message', onMessage)
-      resolve({ kind: 'timeout' })
-    }, timeoutMs)
-    const onMessage = (event: MessageEvent) => {
+      ws.removeEventListener('close', onClose)
+      ws.removeEventListener('error', onError)
+      resolve(value)
+    }
+    const timer = setTimeout(() => settle({ kind: 'timeout' }), timeoutMs)
+    const onMessage = (event: MessageEvent): void => {
       let msg: ServerMessage
       try {
         msg = JSON.parse(String(event.data)) as ServerMessage
       } catch (err) {
-        clearTimeout(timer)
-        ws.removeEventListener('message', onMessage)
-        resolve({ kind: 'error', reason: err instanceof Error ? err.message : String(err) })
+        settle({ kind: 'error', reason: err instanceof Error ? err.message : String(err) })
         return
       }
       const result = match(msg)
-      if (result === null) return
-      clearTimeout(timer)
-      ws.removeEventListener('message', onMessage)
-      resolve(result)
+      if (result !== null) settle(result)
     }
+    const onClose = (): void => settle({ kind: 'error', reason: 'doctor websocket closed before response' })
+    const onError = (err: unknown): void =>
+      settle({ kind: 'error', reason: err instanceof Error ? err.message : String(err) })
     ws.addEventListener('message', onMessage)
+    ws.addEventListener('close', onClose, { once: true })
+    ws.addEventListener('error', onError, { once: true })
   })
 }
 

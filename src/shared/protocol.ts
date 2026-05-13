@@ -43,5 +43,5 @@ export type ServerMessage =
   | { type: 'notification'; payload: unknown; replyTo?: string; meta?: Record<string, string> }
   | { type: 'queue_state'; pending: QueueStateItem[] }
   | { type: 'prompt_started'; messageId: string; text: string }
-  | { type: 'doctor_result'; requestId: DoctorRequestId; checks: DoctorCheckPayload[] }
+  | { type: 'doctor_result'; requestId: DoctorRequestId; checks: DoctorCheckPayload[]; error?: string }
   | { type: 'doctor_fix_result'; requestId: DoctorRequestId; result: DoctorFixPayload }

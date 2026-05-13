@@ -993,3 +993,96 @@ describe('createServer scoped reload', () => {
     ws.close()
   })
 })
+
+describe('createServer doctor channel', () => {
+  test('/doctor path does not create an AgentSession or fire session hooks', async () => {
+    const session = createFakeSession()
+    let createCalls = 0
+    const built = createServer({
+      port: 0,
+      createSession: async () => {
+        createCalls++
+        return session
+      },
+    }).start()
+    server = built
+
+    const ws = new WebSocket(`ws://localhost:${built.port}/doctor`)
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener('open', () => resolve(), { once: true })
+      ws.addEventListener('error', (err) => reject(err), { once: true })
+    })
+
+    ws.send(JSON.stringify({ type: 'doctor', requestId: 'r1' }))
+    const reply = await new Promise<ServerMessage>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 1000)
+      ws.addEventListener(
+        'message',
+        (e) => {
+          clearTimeout(timer)
+          resolve(JSON.parse(String(e.data)) as ServerMessage)
+        },
+        { once: true },
+      )
+    })
+
+    expect(reply.type).toBe('doctor_result')
+    if (reply.type === 'doctor_result') {
+      expect(reply.requestId).toBe('r1')
+      expect(reply.checks).toEqual([])
+    }
+    expect(createCalls).toBe(0)
+    expect(session.disposeCalls).toBe(0)
+
+    ws.close()
+  })
+
+  test('/doctor returns checks from the plugin runtime', async () => {
+    const registry: PluginRegistry = {
+      tools: [],
+      subagents: [],
+      cronJobs: [],
+      skills: [],
+      skillsDirs: [],
+      doctorChecks: [
+        {
+          pluginName: 'memory',
+          checkName: 'ping',
+          pluginConfig: undefined,
+          logger: { info: () => {}, warn: () => {}, error: () => {} },
+          check: {
+            description: 'always ok',
+            run: async () => ({ status: 'ok', message: 'ok' }),
+          },
+        },
+      ],
+    }
+    const session = createFakeSession()
+    const { url } = await startWithSession(session, {
+      pluginRegistry: registry,
+      pluginHooks: (await import('@/plugin')).createHookBus(),
+      agentDir: '/agent',
+    })
+
+    const ws = new WebSocket(`${url}/doctor`)
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener('open', () => resolve(), { once: true })
+      ws.addEventListener('error', (err) => reject(err), { once: true })
+    })
+    ws.send(JSON.stringify({ type: 'doctor', requestId: 'r2' }))
+    const reply = await new Promise<ServerMessage>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), 1000)
+      ws.addEventListener(
+        'message',
+        (e) => {
+          clearTimeout(timer)
+          resolve(JSON.parse(String(e.data)) as ServerMessage)
+        },
+        { once: true },
+      )
+    })
+    if (reply.type !== 'doctor_result') throw new Error('expected doctor_result')
+    expect(reply.checks.map((c) => c.id)).toEqual(['memory.ping'])
+    ws.close()
+  })
+})
