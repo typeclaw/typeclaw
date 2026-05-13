@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
-import { access, constants as fsConstants, mkdir, stat, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { access, constants as fsConstants, stat } from 'node:fs/promises'
+import { join } from 'node:path'
 
 import { CronExpressionParser } from 'cron-parser'
 import { z } from 'zod'
@@ -239,16 +239,9 @@ export default definePlugin({
             const abs = join(dctx.agentDir, rel)
             if (existsSync(abs)) return { status: 'ok', message: `${rel} present` }
             return {
-              status: 'warning',
+              status: 'info',
               message: `${rel} missing`,
-              fix: {
-                description: `Create empty ${rel} so memory-logger has a target.`,
-                apply: async () => {
-                  await mkdir(dirname(abs), { recursive: true })
-                  await writeFile(abs, '', 'utf8')
-                  return { summary: `created ${rel}`, changedPaths: [rel] }
-                },
-              },
+              details: ['memory-logger creates it on demand; this is informational only.'],
             }
           },
         },
