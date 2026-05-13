@@ -29,6 +29,14 @@ export async function commitAutoFixes(opts: CommitOptions): Promise<CommitOutcom
 
   const spawnGit = opts.spawnGit ?? defaultSpawnGit
 
+  const dirty = await spawnGit(['diff', '--cached', '--quiet'], opts.cwd)
+  if (dirty.exitCode !== 0) {
+    return {
+      kind: 'skipped',
+      reason: 'git index is not clean; refusing to mix doctor auto-fixes with unrelated staged changes',
+    }
+  }
+
   const add = await spawnGit(['add', '--', ...pathsStaged], opts.cwd)
   if (add.exitCode !== 0) {
     return { kind: 'failed', reason: `git add failed: ${add.stderr.trim() || `exit ${add.exitCode}`}` }

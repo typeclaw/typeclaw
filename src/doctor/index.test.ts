@@ -260,6 +260,26 @@ test('report.entries preserves source distinction (static vs plugin)', async () 
   expect(sources).toEqual(['static', 'plugin'])
 })
 
+test('refuses commit when git index already has unrelated staged changes', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  writeFileSync(join(cwd, 'unrelated.txt'), 'user-staged change', 'utf8')
+  await run(['git', 'add', 'unrelated.txt'], cwd)
+
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [fakeCheck('alpha', 'warning', { autoFix: true })],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+
+  expect(result.commit?.kind).toBe('skipped')
+  expect(result.commit?.kind === 'skipped' && result.commit.reason).toMatch(/index is not clean/)
+
+  const log = await run(['git', 'log', '--format=%s'], cwd)
+  expect(log.stdout.split('\n').filter(Boolean)).toEqual(['init'])
+})
+
 test('reaches into agent folder when invoked from a subdir of the agent', async () => {
   const cwd = makeTmpAgentDir()
   const subdir = join(cwd, 'workspace')
