@@ -45,8 +45,10 @@ export type RunDoctorOptions = {
 }
 
 export async function runDoctor(opts: RunDoctorOptions = {}): Promise<DoctorRunResult> {
-  const cwd = opts.cwd ?? findAgentDir(process.cwd()) ?? process.cwd()
-  const hasAgentFolder = findAgentDir(cwd) === cwd
+  const startCwd = opts.cwd ?? process.cwd()
+  const agentDir = findAgentDir(startCwd)
+  const cwd = agentDir ?? startCwd
+  const hasAgentFolder = agentDir !== null
   const ctx: CheckContext = { cwd, hasAgentFolder }
 
   const staticChecks = (opts.staticChecks ?? buildStaticChecks()).filter((c) => isAllowed(c, opts.only, c.category))

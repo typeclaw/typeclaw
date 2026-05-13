@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -236,7 +236,7 @@ test('buildCommitMessage formats subject + bullets', async () => {
   expect(msg).toContain('- [plugin] memory.daily-stream-current: created memory/2026-05-12.md')
 })
 
-test('readme example: report.entries preserves source distinction', async () => {
+test('report.entries preserves source distinction (static vs plugin)', async () => {
   const cwd = makeTmpAgentDir()
   const result = await runDoctor({
     cwd,
@@ -258,5 +258,17 @@ test('readme example: report.entries preserves source distinction', async () => 
   })
   const sources = result.initial.entries.map((e) => e.source)
   expect(sources).toEqual(['static', 'plugin'])
-  expect(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')).toBeDefined()
+})
+
+test('reaches into agent folder when invoked from a subdir of the agent', async () => {
+  const cwd = makeTmpAgentDir()
+  const subdir = join(cwd, 'workspace')
+  mkdirSync(subdir, { recursive: true })
+  const result = await runDoctor({
+    cwd: subdir,
+    staticChecks: [fakeCheck('alpha', 'ok')],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.initial.hasAgentFolder).toBe(true)
+  expect(result.initial.cwd).toBe(cwd)
 })
