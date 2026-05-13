@@ -1,3 +1,7 @@
+import { join } from 'node:path'
+
+import lockfile from 'proper-lockfile'
+
 import { findAgentDir } from '@/init'
 import type { DoctorCheckPayload } from '@/shared'
 
@@ -63,20 +67,41 @@ export async function runDoctor(opts: RunDoctorOptions = {}): Promise<DoctorRunR
     return { initial }
   }
 
-  const fetchPluginFix = opts.fetchPluginFix ?? defaultFetchPluginDoctorFix
-  const attempts: FixAttempt[] = []
-  attempts.push(...(await runStaticFixes(staticResults, ctx)))
-  attempts.push(...(await runPluginFixes(pluginResults.entries, fetchPluginFix, ctx)))
+  const release = hasAgentFolder ? await acquireFixLock(cwd) : null
+  try {
+    const fetchPluginFix = opts.fetchPluginFix ?? defaultFetchPluginDoctorFix
+    const attempts: FixAttempt[] = []
+    attempts.push(...(await runStaticFixes(staticResults, ctx)))
+    attempts.push(...(await runPluginFixes(pluginResults.entries, fetchPluginFix, ctx)))
 
-  const commit = hasAgentFolder
-    ? await commitAutoFixes({ cwd, attempts, ...(opts.spawnGit !== undefined ? { spawnGit: opts.spawnGit } : {}) })
-    : { kind: 'skipped' as const, reason: 'no agent folder; nothing to commit' }
+    const commit = hasAgentFolder
+      ? await commitAutoFixes({
+          cwd,
+          attempts,
+          ...(opts.spawnGit !== undefined ? { spawnGit: opts.spawnGit } : {}),
+        })
+      : { kind: 'skipped' as const, reason: 'no agent folder; nothing to commit' }
 
-  const finalStaticResults = await runStaticChecks(staticChecks, ctx)
-  const finalPluginResults = await collectPluginChecks(fetchPluginChecks, ctx, opts.only)
-  const final = buildReport(ctx, finalStaticResults, finalPluginResults)
+    const finalStaticResults = await runStaticChecks(staticChecks, ctx)
+    const finalPluginResults = await collectPluginChecks(fetchPluginChecks, ctx, opts.only)
+    const final = buildReport(ctx, finalStaticResults, finalPluginResults)
 
-  return { initial, fixAttempts: attempts, commit, final }
+    return { initial, fixAttempts: attempts, commit, final }
+  } finally {
+    if (release !== null) {
+      try {
+        await release()
+      } catch {}
+    }
+  }
+}
+
+async function acquireFixLock(cwd: string): Promise<() => Promise<void>> {
+  const lockTarget = join(cwd, 'typeclaw.json')
+  return lockfile.lock(lockTarget, {
+    realpath: false,
+    retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
+  })
 }
 
 type StaticResult = {
