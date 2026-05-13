@@ -160,6 +160,9 @@ export function createTui({
           updateQueuePanel(msg.pending)
           break
         }
+        default: {
+          break
+        }
       }
     })
 
