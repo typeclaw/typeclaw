@@ -148,26 +148,41 @@ function messageOf(err: unknown): string {
 export type PathSanitization = { accepted: string[]; rejected: string[] }
 
 // Plugin fixes declare paths relative to agentDir; the host re-validates on
-// receipt for defense in depth, but rejecting here first keeps the wire
-// payload small and the failure attribution accurate.
+// receipt for defense in depth. The rules here MUST stay identical to the
+// host-side sanitizer in `src/doctor/index.ts` — any plugin-supplied path that
+// would survive normalization to `.` (the agent root), to a `..` escape, or
+// to an absolute filesystem path is rejected so `git add` cannot stage
+// anything outside the explicit fix surface.
 export function sanitizeChangedPaths(paths: readonly string[]): PathSanitization {
   const accepted: string[] = []
   const rejected: string[] = []
   for (const raw of paths) {
-    if (typeof raw !== 'string' || raw.length === 0) {
+    if (typeof raw !== 'string') {
       rejected.push(String(raw))
       continue
     }
-    if (isAbsolute(raw) || raw.includes('\\')) {
+    if (raw.length === 0) {
       rejected.push(raw)
       continue
     }
-    const normalized = normalize(raw)
-    if (normalized.startsWith('..') || normalized.split('/').includes('..')) {
+    if (raw.includes('\0') || raw.includes('\\')) {
       rejected.push(raw)
       continue
     }
-    accepted.push(normalized)
+    if (isAbsolute(raw)) {
+      rejected.push(raw)
+      continue
+    }
+    const stripped = normalize(raw).replace(/\/+$/, '')
+    if (stripped === '.' || stripped === '' || stripped.startsWith('..')) {
+      rejected.push(raw)
+      continue
+    }
+    if (stripped.split('/').includes('..')) {
+      rejected.push(raw)
+      continue
+    }
+    accepted.push(stripped)
   }
   return { accepted, rejected }
 }

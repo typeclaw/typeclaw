@@ -112,10 +112,28 @@ describe('runPluginDoctorFix', () => {
     expect(calls[0]?.agentDir).toBe('/agent')
   })
 
-  test('rejects absolute paths and ".." segments', () => {
-    const result = sanitizeChangedPaths(['memory/ok.md', '/etc/passwd', '../escape', 'mem/../../oops'])
+  test('rejects absolute paths, ".." segments, ".", null bytes, backslashes, and empty', () => {
+    const result = sanitizeChangedPaths([
+      'memory/ok.md',
+      '/etc/passwd',
+      '../escape',
+      'mem/../../oops',
+      '.',
+      './',
+      'foo/..',
+      '',
+      'has\0null',
+      'win\\path',
+    ])
     expect(result.accepted).toEqual(['memory/ok.md'])
-    expect(result.rejected.sort()).toEqual(['../escape', '/etc/passwd', 'mem/../../oops'])
+    expect(result.rejected.sort()).toEqual(
+      ['', '.', './', '../escape', '/etc/passwd', 'foo/..', 'has\0null', 'mem/../../oops', 'win\\path'].sort(),
+    )
+  })
+
+  test('reduces foo/bar/../baz to foo/baz instead of leaking ".."', () => {
+    const result = sanitizeChangedPaths(['foo/bar/../baz', 'foo/./bar'])
+    expect(result.accepted).toEqual(['foo/baz', 'foo/bar'])
   })
 
   test('returns error when check has no apply callback', async () => {

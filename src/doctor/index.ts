@@ -272,16 +272,34 @@ async function runPluginFixes(
 
 // Defense in depth: even though the container-side runner sanitizes
 // changedPaths, re-validate on the host before `git add` so a future protocol
-// change cannot bypass the security boundary by accident.
+// change cannot bypass the security boundary by accident. The rules here MUST
+// stay identical to `sanitizeChangedPaths` in `src/agent/doctor.ts`.
 function sanitizeChangedPathsForHost(_cwd: string, paths: readonly string[]): string[] {
   const out: string[] = []
   for (const raw of paths) {
     if (typeof raw !== 'string' || raw.length === 0) continue
-    if (raw.startsWith('/') || raw.includes('\\')) continue
-    if (raw.split('/').includes('..')) continue
-    out.push(raw)
+    if (raw.includes('\0') || raw.includes('\\')) continue
+    if (raw.startsWith('/')) continue
+    const stripped = posixNormalize(raw).replace(/\/+$/, '')
+    if (stripped === '.' || stripped === '' || stripped.startsWith('..')) continue
+    if (stripped.split('/').includes('..')) continue
+    out.push(stripped)
   }
   return out
+}
+
+function posixNormalize(p: string): string {
+  const segments = p.split('/').filter((s) => s.length > 0 && s !== '.')
+  const stack: string[] = []
+  for (const seg of segments) {
+    if (seg === '..') {
+      if (stack.length === 0) return '..'
+      stack.pop()
+      continue
+    }
+    stack.push(seg)
+  }
+  return stack.join('/') || '.'
 }
 
 export type { Severity }
