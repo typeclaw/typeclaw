@@ -260,6 +260,104 @@ test('report.entries preserves source distinction (static vs plugin)', async () 
   expect(sources).toEqual(['static', 'plugin'])
 })
 
+test('--only filter excludes static checks outside the allowlist', async () => {
+  const cwd = makeTmpAgentDir()
+  const result = await runDoctor({
+    cwd,
+    only: ['docker'],
+    staticChecks: [
+      { ...fakeCheck('docker.x', 'ok'), category: 'docker' },
+      { ...fakeCheck('config.x', 'warning'), category: 'config' },
+    ],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  const names = result.initial.entries.map((e) => e.name)
+  expect(names).toEqual(['docker.x'])
+})
+
+test('--only filter keeps plugin checks when "plugin" is in the list', async () => {
+  const cwd = makeTmpAgentDir()
+  const result = await runDoctor({
+    cwd,
+    only: ['plugin'],
+    staticChecks: [{ ...fakeCheck('config.x', 'ok'), category: 'config' }],
+    fetchPluginChecks: async () => ({
+      kind: 'ok',
+      checks: [
+        {
+          id: 'm.y',
+          pluginName: 'm',
+          checkName: 'y',
+          description: 'y',
+          category: 'plugin:m',
+          status: 'ok',
+          message: 'ok',
+        },
+      ],
+    }),
+  })
+  const names = result.initial.entries.map((e) => e.name)
+  expect(names).toEqual(['y'])
+})
+
+test('records autoFix throws as a failed fix attempt and skips the commit', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  const throwing: import('./types').DoctorCheck = {
+    name: 'throws',
+    category: 'config',
+    description: 'throws',
+    async run() {
+      return {
+        status: 'warning',
+        message: 'broken',
+        fix: {
+          description: 'will throw',
+          autoFix: async () => {
+            throw new Error('disk full')
+          },
+        },
+      }
+    },
+  }
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [throwing],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.fixAttempts?.[0]).toMatchObject({ ok: false, name: 'throws', source: 'static' })
+  expect(result.commit?.kind).toBe('skipped')
+})
+
+test('skips commit when no fix produced any changedPaths', async () => {
+  const cwd = makeTmpAgentDir()
+  await initGitRepo(cwd)
+  const noPathFix: import('./types').DoctorCheck = {
+    name: 'no-paths',
+    category: 'config',
+    description: 'no paths',
+    async run() {
+      return {
+        status: 'warning',
+        message: 'x',
+        fix: {
+          description: 'no-op fix',
+          autoFix: async () => ({ summary: 'no-op', changedPaths: [] }),
+        },
+      }
+    },
+  }
+  const result = await runDoctor({
+    cwd,
+    fix: true,
+    staticChecks: [noPathFix],
+    fetchPluginChecks: async () => ({ kind: 'ok', checks: [] }),
+  })
+  expect(result.commit?.kind).toBe('skipped')
+  expect(result.commit?.kind === 'skipped' && result.commit.reason).toMatch(/no changed paths/)
+})
+
 test('refuses commit when git index already has unrelated staged changes', async () => {
   const cwd = makeTmpAgentDir()
   await initGitRepo(cwd)

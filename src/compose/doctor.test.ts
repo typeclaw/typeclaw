@@ -67,6 +67,25 @@ describe('composeDoctor', () => {
     expect(report.agents).toEqual([])
   })
 
+  test('reports ok=false when any agent has a failing internal check', async () => {
+    const root = makeTmpRoot()
+    makeAgent(root, 'alpha', { port: 8973 })
+    makeAgent(root, 'beta', { port: 9000 })
+
+    const report = await composeDoctor({
+      rootCwd: root,
+      runDoctorFn: async ({ cwd }) => {
+        const passing = passingResult(cwd as string)
+        if ((cwd as string).endsWith('/beta')) {
+          passing.initial.summary.error = 1
+          passing.initial.ok = false
+        }
+        return passing
+      },
+    })
+    expect(report.ok).toBe(false)
+  })
+
   test('runs per-agent doctor by default, skips it under --shallow', async () => {
     const root = makeTmpRoot()
     makeAgent(root, 'alpha', { port: 8973 })
