@@ -88,9 +88,11 @@ async function dial(opts: PluginBridgeOptions): Promise<DialResult> {
   }
   const url = `${baseUrl.replace(/\/$/, '')}/doctor`
   const ws = new WebSocket(url)
+  let dialTimer: ReturnType<typeof setTimeout> | null = null
   try {
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
+        if (dialTimer !== null) clearTimeout(dialTimer)
         ws.removeEventListener('open', onOpen)
         ws.removeEventListener('error', onError)
       }
@@ -102,6 +104,13 @@ async function dial(opts: PluginBridgeOptions): Promise<DialResult> {
         cleanup()
         reject(err instanceof Error ? err : new Error(`failed to connect to ${url}`))
       }
+      dialTimer = setTimeout(() => {
+        cleanup()
+        try {
+          ws.close()
+        } catch {}
+        reject(new Error(`dial timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
       ws.addEventListener('open', onOpen, { once: true })
       ws.addEventListener('error', onError, { once: true })
     })
