@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -405,7 +405,9 @@ async function safeRead(path: string): Promise<string | null> {
 }
 
 async function writeAtomic(path: string, content: string): Promise<void> {
-  await writeFile(path, content)
+  const tmp = `${path}.typeclaw-doctor.tmp`
+  await writeFile(tmp, content)
+  renameSync(tmp, path)
 }
 
 export function relativeToCwd(cwd: string, path: string): string {
