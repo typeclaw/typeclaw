@@ -66,6 +66,21 @@ describe('runPluginDoctorChecks', () => {
     expect(record?.message).toMatch(/timed out/)
   })
 
+  test('aborts the check signal when the timeout fires', async () => {
+    const registry = emptyRegistry()
+    let captured: AbortSignal | undefined
+    registerCheck(registry, 'p1', 'observes-signal', {
+      description: 'x',
+      run: (ctx) =>
+        new Promise<PluginCheckResult>(() => {
+          captured = ctx.signal
+        }),
+    })
+    const [record] = await runPluginDoctorChecks({ registry, agentDir: '/agent', checkTimeoutMs: 20 })
+    expect(captured?.aborted).toBe(true)
+    expect(record?.message).toMatch(/timed out/)
+  })
+
   test('reports fix.hasApply: true only when apply is present', async () => {
     const registry = emptyRegistry()
     registerCheck(registry, 'p1', 'with-apply', {
