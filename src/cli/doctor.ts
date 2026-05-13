@@ -45,8 +45,10 @@ export const doctorCommand = defineCommand({
 
 export function exitCodeFor(result: DoctorRunResult): number {
   const last = result.final ?? result.initial
-  if (last.ok) return 0
-  return 1
+  if (!last.ok) return 1
+  if (result.commit?.kind === 'failed') return 1
+  if (result.fixAttempts?.some((a) => a.ok === false)) return 1
+  return 0
 }
 
 function parseOnly(value: string | undefined): string[] | undefined {
