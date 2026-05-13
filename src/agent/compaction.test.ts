@@ -35,7 +35,7 @@ describe('reserveTokensForModel', () => {
 
     // then
     expect(reserve).toBe(Math.round(window * (1 - COMPACTION_TRIGGER_PERCENT)))
-    expect(reserve).toBe(51_200)
+    expect(reserve).toBe(76_800)
   })
 
   test('scales with the model context window so trigger fraction stays constant', () => {

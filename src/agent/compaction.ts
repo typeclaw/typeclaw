@@ -11,7 +11,21 @@ import { SettingsManager } from '@mariozechner/pi-coding-agent'
 // that's ~6% headroom (94% trigger), at 1M it's ~1.6% (98% trigger). A
 // percentage-derived reserve trips at the same fraction regardless of
 // model, which is what we actually want.
-export const COMPACTION_TRIGGER_PERCENT = 0.8
+//
+// 0.7 (was 0.8) lowers the trigger from 80% to 70% of the window. The
+// previous 80% setting waited until very close to context exhaustion before
+// compacting, which meant a long-lived channel session that gradually
+// accumulated many normal turns would spend a meaningful chunk of its life
+// shipping a near-maximum context to the LLM on every prompt. Empirically:
+// a kakao session that had only ~75K tokens (29% of 256K) but 3.5MB on disk
+// — bloated by one oversized tool result — could not be helped by
+// compaction because the token threshold wasn't reached. That specific
+// shape is handled by the tool-result-cap plugin. This change addresses
+// the orthogonal "many normal turns" case: at 70% we compact 10 percentage
+// points earlier, freeing context bandwidth for the upcoming turn's
+// thinking + tool calls without sacrificing recent history (which is still
+// preserved verbatim per COMPACTION_KEEP_RECENT_TOKENS).
+export const COMPACTION_TRIGGER_PERCENT = 0.7
 
 // Tokens to keep in the recent window after compaction. Fixed (not a
 // percentage) because "recent context" is a property of conversation
