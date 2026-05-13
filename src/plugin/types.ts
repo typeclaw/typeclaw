@@ -186,7 +186,7 @@ export type PluginDoctorContext = {
   readonly signal: AbortSignal
 }
 
-export type PluginCheckStatus = 'ok' | 'warning' | 'error'
+export type PluginCheckStatus = 'ok' | 'warning' | 'error' | 'info'
 
 export type PluginCheckResult = {
   status: PluginCheckStatus

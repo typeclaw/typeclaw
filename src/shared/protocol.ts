@@ -12,7 +12,7 @@ export type DoctorCheckPayload = {
   checkName: string
   description: string
   category: string
-  status: 'ok' | 'warning' | 'error'
+  status: 'ok' | 'warning' | 'error' | 'info'
   message: string
   details?: string[]
   fix?: { description: string; hasApply: boolean }
