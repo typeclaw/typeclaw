@@ -18,7 +18,11 @@ const SHELL_BOUNDARY = String.raw`[\s;|&(\`$]`
 const GIT_INTER = String.raw`(?:\s+-{1,2}[A-Za-z][^\s]*(?:\s+[^-\s][^\s]*)?)*\s+`
 const GIT_PREFIX = String.raw`(?:^|${SHELL_BOUNDARY})git${GIT_INTER}`
 
-const DANGEROUS_COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string }> = [
+// Git/gh/hub patterns: per-segment, can be scoped to workspace/mounts via cd
+// or `git -C`. The "loosening" applies only to these -- pushing a repo
+// cloned into the free-write zone is legitimate work, but the same shape
+// against the agent's own repo at /agent is the exfil threat.
+const GIT_DANGEROUS_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string }> = [
   // -- git push family ------------------------------------------------------
   // The breach: agent obeyed a Slack DM saying `git push origin main` to an
   // attacker-controlled remote. Pushing a repo is the exfil moment - once
@@ -72,9 +76,14 @@ const DANGEROUS_COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string
     label: 'gh repo create --push (creates remote and pushes in one step)',
   },
   { pattern: /(^|[\s;|&(`$])hub\s+(?:create|push)\b/, label: 'hub create / push (GitHub wrapper for git push)' },
-  // -- non-git egress -------------------------------------------------------
-  // The git path is the breach we observed; these are the obvious next-best
-  // exfil channels. A compromised agent that can't push will reach for them.
+]
+
+// Non-git exfil and RCE patterns. These are NOT scopable to workspace/mounts:
+// they reference files by literal path (`@.env`, `-T MEMORY.md`), not by
+// the current working directory, so `cd workspace/foo` doesn't change what
+// they read. The curl | sh shape is RCE rather than exfil but lives here
+// because the same trust failure produced the original breach.
+const EXFIL_DANGEROUS_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string }> = [
   {
     pattern: /(curl|wget|fetch|http|httpie)\s+[^\n;|&`]*(?:--data-binary|--data|-d)\s+@/,
     label: 'curl --data-binary @file (uploads file contents as request body)',
@@ -91,11 +100,6 @@ const DANGEROUS_COMMAND_PATTERNS: ReadonlyArray<{ pattern: RegExp; label: string
     pattern: /(^|[\s;|&(`$])(?:scp|sftp|rsync)\s+[^\n;|&`]*\s+[^\n\s;|&`]+:[^\n;|&`]*/,
     label: 'scp / sftp / rsync to remote host (file exfil over SSH)',
   },
-  // -- remote-code-execution shape -----------------------------------------
-  // `curl ... | sh` / `wget ... | bash` is not exfil per se but it is the
-  // same trust failure that produced the breach: blindly executing remote
-  // payloads. A guard here closes the obvious next-step ("ok, just curl |
-  // bash this script that does the push for me").
   {
     pattern: /(?:curl|wget|fetch)\s+[^\n;|&]*\s\|\s*(?:sh|bash|zsh|fish|dash|ksh)\b/,
     label: 'curl ... | sh (remote-code execution from untrusted URL)',
@@ -150,7 +154,13 @@ export function checkGitExfilGuard(options: {
 
   if (isGuardAcknowledged(args, GUARD_GIT_EXFIL)) return undefined
 
-  const matched = DANGEROUS_COMMAND_PATTERNS.find(({ pattern }) => pattern.test(command))
+  // Find the first dangerous match that is NOT scoped to the agent's
+  // `workspace/` free-write zone. Workspace clones are external repos the
+  // agent legitimately works with (e.g. cloned during a task), so pushing,
+  // re-pointing remotes, or running gh on them is normal work -- the exfil
+  // threat is specifically about the AGENT's own repo (at /agent), which
+  // holds MEMORY.md, IDENTITY.md, SOUL.md, AGENTS.md, and embedded secrets.
+  const matched = findDangerousMatchOutsideWorkspace(command)
   if (!matched) return undefined
 
   return {
@@ -235,9 +245,13 @@ const GIT_REMOTE_CHANGE_REGEX = new RegExp(
 // pushes via --repo=) in a command. Bare `git push` expands to `origin`. Each
 // target is normalized (quotes stripped) before lookup so `git push "origin"`
 // and `git push origin` collide on the same taint key.
+// Pushes scoped to /agent/workspace or /agent/mounts are NOT recorded as
+// taint targets -- those are external repos, and tainting them would leak
+// false positives across unrelated tasks in the same session.
 function parsePushTargets(command: string): Array<{ kind: 'remote'; name: string } | { kind: 'url'; url: string }> {
   const targets: Array<{ kind: 'remote'; name: string } | { kind: 'url'; url: string }> = []
-  for (const segment of splitShellSegments(command)) {
+  for (const { segment, scopedToExternal } of splitSegmentsWithScope(command)) {
+    if (scopedToExternal) continue
     const target = parsePushTargetForSegment(segment)
     if (target) targets.push(target)
   }
@@ -279,7 +293,8 @@ function looksLikeUrl(token: string): boolean {
 
 function parseRemoteChanges(command: string): Array<{ remoteName: string; url: string }> {
   const changes: Array<{ remoteName: string; url: string }> = []
-  for (const segment of splitShellSegments(command)) {
+  for (const { segment, scopedToExternal } of splitSegmentsWithScope(command)) {
+    if (scopedToExternal) continue
     const change = parseRemoteChangeForSegment(segment)
     if (change) changes.push(change)
   }
@@ -325,9 +340,91 @@ function sanitizeUrlForReason(url: string): string {
   return `${cleaned.slice(0, MAX_LEN)}...`
 }
 
-function splitShellSegments(command: string): string[] {
-  // Split on `&&`, `||`, `;`, `|`, single `&` (background), and newlines.
-  // Single `&` was missing originally: `cmd1&cmd2` runs cmd2 too, but a
-  // single-segment view of `cmd1&cmd2` lets the parsers miss cmd2 entirely.
-  return command.split(/(?:&&|\|\||;|\||&|\n|\r)/).map((s) => s.trim())
+// External directories where the agent works on OTHER repos -- `workspace/`
+// is the documented free-write zone and `mounts/<name>` is where the user's
+// bind-mounted host folders land (see container/start.ts MOUNT_TARGET_PREFIX).
+// Repos cloned into either are NOT the agent's own repo, so git push / gh
+// repo create / remote re-pointing inside them is legitimate work, not exfil
+// of the agent's identity files. The agent's own /agent root keeps the guard.
+const EXTERNAL_DIR_PATTERN = /^(?:\.?\/?|\/agent\/)(?:workspace|mounts)(?:\/|$)/
+
+function isExternalScopedPath(path: string): boolean {
+  const unquoted = stripQuotes(path)
+  return EXTERNAL_DIR_PATTERN.test(unquoted)
+}
+
+// Per-segment cwd override from `git -C <path>`. Local to the segment because
+// -C only applies to the single git invocation, not to siblings in a chain.
+const GIT_DASH_C_REGEX = /(?:^|[\s;|&(`$])git\s+(?:-c\s+[^\s]+\s+)*-C\s+([^\s]+)/
+
+function gitDashCPathIsExternal(segment: string): boolean {
+  const match = segment.match(GIT_DASH_C_REGEX)
+  if (!match || !match[1]) return false
+  return isExternalScopedPath(match[1])
+}
+
+// Classifies the effect of a bare `cd <path>` segment on subsequent
+// commands in the same chain. Returns 'external' when cd targets a path
+// under /agent/workspace or /agent/mounts; 'reset' when cd targets an
+// absolute path outside those zones, an empty cd (HOME), or `~` (which
+// would land outside the agent dir); undefined for relative-path cds
+// (e.g. `cd subdir`, `cd ..`) where we can't tell without true path
+// tracking -- the walker leaves prior scope unchanged in that case so
+// `cd workspace/foo && cd subdir && git push` stays scoped to external.
+const CD_ONLY_REGEX = /^cd(?:\s+([^\s;|&]+))?\s*$/
+
+function cdEffect(segment: string): 'external' | 'reset' | undefined {
+  const match = segment.match(CD_ONLY_REGEX)
+  if (!match) return undefined
+  const rawTarget = match[1]
+  if (!rawTarget) return 'reset'
+  const target = stripQuotes(rawTarget)
+  if (isExternalScopedPath(target)) return 'external'
+  if (target.startsWith('/') || target.startsWith('~')) return 'reset'
+  return undefined
+}
+
+// Walks segments left-to-right, tracking the "current scope is external"
+// flag across `&&`, `;`, and newlines (which preserve cwd in real shells).
+// Resets the flag at `|`, `||`, `&` (single, background) and at any segment
+// containing parens / command substitution markers -- in those cases shell
+// semantics make cwd inheritance unreliable enough that we'd rather
+// false-block than false-allow. Each returned entry describes whether the
+// dangerous match in THAT segment should be considered scoped to an external
+// dir (and therefore allowed).
+function splitSegmentsWithScope(command: string): Array<{ segment: string; scopedToExternal: boolean }> {
+  const results: Array<{ segment: string; scopedToExternal: boolean }> = []
+  let currentExternal = false
+
+  const tokens = command.split(/(&&|\|\||;|\||&|\n|\r)/)
+  for (let i = 0; i < tokens.length; i += 2) {
+    const segment = (tokens[i] ?? '').trim()
+    const separator = tokens[i + 1] ?? ''
+
+    const segmentScoped = currentExternal || gitDashCPathIsExternal(segment)
+    results.push({ segment, scopedToExternal: segmentScoped })
+
+    const effect = /[`$(]/.test(segment) ? 'reset' : cdEffect(segment)
+    if (effect === 'external') currentExternal = true
+    else if (effect === 'reset') currentExternal = false
+
+    if (separator === '|' || separator === '||' || separator === '&') {
+      currentExternal = false
+    }
+  }
+
+  return results
+}
+
+function findDangerousMatchOutsideWorkspace(command: string): { pattern: RegExp; label: string } | undefined {
+  const exfilMatch = EXFIL_DANGEROUS_PATTERNS.find(({ pattern }) => pattern.test(command))
+  if (exfilMatch) return exfilMatch
+
+  for (const { segment, scopedToExternal } of splitSegmentsWithScope(command)) {
+    if (!segment) continue
+    if (scopedToExternal) continue
+    const matched = GIT_DANGEROUS_PATTERNS.find(({ pattern }) => pattern.test(segment))
+    if (matched) return matched
+  }
+  return undefined
 }
