@@ -4,7 +4,9 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import type { HookBus } from '@/plugin'
 import type { Stream, Unsubscribe } from '@/stream'
 
-import type { CronJob, ExecJob, PromptJob } from './schema'
+import { DEFAULT_EXEC_MAX_OUTPUT_BYTES, type CronJob, type ExecJob, type PromptJob } from './schema'
+
+export type ExecResult = { stdin: string; stderr: string; exitCode: number }
 
 // `hooks`, `sessionId`, `agentDir`, and `getTranscriptPath` are optional so
 // test fakes can stay one-liners. When present, the consumer fires
@@ -80,7 +82,7 @@ export function createCronConsumer({
         inFlight.add(job.id)
         try {
           if (job.kind === 'prompt') {
-            await runPrompt(job, createSessionForCron, stream, logger)
+            await runPrompt(job, cwd, createSessionForCron, stream, logger)
           } else {
             await runExec(job, cwd)
           }
@@ -104,10 +106,15 @@ export function createCronConsumer({
 
 async function runPrompt(
   job: PromptJob,
+  cwd: string,
   createSessionForCron: (job: PromptJob) => Promise<CronSession>,
   stream: Stream,
   logger: CronConsumerLogger,
 ): Promise<void> {
+  const exec = job.exec !== undefined ? await runExecForPrompt(job, cwd) : undefined
+  const effectivePrompt = exec !== undefined ? appendExecToPrompt(job.prompt, exec) : job.prompt
+  const effectivePayload = exec !== undefined ? mergeExecIntoPayload(job.payload, exec) : job.payload
+
   if (job.subagent !== undefined) {
     // Propagate the cron job's role and origin into the spawned subagent.
     // Without this, every cron-triggered subagent (e.g. memory dreaming)
@@ -127,7 +134,7 @@ async function runPrompt(
         ...(job.scheduledByRole !== undefined ? { spawnedByRole: job.scheduledByRole } : {}),
         spawnedByOriginJson: JSON.stringify(parentOrigin),
       },
-      payload: job.payload,
+      payload: effectivePayload,
     })
     return
   }
@@ -151,7 +158,7 @@ async function runPrompt(
       await session.hooks.runSessionTurnStart(turnEvent)
     }
     try {
-      await session.prompt(job.prompt)
+      await session.prompt(effectivePrompt)
     } finally {
       if (session.hooks && turnEvent !== undefined) {
         await session.hooks.runSessionTurnEnd(turnEvent)
@@ -193,4 +200,59 @@ function isCronJob(value: unknown): value is CronJob {
   const v = value as { id?: unknown; kind?: unknown }
   if (typeof v.id !== 'string') return false
   return v.kind === 'prompt' || v.kind === 'exec'
+}
+
+export async function runExecForPrompt(job: PromptJob, cwd: string): Promise<ExecResult> {
+  if (job.exec === undefined || job.exec.length === 0) {
+    throw new Error(`prompt job ${job.id}: exec is required for runExecForPrompt`)
+  }
+  const [cmd, ...args] = job.exec
+  if (!cmd) throw new Error(`prompt job ${job.id}: empty exec command`)
+  const cap = job.execMaxOutputBytes ?? DEFAULT_EXEC_MAX_OUTPUT_BYTES
+  const proc = Bun.spawn({ cmd: [cmd, ...args], cwd, stdout: 'pipe', stderr: 'pipe' })
+  const [stdoutRaw, stderrRaw, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  return {
+    stdin: truncateUtf8(stdoutRaw, cap),
+    stderr: truncateUtf8(stderrRaw, cap),
+    exitCode,
+  }
+}
+
+export function appendExecToPrompt(prompt: string, exec: ExecResult): string {
+  const parts = [prompt, '', '```', exec.stdin, '```']
+  if (exec.stderr.length > 0) {
+    parts.push('', 'stderr:', '```', exec.stderr, '```')
+  }
+  if (exec.exitCode !== 0) {
+    parts.push('', `exit code: ${exec.exitCode}`)
+  }
+  return parts.join('\n')
+}
+
+export function mergeExecIntoPayload(originalPayload: unknown, exec: ExecResult): unknown {
+  if (originalPayload === undefined) return { exec }
+  if (typeof originalPayload === 'object' && originalPayload !== null && !Array.isArray(originalPayload)) {
+    return { ...(originalPayload as Record<string, unknown>), exec }
+  }
+  // Non-object payload (string, array, number, etc.): wrap so the original
+  // value is preserved as `payload.payload` and exec sits alongside it. This
+  // is the conservative shape — subagents that declare object payloadSchemas
+  // never see this branch in practice.
+  return { payload: originalPayload, exec }
+}
+
+function truncateUtf8(s: string, maxBytes: number): string {
+  const encoder = new TextEncoder()
+  const bytes = encoder.encode(s)
+  if (bytes.length <= maxBytes) return s
+  // Decode the first `maxBytes` bytes with the streaming `fatal: false`
+  // decoder so a multi-byte boundary in the middle of a character degrades
+  // to U+FFFD instead of throwing.
+  const decoder = new TextDecoder('utf-8', { fatal: false })
+  const head = decoder.decode(bytes.subarray(0, maxBytes))
+  return `${head}\n[truncated ${bytes.length - maxBytes} bytes]`
 }

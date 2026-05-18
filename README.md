@@ -28,7 +28,7 @@ TypeClaw is the agent I wanted to use:
 - 🔌 **Plugin system** — plain TypeScript modules contribute tools, skills, subagents, channels, and typed config
 - 💬 **Multi-channel** — Slack, Discord, and a websocket TUI out of the box; one agent, many inboxes
 - 👥 **Group chat awareness** — knows who's in the room, distinguishes humans from bots, and stays engaged after a reply without re-mentioning
-- ⏰ **Cron** — schedule prompts or shell commands; per-job coalescing so slow jobs don't pile up
+- ⏰ **Cron** — schedule prompts or shell commands; prompts can pipe a shell command's output into the LLM (`exec → llm`); per-job coalescing so slow jobs don't pile up
 - 📚 **Skills on demand** — markdown procedures the agent loads only when relevant; zero token cost until used
 - 🌱 **Self-improving** — bundled memory plugin observes the agent's work and consolidates it into long-term memory (see below)
 - 🧠 **Muscle memory** — repeated procedures get distilled into reusable skills that the agent writes for itself

@@ -6,7 +6,15 @@ import { join } from 'node:path'
 import type { HookBus } from '@/plugin'
 import { createStream } from '@/stream'
 
-import { createCronConsumer, type CronConsumerLogger, type CronSession } from './consumer'
+import {
+  appendExecToPrompt,
+  createCronConsumer,
+  type CronConsumerLogger,
+  type CronSession,
+  type ExecResult,
+  mergeExecIntoPayload,
+  runExecForPrompt,
+} from './consumer'
 import type { CronJob, ExecJob, PromptJob } from './schema'
 
 function fakeHooks(events: string[]): HookBus {
@@ -545,6 +553,310 @@ describe('createCronConsumer', () => {
 
     // then
     expect(errors).toEqual([])
+
+    consumer.stop()
+  })
+})
+
+describe('runExecForPrompt', () => {
+  test('captures stdout, stderr, and exitCode from a successful command', async () => {
+    const job: PromptJob = {
+      id: 'j',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['sh', '-c', 'echo out; echo err 1>&2; exit 0'],
+    }
+    const result = await runExecForPrompt(job, root)
+    expect(result.stdin.trim()).toBe('out')
+    expect(result.stderr.trim()).toBe('err')
+    expect(result.exitCode).toBe(0)
+  })
+
+  test('captures non-zero exit code without throwing — LLM gets to see the failure', async () => {
+    const job: PromptJob = {
+      id: 'j',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['sh', '-c', 'echo last-out; echo last-err 1>&2; exit 7'],
+    }
+    const result = await runExecForPrompt(job, root)
+    expect(result.exitCode).toBe(7)
+    expect(result.stdin.trim()).toBe('last-out')
+    expect(result.stderr.trim()).toBe('last-err')
+  })
+
+  test('truncates stdout at execMaxOutputBytes with a marker', async () => {
+    const job: PromptJob = {
+      id: 'j',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['sh', '-c', 'printf "%0.s." {1..2000}'],
+      execMaxOutputBytes: 100,
+    }
+    const result = await runExecForPrompt(job, root)
+    expect(result.stdin.length).toBeGreaterThan(100)
+    expect(result.stdin).toContain('[truncated')
+    expect(result.stdin).toContain('1900 bytes]')
+  })
+
+  test('truncates stderr independently with the same cap', async () => {
+    const job: PromptJob = {
+      id: 'j',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['sh', '-c', 'printf "%0.s." {1..2000} 1>&2'],
+      execMaxOutputBytes: 50,
+    }
+    const result = await runExecForPrompt(job, root)
+    expect(result.stderr).toContain('[truncated')
+    expect(result.stderr).toContain('1950 bytes]')
+    expect(result.stdin).toBe('')
+  })
+
+  test('uses agent cwd so commands like `pwd` resolve to the agent folder', async () => {
+    const job: PromptJob = {
+      id: 'j',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['pwd'],
+    }
+    const result = await runExecForPrompt(job, root)
+    // On macOS, /tmp is a symlink to /private/tmp — accept either.
+    expect(result.stdin.trim().endsWith(root) || result.stdin.trim() === root).toBe(true)
+  })
+
+  test('rejects when exec is absent (caller bug)', async () => {
+    const job: PromptJob = { id: 'j', schedule: '* * * * *', enabled: true, kind: 'prompt', prompt: 'p' }
+    await expect(runExecForPrompt(job, root)).rejects.toThrow(/exec is required/)
+  })
+})
+
+describe('appendExecToPrompt', () => {
+  test('appends stdout as a fenced block under the prompt text', () => {
+    const exec: ExecResult = { stdin: 'hello\nworld', stderr: '', exitCode: 0 }
+    const result = appendExecToPrompt('Summarize:', exec)
+    expect(result).toBe('Summarize:\n\n```\nhello\nworld\n```')
+  })
+
+  test('omits stderr block when stderr is empty', () => {
+    const exec: ExecResult = { stdin: 'out', stderr: '', exitCode: 0 }
+    expect(appendExecToPrompt('p', exec)).not.toContain('stderr')
+  })
+
+  test('includes a stderr fenced block when stderr is non-empty', () => {
+    const exec: ExecResult = { stdin: 'out', stderr: 'warning: foo', exitCode: 0 }
+    const result = appendExecToPrompt('p', exec)
+    expect(result).toContain('stderr:')
+    expect(result).toContain('warning: foo')
+  })
+
+  test('appends "exit code: N" only when exitCode is non-zero', () => {
+    const ok: ExecResult = { stdin: 'out', stderr: '', exitCode: 0 }
+    expect(appendExecToPrompt('p', ok)).not.toContain('exit code')
+
+    const fail: ExecResult = { stdin: 'out', stderr: '', exitCode: 7 }
+    expect(appendExecToPrompt('p', fail)).toContain('exit code: 7')
+  })
+})
+
+describe('mergeExecIntoPayload', () => {
+  test('returns { exec } when no original payload', () => {
+    const exec: ExecResult = { stdin: 'x', stderr: '', exitCode: 0 }
+    expect(mergeExecIntoPayload(undefined, exec)).toEqual({ exec })
+  })
+
+  test('merges into an existing object payload without overwriting unrelated fields', () => {
+    const exec: ExecResult = { stdin: 'x', stderr: '', exitCode: 0 }
+    const merged = mergeExecIntoPayload({ branch: 'main', limit: 10 }, exec)
+    expect(merged).toEqual({ branch: 'main', limit: 10, exec })
+  })
+
+  test('overwrites a prior `exec` key — most-recent run wins', () => {
+    const exec: ExecResult = { stdin: 'fresh', stderr: '', exitCode: 0 }
+    const merged = mergeExecIntoPayload({ exec: { stdin: 'stale', stderr: '', exitCode: 99 } }, exec)
+    expect(merged).toEqual({ exec })
+  })
+
+  test('wraps non-object payload (string) under `payload` so it is preserved', () => {
+    const exec: ExecResult = { stdin: 'x', stderr: '', exitCode: 0 }
+    expect(mergeExecIntoPayload('a string', exec)).toEqual({ payload: 'a string', exec })
+  })
+
+  test('wraps array payload under `payload` (zod object schemas reject arrays anyway, but data is preserved)', () => {
+    const exec: ExecResult = { stdin: 'x', stderr: '', exitCode: 0 }
+    expect(mergeExecIntoPayload([1, 2, 3], exec)).toEqual({ payload: [1, 2, 3], exec })
+  })
+
+  test('wraps null payload (null is typeof object but should not be merged into)', () => {
+    const exec: ExecResult = { stdin: 'x', stderr: '', exitCode: 0 }
+    expect(mergeExecIntoPayload(null, exec)).toEqual({ payload: null, exec })
+  })
+})
+
+describe('cron prompt job with `exec` pre-LLM command', () => {
+  test('without subagent: appends exec stdout to the prompt text the session receives', async () => {
+    // given
+    const stream = createStream()
+    const factory = makeFakeSessionFactory()
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: factory.createSessionForCron,
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    // when
+    publishCron(stream, {
+      id: 'with-exec',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'Summarize:',
+      exec: ['sh', '-c', 'echo from-exec'],
+    })
+    // exec spawning needs setTimeout, not setImmediate, to let the
+    // subprocess actually finish.
+    await new Promise((r) => setTimeout(r, 100))
+
+    // then
+    const calls = factory.callsByJob.get('with-exec')
+    if (!calls || calls.length === 0) throw new Error('expected a prompt call')
+    expect(calls[0]).toContain('Summarize:')
+    expect(calls[0]).toContain('from-exec')
+    expect(calls[0]).toContain('```')
+
+    consumer.stop()
+  })
+
+  test('without subagent: non-zero exit code is appended to the prompt', async () => {
+    const stream = createStream()
+    const factory = makeFakeSessionFactory()
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: factory.createSessionForCron,
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, {
+      id: 'failing-exec',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'Investigate:',
+      exec: ['sh', '-c', 'echo did-something; exit 4'],
+    })
+    await new Promise((r) => setTimeout(r, 100))
+
+    const calls = factory.callsByJob.get('failing-exec')
+    if (!calls || calls.length === 0) throw new Error('expected a prompt call')
+    expect(calls[0]).toContain('did-something')
+    expect(calls[0]).toContain('exit code: 4')
+
+    consumer.stop()
+  })
+
+  test('with subagent: exec result is merged into the new-session payload', async () => {
+    const stream = createStream()
+    const factory = makeFakeSessionFactory()
+    const newSessionMessages: Array<{ subagent: string; payload: unknown }> = []
+    stream.subscribe({ target: { kind: 'new-session' } }, (msg) => {
+      const target = msg.target as { kind: 'new-session'; subagent: string }
+      newSessionMessages.push({ subagent: target.subagent, payload: msg.payload })
+    })
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: factory.createSessionForCron,
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, {
+      id: 'sub-exec',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'fallback',
+      subagent: 'commit-summarizer',
+      payload: { branch: 'main' },
+      exec: ['sh', '-c', 'echo three-commits'],
+    })
+    await new Promise((r) => setTimeout(r, 100))
+
+    expect(newSessionMessages).toHaveLength(1)
+    const payload = newSessionMessages[0]?.payload as {
+      branch: string
+      exec: { stdin: string; stderr: string; exitCode: number }
+    }
+    expect(payload.branch).toBe('main')
+    expect(payload.exec.stdin.trim()).toBe('three-commits')
+    expect(payload.exec.exitCode).toBe(0)
+    expect(factory.callsByJob.size).toBe(0)
+
+    consumer.stop()
+  })
+
+  test('without exec: prompt and payload pass through unchanged (regression guard)', async () => {
+    const stream = createStream()
+    const factory = makeFakeSessionFactory()
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: factory.createSessionForCron,
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, promptJob('no-exec', 'plain prompt'))
+    await new Promise((r) => setImmediate(r))
+
+    expect(factory.callsByJob.get('no-exec')).toEqual(['plain prompt'])
+
+    consumer.stop()
+  })
+
+  test('exec command spawn failure (ENOENT) is logged and does not crash the consumer', async () => {
+    const stream = createStream()
+    const factory = makeFakeSessionFactory()
+    const errors: string[] = []
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: factory.createSessionForCron,
+      logger: { ...silentLogger, error: (m) => errors.push(m) },
+    })
+    consumer.start()
+
+    publishCron(stream, {
+      id: 'enoent',
+      schedule: '* * * * *',
+      enabled: true,
+      kind: 'prompt',
+      prompt: 'p',
+      exec: ['no-such-binary-exists-12345'],
+    })
+    await new Promise((r) => setTimeout(r, 100))
+
+    expect(errors.length).toBeGreaterThan(0)
+    expect(factory.callsByJob.size).toBe(0)
+
+    // Consumer survives — a subsequent job runs normally.
+    publishCron(stream, promptJob('after', 'still alive'))
+    await new Promise((r) => setImmediate(r))
+    expect(factory.callsByJob.get('after')).toEqual(['still alive'])
 
     consumer.stop()
   })

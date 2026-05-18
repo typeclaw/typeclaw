@@ -591,6 +591,30 @@ The TUI ↔ WS protocol depends on the stream-driven drain loop in two non-obvio
 
 This split means a long-running job no longer blocks subsequent ticks at the scheduler layer — the scheduler fires N times for N ticks, and any overlapping fires for the same job are dropped by the consumer with a warning. Same observable behavior as before, cleaner ownership.
 
+### Cron `prompt` job with `exec` (pre-LLM command)
+
+A `prompt`-kind cron job may optionally declare an `exec` array. When present, the consumer runs the command via `Bun.spawn` (cwd = agent dir) **before** firing the LLM, captures stdout / stderr / exitCode, truncates each to `execMaxOutputBytes` (default 64 KiB), and feeds the result into the LLM call:
+
+- **Without `subagent`:** stdout appended to the prompt text as a fenced block. Stderr appended as a second fenced block when non-empty. `exit code: N` line appended when non-zero. The session's default tool set is unchanged — which means `channel_send` works for "exec → reach out to a channel" flows out of the box.
+- **With `subagent`:** result merged into the new-session payload as `payload.exec = { stdin, stderr, exitCode }`. The subagent's `payloadSchema` should declare `exec: z.object({ stdin: z.string(), stderr: z.string(), exitCode: z.number() }).optional()` to opt in. Non-object original payloads are wrapped as `{ payload: <original>, exec }` to preserve data.
+
+The LLM runs **regardless of exit code** — the model sees the result (including failures) and decides what to do. For conditional firing, compose in the command itself: `["bash", "-c", "gh run list … | jq -e '.[].conclusion == \"failure\"' && echo failed"]` — empty stdout on success, output on failure, LLM decides what to summarize.
+
+Worked example (no subagent, posts to Slack on CI failure):
+
+```json
+{
+  "id": "ci-watcher",
+  "kind": "prompt",
+  "schedule": "*/10 * * * *",
+  "scheduledByRole": "owner",
+  "exec": ["gh", "run", "list", "--limit", "5", "--json", "conclusion,name,url"],
+  "prompt": "If any of the last 5 CI runs below failed, post to Slack workspace T0123 channel C0ENGR: 'CI broke: <name> <url>'. Otherwise stay silent (no tool calls)."
+}
+```
+
+Subagent-tool gotcha: subagents declared with an explicit `tools` field get only what they declared — channel tools must be opted in via `customTools` or by reusing the default tool set. The bundled `memory-logger` and `dreaming` subagents intentionally don't carry channel tools, which is why a "summarize and post" exec→llm flow should usually go through the no-subagent path unless you're authoring a plugin subagent that takes ownership of the routing.
+
 ### `stream_snapshot` agent tool
 
 `src/agent/tools/stream-snapshot.ts` exposes a read-only tool to the agent that reads from the broker's bounded ring buffer (default 1000 events). The agent can ask "what cron jobs fired in the last minute?" or "did any broadcasts arrive while I was thinking?" without any wire round-trip — the tool is in-process. Read-only by design: the agent cannot publish via this tool. Wired into `createSession` only when a `Stream` is injected.
