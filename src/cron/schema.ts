@@ -23,11 +23,30 @@ const baseJob = z.object({
   scheduledByOrigin: z.unknown().optional(),
 })
 
+// Default cap shared by stdout and stderr when a prompt job pipes an exec
+// command's output into the LLM. 64 KiB fits typical CLI output (e.g.
+// `git log --oneline -100` is ~5 KiB) while staying well under any model's
+// context window. Per-job override via `execMaxOutputBytes`.
+export const DEFAULT_EXEC_MAX_OUTPUT_BYTES = 65536
+
 const promptJob = baseJob.extend({
   kind: z.literal('prompt'),
   prompt: z.string().min(1),
   subagent: z.string().min(1).optional(),
   payload: z.unknown().optional(),
+  // Optional pre-LLM command. When present, the cron consumer spawns this
+  // command (cwd = agent dir) BEFORE invoking the LLM, captures
+  // stdout/stderr/exitCode, and feeds the result into the prompt (no
+  // subagent: appended as a fenced block) or the payload (with subagent:
+  // merged as `payload.exec = { stdin, stderr, exitCode }`). The LLM runs
+  // regardless of exit code — the model sees the result and decides what
+  // to do. For conditional firing, use shell composition in the command
+  // itself (`bash -c "cmd1 && cmd2"`).
+  exec: z.array(z.string().min(1)).min(1).optional(),
+  // Cap applied independently to stdout and stderr. Larger outputs are
+  // truncated with a `[truncated N bytes]` marker appended to the affected
+  // stream. Defaults to DEFAULT_EXEC_MAX_OUTPUT_BYTES.
+  execMaxOutputBytes: z.number().int().positive().optional(),
 })
 
 const execJob = baseJob.extend({

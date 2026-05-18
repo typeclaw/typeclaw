@@ -106,6 +106,75 @@ describe('cronFileSchema', () => {
       }),
     ).toThrow()
   })
+
+  test('accepts a prompt job with an `exec` pre-LLM command', () => {
+    const parsed = cronFileSchema.parse({
+      jobs: [
+        {
+          id: 'morning-summary',
+          schedule: '0 9 * * *',
+          kind: 'prompt',
+          prompt: 'Summarize yesterday.',
+          exec: ['git', 'log', '--oneline', '--since=yesterday'],
+        },
+      ],
+    })
+    const job = parsed.jobs[0]
+    if (!job || job.kind !== 'prompt') throw new Error('expected a prompt job')
+    expect(job.exec).toEqual(['git', 'log', '--oneline', '--since=yesterday'])
+    expect(job.execMaxOutputBytes).toBeUndefined()
+  })
+
+  test('rejects a prompt job with an empty `exec` array', () => {
+    expect(() =>
+      cronFileSchema.parse({
+        jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', exec: [] }],
+      }),
+    ).toThrow()
+  })
+
+  test('rejects a prompt job with an empty string inside `exec`', () => {
+    expect(() =>
+      cronFileSchema.parse({
+        jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', exec: ['ls', ''] }],
+      }),
+    ).toThrow()
+  })
+
+  test('accepts `execMaxOutputBytes` as a positive integer', () => {
+    const parsed = cronFileSchema.parse({
+      jobs: [
+        {
+          id: 'capped',
+          schedule: '* * * * *',
+          kind: 'prompt',
+          prompt: 'x',
+          exec: ['echo', 'hi'],
+          execMaxOutputBytes: 1024,
+        },
+      ],
+    })
+    const job = parsed.jobs[0]
+    if (!job || job.kind !== 'prompt') throw new Error('expected a prompt job')
+    expect(job.execMaxOutputBytes).toBe(1024)
+  })
+
+  test('rejects `execMaxOutputBytes <= 0`', () => {
+    expect(() =>
+      cronFileSchema.parse({
+        jobs: [
+          {
+            id: 'j',
+            schedule: '* * * * *',
+            kind: 'prompt',
+            prompt: 'x',
+            exec: ['echo', 'hi'],
+            execMaxOutputBytes: 0,
+          },
+        ],
+      }),
+    ).toThrow()
+  })
 })
 
 describe('parseCronFile', () => {
