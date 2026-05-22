@@ -24,7 +24,7 @@ function tmpRoot(): string {
 }
 
 function streamPath(root: string): string {
-  return join(root, 'memory', `${formatLocalDate()}.jsonl`)
+  return join(root, 'memory', 'streams', `${formatLocalDate()}.jsonl`)
 }
 
 function ctx(root: string): ToolContext {

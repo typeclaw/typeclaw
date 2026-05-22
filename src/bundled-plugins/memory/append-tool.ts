@@ -5,8 +5,8 @@ import { z } from 'zod'
 
 import { defineTool } from '@/plugin'
 
-import { dailyStreamPath } from './memory-paths'
 import { fragmentContentHash } from './fragment-parser'
+import { dailyStreamPath } from './memory-paths'
 import { detectSecrets } from './secret-detector'
 import { newEventId, timestampFromId } from './stream-events'
 import type { FragmentEvent, WatermarkEvent } from './stream-events'
@@ -95,8 +95,6 @@ export const advanceWatermarkTool = defineTool({
     }
   },
 })
-
-
 
 function assertNoSecrets(content: string): void {
   const secrets = detectSecrets(content)

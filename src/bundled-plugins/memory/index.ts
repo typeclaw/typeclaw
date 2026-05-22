@@ -318,7 +318,7 @@ export default definePlugin({
                     const result = await runMigration({ agentDir: fixCtx.agentDir, logger: fixCtx.logger })
                     return {
                       summary: `migrated ${result.migrated.length} legacy .md daily stream(s) to .jsonl`,
-                      changedPaths: result.migrated.map((d) => `memory/${d}.jsonl`),
+                      changedPaths: result.migrated.map((d) => `memory/streams/${d}.jsonl`),
                     }
                   },
                 },

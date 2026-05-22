@@ -78,7 +78,7 @@ describe('memory plugin shape', () => {
 
     const { exports } = await bootMemoryPlugin(agentDir, {})
 
-    expect(existsSync(join(memoryDir, '2026-05-15.jsonl'))).toBe(true)
+    expect(existsSync(join(memoryDir, 'streams', '2026-05-15.jsonl'))).toBe(true)
     expect(existsSync(join(memoryDir, '2026-05-15.md'))).toBe(false)
     expect(exports.hooks).toBeDefined()
     expect(exports.subagents).toBeDefined()
@@ -713,9 +713,9 @@ describe('doctor checks', () => {
 
     const fixResult = await result.fix!.apply!({ pluginName: 'memory', agentDir, config: {}, logger })
     expect(fixResult.summary).toContain('migrated')
-    expect(fixResult.changedPaths).toContain('memory/2026-05-15.jsonl')
+    expect(fixResult.changedPaths).toContain('memory/streams/2026-05-15.jsonl')
     expect(existsSync(join(memoryDir, '2026-05-15.md'))).toBe(false)
-    expect(existsSync(join(memoryDir, '2026-05-15.jsonl'))).toBe(true)
+    expect(existsSync(join(memoryDir, 'streams', '2026-05-15.jsonl'))).toBe(true)
   })
 
   test('legacy-md-cleanup: Case B — both .md and .jsonl present → warning, no fix.apply', async () => {
