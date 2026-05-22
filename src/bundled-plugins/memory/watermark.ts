@@ -21,10 +21,9 @@ export async function readWatermarkFromFile(streamFilePath: string, parentSessio
 }
 
 // Returns the latest watermark entry id for `parentSessionId` across all
-// `YYYY-MM-DD.jsonl` daily-stream files under `memoryDir`, walking newest-first
+// `YYYY-MM-DD.jsonl` daily-stream files under `streamsDir`, walking newest-first
 // (by filename, which is equivalent to chronological order). Short-circuits
-// on the first file that contains a matching marker — for the common case
-// where memory-logger ran yesterday, this reads exactly one file.
+// on the first file that contains a matching marker.
 //
 // Why cross-day: channel sessions (Slack, Discord, KakaoTalk) routinely
 // survive the midnight rollover because the same human keeps the same
@@ -37,10 +36,10 @@ export async function readWatermarkFromFile(streamFilePath: string, parentSessio
 // boundary. This means yesterday's stream is treated as read-only history,
 // which it already is by construction (dreaming snapshots full days, never
 // touches in-progress days).
-export async function readLatestWatermark(memoryDir: string, parentSessionId: string): Promise<string | null> {
+export async function readLatestWatermark(streamsDir: string, parentSessionId: string): Promise<string | null> {
   let entries: string[]
   try {
-    entries = await readdir(memoryDir)
+    entries = await readdir(streamsDir)
   } catch {
     return null
   }
@@ -48,7 +47,7 @@ export async function readLatestWatermark(memoryDir: string, parentSessionId: st
     .filter((name) => DAILY_STREAM_NAME.test(name))
     .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
   for (const name of dailyStreams) {
-    const watermark = await readWatermarkFromFile(join(memoryDir, name), parentSessionId)
+    const watermark = await readWatermarkFromFile(join(streamsDir, name), parentSessionId)
     if (watermark !== null) return watermark
   }
   return null

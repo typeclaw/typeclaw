@@ -295,9 +295,9 @@ export function createMemoryLoggerSubagent(
     },
     handler: async (ctx, runSession) => {
       const today = formatLocalDate()
-      const memoryDir = join(ctx.payload.agentDir, 'memory')
-      const streamFile = join(memoryDir, `${today}.jsonl`)
-      const watermark = await readLatestWatermark(memoryDir, ctx.payload.parentSessionId)
+      const streamDir = join(ctx.payload.agentDir, 'memory', 'streams')
+      const streamFile = join(streamDir, `${today}.jsonl`)
+      const watermark = await readLatestWatermark(streamDir, ctx.payload.parentSessionId)
       const start = Date.now()
       logger.info(
         `[memory-logger] ${ctx.payload.parentSessionId} start stream=${today}.jsonl watermark=${watermark ?? 'none'}`,
