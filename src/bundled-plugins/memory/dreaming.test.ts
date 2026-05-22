@@ -33,7 +33,7 @@ let agentDir: string
 
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-dream-'))
-  await mkdir(join(agentDir, 'memory'), { recursive: true })
+  await mkdir(join(agentDir, 'memory', 'streams'), { recursive: true })
 })
 
 afterEach(async () => {
@@ -121,7 +121,7 @@ describe('dreaming subagent declarations', () => {
 
   test('teaches the dreaming session to cite fragments by id, not by line range', () => {
     const sub = createDreamingSubagent()
-    expect(sub.systemPrompt).toContain('memory/yyyy-MM-dd#<fragment-id>')
+    expect(sub.systemPrompt).toContain('streams/yyyy-MM-dd#<id>')
     expect(sub.systemPrompt).toContain('cites its source fragments by id')
     expect(sub.systemPrompt).not.toContain('memory/yyyy-MM-dd:<line>-<line>')
     expect(sub.systemPrompt).not.toContain('memory/yyyy-MM-dd:<fragment line range>')
@@ -221,7 +221,7 @@ describe('dreaming subagent (compaction wiring)', () => {
   test('after a successful run, the touched daily stream is compacted using the MEMORY.md citations', async () => {
     // Three fragments and three watermarks (two redundant) on the same day.
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [
         fragmentLine('keep-me'),
         watermarkLine('keep-me'),
@@ -244,15 +244,15 @@ describe('dreaming subagent (compaction wiring)', () => {
           'Conclusion.',
           '',
           'fragments:',
-          '- memory/2026-04-27#f-keep-me',
-          '- memory/2026-04-27#f-also-keep-me',
+          '- streams/2026-04-27#f-keep-me',
+          '- streams/2026-04-27#f-also-keep-me',
         ].join('\n'),
       )
     }
 
     await invokeDreaming(agentDir, { runSession })
 
-    const raw = await readFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'utf8')
+    const raw = await readFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'utf8')
     const lines = raw.trim().split('\n')
     const events = lines.map((l) => JSON.parse(l) as { type: string; id: string; source?: string; entry?: string })
 
@@ -269,7 +269,7 @@ describe('dreaming subagent (compaction wiring)', () => {
 
   test('does NOT drop fragments when MEMORY.md was not rewritten this run (the runSession no-op case must not eat memory)', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), watermarkLine('a'), watermarkLine('b')].join(''),
     )
     // runSession is a no-op stub: the LLM decided nothing met the bar this run
@@ -279,7 +279,7 @@ describe('dreaming subagent (compaction wiring)', () => {
 
     await invokeDreaming(agentDir)
 
-    const raw = await readFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'utf8')
+    const raw = await readFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'utf8')
     const events = raw
       .trim()
       .split('\n')
@@ -300,19 +300,19 @@ describe('dreaming subagent (compaction wiring)', () => {
 
   test('DOES drop dreamed-but-uncited fragments when MEMORY.md WAS rewritten this run', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('cited'), fragmentLine('uncited')].join(''),
     )
     const runSession: RunSession = async () => {
       await writeFile(
         join(agentDir, 'MEMORY.md'),
-        ['# Memory', '', '## kept', 'Conclusion.', '', 'fragments:', '- memory/2026-04-27#f-cited'].join('\n'),
+        ['# Memory', '', '## kept', 'Conclusion.', '', 'fragments:', '- streams/2026-04-27#f-cited'].join('\n'),
       )
     }
 
     await invokeDreaming(agentDir, { runSession })
 
-    const raw = await readFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'utf8')
+    const raw = await readFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'utf8')
     const fragmentIds = raw
       .trim()
       .split('\n')
@@ -323,7 +323,10 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('reverts MEMORY.md when the subagent drops a previously-cited fragment id', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), [fragmentLine('keep'), fragmentLine('also')].join(''))
+    await writeFile(
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
+      [fragmentLine('keep'), fragmentLine('also')].join(''),
+    )
     const beforeText = [
       '# Memory',
       '',
@@ -331,8 +334,8 @@ describe('dreaming subagent (compaction wiring)', () => {
       'Conclusion.',
       '',
       'fragments:',
-      '- memory/2026-04-27#f-keep',
-      '- memory/2026-04-27#f-also',
+      '- streams/2026-04-27#f-keep',
+      '- streams/2026-04-27#f-also',
     ].join('\n')
     await writeFile(join(agentDir, 'MEMORY.md'), beforeText)
 
@@ -340,7 +343,7 @@ describe('dreaming subagent (compaction wiring)', () => {
     const runSession: RunSession = async () => {
       await writeFile(
         join(agentDir, 'MEMORY.md'),
-        ['# Memory', '', '## Half topic', 'Conclusion.', '', 'fragments:', '- memory/2026-04-27#f-keep'].join('\n'),
+        ['# Memory', '', '## Half topic', 'Conclusion.', '', 'fragments:', '- streams/2026-04-27#f-keep'].join('\n'),
       )
     }
 
@@ -355,7 +358,10 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('on a superset violation, dreamed-ids still advance (no infinite loop) but compaction does not GC fragments', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), [fragmentLine('keep'), fragmentLine('also')].join(''))
+    await writeFile(
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
+      [fragmentLine('keep'), fragmentLine('also')].join(''),
+    )
     await writeFile(
       join(agentDir, 'MEMORY.md'),
       [
@@ -365,14 +371,14 @@ describe('dreaming subagent (compaction wiring)', () => {
         'Conclusion.',
         '',
         'fragments:',
-        '- memory/2026-04-27#f-keep',
-        '- memory/2026-04-27#f-also',
+        '- streams/2026-04-27#f-keep',
+        '- streams/2026-04-27#f-also',
       ].join('\n'),
     )
     const runSession: RunSession = async () => {
       await writeFile(
         join(agentDir, 'MEMORY.md'),
-        ['# Memory', '', '## Only one', 'Conclusion.', '', 'fragments:', '- memory/2026-04-27#f-keep'].join('\n'),
+        ['# Memory', '', '## Only one', 'Conclusion.', '', 'fragments:', '- streams/2026-04-27#f-keep'].join('\n'),
       )
     }
 
@@ -381,7 +387,7 @@ describe('dreaming subagent (compaction wiring)', () => {
     const state = await loadDreamingState(agentDir)
     expect(new Set(state.dreamedThrough['2026-04-27']?.dreamedIds ?? [])).toEqual(new Set(['f-keep', 'f-also']))
 
-    const raw = await readFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'utf8')
+    const raw = await readFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'utf8')
     const fragmentIds = raw
       .trim()
       .split('\n')
@@ -393,7 +399,10 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('does NOT revert when the subagent legitimately rewrites with the same citation set (merge case)', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), [fragmentLine('a'), fragmentLine('b')].join(''))
+    await writeFile(
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
+      [fragmentLine('a'), fragmentLine('b')].join(''),
+    )
     await writeFile(
       join(agentDir, 'MEMORY.md'),
       [
@@ -403,13 +412,13 @@ describe('dreaming subagent (compaction wiring)', () => {
         'A.',
         '',
         'fragments:',
-        '- memory/2026-04-27#f-a',
+        '- streams/2026-04-27#f-a',
         '',
         '## Topic B',
         'B.',
         '',
         'fragments:',
-        '- memory/2026-04-27#f-b',
+        '- streams/2026-04-27#f-b',
       ].join('\n'),
     )
     const mergedText = [
@@ -419,8 +428,8 @@ describe('dreaming subagent (compaction wiring)', () => {
       'Conclusion.',
       '',
       'fragments:',
-      '- memory/2026-04-27#f-a',
-      '- memory/2026-04-27#f-b',
+      '- streams/2026-04-27#f-a',
+      '- streams/2026-04-27#f-b',
     ].join('\n')
     const runSession: RunSession = async () => {
       await writeFile(join(agentDir, 'MEMORY.md'), mergedText)
@@ -436,10 +445,10 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('on revert-write failure, refuses to advance dreamed-ids or run compaction (leaves recovery to the operator)', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('only'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('only'))
     await writeFile(
       join(agentDir, 'MEMORY.md'),
-      ['# Memory', '', '## Cited', 'C.', '', 'fragments:', '- memory/2026-04-27#f-already-cited'].join('\n'),
+      ['# Memory', '', '## Cited', 'C.', '', 'fragments:', '- streams/2026-04-27#f-already-cited'].join('\n'),
     )
     // The subagent drops the previously-cited id (forcing a superset
     // violation), AND replaces MEMORY.md with a directory so the revert
@@ -463,7 +472,7 @@ describe('dreaming subagent (compaction wiring)', () => {
     })
 
     expect(errors.some((m) => m.includes('citation-superset violation AND revert failed'))).toBe(true)
-    expect(errors.some((m) => m.includes('git checkout -- MEMORY.md'))).toBe(true)
+    expect(errors.some((m) => m.includes('git checkout -- memory/'))).toBe(true)
     // Dreamed-ids must NOT have advanced — next run gets a second chance.
     const state = await loadDreamingState(agentDir)
     expect(state.dreamedThrough['2026-04-27']).toBeUndefined()
@@ -472,10 +481,10 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('on a successful revert, the warning explicitly names the new-fragment-orphaning tradeoff so operators can read the log', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), [fragmentLine('new')].join(''))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), [fragmentLine('new')].join(''))
     await writeFile(
       join(agentDir, 'MEMORY.md'),
-      ['# Memory', '', '## Old', 'C.', '', 'fragments:', '- memory/2026-04-26#f-old-cite'].join('\n'),
+      ['# Memory', '', '## Old', 'C.', '', 'fragments:', '- streams/2026-04-26#f-old-cite'].join('\n'),
     )
     const runSession: RunSession = async () => {
       await writeFile(join(agentDir, 'MEMORY.md'), ['# Memory', '', '## Dropped old citation', 'C.'].join('\n'))
@@ -492,7 +501,7 @@ describe('dreaming subagent (compaction wiring)', () => {
   })
 
   test('does NOT trigger the safety net on first-ever run (empty prior MEMORY.md is the empty citation set)', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('first'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('first'))
     const newText = [
       '# Memory',
       '',
@@ -500,7 +509,7 @@ describe('dreaming subagent (compaction wiring)', () => {
       'Conclusion.',
       '',
       'fragments:',
-      '- memory/2026-04-27#f-first',
+      '- streams/2026-04-27#f-first',
     ].join('\n')
     const runSession: RunSession = async () => {
       await writeFile(join(agentDir, 'MEMORY.md'), newText)
@@ -517,7 +526,7 @@ describe('dreaming subagent (compaction wiring)', () => {
 
   test('emits a [dreaming] compaction log line when files are rewritten', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('f1'), watermarkLine('w1'), watermarkLine('w2')].join(''),
     )
     const infos: string[] = []
@@ -544,7 +553,7 @@ describe('dreaming subagent (orchestration)', () => {
 
   test('skips dreaming when every fragment id is already in the dreamed-id set', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('frag1'), fragmentLine('frag2'), fragmentLine('frag3')].join(''),
     )
     await writeFile(
@@ -561,7 +570,7 @@ describe('dreaming subagent (orchestration)', () => {
 
   test('prompts subagent only with fragment ids not yet in the dreamed-id set', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), fragmentLine('b'), fragmentLine('c'), fragmentLine('d'), fragmentLine('e')].join(''),
     )
     await writeFile(
@@ -572,7 +581,7 @@ describe('dreaming subagent (orchestration)', () => {
     const { prompts } = await invokeDreaming(agentDir)
 
     expect(prompts).toHaveLength(1)
-    expect(prompts[0]).toContain('memory/2026-04-27.jsonl')
+    expect(prompts[0]).toContain('memory/streams/2026-04-27.jsonl')
     expect(prompts[0]).toContain('f-c')
     expect(prompts[0]).toContain('f-d')
     expect(prompts[0]).toContain('f-e')
@@ -581,17 +590,17 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('teaches the subagent to cite by id in the per-run prompt, not by line number', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('one'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('one'))
 
     const { prompts } = await invokeDreaming(agentDir)
 
-    expect(prompts[0]).toContain('memory/yyyy-MM-dd#<id>')
+    expect(prompts[0]).toContain('streams/yyyy-MM-dd#<id>')
     expect(prompts[0]).not.toMatch(/offset=\d+/)
     expect(prompts[0]).not.toMatch(/total file lines/)
   })
 
   test('omits the strength-signals block entirely when MEMORY.md is missing or has no topics', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('only'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('only'))
 
     const { prompts } = await invokeDreaming(agentDir)
 
@@ -609,18 +618,18 @@ describe('dreaming subagent (orchestration)', () => {
         'Conclusion.',
         '',
         'fragments:',
-        '- memory/2026-04-25#f-cite1',
-        '- memory/2026-04-26#f-cite2',
-        '- memory/2026-04-27#f-cite3',
+        '- streams/2026-04-25#f-cite1',
+        '- streams/2026-04-26#f-cite2',
+        '- streams/2026-04-27#f-cite3',
         '',
         '## Weak topic',
         'Conclusion.',
         '',
         'fragments:',
-        '- memory/2026-04-20#f-old',
+        '- streams/2026-04-20#f-old',
       ].join('\n'),
     )
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('new'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('new'))
 
     const { prompts } = await invokeDreaming(agentDir)
 
@@ -632,7 +641,7 @@ describe('dreaming subagent (orchestration)', () => {
 
   test('adds every undreamed fragment id to the dreamed-id set after a successful run', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), fragmentLine('b'), fragmentLine('c'), fragmentLine('d')].join(''),
     )
 
@@ -643,8 +652,8 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('passes multiple undreamed days oldest-first to the subagent', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-25.jsonl'), fragmentLine('older'))
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('newer'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-25.jsonl'), fragmentLine('older'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('newer'))
 
     const { prompts } = await invokeDreaming(agentDir)
 
@@ -654,7 +663,7 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('calls commitMemory after the subagent finishes', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('only'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('only'))
     const commits: string[] = []
 
     await invokeDreaming(agentDir, {
@@ -667,7 +676,7 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('does NOT advance the dreamed-id set when prompt() throws', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('oops'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('oops'))
 
     await expect(invokeDreaming(agentDir, { throwOnRunSession: true })).rejects.toThrow(/LLM blew up/)
     const state = await loadDreamingState(agentDir)
@@ -675,14 +684,14 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('skips when no fragment events are undreamed (a stream containing only watermarks does not trigger a run)', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), watermarkLine('w1'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), watermarkLine('w1'))
 
     const { prompts } = await invokeDreaming(agentDir)
     expect(prompts).toHaveLength(0)
   })
 
   test('writes the dreaming state file under memory/.dreaming-state.json', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('only'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('only'))
 
     await invokeDreaming(agentDir)
 
@@ -692,7 +701,7 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('creates MEMORY.md if missing on first dreaming run (replaces init scaffold)', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('one'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('one'))
     await expect(readFile(join(agentDir, 'MEMORY.md'), 'utf8')).rejects.toThrow()
 
     await invokeDreaming(agentDir)
@@ -703,7 +712,7 @@ describe('dreaming subagent (orchestration)', () => {
 
   test('emits [dreaming] start, dreamed-ids-advanced, and done log lines on a successful run', async () => {
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), fragmentLine('b'), fragmentLine('c')].join(''),
     )
     const infos: string[] = []
@@ -721,7 +730,7 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('emits a [dreaming] commit-failed warning when commitMemory throws but does not rethrow', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('frag'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('frag'))
     const warnings: string[] = []
     const logger: DreamingLogger = { info: () => {}, warn: (m) => warnings.push(m), error: () => {} }
 
@@ -736,7 +745,7 @@ describe('dreaming subagent (orchestration)', () => {
   })
 
   test('emits a [dreaming] run-threw warning and rethrows when runSession fails', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('frag'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('frag'))
     const warnings: string[] = []
     const logger: DreamingLogger = { info: (m) => void m, warn: (m) => warnings.push(m), error: () => {} }
 
@@ -793,7 +802,7 @@ async function skipWorktreeFiles(cwd: string): Promise<string[]> {
 
 describe('commitMemorySnapshot', () => {
   test('is a no-op when the directory is not a git repo', async () => {
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'fragment\n')
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'fragment\n')
     await commitMemorySnapshot(agentDir)
     expect(await trackedFiles(agentDir)).toEqual([])
   })
@@ -801,22 +810,22 @@ describe('commitMemorySnapshot', () => {
   test('first run: force-adds memory artifacts, commits, and sets skip-worktree on tracked files', async () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'fragment\n')
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'fragment\n')
 
     await commitMemorySnapshot(agentDir)
 
-    expect(await trackedFiles(agentDir)).toEqual(['MEMORY.md', 'memory/2026-04-27.jsonl'])
-    expect(await skipWorktreeFiles(agentDir)).toEqual(['MEMORY.md', 'memory/2026-04-27.jsonl'])
+    expect(await trackedFiles(agentDir)).toEqual(['MEMORY.md', 'memory/streams/2026-04-27.jsonl'])
+    expect(await skipWorktreeFiles(agentDir)).toEqual(['MEMORY.md', 'memory/streams/2026-04-27.jsonl'])
     expect(await porcelainStatus(agentDir)).toBe('')
   })
 
   test('subsequent edits to tracked memory files do not appear in git status', async () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'first\n')
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'first\n')
     await commitMemorySnapshot(agentDir)
 
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), 'first\nsecond\n')
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), 'first\nsecond\n')
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory v2\n')
 
     expect(await porcelainStatus(agentDir)).toBe('')
@@ -848,7 +857,7 @@ describe('dream commit message', () => {
   test('starts with `dream:` and ends with a single emoji from the pool', async () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('one'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('one'))
 
     await commitMemorySnapshot(agentDir)
 
@@ -862,7 +871,7 @@ describe('dream commit message', () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), fragmentLine('b'), fragmentLine('c'), fragmentLine('d'), fragmentLine('e')].join(''),
     )
 
@@ -875,7 +884,7 @@ describe('dream commit message', () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('a'), watermarkLine('a'), fragmentLine('b'), watermarkLine('b'), legacyProseLine()].join(''),
     )
 
@@ -887,7 +896,7 @@ describe('dream commit message', () => {
   test('uses singular `fragment` when exactly one line was added', async () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('only-one'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('only-one'))
 
     await commitMemorySnapshot(agentDir)
 
@@ -898,7 +907,7 @@ describe('dream commit message', () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('f1'), fragmentLine('f2'), fragmentLine('f3')].join(''),
     )
     await mkdir(join(agentDir, 'memory', 'skills', 'pr-review'), { recursive: true })
@@ -912,7 +921,7 @@ describe('dream commit message', () => {
   test('reports `N new skills` when multiple muscle-memory skills are newly added', async () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('frag'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('frag'))
     await mkdir(join(agentDir, 'memory', 'skills', 'one'), { recursive: true })
     await mkdir(join(agentDir, 'memory', 'skills', 'two'), { recursive: true })
     await writeFile(join(agentDir, 'memory', 'skills', 'one', 'SKILL.md'), '---\nname: one\n---\n#1\n')
@@ -927,7 +936,7 @@ describe('dream commit message', () => {
     // First commit establishes baseline so the second snapshot only sees MEMORY.md changes.
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# v1\n')
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentLine('frag'))
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentLine('frag'))
     await commitMemorySnapshot(agentDir)
 
     await writeFile(join(agentDir, 'MEMORY.md'), '# v2\n')
@@ -940,7 +949,7 @@ describe('dream commit message', () => {
     await initRepo(agentDir)
     await writeFile(join(agentDir, 'MEMORY.md'), '# Memory\n')
     await writeFile(
-      join(agentDir, 'memory', '2026-04-27.jsonl'),
+      join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'),
       [fragmentLine('frag1'), fragmentLine('frag2')].join(''),
     )
     await commitMemorySnapshot(agentDir)
@@ -948,7 +957,7 @@ describe('dream commit message', () => {
     // Truncate the stream below its previous line count — numstat sees 0 added
     // (only deletions), and MEMORY.md is untouched. The state file is still
     // staged, which is exactly the `watermarks only` shape.
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), '')
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), '')
     await writeFile(join(agentDir, DREAMING_STATE_FILE), '{"version":1,"dreamedThrough":{}}')
     await commitMemorySnapshot(agentDir)
 
