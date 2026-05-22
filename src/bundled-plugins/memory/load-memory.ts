@@ -67,10 +67,10 @@ async function readEntry(agentDir: string, name: string): Promise<FileEntry> {
 }
 
 async function readStreamEntries(agentDir: string, currentSessionId: string | undefined): Promise<FileEntry[]> {
-  const memoryDir = join(agentDir, 'memory')
+  const streamsDir = join(agentDir, 'memory', 'streams')
   let names: string[]
   try {
-    names = await readdir(memoryDir)
+    names = await readdir(streamsDir)
   } catch {
     return []
   }
@@ -81,8 +81,8 @@ async function readStreamEntries(agentDir: string, currentSessionId: string | un
     dated.map(async (name) => {
       const date = STREAM_DATE_FROM_FILENAME.exec(name)?.[1] ?? ''
       const dreamedIds = getDreamedIds(state, date)
-      const entry = await readStreamEntry(memoryDir, name)
-      const filtered = dropSelfSessionFragments({ ...entry, name: `memory/${name}` }, currentSessionId)
+      const entry = await readStreamEntry(streamsDir, name)
+      const filtered = dropSelfSessionFragments({ ...entry, name: `memory/streams/${name}` }, currentSessionId)
       const tail = sliceUndreamedTail(filtered, dreamedIds)
       return renderStreamEntry(tail)
     }),
@@ -90,8 +90,8 @@ async function readStreamEntries(agentDir: string, currentSessionId: string | un
   return entries.filter((e) => !e.fullyDreamed)
 }
 
-async function readStreamEntry(memoryDir: string, name: string): Promise<StreamEntry> {
-  const filePath = join(memoryDir, name)
+async function readStreamEntry(streamsDir: string, name: string): Promise<StreamEntry> {
+  const filePath = join(streamsDir, name)
   const events = await readEvents(filePath)
   return { name, path: filePath, events }
 }
