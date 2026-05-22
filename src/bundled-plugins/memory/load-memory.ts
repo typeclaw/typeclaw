@@ -4,8 +4,11 @@ import { join } from 'node:path'
 import type { SessionOrigin } from '@/agent/session-origin'
 
 import { getDreamedIds, loadDreamingState } from './dreaming-state'
+import { type MemoryIndex, parseMemoryIndex } from './memory-index'
+import { activeTopicsDir, memoryIndexPath } from './memory-paths'
 import type { StreamEvent } from './stream-events'
 import { readEvents } from './stream-io'
+import { loadTopicShards } from './topic-shard'
 
 const MAX_FILE_BYTES = 12 * 1024
 const STREAM_FILE_PATTERN = /^\d{4}-\d{2}-\d{2}\.jsonl$/
@@ -26,12 +29,6 @@ const CHANNEL_MEMORY_BOUNDARY = [
 
 export type LoadMemoryOptions = {
   origin?: SessionOrigin
-  // Fragments tagged `source=<currentSessionId>` are dropped on injection: the
-  // current session already has its raw transcript in conversation history, so
-  // re-injecting the memory-logger summary is duplication AND cache-busts every
-  // turn (a new fragment is appended on each idle). Fragments from *other*
-  // sessions on the same day are kept — that cross-session bridge is the whole
-  // reason daily streams are injected at all.
   currentSessionId?: string
 }
 
@@ -50,9 +47,66 @@ type StreamEntry = {
 }
 
 export async function loadMemory(agentDir: string, options: LoadMemoryOptions = {}): Promise<string> {
+  const index = await readMemoryIndex(agentDir)
+  if (index !== null) {
+    return await loadMemoryFromShards(agentDir, index, options)
+  }
+  return await loadMemoryLegacy(agentDir, options)
+}
+
+async function loadMemoryFromShards(agentDir: string, index: MemoryIndex, options: LoadMemoryOptions): Promise<string> {
+  const activeShards = await loadTopicShards(activeTopicsDir(agentDir))
+  const streams = await readStreamEntries(agentDir, options.currentSessionId)
+
+  const lines = ['# Memory', '', MEMORY_FRAMING, '']
+  if (options.origin?.kind === 'channel') lines.push(...CHANNEL_MEMORY_BOUNDARY, '')
+
+  // Active topics
+  if (activeShards.length > 0) {
+    for (const shard of activeShards) {
+      lines.push(`## ${shard.heading}`, '', shard.body, '')
+    }
+  }
+
+  // Historical observations from index
+  if (index.historicalObservations.length > 0) {
+    lines.push('## Historical observations', '')
+    for (const obs of index.historicalObservations) {
+      lines.push(`- ${obs}`)
+    }
+    lines.push('')
+  }
+
+  // Undreamed streams
+  for (const entry of streams) {
+    lines.push(`## ${entry.name}`, '', renderBody(entry), '')
+  }
+
+  // Index footer showing archived topics
+  if (index.archivedTopics.length > 0) {
+    lines.push('---', '')
+    lines.push(`**${index.archivedTopics.length} archived topic(s) available.**`)
+    lines.push('Use `search_memory` tool to retrieve relevant archived topics on demand.')
+    lines.push('')
+  }
+
+  return lines.join('\n').trimEnd()
+}
+
+async function loadMemoryLegacy(agentDir: string, options: LoadMemoryOptions): Promise<string> {
   const longTerm = await readEntry(agentDir, 'MEMORY.md')
   const streams = await readStreamEntries(agentDir, options.currentSessionId)
-  return renderSection(longTerm, streams, options)
+  return renderSectionLegacy(longTerm, streams, options)
+}
+
+async function readMemoryIndex(agentDir: string): Promise<MemoryIndex | null> {
+  const path = memoryIndexPath(agentDir)
+  try {
+    const text = await readFile(path, 'utf8')
+    return parseMemoryIndex(text)
+  } catch {
+    return null
+  }
 }
 
 async function readEntry(agentDir: string, name: string): Promise<FileEntry> {
@@ -96,10 +150,6 @@ async function readStreamEntry(streamsDir: string, name: string): Promise<Stream
   return { name, path: filePath, events }
 }
 
-// Slice off the events whose ids already appear in the dreamed-id set so the
-// agent never sees a fragment twice (once in MEMORY.md and once in the daily
-// stream). Events without an id (legacy_prose) are always kept — they
-// pre-date the dreamed-id contract and cannot be addressed by id.
 function sliceUndreamedTail(entry: StreamEntry, dreamedIds: ReadonlySet<string>): StreamEntry {
   if (dreamedIds.size === 0) return entry
   const tail = entry.events.filter((event) => {
@@ -111,14 +161,6 @@ function sliceUndreamedTail(entry: StreamEntry, dreamedIds: ReadonlySet<string>)
   return { ...entry, name: `${entry.name} (undreamed tail)`, events: tail }
 }
 
-// Drop events authored by the current session: the raw turns they
-// distilled from are already in the LLM's conversation history, so re-injecting
-// the memory-logger summary is duplication. More importantly, new fragments are
-// appended after every idle turn, so without this filter the daily-stream
-// region of the system prompt mutates every turn and busts provider prefix
-// caching from that point downward. Fragments from *other* sessions on the
-// same day are kept intact — that's the cross-session bridge daily streams
-// exist for.
 function dropSelfSessionFragments(entry: StreamEntry, currentSessionId: string | undefined): StreamEntry {
   if (currentSessionId === undefined || entry.fullyDreamed) return entry
   const events = entry.events.filter((event) => {
@@ -150,7 +192,7 @@ function renderEventsAsMarkdown(events: StreamEvent[]): string {
   return parts.join('\n')
 }
 
-function renderSection(longTerm: FileEntry, streams: FileEntry[], options: LoadMemoryOptions): string {
+function renderSectionLegacy(longTerm: FileEntry, streams: FileEntry[], options: LoadMemoryOptions): string {
   const lines = ['# Memory', '', MEMORY_FRAMING, '']
   if (options.origin?.kind === 'channel') lines.push(...CHANNEL_MEMORY_BOUNDARY, '')
   lines.push(`## ${longTerm.name}`, '')
