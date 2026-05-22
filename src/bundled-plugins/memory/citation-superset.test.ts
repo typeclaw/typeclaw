@@ -9,37 +9,37 @@ const ID_D = '019e2ef0-aaaa-77ef-bbbb-cccccccccccc'
 
 describe('checkCitationSuperset', () => {
   test('returns ok when old is empty (first-ever dreaming run)', () => {
-    expect(checkCitationSuperset('', `- memory/2026-05-16#${ID_A}`)).toEqual({ ok: true })
-    expect(checkCitationSuperset('# Memory\n', `- memory/2026-05-16#${ID_A}`)).toEqual({ ok: true })
+    expect(checkCitationSuperset('', `- streams/2026-05-16#${ID_A}`)).toEqual({ ok: true })
+    expect(checkCitationSuperset('# Memory\n', `- streams/2026-05-16#${ID_A}`)).toEqual({ ok: true })
   })
 
   test('returns ok when new is a strict superset of old', () => {
-    const oldText = `- memory/2026-05-16#${ID_A}`
-    const newText = [`- memory/2026-05-16#${ID_A}`, `- memory/2026-05-16#${ID_B}`].join('\n')
+    const oldText = `- streams/2026-05-16#${ID_A}`
+    const newText = [`- streams/2026-05-16#${ID_A}`, `- memory/2026-05-16#${ID_B}`].join('\n')
 
     expect(checkCitationSuperset(oldText, newText)).toEqual({ ok: true })
   })
 
   test('returns ok when new exactly equals old', () => {
-    const text = [`- memory/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
+    const text = [`- streams/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
 
     expect(checkCitationSuperset(text, text)).toEqual({ ok: true })
   })
 
   test('returns ok across topic restructure when every old id is still cited somewhere new', () => {
-    const oldText = ['## Topic A', `- memory/2026-05-16#${ID_A}`, '## Topic B', `- memory/2026-05-15#${ID_B}`].join(
+    const oldText = ['## Topic A', `- streams/2026-05-16#${ID_A}`, '## Topic B', `- memory/2026-05-15#${ID_B}`].join(
       '\n',
     )
-    const newText = ['## Merged', `- memory/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
+    const newText = ['## Merged', `- streams/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
 
     expect(checkCitationSuperset(oldText, newText)).toEqual({ ok: true })
   })
 
   test('returns failure listing the dropped ids when new is missing an old citation', () => {
-    const oldText = [`- memory/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`, `- memory/2026-05-15#${ID_C}`].join(
+    const oldText = [`- streams/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`, `- memory/2026-05-15#${ID_C}`].join(
       '\n',
     )
-    const newText = [`- memory/2026-05-16#${ID_A}`].join('\n')
+    const newText = [`- streams/2026-05-16#${ID_A}`].join('\n')
 
     const verdict = checkCitationSuperset(oldText, newText)
 
@@ -54,10 +54,10 @@ describe('checkCitationSuperset', () => {
 
   test('reports missing ids sorted by date then id (stable for log/test assertions)', () => {
     const oldText = [
-      `- memory/2026-05-16#${ID_C}`,
-      `- memory/2026-05-16#${ID_A}`,
-      `- memory/2026-05-15#${ID_D}`,
-      `- memory/2026-05-15#${ID_B}`,
+      `- streams/2026-05-16#${ID_C}`,
+      `- streams/2026-05-16#${ID_A}`,
+      `- streams/2026-05-15#${ID_D}`,
+      `- streams/2026-05-15#${ID_B}`,
     ].join('\n')
     const newText = ''
 
@@ -75,8 +75,8 @@ describe('checkCitationSuperset', () => {
   })
 
   test('returns failure when new drops an entire date (whole topic deleted)', () => {
-    const oldText = [`- memory/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
-    const newText = `- memory/2026-05-16#${ID_A}`
+    const oldText = [`- streams/2026-05-16#${ID_A}`, `- memory/2026-05-15#${ID_B}`].join('\n')
+    const newText = `- streams/2026-05-16#${ID_A}`
 
     const verdict = checkCitationSuperset(oldText, newText)
 
@@ -87,7 +87,7 @@ describe('checkCitationSuperset', () => {
   })
 
   test('treats inline-prose citations the same as fragments: bullets', () => {
-    const oldText = `prose mentions memory/2026-05-16#${ID_A} once`
+    const oldText = `prose mentions streams/2026-05-16#${ID_A} once`
     const newText = ''
 
     const verdict = checkCitationSuperset(oldText, newText)
