@@ -16,14 +16,14 @@ describe('computeTopicStrengths', () => {
   test('counts citations and distinct days per topic', () => {
     const text = [
       '## Burst',
-      `- memory/2026-05-15#${ID_A}`,
-      `- memory/2026-05-15#${ID_B}`,
-      `- memory/2026-05-15#${ID_C}`,
+      `- streams/2026-05-15#${ID_A}`,
+      `- streams/2026-05-15#${ID_B}`,
+      `- streams/2026-05-15#${ID_C}`,
       '',
       '## Spread',
-      `- memory/2026-05-13#${ID_A}`,
-      `- memory/2026-05-15#${ID_B}`,
-      `- memory/2026-05-18#${ID_C}`,
+      `- streams/2026-05-13#${ID_A}`,
+      `- streams/2026-05-15#${ID_B}`,
+      `- streams/2026-05-18#${ID_C}`,
     ].join('\n')
 
     const result = computeTopicStrengths(text, '2026-05-20')
@@ -36,9 +36,9 @@ describe('computeTopicStrengths', () => {
   test('reports lastReinforcedDate as the most recent citation date', () => {
     const text = [
       '## Topic',
-      `- memory/2026-05-13#${ID_A}`,
-      `- memory/2026-05-18#${ID_B}`,
-      `- memory/2026-05-15#${ID_C}`,
+      `- streams/2026-05-13#${ID_A}`,
+      `- streams/2026-05-18#${ID_B}`,
+      `- streams/2026-05-15#${ID_C}`,
     ].join('\n')
 
     const [topic] = computeTopicStrengths(text, '2026-05-20')
@@ -48,7 +48,7 @@ describe('computeTopicStrengths', () => {
   })
 
   test('daysSinceLastReinforced is 0 on the same day', () => {
-    const text = ['## Today', `- memory/2026-05-20#${ID_A}`].join('\n')
+    const text = ['## Today', `- streams/2026-05-20#${ID_A}`].join('\n')
 
     const [topic] = computeTopicStrengths(text, '2026-05-20')
 
@@ -68,7 +68,7 @@ describe('computeTopicStrengths', () => {
   })
 
   test('clamps a future-dated citation to 0 days (clock-skew defense, not punishment)', () => {
-    const text = ['## Time traveler', `- memory/2026-05-25#${ID_A}`].join('\n')
+    const text = ['## Time traveler', `- streams/2026-05-25#${ID_A}`].join('\n')
 
     const [topic] = computeTopicStrengths(text, '2026-05-20')
 
@@ -84,7 +84,7 @@ describe('computeTopicStrengths', () => {
   })
 
   test('preserves topic order (the dreaming subagent sees topics in MEMORY.md write order)', () => {
-    const text = ['## First', `- memory/2026-05-15#${ID_A}`, '', '## Second', `- memory/2026-05-15#${ID_B}`].join('\n')
+    const text = ['## First', `- streams/2026-05-15#${ID_A}`, '', '## Second', `- memory/2026-05-15#${ID_B}`].join('\n')
 
     const result = computeTopicStrengths(text, '2026-05-20')
 
@@ -94,10 +94,10 @@ describe('computeTopicStrengths', () => {
   test('dedupes distinctDays per citation date, not per fragment id', () => {
     const text = [
       '## Topic',
-      `- memory/2026-05-15#${ID_A}`,
-      `- memory/2026-05-15#${ID_B}`,
-      `- memory/2026-05-15#${ID_C}`,
-      `- memory/2026-05-16#${ID_D}`,
+      `- streams/2026-05-15#${ID_A}`,
+      `- streams/2026-05-15#${ID_B}`,
+      `- streams/2026-05-15#${ID_C}`,
+      `- streams/2026-05-16#${ID_D}`,
     ].join('\n')
 
     const [topic] = computeTopicStrengths(text, '2026-05-20')

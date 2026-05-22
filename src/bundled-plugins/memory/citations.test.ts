@@ -7,18 +7,18 @@ const ID_B = '019e2ecf-f2d5-70ee-83f6-005fb5451c51'
 const ID_C = '019e2ee8-bcc4-772f-8821-876162c5e601'
 
 describe('formatCitation', () => {
-  test('produces the canonical memory/yyyy-MM-dd#<id> shape', () => {
-    expect(formatCitation('2026-05-16', ID_A)).toBe(`memory/2026-05-16#${ID_A}`)
+  test('produces the canonical streams/yyyy-MM-dd#<id> shape', () => {
+    expect(formatCitation('2026-05-16', ID_A)).toBe(`streams/2026-05-16#${ID_A}`)
   })
 })
 
 describe('isCitationLine', () => {
   test('matches a citation line with a leading dash and space', () => {
-    expect(isCitationLine(`- memory/2026-05-16#${ID_A}`)).toBe(true)
+    expect(isCitationLine(`- streams/2026-05-16#${ID_A}`)).toBe(true)
   })
 
   test('matches a bare citation line', () => {
-    expect(isCitationLine(`memory/2026-05-16#${ID_A}`)).toBe(true)
+    expect(isCitationLine(`streams/2026-05-16#${ID_A}`)).toBe(true)
   })
 
   test('rejects a legacy line-range citation', () => {
@@ -37,9 +37,9 @@ describe('parseCitations', () => {
       'Conclusion paragraph.',
       '',
       'fragments:',
-      `- memory/2026-05-16#${ID_A}`,
-      `- memory/2026-05-16#${ID_B}`,
-      `- memory/2026-05-15#${ID_C}`,
+      `- streams/2026-05-16#${ID_A}`,
+      `- streams/2026-05-16#${ID_B}`,
+      `- streams/2026-05-15#${ID_C}`,
     ].join('\n')
 
     const result = parseCitations(text)
@@ -60,7 +60,7 @@ describe('parseCitations', () => {
       '',
       '## New topic',
       'fragments:',
-      `- memory/2026-05-16#${ID_A}`,
+      `- streams/2026-05-16#${ID_A}`,
     ].join('\n')
 
     const result = parseCitations(text)
@@ -70,7 +70,7 @@ describe('parseCitations', () => {
   })
 
   test('deduplicates repeated citations of the same fragment', () => {
-    const text = [`- memory/2026-05-16#${ID_A}`, `- memory/2026-05-16#${ID_A}`].join('\n')
+    const text = [`- streams/2026-05-16#${ID_A}`, `- streams/2026-05-16#${ID_A}`].join('\n')
 
     const result = parseCitations(text)
 
@@ -78,7 +78,7 @@ describe('parseCitations', () => {
   })
 
   test('citation can appear inline inside prose, not only as a bullet line', () => {
-    const text = `see memory/2026-05-16#${ID_A} for context`
+    const text = `see streams/2026-05-16#${ID_A} for context`
 
     const result = parseCitations(text)
 

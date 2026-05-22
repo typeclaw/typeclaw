@@ -21,7 +21,7 @@ let agentDir: string
 
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-compact-'))
-  await mkdir(join(agentDir, 'memory'), { recursive: true })
+  await mkdir(join(agentDir, 'memory', 'streams'), { recursive: true })
 })
 
 afterEach(async () => {
@@ -29,7 +29,7 @@ afterEach(async () => {
 })
 
 async function writeStream(date: string, lines: string[]): Promise<string> {
-  const path = join(agentDir, 'memory', `${date}.jsonl`)
+  const path = join(agentDir, 'memory', 'streams', `${date}.jsonl`)
   await writeFile(path, lines.join('\n') + '\n')
   return path
 }

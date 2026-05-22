@@ -28,7 +28,7 @@ function watermark(source: string, entry: string, id = `w-${entry}`): string {
 
 function makeAgentDir(): string {
   const root = mkdtempSync(join(tmpdir(), 'memory-agent-'))
-  mkdirSync(join(root, 'memory'))
+  mkdirSync(join(root, 'memory', 'streams'), { recursive: true })
   mkdirSync(join(root, 'sessions'))
   return root
 }
@@ -295,7 +295,7 @@ describe('memoryLoggerSubagent', () => {
     const prompt = runSessionCalls[0]!.userPrompt!
     expect(prompt).toContain(transcript)
     expect(prompt).toContain('ses_abc')
-    expect(prompt).toMatch(/memory\/\d{4}-\d{2}-\d{2}\.jsonl/)
+    expect(prompt).toMatch(/memory\/streams\/\d{4}-\d{2}-\d{2}\.jsonl/)
   })
 
   test('handler includes channel location and participants in the initial prompt', async () => {
@@ -346,7 +346,7 @@ describe('memoryLoggerSubagent', () => {
     const transcript = join(agentDir, 'sessions', 'ses_abc.jsonl')
     writeFileSync(transcript, '')
     const today = formatLocalDate()
-    writeFileSync(join(agentDir, 'memory', `${today}.jsonl`), fragment('ses_abc', 'watermrk'))
+    writeFileSync(join(agentDir, 'memory', 'streams', `${today}.jsonl`), fragment('ses_abc', 'watermrk'))
 
     const { runSessionCalls } = await invokeWith(
       { parentSessionId: 'ses_abc', parentTranscriptPath: transcript, agentDir },
@@ -368,7 +368,7 @@ describe('memoryLoggerSubagent', () => {
     const yesterdayName = `${yyyy}-${mm}-${dd}.jsonl`
     expect(yesterdayName).not.toBe(`${today}.jsonl`)
     writeFileSync(
-      join(agentDir, 'memory', yesterdayName),
+      join(agentDir, 'memory', 'streams', yesterdayName),
       [fragment('ses_abc', 'yesterday-morning'), watermark('ses_abc', 'yesterday-evening')].join(''),
     )
 

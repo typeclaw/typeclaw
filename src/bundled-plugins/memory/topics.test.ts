@@ -29,14 +29,14 @@ describe('parseTopics', () => {
       'Conclusion for A.',
       '',
       'fragments:',
-      `- memory/2026-05-16#${ID_A}`,
-      `- memory/2026-05-15#${ID_B}`,
+      `- streams/2026-05-16#${ID_A}`,
+      `- streams/2026-05-15#${ID_B}`,
       '',
       '## Topic B',
       'Conclusion for B.',
       '',
       'fragments:',
-      `- memory/2026-05-16#${ID_C}`,
+      `- streams/2026-05-16#${ID_C}`,
     ].join('\n')
 
     const topics = parseTopics(text)
@@ -52,7 +52,7 @@ describe('parseTopics', () => {
   })
 
   test('preserves heading order even when topics share a date', () => {
-    const text = ['## Older', `- memory/2026-05-15#${ID_A}`, '', '## Newer', `- memory/2026-05-15#${ID_B}`].join('\n')
+    const text = ['## Older', `- streams/2026-05-15#${ID_A}`, '', '## Newer', `- memory/2026-05-15#${ID_B}`].join('\n')
 
     const topics = parseTopics(text)
     expect(topics.map((t) => t.heading)).toEqual(['Older', 'Newer'])
@@ -69,10 +69,10 @@ describe('parseTopics', () => {
   test('drops citations that appear in the preamble above the first h2 (they belong to no topic)', () => {
     const text = [
       '# Memory',
-      `see memory/2026-05-16#${ID_A} for context`,
+      `see streams/2026-05-16#${ID_A} for context`,
       '',
       '## Real topic',
-      `- memory/2026-05-15#${ID_B}`,
+      `- streams/2026-05-15#${ID_B}`,
     ].join('\n')
 
     const topics = parseTopics(text)
@@ -88,7 +88,7 @@ describe('parseTopics', () => {
   })
 
   test('keeps an empty-string heading rather than dropping the topic (subagent can see and clean it)', () => {
-    const text = ['## ', `- memory/2026-05-16#${ID_A}`].join('\n')
+    const text = ['## ', `- streams/2026-05-16#${ID_A}`].join('\n')
 
     const topics = parseTopics(text)
 
@@ -98,7 +98,7 @@ describe('parseTopics', () => {
   })
 
   test('counts inline-prose citations toward the topic, not only fragments: bullets', () => {
-    const text = ['## Inline citer', `mentioned in memory/2026-05-16#${ID_A} earlier`].join('\n')
+    const text = ['## Inline citer', `mentioned in streams/2026-05-16#${ID_A} earlier`].join('\n')
 
     const topics = parseTopics(text)
 
@@ -106,7 +106,7 @@ describe('parseTopics', () => {
   })
 
   test('ignores h3+ headings (they belong to the surrounding h2 topic)', () => {
-    const text = ['## Parent', '### Subheading', `- memory/2026-05-16#${ID_A}`].join('\n')
+    const text = ['## Parent', '### Subheading', `- streams/2026-05-16#${ID_A}`].join('\n')
 
     const topics = parseTopics(text)
 
