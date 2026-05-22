@@ -126,7 +126,8 @@ describe('createResourceLoader', () => {
       topic: 'tuesday-fragment-marker',
       body: 'tuesday-fragment-body',
     })
-    await writeFile(join(agentDir, 'memory', '2026-04-27.jsonl'), fragmentEvent + '\n')
+    await mkdir(join(agentDir, 'memory', 'streams'), { recursive: true })
+    await writeFile(join(agentDir, 'memory', 'streams', '2026-04-27.jsonl'), fragmentEvent + '\n')
 
     const loader = await createResourceLoader({ agentDir })
 
@@ -134,7 +135,7 @@ describe('createResourceLoader', () => {
     expect(prompt).toContain('# Memory')
     expect(prompt).toContain('Neo prefers terse replies.')
     expect(prompt).toContain('tuesday-fragment-marker')
-    expect(prompt).toContain('## memory/2026-04-27.jsonl')
+    expect(prompt).toContain('## memory/streams/2026-04-27.jsonl')
   })
 
   test('places the memory section AFTER gitNudge so the dirty-files list stays in the cache prefix relative to the most-volatile memory region', async () => {
