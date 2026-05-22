@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { access, constants as fsConstants, mkdir, readdir, stat, writeFile } from 'node:fs/promises'
+import { access, constants as fsConstants, mkdir, readdir, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { CronExpressionParser } from 'cron-parser'
@@ -91,6 +91,11 @@ export default definePlugin({
     const bufferBytes = ctx.config.bufferBytes
     const spawnTimeoutMs = ctx.config.spawnTimeoutMs
     const dreamingSchedule = ctx.config.dreaming?.schedule ?? DEFAULT_DREAMING_SCHEDULE
+
+    const streamMigrationCount = await migrateStreamsToDir(ctx.agentDir, ctx.logger)
+    if (streamMigrationCount > 0) {
+      ctx.logger.info(`[memory] migrated ${streamMigrationCount} stream file(s) to memory/streams/`)
+    }
 
     const migrationResult = await runMigration({
       agentDir: ctx.agentDir,
@@ -259,7 +264,7 @@ export default definePlugin({
           description: "today's daily stream file exists",
           run: async (dctx) => {
             const today = new Date().toISOString().slice(0, 10)
-            const rel = `memory/${today}.jsonl`
+            const rel = `memory/streams/${today}.jsonl`
             const abs = join(dctx.agentDir, rel)
             if (existsSync(abs)) return { status: 'ok', message: `${rel} present` }
             return {
@@ -359,4 +364,40 @@ async function raceSpawn(work: Promise<void>, ms: number): Promise<void> {
   } finally {
     if (timer !== null) clearTimeout(timer)
   }
+}
+
+const STREAM_FILE_NAME = /^\d{4}-\d{2}-\d{2}\.jsonl$/
+
+async function migrateStreamsToDir(agentDir: string, logger: { warn: (m: string) => void }): Promise<number> {
+  const memoryDir = join(agentDir, 'memory')
+  const streamsDir = join(memoryDir, 'streams')
+
+  let entries: string[]
+  try {
+    entries = await readdir(memoryDir)
+  } catch {
+    return 0
+  }
+
+  const streamFiles = entries.filter((name) => STREAM_FILE_NAME.test(name))
+  if (streamFiles.length === 0) return 0
+
+  await mkdir(streamsDir, { recursive: true })
+
+  let migrated = 0
+  for (const name of streamFiles) {
+    const oldPath = join(memoryDir, name)
+    const newPath = join(streamsDir, name)
+    if (existsSync(newPath)) {
+      logger.warn(`[memory:migration] skipped ${name}: already exists in memory/streams/`)
+      continue
+    }
+    try {
+      await rename(oldPath, newPath)
+      migrated++
+    } catch (err) {
+      logger.warn(`[memory:migration] failed to move ${name}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return migrated
 }
