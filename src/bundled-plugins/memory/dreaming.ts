@@ -58,10 +58,10 @@ type StreamSnapshots = {
 }
 
 async function collectStreamSnapshots(agentDir: string, state: DreamingState): Promise<StreamSnapshots> {
-  const memoryDir = join(agentDir, 'memory')
-  if (!existsSync(memoryDir)) return { undreamed: [] }
+  const streamsDir = join(agentDir, 'memory', 'streams')
+  if (!existsSync(streamsDir)) return { undreamed: [] }
 
-  const names = await readdir(memoryDir)
+  const names = await readdir(streamsDir)
   const dated = names
     .map((name) => ({ name, match: STREAM_FILE_PATTERN.exec(name) }))
     .filter((x): x is { name: string; match: RegExpExecArray } => x.match !== null)
@@ -70,7 +70,7 @@ async function collectStreamSnapshots(agentDir: string, state: DreamingState): P
 
   const snapshots = await Promise.all(
     dated.map(async ({ name, date }): Promise<StreamSnapshot> => {
-      const events = await readEvents(join(memoryDir, name))
+      const events = await readEvents(join(streamsDir, name))
       const dreamedIds = getDreamedIds(state, date)
       const undreamedIds = collectUndreamedFragmentIds(events, dreamedIds)
       return { date, filename: name, undreamedIds }
@@ -146,10 +146,10 @@ export async function compactDailyStreams(
   options: CompactionOptions,
 ): Promise<CompactionStats> {
   const stats: CompactionStats = { filesCompacted: 0, watermarksDropped: 0, fragmentsDropped: 0 }
-  const memoryDir = join(agentDir, 'memory')
+  const streamsDir = join(agentDir, 'memory', 'streams')
 
   for (const date of touchedDates) {
-    const path = join(memoryDir, `${date}.jsonl`)
+    const path = join(streamsDir, `${date}.jsonl`)
     if (!existsSync(path)) continue
 
     const events = await readEvents(path)
@@ -231,6 +231,10 @@ async function ensureMemoryFiles(agentDir: string): Promise<void> {
   const memoryDir = join(agentDir, 'memory')
   if (!existsSync(memoryDir)) {
     await mkdir(memoryDir, { recursive: true })
+  }
+  const streamsDir = join(memoryDir, 'streams')
+  if (!existsSync(streamsDir)) {
+    await mkdir(streamsDir, { recursive: true })
   }
 }
 
@@ -346,7 +350,7 @@ export async function buildCommitMessage(
   return `dream: ${summary} ${emojiPicker()}`
 }
 
-const STREAM_FILE_RELATIVE = /^memory\/\d{4}-\d{2}-\d{2}\.jsonl$/
+const STREAM_FILE_RELATIVE = /^memory\/streams\/\d{4}-\d{2}-\d{2}\.jsonl$/
 const SKILL_FILE_RELATIVE = /^memory\/skills\/([^/]+)\/SKILL\.md$/
 
 async function buildDreamSummary(bun: { spawn: typeof Bun.spawn }, cwd: string, staged: string[]): Promise<string> {

@@ -10,14 +10,14 @@
 // so legacy citations from before the cutover are dropped — they no longer
 // pin fragments alive against compaction.
 
-const CITATION_LINE = /^[\s-]*memory\/(\d{4}-\d{2}-\d{2})#([\w-]+)\s*$/im
+const CITATION_LINE = /^[\s-]*(?:memory|streams)\/(\d{4}-\d{2}-\d{2})#([\w-]+)\s*$/im
 
-const CITATION_LINE_GLOBAL = /memory\/(\d{4}-\d{2}-\d{2})#([\w-]+)/g
+const CITATION_LINE_GLOBAL = /(?:memory|streams)\/(\d{4}-\d{2}-\d{2})#([\w-]+)/g
 
 export type Citation = { date: string; fragmentId: string }
 
 export function formatCitation(date: string, fragmentId: string): string {
-  return `memory/${date}#${fragmentId}`
+  return `streams/${date}#${fragmentId}`
 }
 
 // Parse every citation in `text` and return them grouped by date. The
