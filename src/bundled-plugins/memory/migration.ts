@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { readdir, readFile, unlink } from 'node:fs/promises'
+import { mkdir, readdir, readFile, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { clearDreamedIds, loadDreamingState, saveDreamingState } from './dreaming-state'
@@ -54,10 +54,17 @@ export async function runMigration(options: RunMigrationOptions): Promise<Migrat
     return result
   }
 
-  const dates = collectDailyDates(entries)
+  let streamEntries: string[] = []
+  try {
+    streamEntries = await readdir(join(memoryDir, 'streams'))
+  } catch {
+    // streams directory doesn't exist yet
+  }
+
+  const dates = collectDailyDates([...entries, ...streamEntries])
   for (const date of dates) {
     const mdPath = join(memoryDir, `${date}.md`)
-    const jsonlPath = join(memoryDir, `${date}.jsonl`)
+    const jsonlPath = join(memoryDir, 'streams', `${date}.jsonl`)
     const hasMd = existsSync(mdPath)
     const hasJsonl = existsSync(jsonlPath)
 
@@ -87,6 +94,7 @@ export async function runMigration(options: RunMigrationOptions): Promise<Migrat
 
     const counts = countEvents(events)
     try {
+      await mkdir(join(memoryDir, 'streams'), { recursive: true })
       await (options.writeEventsAtomic ?? defaultWriteEventsAtomic)(jsonlPath, events)
     } catch (err) {
       options.logger.error(`[memory:migration] ${date}.md: failed to write JSONL: ${describeError(err)}`)
@@ -230,7 +238,7 @@ async function commitMigration(
     return
   }
 
-  const jsonlPaths = dates.map((date) => `memory/${date}.jsonl`)
+  const jsonlPaths = dates.map((date) => `memory/streams/${date}.jsonl`)
   const addJsonl = await spawn(['add', '--', ...jsonlPaths], { cwd: agentDir })
   if (addJsonl.exitCode !== 0) {
     logger.warn(`[memory:migration] git add failed: ${addJsonl.stderr || addJsonl.stdout}`.trim())

@@ -17,7 +17,7 @@ describe('runMigration', () => {
   beforeEach(async () => {
     agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-memory-migration-'))
     memoryDir = join(agentDir, 'memory')
-    await mkdir(memoryDir, { recursive: true })
+    await mkdir(join(memoryDir, 'streams'), { recursive: true })
     messages = { info: [], warn: [], error: [] }
     logger = {
       info: (message) => messages.info.push(message),
@@ -45,9 +45,9 @@ describe('runMigration', () => {
     expect(result.watermarkCount).toBe(1)
     expect(result.legacyProseCount).toBe(0)
     expect(existsSync(join(memoryDir, '2026-05-16.md'))).toBe(false)
-    expect(existsSync(join(memoryDir, '2026-05-16.jsonl'))).toBe(true)
+    expect(existsSync(join(memoryDir, 'streams', '2026-05-16.jsonl'))).toBe(true)
 
-    const events = await readEvents(join(memoryDir, '2026-05-16.jsonl'))
+    const events = await readEvents(join(memoryDir, 'streams', '2026-05-16.jsonl'))
     expect(events.map((event) => event.type)).toEqual(['fragment', 'watermark', 'fragment'])
     expect(events[0]).toMatchObject({ source: 'ses_a', entry: 'entry_1', topic: 'First Topic', body: 'First body\n' })
     expect(events[1]).toMatchObject({ source: 'ses_a', entry: 'entry_2' })
@@ -67,14 +67,14 @@ describe('runMigration', () => {
     const result = await runMigration({ agentDir, logger })
 
     expect(result.legacyProseCount).toBe(2)
-    const events = await readEvents(join(memoryDir, '2026-05-16.jsonl'))
+    const events = await readEvents(join(memoryDir, 'streams', '2026-05-16.jsonl'))
     expect(events.map((event) => event.type)).toEqual(['legacy_prose', 'fragment', 'watermark', 'legacy_prose'])
     expect(events[0]).toMatchObject({ text: 'intro prose\n', origin: 'migration' })
     expect(events[3]).toMatchObject({ text: '\ntail prose\n', origin: 'migration' })
   })
 
   test('skips a date that only has an already-migrated JSONL file', async () => {
-    await writeFile(join(memoryDir, '2026-05-16.jsonl'), '', 'utf8')
+    await writeFile(join(memoryDir, 'streams', '2026-05-16.jsonl'), '', 'utf8')
 
     const result = await runMigration({ agentDir, logger })
 
@@ -84,14 +84,14 @@ describe('runMigration', () => {
 
   test('skips a conflict when markdown and JSONL both exist', async () => {
     await writeDailyMd('2026-05-16', '<!-- watermark source=ses_a entry=entry_1 -->')
-    await writeFile(join(memoryDir, '2026-05-16.jsonl'), 'existing\n', 'utf8')
+    await writeFile(join(memoryDir, 'streams', '2026-05-16.jsonl'), 'existing\n', 'utf8')
 
     const result = await runMigration({ agentDir, logger })
 
     expect(result.migrated).toEqual([])
     expect(result.skipped).toEqual(['2026-05-16'])
     expect(await readFile(join(memoryDir, '2026-05-16.md'), 'utf8')).toContain('watermark')
-    expect(await readFile(join(memoryDir, '2026-05-16.jsonl'), 'utf8')).toBe('existing\n')
+    expect(await readFile(join(memoryDir, 'streams', '2026-05-16.jsonl'), 'utf8')).toBe('existing\n')
     expect(messages.warn.some((message) => message.includes('both .md and .jsonl exist'))).toBe(true)
   })
 
@@ -109,7 +109,7 @@ describe('runMigration', () => {
     expect(result.migrated).toEqual([])
     expect(result.skipped).toEqual(['2026-05-16'])
     expect(existsSync(join(memoryDir, '2026-05-16.md'))).toBe(true)
-    expect(existsSync(join(memoryDir, '2026-05-16.jsonl'))).toBe(false)
+    expect(existsSync(join(memoryDir, 'streams', '2026-05-16.jsonl'))).toBe(false)
     expect(messages.error.some((message) => message.includes('disk full'))).toBe(true)
   })
 
@@ -161,7 +161,7 @@ describe('runMigration', () => {
 
     const result = await runMigration({ agentDir, logger })
 
-    const jsonl = await readFile(join(memoryDir, '2026-05-16.jsonl'), 'utf8')
+    const jsonl = await readFile(join(memoryDir, 'streams', '2026-05-16.jsonl'), 'utf8')
 
     expect(result.migrated).toEqual(['2026-05-16'])
     expect(result.fragmentCount).toBe(0)
@@ -178,7 +178,7 @@ describe('runMigration', () => {
     )
 
     const result = await runMigration({ agentDir, logger })
-    const events = await readEvents(join(memoryDir, '2026-05-16.jsonl'))
+    const events = await readEvents(join(memoryDir, 'streams', '2026-05-16.jsonl'))
 
     expect(result.legacyProseCount).toBe(1)
     expect(result.watermarkCount).toBe(1)
