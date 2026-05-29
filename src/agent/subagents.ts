@@ -38,6 +38,46 @@ export type RunSession = (override?: { userPrompt?: string }) => Promise<void>
 // `AgentSessionTools` + `ToolDefinition[]` that pi-coding-agent actually
 // consumes. The boundary is real and load-bearing — collapsing it would
 // expose pi-coding-agent's internal API as part of the plugin contract.
+export type SandboxMount = {
+  src: string
+  dst: string
+  mode: 'ro' | 'rw'
+}
+
+// Per-tool bwrap sandbox for `bash` calls originating from this subagent.
+// When set, the bash tool wrapper rewrites `args.command` into a `bwrap …
+// bash -c <command>` invocation before pi-coding-agent's bash tool executes
+// it. The wrapper runs AFTER existing `tool.before` hooks (so guards like
+// secret-exfil-bash and git-exfil still see the original command and can
+// pattern-match against it). The wrapper runs BEFORE `tool.execute`, so the
+// kernel-level isolation applies to the actual process.
+//
+// Defaults (`sandbox: true` or omitted fields) are strict: no network, no
+// /agent visibility, --clearenv, tmpfs /tmp + /proc (the latter avoids the
+// OrbStack /proc-leak documented in docs/internals/sandbox.mdx). Widen
+// deliberately per-subagent: `mounts` for read-only access to specific
+// agent-folder paths, `envPassthrough` to forward named env vars (never
+// FIREWORKS_API_KEY or other model credentials), `network: 'inherit'` only
+// when the subagent legitimately needs egress AND the threat model accepts
+// the broader blast radius (see docs/internals/sandbox.mdx for why this is
+// usually wrong for read-only subagents that consume attacker-controlled
+// content).
+//
+// `allowlist` is a defense-in-depth prefix filter that runs before bwrap is
+// invoked. Commands containing shell metacharacters (`;`, `&`, `|`, `` ` ``,
+// `$`, `(`, `)`, `<`, `>`, `\`, newline) are always rejected; allowlisted
+// prefixes must match the normalized command after that check. The
+// allowlist is a scoping tool (catches model-being-too-eager); the bwrap
+// sandbox itself is the containment tool (catches prompt-injection-succeeded).
+// Both layers compose in the wrapper.
+export type SandboxOptions = {
+  mounts?: SandboxMount[]
+  network?: 'none' | 'inherit'
+  envPassthrough?: string[]
+  allowlist?: string[]
+  cwd?: string
+}
+
 export type SubagentShared<P = unknown> = {
   systemPrompt: string
   // Model profile this subagent prefers. Resolved against `config.models` at
@@ -63,6 +103,7 @@ export type SubagentShared<P = unknown> = {
   // hangs" symptom. Omit for no ceiling (legacy behavior; the spawn waits
   // as long as the provider takes).
   timeoutMs?: number
+  sandbox?: true | SandboxOptions
 }
 
 export type Subagent<P = unknown> = SubagentShared<P> & {
