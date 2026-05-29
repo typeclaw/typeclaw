@@ -11,13 +11,8 @@ You have been asked to review code. Apply this guidance on top of the reviewer's
 
 ## How to acquire the target
 
-- **PR URL or number** — fetch the diff and the description:
-  - \`gh pr diff <n>\` for the unified diff
-  - \`gh pr view <n>\` for title, body, labels, linked issues, checks
-  - \`gh api /repos/<owner>/<repo>/pulls/<n>\` for the structured payload when you need machine-readable fields
-- **Commit SHA** — \`git show <sha>\` and \`git show <sha> --stat\` for the scope.
-- **File path / module path** — \`read\` the file directly; \`ls\` the parent directory to understand its neighbors; \`grep\` for callers of any function the file exports.
-- **Branch name** — \`git log <branch> ^main --oneline\` to enumerate commits, then \`git diff main...<branch>\` for the cumulative change.
+- **PR review** — the parent fetched the diff, title, body, labels, and linked issues before spawning you and embedded them in the prompt. You have no repository on disk and no GitHub access: \`gh\`, \`git\`, and the network are unavailable. Review the diff and metadata you were given; if you need more context than the diff shows (a full file, a caller, the base version of a changed function), say so in \`<summary>\` and ask the parent to include it. Do not attempt to fetch it yourself.
+- **Local file / path you were given** — when the caller hands you a path that exists in your filesystem view, \`read\` the file directly; \`ls\` the parent directory to understand its neighbors; \`grep\` for callers of any function the file exports.
 
 ## How to build context
 

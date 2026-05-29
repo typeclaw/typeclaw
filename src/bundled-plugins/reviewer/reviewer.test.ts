@@ -210,7 +210,11 @@ describe('reviewer skill content', () => {
     expect(lower).toContain('correctness')
     expect(lower).toContain('security')
     expect(lower).toContain('test coverage')
-    expect(lower).toContain('gh pr diff')
+    // Drift guard for the post-#452 contract: bash is sandboxed without
+    // network, so the parent fetches PR content and embeds it in the
+    // prompt — the skill must teach this, not legacy `gh pr diff` calls.
+    expect(lower).toContain('the parent fetched')
+    expect(lower).not.toContain('gh pr diff')
   })
 
   test('general skill body teaches universal review craft (load-bearing audience-fit phrasing)', () => {
@@ -244,5 +248,38 @@ describe('reviewerPayloadSchema', () => {
   test('passes through unknown fields (forward-compat with future spawn-tool params, matches explorer/scout/operator)', () => {
     const result = reviewerPayloadSchema.safeParse({ requestId: 'bg_t1', futureField: 42 })
     expect(result.success).toBe(true)
+  })
+
+  test('accepts an explicit inline-diff reviewTarget', () => {
+    expect(reviewerPayloadSchema.safeParse({ reviewTarget: { kind: 'inline-diff' } }).success).toBe(true)
+  })
+})
+
+describe('reviewer sandbox honesty (no nest-git confusion)', () => {
+  test('sandbox mounts nothing — the reviewer has no repository on disk', () => {
+    const sub = createReviewerSubagent()
+    const sandbox = sub.sandbox
+    const mounts = typeof sandbox === 'object' ? (sandbox.mounts ?? []) : []
+    expect(mounts).toEqual([])
+    // regression guard: the agent nest's git must never be mounted as the target
+    const serialized = JSON.stringify(sandbox)
+    expect(serialized).not.toContain('/agent/.git')
+    expect(serialized).not.toContain('/work/.git')
+  })
+
+  test('allowlist has no git — there is no repo to run git against', () => {
+    const sub = createReviewerSubagent()
+    const sandbox = sub.sandbox
+    const allowlist = typeof sandbox === 'object' ? (sandbox.allowlist ?? []) : []
+    expect(allowlist.some((p) => p === 'git' || p.startsWith('git '))).toBe(false)
+    // pipeline tools for working with inline content remain
+    expect(allowlist).toContain('cat')
+    expect(allowlist).toContain('jq')
+  })
+
+  test('prompt does not claim a repo/checkout the reviewer does not have', () => {
+    expect(REVIEWER_SYSTEM_PROMPT).not.toContain('/agent/.git')
+    expect(REVIEWER_SYSTEM_PROMPT).not.toContain('/work/.git')
+    expect(REVIEWER_SYSTEM_PROMPT.toLowerCase()).not.toContain('this checkout')
   })
 })
