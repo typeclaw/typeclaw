@@ -27,6 +27,12 @@ export type StageGithubPrOptions = {
 const SANDBOX_PATH = '/work'
 const GITHUB_API = 'https://api.github.com'
 
+// Hard caps to bound a malicious/oversized PR archive. The compressed cap
+// rejects before gunzip (cheap); the decompressed cap is enforced during the
+// header walk so a zip-bomb cannot expand unbounded in memory.
+const MAX_COMPRESSED_BYTES = 100 * 1024 * 1024
+const MAX_DECOMPRESSED_BYTES = 500 * 1024 * 1024
+
 export async function stageGithubPr(options: StageGithubPrOptions): Promise<StagedRepo> {
   const { target, token } = options
   const doFetch = options.fetchImpl ?? fetch
@@ -38,6 +44,9 @@ export async function stageGithubPr(options: StageGithubPrOptions): Promise<Stag
     throw new StagingError(`tarball fetch failed (${res.status}) for ${target.owner}/${target.repo}@${headSha}`)
   }
   const gz = Buffer.from(await res.arrayBuffer())
+  if (gz.length > MAX_COMPRESSED_BYTES) {
+    throw new StagingError(`tarball too large: ${gz.length} bytes exceeds ${MAX_COMPRESSED_BYTES}`)
+  }
 
   const root = await mkdtemp(join(tmpdir(), 'typeclaw-review-'))
   const repoDir = join(root, 'repo')
@@ -131,6 +140,14 @@ function assertSafeRawName(name: string): void {
   if (name.startsWith('/') || /^[A-Za-z]:[\\/]/.test(name)) {
     throw new StagingError(`refusing absolute tar entry path: "${name}"`)
   }
+  // Reject `..` on the RAW name (before stripTopLevel): otherwise `../evil`
+  // would have its first segment stripped to `evil` and slip the traversal
+  // check, even though it never escapes destRoot. Keeps the stated invariant
+  // ("reject traversal") true rather than relying on the join() containment.
+  const parts = name.replace(/\\/g, '/').split('/')
+  if (parts.some((p) => p === '..')) {
+    throw new StagingError(`refusing tar entry with parent-traversal: "${name}"`)
+  }
 }
 
 function assertSafeRelativePath(rel: string, original: string): void {
@@ -167,20 +184,41 @@ type TarEntry = { name: string; typeflag: string; data: Buffer }
 function parseTarEntries(buf: Buffer): TarEntry[] {
   const entries: TarEntry[] = []
   let offset = 0
+  let totalData = 0
   while (offset + 512 <= buf.length) {
     const header = buf.subarray(offset, offset + 512)
     if (isZeroBlock(header)) break
     const name = readString(header, 0, 100)
     const prefix = readString(header, 345, 155)
     const fullName = prefix !== '' ? `${prefix}/${name}` : name
-    const size = parseOctal(readString(header, 124, 12))
+    const size = parseSize(header.subarray(124, 136))
     const typeflag = String.fromCharCode(header[156] ?? 0)
     const dataStart = offset + 512
+    // Reject a declared size that runs past the buffer: a truncated/corrupt
+    // archive would otherwise stage a silently-incomplete file.
+    if (dataStart + size > buf.length) {
+      throw new StagingError(`truncated tar entry "${fullName}": declared size exceeds archive`)
+    }
+    totalData += size
+    if (totalData > MAX_DECOMPRESSED_BYTES) {
+      throw new StagingError(`archive too large: decompressed content exceeds ${MAX_DECOMPRESSED_BYTES} bytes`)
+    }
     const data = buf.subarray(dataStart, dataStart + size)
     entries.push({ name: fullName, typeflag: typeflag === '\0' ? '0' : typeflag, data: Buffer.from(data) })
     offset = dataStart + Math.ceil(size / 512) * 512
   }
   return entries
+}
+
+// Tar size field: octal ASCII normally, but GNU encodes sizes >= 8GiB in
+// base-256 (high bit of the first byte set). We don't support repos that
+// large for review; reject base-256 rather than silently mis-parsing it as a
+// tiny octal value (which would truncate the entry and corrupt the staged file).
+function parseSize(field: Buffer): number {
+  if (field.length > 0 && (field[0]! & 0x80) !== 0) {
+    throw new StagingError('tar entry uses base-256 size encoding (file too large for review)')
+  }
+  return parseOctal(field.toString('utf8'))
 }
 
 function isZeroBlock(block: Buffer): boolean {

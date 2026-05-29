@@ -22,12 +22,17 @@ function tarHeader(spec: TarSpec): Buffer {
   block[156] = (spec.typeflag ?? '0').charCodeAt(0)
   block.write('ustar\0', 257, 6, 'utf8')
   block.write('00', 263, 2, 'utf8')
-  // checksum: fill spaces, sum bytes, write octal
+  recomputeChecksum(block)
+  return block
+}
+
+// ustar checksum: zero the field as spaces, sum all 512 bytes, write octal.
+// Exposed so tests that mutate a header (size field) can re-sign it.
+function recomputeChecksum(block: Buffer): void {
   block.fill(' ', 148, 156)
   let sum = 0
   for (let i = 0; i < 512; i++) sum += block[i] ?? 0
   block.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'utf8')
-  return block
 }
 
 function makeTarGz(specs: TarSpec[]): Buffer {
@@ -92,6 +97,32 @@ describe('extractTarGzSafely', () => {
     const dest = await freshDest()
     const gz = makeTarGz([{ name: `${TOP}/hard`, typeflag: '1', data: 'x' }])
     await expect(extractTarGzSafely(gz, dest)).rejects.toThrow(/typeflag|unsafe/i)
+  })
+
+  test('rejects raw `..` traversal even though stripTopLevel would have removed the first segment', async () => {
+    const dest = await freshDest()
+    const gz = makeTarGz([{ name: `${TOP}/../evil.txt`, data: 'pwn' }])
+    await expect(extractTarGzSafely(gz, dest)).rejects.toThrow(/parent-traversal/i)
+  })
+
+  test('rejects a truncated entry whose declared size runs past the archive', async () => {
+    // given: a header declaring 4096 bytes but only one 512-byte data block present
+    const dest = await freshDest()
+    const header = tarHeader({ name: `${TOP}/big.ts` })
+    header.write(`${(4096).toString(8).padStart(11, '0')}\0`, 124, 12, 'utf8')
+    recomputeChecksum(header)
+    const gz = gzipSync(Buffer.concat([header, Buffer.alloc(512, 0x41), Buffer.alloc(1024, 0)]))
+    await expect(extractTarGzSafely(gz, dest)).rejects.toThrow(/truncated/i)
+  })
+
+  test('rejects a base-256-encoded size field (file too large)', async () => {
+    // given: high bit set on the first size byte = GNU base-256 large-size encoding
+    const dest = await freshDest()
+    const header = tarHeader({ name: `${TOP}/huge.bin` })
+    header[124] = 0x80
+    recomputeChecksum(header)
+    const gz = gzipSync(Buffer.concat([header, Buffer.alloc(1024, 0)]))
+    await expect(extractTarGzSafely(gz, dest)).rejects.toThrow(/base-256/i)
   })
 })
 
