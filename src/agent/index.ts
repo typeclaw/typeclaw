@@ -38,7 +38,7 @@ import { createReloadTool } from './reload-tool'
 import { loadSelf } from './self'
 import { SESSION_META_CUSTOM_TYPE, sessionMetaPayload } from './session-meta'
 import { renderSessionOrigin, type SessionOrigin, type SessionRoleContext } from './session-origin'
-import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
+import type { CreateSessionForSubagent, SubagentRegistry, SubagentShared } from './subagents'
 import { DEFAULT_SYSTEM_PROMPT, renderRuntimeBlock, SLIM_SYSTEM_PROMPT } from './system-prompt'
 import {
   createBudgetState,
@@ -72,6 +72,12 @@ export type PluginSessionWiring = {
   hooks: HookBus
   sessionId: string
   agentDir: string
+  // Optional per-session lookup for SubagentShared by name. Supplied by
+  // `createSessionForSubagent` in `src/run/index.ts` so the bash-tool wrapper
+  // can read `subagent.sandbox` at execute time without coupling to a
+  // specific registry instance. Sessions that don't need sandbox lookup
+  // (TUI, channel, cron) omit it; the wrapper short-circuits when undefined.
+  getSubagentByName?: (name: string) => SubagentShared | undefined
 }
 
 export type PluginSubagentSelection = {
@@ -335,6 +341,9 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           sessionId: options.plugins.sessionId,
           hooks: options.plugins.hooks,
           getOrigin,
+          ...(options.plugins.getSubagentByName !== undefined
+            ? { getSubagentByName: options.plugins.getSubagentByName }
+            : {}),
         })
       : []
   const wrappedCustomSystemTools = wrapSystemTools(customSystemTools, options.plugins, getOrigin)
@@ -606,6 +615,7 @@ function wrapSystemAgentTools(
       sessionId: plugins.sessionId,
       hooks: plugins.hooks,
       getOrigin,
+      ...(plugins.getSubagentByName !== undefined ? { getSubagentByName: plugins.getSubagentByName } : {}),
     }),
   )
 }
@@ -622,6 +632,7 @@ function wrapSystemTools(
       sessionId: plugins.sessionId,
       hooks: plugins.hooks,
       getOrigin,
+      ...(plugins.getSubagentByName !== undefined ? { getSubagentByName: plugins.getSubagentByName } : {}),
     }),
   )
 }

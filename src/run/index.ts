@@ -266,6 +266,12 @@ export async function startAgent({
           hooks: snap.hooks,
           sessionId,
           agentDir: cwd,
+          // Per-subagent sandbox lookup: the bash-tool wrapper calls this
+          // at execute time to pick up the calling subagent's `sandbox`
+          // declaration. Read off the current snapshot lazily so plugin
+          // reload (which rebuilds the registry but not this closure) is
+          // visible to in-flight tool calls.
+          getSubagentByName: (name) => pluginRuntime.get().subagents[name],
         },
         pluginSubagent: {
           pluginName: entry.pluginName,

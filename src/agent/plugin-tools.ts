@@ -33,7 +33,9 @@ import type {
 
 import { createLoopGuard, type LoopGuard } from './loop-guard'
 import { checkImageReadRedirect } from './multimodal/read-redirect'
+import { applySubagentSandbox } from './sandbox'
 import type { SessionOrigin } from './session-origin'
+import type { SubagentShared } from './subagents'
 import { webfetchTool } from './tools/webfetch'
 import { websearchTool } from './tools/websearch'
 
@@ -134,6 +136,13 @@ export type WrapSystemToolOptions = {
   sessionId: string
   hooks: HookBus
   getOrigin?: () => SessionOrigin | undefined
+  // Resolved per-call against the session's plugin runtime, so per-subagent
+  // sandbox config (declared on `SubagentShared.sandbox`) is picked up at
+  // tool-execute time without coupling the wrapper to a specific
+  // SubagentRegistry instance. Returns undefined for unknown names and for
+  // non-subagent origins (where the wrapper short-circuits anyway). See
+  // src/agent/sandbox.ts for the consumer.
+  getSubagentByName?: (name: string) => SubagentShared | undefined
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
@@ -262,6 +271,15 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       }
       stripGuardAcknowledgements(mutableArgs)
 
+      if (opts.getSubagentByName !== undefined) {
+        await applySubagentSandbox({
+          tool: tool.name,
+          args: mutableArgs,
+          origin: liveOrigin,
+          getSubagentByName: opts.getSubagentByName,
+        })
+      }
+
       const result = await tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate, ctx)
       const hookResult: ToolResult = {
         content: result.content as ContentPart[],
@@ -323,6 +341,15 @@ export function wrapSystemAgentTool<TParams extends TSchema, TDetails = unknown>
         throw new Error(`blocked: ${readGuardResult.reason}`)
       }
       stripGuardAcknowledgements(mutableArgs)
+
+      if (opts.getSubagentByName !== undefined) {
+        await applySubagentSandbox({
+          tool: tool.name,
+          args: mutableArgs,
+          origin: liveOrigin,
+          getSubagentByName: opts.getSubagentByName,
+        })
+      }
 
       const result = await tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate)
       const hookResult: ToolResult = {
@@ -392,6 +419,20 @@ export function wrapAgentToolAsCustomToolDefinition<TParams extends TSchema, TDe
         throw new Error(`blocked: ${readGuardResult.reason}`)
       }
       stripGuardAcknowledgements(mutableArgs)
+
+      // Per-subagent bwrap sandbox. Runs AFTER all guards (so guards see the
+      // original command) and BEFORE tool.execute (so the kernel-level
+      // isolation applies). No-op for non-bash tools, non-subagent origins,
+      // and subagents that did not declare `sandbox`. Throws on allowlist
+      // rejection or missing bwrap binary.
+      if (opts.getSubagentByName !== undefined) {
+        await applySubagentSandbox({
+          tool: tool.name,
+          args: mutableArgs,
+          origin: liveOrigin,
+          getSubagentByName: opts.getSubagentByName,
+        })
+      }
 
       const result = await tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate)
       const hookResult: ToolResult = {
