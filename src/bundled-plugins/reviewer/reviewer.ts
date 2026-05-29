@@ -15,6 +15,7 @@ import {
 
 import { CODE_REVIEW_SKILL } from './skills/code-review'
 import { GENERAL_REVIEW_SKILL } from './skills/general'
+import { type GithubPrTarget, stageGithubPr } from './staging'
 
 // The curated set of review-domain skills the reviewer can load on
 // demand via its `load_skill` tool. Order is the order the model sees
@@ -26,46 +27,66 @@ import { GENERAL_REVIEW_SKILL } from './skills/general'
 // no runtime change required.
 export const REVIEWER_SKILLS: readonly LoadableSkill[] = [CODE_REVIEW_SKILL, GENERAL_REVIEW_SKILL]
 
-// Per-subagent bwrap sandbox. The reviewer reads attacker-controlled content
-// (PR diffs, issue bodies, web pages) so a prompt injection in that content
-// can steer the model into emitting hostile bash commands. The sandbox closes
-// the network (so `curl evil.com/foo` fails harmlessly), hides /agent (so
-// FIREWORKS_API_KEY / GITHUB_TOKEN cannot be exfiltrated), and limits bash
-// to local read-only git against a ro mount of /agent/.git. See
+// Per-subagent bwrap sandbox base profile. The reviewer reads attacker-
+// controlled content (PR source, diffs, issue bodies, web pages) so a prompt
+// injection can steer the model into emitting hostile bash commands. The
+// sandbox closes the network (so `curl evil.com` fails harmlessly), hides
+// /agent (so FIREWORKS_API_KEY / GH_TOKEN cannot be exfiltrated via the bash
+// child's env — see --clearenv in sandbox.ts), and limits bash to a read-only
+// pipeline allowlist operating on the staged tree mounted at /work. See
 // docs/internals/sandbox.mdx for the full threat model.
 //
-// `gh` is intentionally NOT in the allowlist. A broad GH_TOKEN (the default
-// for a developer who ran `gh auth login` once for their work account) gives
-// `gh api -X GET` access to every private repo, gist, workflow log, and org
-// the user has access to — far beyond the PR being reviewed. Prefix-matching
-// on `gh api -X GET` is also bypassable via a later `--method POST` flag
-// override. The parent fetches PR content itself and passes it inline in
-// the reviewer's prompt; this contract closes the network-egress side of
-// the threat model and matches the "subagent receives content, does not
-// fetch content" convention shared by scout/explorer/operator.
+// `gh` is intentionally NOT in the allowlist, and the reviewer never holds a
+// token. A broad GH_TOKEN gives `gh api -X GET` access to every private repo,
+// gist, workflow log, and org the user has — far beyond the PR being reviewed.
+// Instead, the reviewer's HANDLER (which runs with the parent's credentials,
+// outside the bash jail) fetches the PR head as a credential-free local tree
+// and mounts it at /work. The reviewer then reads/greps/traces the full tree
+// offline. This gives deep cross-file review WITHOUT the token ever entering
+// the jail — the network-egress and lateral-access sides of the threat model
+// stay closed.
+//
+// No target mount is declared here: it is supplied per-review by the handler
+// (see buildReviewSandbox) so concurrent reviews of different PRs get isolated
+// mounts via the per-session sandbox override (CreateSessionForSubagentOptions
+// .sandboxOverride). The base profile is used as-is only for non-PR reviews
+// (local-file targets the parent already placed on disk).
+const REVIEWER_ALLOWLIST = [
+  'git log',
+  'git diff',
+  'git show',
+  'git blame',
+  'git status',
+  'git grep',
+  'git rev-parse',
+  'git ls-files',
+  'git cat-file',
+  'ls',
+  'find',
+  'grep',
+  'cat',
+  'head',
+  'tail',
+  'wc',
+  'sort',
+  'uniq',
+  'jq',
+  'yq',
+]
+
 const REVIEWER_SANDBOX = {
   network: 'none' as const,
-  mounts: [{ src: '/agent/.git', dst: '/work/.git', mode: 'ro' as const }],
-  allowlist: [
-    'git log',
-    'git diff',
-    'git show',
-    'git blame',
-    'git status',
-    'git grep',
-    'git rev-parse',
-    'git ls-files',
-    'git cat-file',
-    'cat',
-    'head',
-    'tail',
-    'wc',
-    'sort',
-    'uniq',
-    'jq',
-    'yq',
-  ],
+  allowlist: REVIEWER_ALLOWLIST,
   cwd: '/work',
+}
+
+function buildReviewSandbox(mountSrc: string) {
+  return {
+    network: 'none' as const,
+    mounts: [{ src: mountSrc, dst: '/work', mode: 'ro' as const }],
+    allowlist: REVIEWER_ALLOWLIST,
+    cwd: '/work',
+  }
 }
 
 export const REVIEWER_SYSTEM_PROMPT = `You are a review specialist running inside TypeClaw. Your job: produce a careful, structured review of a target the caller hands you — a code change, a written plan, a design document, a docs update, a draft argument, or anything else that benefits from another pair of eyes — and return findings the caller can act on.
@@ -90,7 +111,7 @@ The runtime exposes these tools to you by these EXACT names — call them by nam
 - \`grep\` — search file contents by text or regex
 - \`find\` — locate files by name pattern
 - \`ls\` — list a directory's immediate contents
-- \`bash\` — sandboxed read-only commands ONLY. The bash tool runs in a bwrap sandbox: no network, no /agent visibility, read-only mount of /agent/.git at /work/.git, fixed allowlist of \`git\` subcommands (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) and pipeline tools (\`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). Shell metacharacters (\`;\`, \`&\`, \`|\`, \`\`\`, \`$\`, \`(\`, \`)\`, \`<\`, \`>\`, \`\\\`, newline) are rejected before the sandbox runs. \`gh\`, \`curl\`, and other network tools are NOT available — if a PR diff or external content is needed, expect it inline in the prompt (the parent fetches it for you).
+- \`bash\` — sandboxed read-only commands ONLY. The bash tool runs in a bwrap sandbox: no network, no /agent visibility, no credentials. For a PR review, the full PR-head source tree is staged read-only and mounted at \`/work\` (your cwd) — \`cat\`, \`ls\`, \`find\`, \`grep\` it freely, and trace imports/callers/base classes across the WHOLE tree, not just the diff. The allowlist is \`git\` subcommands (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) plus pipeline tools (\`ls\`, \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). Note a GitHub tarball checkout has no \`.git\`, so prefer \`find\`/\`grep\`/\`cat\` over \`git\` for PR trees. Shell metacharacters (\`;\`, \`&\`, \`|\`, \`\`\`, \`$\`, \`(\`, \`)\`, \`<\`, \`>\`, \`\\\`, newline) are rejected before the sandbox runs. \`gh\`, \`curl\`, and other network tools are NOT available — the parent fetched the tree and any inline diff for you.
 - \`websearch\` — search the public web (e.g. for OWASP guidance, RFCs, library changelogs, framework docs, prior art)
 - \`webfetch\` — fetch a single URL (e.g. to read a linked spec, vendor doc, or article cited in the target)
 - \`load_skill\` — load a curated review skill by name. See the section below.
@@ -103,7 +124,7 @@ You are domain-neutral. Specific review craft — what to look for in code, in a
 
 The first thing you do for any review is:
 
-1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Pull-request reviews receive the diff and metadata inline in the prompt (the parent fetched it via \`gh\` before spawning you); local-file reviews give you a path you can \`read\`. Inspect what you were given, then decide.
+1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Pull-request reviews receive the diff and metadata inline in the prompt AND the full PR-head source tree staged at \`/work\` (read it with \`read\`/\`grep\`/\`find\` or sandboxed \`bash\`); local-file reviews give you a path you can \`read\`. Inspect what you were given, then decide.
 2. **Call \`load_skill\` with the matching skill name.** The \`load_skill\` tool's description lists the available skills and what each is for — pick the one whose description fits the target. If none of the domain skills fit, load \`general\`.
 3. **Apply that skill's guidance on top of the universal contract below.** The skill tells you what to look for in this domain, what to ignore, and how to map severity for this kind of artifact. The universal output contract (severity, evidence, suggestion, verdict, \`<review>\` block) does not change.
 
@@ -164,15 +185,53 @@ End every response with a single \`<review>\` block. Use this exact structure:
 
 You have one shot. The parent receives your final assistant message verbatim — make it complete and self-contained.`
 
+const githubPrTargetSchema = z.object({
+  kind: z.literal('github-pr'),
+  owner: z.string().min(1),
+  repo: z.string().min(1),
+  pullNumber: z.number().int().positive(),
+  headSha: z.string().min(1).optional(),
+})
+
 export const reviewerPayloadSchema = z
   .object({
     requestId: z.string().optional(),
     prompt: z.string().optional(),
     description: z.string().optional(),
+    reviewTarget: githubPrTargetSchema.optional(),
   })
   .passthrough()
 
 export type ReviewerPayload = z.infer<typeof reviewerPayloadSchema>
+
+function createReviewerHandler(): Subagent<ReviewerPayload>['handler'] {
+  return async (ctx, runSession) => {
+    const target = ctx.payload?.reviewTarget
+    const token = process.env.GH_TOKEN
+
+    // Non-PR review (local-file target the parent placed on disk), or no
+    // reviewTarget: fall back to the base sandbox + the original prompt.
+    if (target === undefined || target.kind !== 'github-pr') {
+      await runSession()
+      return
+    }
+    // A github-pr target but no credentials to stage it: degrade to inline
+    // review rather than failing the whole spawn. The reviewer works from
+    // whatever the parent embedded in the prompt.
+    if (token === undefined || token === '') {
+      await runSession()
+      return
+    }
+
+    const staged = await stageGithubPr({ target: target as GithubPrTarget, token })
+    try {
+      const enriched = `${ctx.userPrompt}\n\n---\nThe PR head tree (${target.owner}/${target.repo}@${staged.headSha}) is staged for you:\n- file tools (read/grep/find/ls): ${staged.hostPath}\n- sandboxed bash: /work\nThe tree is read-only, offline, and credential-free. Trace imports, callers, and base classes across the full tree — you are not limited to the diff.`
+      await runSession({ userPrompt: enriched, sandbox: buildReviewSandbox(staged.hostPath) })
+    } finally {
+      await staged.dispose()
+    }
+  }
+}
 
 export function createReviewerSubagent(): Subagent<ReviewerPayload> {
   const loadSkillTool = createLoadSkillTool({
@@ -194,6 +253,7 @@ If none of the listed skills fit the target, load \`general\` and explain in \`<
     tools: [readTool, grepTool, findTool, lsTool, bashTool, websearchTool, webfetchTool],
     customTools: [loadSkillTool],
     payloadSchema: reviewerPayloadSchema,
+    handler: createReviewerHandler(),
     visibility: 'public',
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     sandbox: REVIEWER_SANDBOX,

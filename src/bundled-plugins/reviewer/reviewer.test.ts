@@ -249,4 +249,55 @@ describe('reviewerPayloadSchema', () => {
     const result = reviewerPayloadSchema.safeParse({ requestId: 'bg_t1', futureField: 42 })
     expect(result.success).toBe(true)
   })
+
+  test('accepts a github-pr reviewTarget', () => {
+    const result = reviewerPayloadSchema.safeParse({
+      requestId: 'bg_t1',
+      reviewTarget: { kind: 'github-pr', owner: 'o', repo: 'r', pullNumber: 7 },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test('rejects a malformed reviewTarget (wrong kind / missing fields)', () => {
+    expect(reviewerPayloadSchema.safeParse({ reviewTarget: { kind: 'gitlab-mr' } }).success).toBe(false)
+    expect(reviewerPayloadSchema.safeParse({ reviewTarget: { kind: 'github-pr', owner: 'o' } }).success).toBe(false)
+  })
+})
+
+describe('reviewer sandbox contract (deep-review staging)', () => {
+  test('base sandbox no longer ro-mounts the agent nest .git', () => {
+    const sub = createReviewerSubagent()
+    const sandbox = sub.sandbox
+    const mounts = typeof sandbox === 'object' ? (sandbox.mounts ?? []) : []
+    expect(mounts.some((m) => m.src === '/agent/.git' || m.dst === '/work/.git')).toBe(false)
+  })
+
+  test('base sandbox keeps network none and cwd /work', () => {
+    const sub = createReviewerSubagent()
+    const sandbox = sub.sandbox
+    if (typeof sandbox !== 'object') throw new Error('expected object sandbox')
+    expect(sandbox.network).toBe('none')
+    expect(sandbox.cwd).toBe('/work')
+  })
+
+  test('gh is NOT in the sandbox allowlist (token never enters the jail)', () => {
+    const sub = createReviewerSubagent()
+    const sandbox = sub.sandbox
+    const allowlist = typeof sandbox === 'object' ? (sandbox.allowlist ?? []) : []
+    expect(allowlist.some((p) => p.startsWith('gh'))).toBe(false)
+    expect(allowlist).toContain('find')
+    expect(allowlist).toContain('grep')
+  })
+
+  test('prompt teaches the staged /work tree for deep cross-file review', () => {
+    const lower = REVIEWER_SYSTEM_PROMPT.toLowerCase()
+    expect(lower).toContain('/work')
+    expect(lower).toContain('staged')
+    expect(lower).not.toContain('/agent/.git')
+  })
+
+  test('declares a handler (parent-side staging runs before the reviewer session)', () => {
+    const sub = createReviewerSubagent()
+    expect(typeof sub.handler).toBe('function')
+  })
 })

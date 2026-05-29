@@ -329,6 +329,32 @@ describe.skipIf(!bwrapAvailable)('applySubagentSandbox — bwrap argv constructi
     // with the apostrophe properly escaped by shellQuote.
     expect(cmd).toContain("'git log --grep=can'\\''t'")
   })
+
+  test('staged review mount (the #465 reviewer shape): ro-bind staged tree at /work, clearenv, no network', async () => {
+    // given: a reviewer-shaped per-review sandbox mounting a staged tarball tree
+    const args = { command: 'cat src/index.ts' }
+    await applySubagentSandbox({
+      tool: 'bash',
+      args,
+      origin: SUBAGENT_ORIGIN,
+      getSubagentByName: registry({
+        'test-reviewer': makeSubagent({
+          network: 'none',
+          mounts: [{ src: '/tmp/typeclaw-review-abc/repo', dst: '/work', mode: 'ro' }],
+          allowlist: ['cat'],
+          cwd: '/work',
+        }),
+      }),
+    })
+
+    // then: staged tree is read-only at /work, cwd is /work, env is cleared,
+    // and the network stays unshared (no token/egress path for untrusted code)
+    const cmd = args.command as string
+    expect(cmd).toContain('--ro-bind /tmp/typeclaw-review-abc/repo /work')
+    expect(cmd).toContain('--chdir /work')
+    expect(cmd).toContain('--clearenv')
+    expect(cmd).not.toContain('--share-net')
+  })
 })
 
 describe('applySubagentSandbox — fail-closed when bwrap unavailable', () => {
