@@ -9,7 +9,6 @@ describe('reviewer subagent — load-bearing prompt phrases', () => {
     [
       'READ-ONLY',
       'STRICTLY PROHIBITED',
-      'parallel',
       '<review>',
       '<summary>',
       '<findings>',
@@ -41,15 +40,18 @@ describe('reviewer subagent — load-bearing prompt phrases', () => {
     expect(REVIEWER_SYSTEM_PROMPT).toContain('git push')
   })
 
-  test('prompt names the dedicated tools by their exact runtime names', () => {
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`read`')
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`grep`')
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`find`')
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`ls`')
+  test('prompt names only the two surviving tools (bash + load_skill) by exact runtime name', () => {
     expect(REVIEWER_SYSTEM_PROMPT).toContain('`bash`')
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`websearch`')
-    expect(REVIEWER_SYSTEM_PROMPT).toContain('`webfetch`')
     expect(REVIEWER_SYSTEM_PROMPT).toContain('`load_skill`')
+  })
+
+  test('prompt does NOT advertise unsandboxed file tools or web tools (exfil-surface drift guard)', () => {
+    // Security drift guard: read/grep/find/ls are unsandboxed host tools and
+    // webfetch/websearch are network sinks. A reviewer reads attacker content,
+    // so these were removed; the prompt must not re-advertise them as tools.
+    expect(REVIEWER_SYSTEM_PROMPT).not.toContain('`read`')
+    expect(REVIEWER_SYSTEM_PROMPT).not.toContain('`websearch`')
+    expect(REVIEWER_SYSTEM_PROMPT).not.toContain('`webfetch`')
   })
 
   test('prompt is domain-neutral: does NOT inline code-review-specific workflow steps in the "how to review" section', () => {
@@ -92,10 +94,11 @@ describe('reviewer subagent — load-bearing prompt phrases', () => {
     expect(REVIEWER_SYSTEM_PROMPT).toContain('cannot point at a line')
   })
 
-  test('prompt tells reviewer to verify external claims with web tools (citations not vibes)', () => {
+  test('prompt tells reviewer to be skeptical of external claims and flag unverifiable ones (no web access)', () => {
     const lower = REVIEWER_SYSTEM_PROMPT.toLowerCase()
-    expect(lower).toContain('verify external claims')
-    expect(lower).toContain('cite the source')
+    expect(lower).toContain('skeptical of external claims')
+    expect(lower).toContain('no web access')
+    expect(lower).toContain('ask the parent to verify')
   })
 
   test('prompt frames the role as deep-model analysis (so token-spend is justified)', () => {
@@ -121,10 +124,19 @@ describe('reviewer subagent declaration', () => {
     expect(sub.requiresSpecificPermission ?? false).toBe(false)
   })
 
-  test('tools list is read-only by whitelist: read/grep/find/ls/bash/websearch/webfetch with NO write/edit', () => {
+  test('tools list is bash-only: filesystem access is funneled through the bwrap jail, no host file tools or web sinks', () => {
     const sub = createReviewerSubagent()
     const toolNames = (sub.tools ?? []).map((t) => t.__builtinTool).sort()
-    expect(toolNames).toEqual(['bash', 'find', 'grep', 'ls', 'read', 'webfetch', 'websearch'])
+    expect(toolNames).toEqual(['bash'])
+    // unsandboxed host file tools — would bypass the /work jail
+    expect(toolNames).not.toContain('read')
+    expect(toolNames).not.toContain('grep')
+    expect(toolNames).not.toContain('find')
+    expect(toolNames).not.toContain('ls')
+    // network sinks — would pair with a read into an exfil channel
+    expect(toolNames).not.toContain('webfetch')
+    expect(toolNames).not.toContain('websearch')
+    // write/edit never present (read-only)
     expect(toolNames).not.toContain('write')
     expect(toolNames).not.toContain('edit')
   })

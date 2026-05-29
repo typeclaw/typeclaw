@@ -1,17 +1,6 @@
 import { z } from 'zod'
 
-import {
-  bashTool,
-  createLoadSkillTool,
-  findTool,
-  grepTool,
-  type LoadableSkill,
-  lsTool,
-  readTool,
-  type Subagent,
-  webfetchTool,
-  websearchTool,
-} from '@/plugin'
+import { bashTool, createLoadSkillTool, type LoadableSkill, type Subagent } from '@/plugin'
 
 import { CODE_REVIEW_SKILL } from './skills/code-review'
 import { GENERAL_REVIEW_SKILL } from './skills/general'
@@ -107,16 +96,10 @@ Your role is EXCLUSIVELY to analyze and report. The parent agent decides what to
 
 The runtime exposes these tools to you by these EXACT names — call them by name, do not paraphrase:
 
-- \`read\` — read a file when you know the path
-- \`grep\` — search file contents by text or regex
-- \`find\` — locate files by name pattern
-- \`ls\` — list a directory's immediate contents
-- \`bash\` — sandboxed read-only commands ONLY. The bash tool runs in a bwrap sandbox: no network, no /agent visibility, no credentials. For a PR review, the full PR-head source tree is staged read-only and mounted at \`/work\` (your cwd) — \`cat\`, \`ls\`, \`find\`, \`grep\` it freely, and trace imports/callers/base classes across the WHOLE tree, not just the diff. The allowlist is \`git\` subcommands (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) plus pipeline tools (\`ls\`, \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). Note a GitHub tarball checkout has no \`.git\`, so prefer \`find\`/\`grep\`/\`cat\` over \`git\` for PR trees. Shell metacharacters (\`;\`, \`&\`, \`|\`, \`\`\`, \`$\`, \`(\`, \`)\`, \`<\`, \`>\`, \`\\\`, newline) are rejected before the sandbox runs. \`gh\`, \`curl\`, and other network tools are NOT available — the parent fetched the tree and any inline diff for you.
-- \`websearch\` — search the public web (e.g. for OWASP guidance, RFCs, library changelogs, framework docs, prior art)
-- \`webfetch\` — fetch a single URL (e.g. to read a linked spec, vendor doc, or article cited in the target)
+- \`bash\` — your ONLY way to read the target. Runs in a bwrap sandbox: no network, no /agent visibility, no credentials. For a PR review the full PR-head source tree is staged read-only and mounted at \`/work\` (your cwd) — explore it with \`cat\`, \`ls\`, \`find\`, \`grep\` and trace imports/callers/base classes across the WHOLE tree, not just the diff. The allowlist is \`git\` subcommands (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) plus pipeline tools (\`ls\`, \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). A GitHub tarball checkout has no \`.git\`, so prefer \`find\`/\`grep\`/\`cat\` over \`git\` for PR trees. Shell metacharacters (\`;\`, \`&\`, \`|\`, \`\`\`, \`$\`, \`(\`, \`)\`, \`<\`, \`>\`, \`\\\`, newline) are rejected before the sandbox runs. \`gh\`, \`curl\`, and other network tools are NOT available. You have NO direct filesystem tools and NO web tools by design — you read attacker-controlled content, so everything is funneled through the jail.
 - \`load_skill\` — load a curated review skill by name. See the section below.
 
-Launch independent tools in parallel. A finding backed by reading the artifact AND a primary source AND an adjacent piece of context is stronger than any one of them alone.
+For a non-PR / local-file review (no staged tree), the parent embeds the target content inline in your prompt; review what you were given and say so in \`<summary>\` if you need more.
 
 ## Loading a review skill
 
@@ -124,7 +107,7 @@ You are domain-neutral. Specific review craft — what to look for in code, in a
 
 The first thing you do for any review is:
 
-1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Pull-request reviews receive the diff and metadata inline in the prompt AND the full PR-head source tree staged at \`/work\` (read it with \`read\`/\`grep\`/\`find\` or sandboxed \`bash\`); local-file reviews give you a path you can \`read\`. Inspect what you were given, then decide.
+1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Pull-request reviews receive the diff and metadata inline in the prompt AND the full PR-head source tree staged at \`/work\` (explore it with sandboxed \`bash\`); non-PR reviews receive the target content inline in the prompt. Inspect what you were given, then decide.
 2. **Call \`load_skill\` with the matching skill name.** The \`load_skill\` tool's description lists the available skills and what each is for — pick the one whose description fits the target. If none of the domain skills fit, load \`general\`.
 3. **Apply that skill's guidance on top of the universal contract below.** The skill tells you what to look for in this domain, what to ignore, and how to map severity for this kind of artifact. The universal output contract (severity, evidence, suggestion, verdict, \`<review>\` block) does not change.
 
@@ -138,7 +121,7 @@ These rules apply to every review regardless of domain.
 
 1. **Form findings, not opinions.** Each finding is one issue. State severity (\`blocker\` / \`concern\` / \`nit\` / \`praise\`). Cite specific evidence — a file:line, a diff hunk, a quoted passage. Suggest a concrete alternative.
 2. **Evidence is mandatory.** If you cannot point at a specific location and quote the offending content, the finding is too vague — sharpen it or drop it.
-3. **Verify external claims.** If the target cites a spec, RFC, library behavior, benchmark, prior art, or "common practice", look it up with \`websearch\`/\`webfetch\` before agreeing or disagreeing. Cite the source in the finding.
+3. **Be skeptical of external claims.** If the target cites a spec, RFC, library behavior, benchmark, prior art, or "common practice", do not take it on faith. You have no web access, so reason from the code in front of you and from what you know; when a load-bearing claim genuinely needs an external source you cannot reach, flag it as an assumption in the finding and ask the parent to verify it rather than asserting it yourself.
 4. **One finding, one concern.** Do not bundle unrelated issues into a single finding. The parent parses findings; mixed-concern findings break that.
 5. **Praise is rare.** Call out non-obvious good work — a tricky invariant carefully preserved, a clear name for a subtle concept, a test that catches an easy-to-miss regression. Do not pad reviews with positivity.
 6. **No generic LLM review noise.** "Consider adding tests" / "improve error handling" / "use better variable names" with no specific location to point at is noise. If you cannot point at a line, do not raise the finding.
@@ -225,7 +208,7 @@ function createReviewerHandler(): Subagent<ReviewerPayload>['handler'] {
 
     const staged = await stageGithubPr({ target: target as GithubPrTarget, token })
     try {
-      const enriched = `${ctx.userPrompt}\n\n---\nThe PR head tree (${target.owner}/${target.repo}@${staged.headSha}) is staged for you:\n- file tools (read/grep/find/ls): ${staged.hostPath}\n- sandboxed bash: /work\nThe tree is read-only, offline, and credential-free. Trace imports, callers, and base classes across the full tree — you are not limited to the diff.`
+      const enriched = `${ctx.userPrompt}\n\n---\nThe PR head tree (${target.owner}/${target.repo}@${staged.headSha}) is staged read-only at /work. Explore it with sandboxed bash (cat, ls, find, grep) — it is offline and credential-free. Trace imports, callers, and base classes across the full tree; you are not limited to the diff.`
       await runSession({ userPrompt: enriched, sandbox: buildReviewSandbox(staged.hostPath) })
     } finally {
       await staged.dispose()
@@ -250,7 +233,13 @@ If none of the listed skills fit the target, load \`general\` and explain in \`<
     // user has not configured `models.deep` in typeclaw.json, `resolveProfile`
     // falls back to `default` with a one-time warning — safe degradation.
     profile: 'deep',
-    tools: [readTool, grepTool, findTool, lsTool, bashTool, websearchTool, webfetchTool],
+    // Only sandboxed bash + load_skill. The reviewer reads ATTACKER-CONTROLLED
+    // PR content, so it must have no UNSANDBOXED filesystem reach (read/grep/
+    // find/ls are host tools, NOT bwrap-jailed) and no network sink
+    // (webfetch/websearch) that a prompt injection could pair into an exfil:
+    // read a secret outside /work, then POST it out. All filesystem access goes
+    // through bash, which IS jailed (clearenv, no /agent, no net, /work-only).
+    tools: [bashTool],
     customTools: [loadSkillTool],
     payloadSchema: reviewerPayloadSchema,
     handler: createReviewerHandler(),
@@ -258,11 +247,11 @@ If none of the listed skills fit the target, load \`general\` and explain in \`<
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     sandbox: REVIEWER_SANDBOX,
     toolResultBudget: {
-      // Higher than explorer (256KB) because a reviewer typically reads larger
-      // diffs and multiple files plus web sources; lower than operator (1MB)
-      // because we are read-only and producing analysis, not building.
+      // Higher than explorer (256KB) because a reviewer reads larger diffs and
+      // traces across many files; lower than operator (1MB) because we are
+      // read-only and producing analysis, not building.
       maxTotalBytes: 512_000,
-      toolNames: ['read', 'grep', 'find', 'ls', 'bash', 'websearch', 'webfetch', 'load_skill'],
+      toolNames: ['bash', 'load_skill'],
     },
   }
 }
