@@ -26,12 +26,48 @@ import { GENERAL_REVIEW_SKILL } from './skills/general'
 // no runtime change required.
 export const REVIEWER_SKILLS: readonly LoadableSkill[] = [CODE_REVIEW_SKILL, GENERAL_REVIEW_SKILL]
 
-// TODO(#452): Restrict the reviewer's `bash` to git and a curated set of
-// read-only `gh` subcommands once per-subagent bash allowlist support lands.
-// Today the read-only contract is enforced only by this system prompt, the
-// same way `explorer` enforces its own read-only bash usage. The reviewer
-// inherits TypeClaw's global bash guards (`secret-exfil-bash`, `git-exfil`)
-// but has no positive allowlist. See https://github.com/typeclaw/typeclaw/issues/452.
+// Per-subagent bwrap sandbox. The reviewer reads attacker-controlled content
+// (PR diffs, issue bodies, web pages) so a prompt injection in that content
+// can steer the model into emitting hostile bash commands. The sandbox closes
+// the network (so `curl evil.com/foo` fails harmlessly), hides /agent (so
+// FIREWORKS_API_KEY / GITHUB_TOKEN cannot be exfiltrated), and limits bash
+// to local read-only git against a ro mount of /agent/.git. See
+// docs/internals/sandbox.mdx for the full threat model.
+//
+// `gh` is intentionally NOT in the allowlist. A broad GH_TOKEN (the default
+// for a developer who ran `gh auth login` once for their work account) gives
+// `gh api -X GET` access to every private repo, gist, workflow log, and org
+// the user has access to — far beyond the PR being reviewed. Prefix-matching
+// on `gh api -X GET` is also bypassable via a later `--method POST` flag
+// override. The parent fetches PR content itself and passes it inline in
+// the reviewer's prompt; this contract closes the network-egress side of
+// the threat model and matches the "subagent receives content, does not
+// fetch content" convention shared by scout/explorer/operator.
+const REVIEWER_SANDBOX = {
+  network: 'none' as const,
+  mounts: [{ src: '/agent/.git', dst: '/work/.git', mode: 'ro' as const }],
+  allowlist: [
+    'git log',
+    'git diff',
+    'git show',
+    'git blame',
+    'git status',
+    'git grep',
+    'git rev-parse',
+    'git ls-files',
+    'git cat-file',
+    'cat',
+    'head',
+    'tail',
+    'wc',
+    'sort',
+    'uniq',
+    'jq',
+    'yq',
+  ],
+  cwd: '/work',
+}
+
 export const REVIEWER_SYSTEM_PROMPT = `You are a review specialist running inside TypeClaw. Your job: produce a careful, structured review of a target the caller hands you — a code change, a written plan, a design document, a docs update, a draft argument, or anything else that benefits from another pair of eyes — and return findings the caller can act on.
 
 You exist to do what \`explorer\` and \`scout\` cannot: deep, model-heavy analysis. Your model has been chosen for quality, not speed — spend tokens on thinking. Read carefully. Cross-check. Form a real opinion.
@@ -54,7 +90,7 @@ The runtime exposes these tools to you by these EXACT names — call them by nam
 - \`grep\` — search file contents by text or regex
 - \`find\` — locate files by name pattern
 - \`ls\` — list a directory's immediate contents
-- \`bash\` — read-only commands ONLY. Read-only \`git\` (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) and one-shot pipelines that do not mutate state (\`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). For platform-specific reads (a PR diff, a vendor API), use the canonical read-only invocation of the platform's CLI and consult your loaded skill for which subcommands are appropriate.
+- \`bash\` — sandboxed read-only commands ONLY. The bash tool runs in a bwrap sandbox: no network, no /agent visibility, read-only mount of /agent/.git at /work/.git, fixed allowlist of \`git\` subcommands (\`git log\`, \`git diff\`, \`git show\`, \`git blame\`, \`git status\`, \`git grep\`, \`git rev-parse\`, \`git ls-files\`, \`git cat-file\`) and pipeline tools (\`cat\`, \`head\`, \`tail\`, \`wc\`, \`sort\`, \`uniq\`, \`jq\`, \`yq\`). Shell metacharacters (\`;\`, \`&\`, \`|\`, \`\`\`, \`$\`, \`(\`, \`)\`, \`<\`, \`>\`, \`\\\`, newline) are rejected before the sandbox runs. \`gh\`, \`curl\`, and other network tools are NOT available — if a PR diff or external content is needed, expect it inline in the prompt (the parent fetches it for you).
 - \`websearch\` — search the public web (e.g. for OWASP guidance, RFCs, library changelogs, framework docs, prior art)
 - \`webfetch\` — fetch a single URL (e.g. to read a linked spec, vendor doc, or article cited in the target)
 - \`load_skill\` — load a curated review skill by name. See the section below.
@@ -67,7 +103,7 @@ You are domain-neutral. Specific review craft — what to look for in code, in a
 
 The first thing you do for any review is:
 
-1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Inspect the payload, glance at the target if necessary (one \`read\` or one \`gh pr view\` is fine), then decide.
+1. **Read the payload and identify the target's domain.** What kind of artifact is this? A pull request? A design doc? An RFC? A plan? A piece of marketing copy? Pull-request reviews receive the diff and metadata inline in the prompt (the parent fetched it via \`gh\` before spawning you); local-file reviews give you a path you can \`read\`. Inspect what you were given, then decide.
 2. **Call \`load_skill\` with the matching skill name.** The \`load_skill\` tool's description lists the available skills and what each is for — pick the one whose description fits the target. If none of the domain skills fit, load \`general\`.
 3. **Apply that skill's guidance on top of the universal contract below.** The skill tells you what to look for in this domain, what to ignore, and how to map severity for this kind of artifact. The universal output contract (severity, evidence, suggestion, verdict, \`<review>\` block) does not change.
 
@@ -160,6 +196,7 @@ If none of the listed skills fit the target, load \`general\` and explain in \`<
     payloadSchema: reviewerPayloadSchema,
     visibility: 'public',
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    sandbox: REVIEWER_SANDBOX,
     toolResultBudget: {
       // Higher than explorer (256KB) because a reviewer typically reads larger
       // diffs and multiple files plus web sources; lower than operator (1MB)

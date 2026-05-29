@@ -210,7 +210,11 @@ describe('reviewer skill content', () => {
     expect(lower).toContain('correctness')
     expect(lower).toContain('security')
     expect(lower).toContain('test coverage')
-    expect(lower).toContain('gh pr diff')
+    // Drift guard for the post-#452 contract: bash is sandboxed without
+    // network, so the parent fetches PR content and embeds it in the
+    // prompt — the skill must teach this, not legacy `gh pr diff` calls.
+    expect(lower).toContain('the parent fetched')
+    expect(lower).not.toContain('gh pr diff')
   })
 
   test('general skill body teaches universal review craft (load-bearing audience-fit phrasing)', () => {

@@ -11,13 +11,10 @@ You have been asked to review code. Apply this guidance on top of the reviewer's
 
 ## How to acquire the target
 
-- **PR URL or number** — fetch the diff and the description:
-  - \`gh pr diff <n>\` for the unified diff
-  - \`gh pr view <n>\` for title, body, labels, linked issues, checks
-  - \`gh api /repos/<owner>/<repo>/pulls/<n>\` for the structured payload when you need machine-readable fields
-- **Commit SHA** — \`git show <sha>\` and \`git show <sha> --stat\` for the scope.
+- **PR review** — the parent fetched the diff, title, body, labels, and linked issues before spawning you and embedded them in the prompt. The bash tool runs sandboxed without network access; \`gh\` is not available. If you need additional PR context, ask the parent to fetch it; do not attempt to call \`gh\` yourself.
+- **Commit SHA in this repo** — \`git show <sha>\` and \`git show <sha> --stat\` against the read-only mount of /agent/.git at /work/.git.
 - **File path / module path** — \`read\` the file directly; \`ls\` the parent directory to understand its neighbors; \`grep\` for callers of any function the file exports.
-- **Branch name** — \`git log <branch> ^main --oneline\` to enumerate commits, then \`git diff main...<branch>\` for the cumulative change.
+- **Branch name in this repo** — \`git log <branch> ^main --oneline\` to enumerate commits, then \`git diff main...<branch>\` for the cumulative change. Both run against the local /work/.git mount.
 
 ## How to build context
 
