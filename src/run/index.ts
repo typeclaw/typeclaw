@@ -10,6 +10,7 @@ import {
   defaultCreateSessionForSubagent,
   invokeSubagent,
   isSubagentTimeoutError,
+  overlaySandboxOverride,
   type Subagent as InternalSubagent,
   type SubagentConsumer,
   type SubagentRegistry,
@@ -270,8 +271,16 @@ export async function startAgent({
           // at execute time to pick up the calling subagent's `sandbox`
           // declaration. Read off the current snapshot lazily so plugin
           // reload (which rebuilds the registry but not this closure) is
-          // visible to in-flight tool calls.
-          getSubagentByName: (name) => pluginRuntime.get().subagents[name],
+          // visible to in-flight tool calls. When this spawn supplied a
+          // sandboxOverride, overlay it for THIS subagent only — per-session
+          // isolation, no registry mutation, so concurrent spawns don't race.
+          getSubagentByName: (name) =>
+            overlaySandboxOverride(
+              pluginRuntime.get().subagents[name],
+              name,
+              origin.subagent,
+              subagentOptions?.sandboxOverride,
+            ),
         },
         pluginSubagent: {
           pluginName: entry.pluginName,

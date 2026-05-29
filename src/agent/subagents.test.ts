@@ -9,6 +9,7 @@ import type { AgentSession } from './index'
 import {
   createSubagentConsumer,
   invokeSubagent,
+  overlaySandboxOverride,
   startSubagent,
   type Subagent,
   validateSubagentPayload,
@@ -312,6 +313,97 @@ describe('invokeSubagent', () => {
       }),
     ).rejects.toThrow(/subagent boom/)
     expect(events).toEqual(['end:sub-boom'])
+  })
+
+  test('runSession({sandbox}) threads sandboxOverride into createSessionForSubagent', async () => {
+    // given
+    const seen: Array<true | { mounts?: unknown } | undefined> = []
+    const stagedSandbox = { network: 'none' as const, mounts: [{ src: '/tmp/x', dst: '/work', mode: 'ro' as const }] }
+    const registry = {
+      reviewer: {
+        systemPrompt: 'X',
+        handler: async (_ctx, runSession) => {
+          await runSession({ sandbox: stagedSandbox })
+        },
+      } satisfies Subagent,
+    }
+
+    // when
+    await invokeSubagent('reviewer', {
+      registry,
+      createSessionForSubagent: async (_sub, opts) => {
+        seen.push(opts?.sandboxOverride)
+        return fakeSession().session
+      },
+      agentDir: '/agent',
+      userPrompt: 'review',
+    })
+
+    // then
+    expect(seen).toEqual([stagedSandbox])
+  })
+
+  test('runSession() without sandbox leaves sandboxOverride undefined', async () => {
+    // given
+    const seen: Array<unknown> = []
+    const registry = { plain: { systemPrompt: 'X' } satisfies Subagent }
+
+    // when
+    await invokeSubagent('plain', {
+      registry,
+      createSessionForSubagent: async (_sub, opts) => {
+        seen.push(opts?.sandboxOverride)
+        return fakeSession().session
+      },
+      agentDir: '/agent',
+      userPrompt: 'go',
+    })
+
+    // then
+    expect(seen).toEqual([undefined])
+  })
+})
+
+describe('overlaySandboxOverride', () => {
+  const reviewer: Subagent = { systemPrompt: 'R', sandbox: { network: 'none' } }
+  const explorer: Subagent = { systemPrompt: 'E' }
+
+  test("applies override to the spawn's own subagent", () => {
+    const staged = { network: 'none' as const, mounts: [{ src: '/tmp/r', dst: '/work', mode: 'ro' as const }] }
+    const result = overlaySandboxOverride(reviewer, 'reviewer', 'reviewer', staged)
+    expect(result?.sandbox).toBe(staged)
+  })
+
+  test('does not mutate the shared registry entry', () => {
+    const staged = { network: 'none' as const, mounts: [{ src: '/tmp/r', dst: '/work', mode: 'ro' as const }] }
+    overlaySandboxOverride(reviewer, 'reviewer', 'reviewer', staged)
+    expect(reviewer.sandbox).toEqual({ network: 'none' })
+  })
+
+  test('leaves a different subagent untouched even when an override is set', () => {
+    const staged = { network: 'none' as const }
+    const result = overlaySandboxOverride(explorer, 'explorer', 'reviewer', staged)
+    expect(result).toBe(explorer)
+    expect(result?.sandbox).toBeUndefined()
+  })
+
+  test('returns undefined for a registry miss', () => {
+    expect(overlaySandboxOverride(undefined, 'gone', 'reviewer', { network: 'none' })).toBeUndefined()
+  })
+
+  test('no cross-talk: two overlays from one base resolve to their own sandbox', () => {
+    const s1 = { network: 'none' as const, mounts: [{ src: '/tmp/a', dst: '/work', mode: 'ro' as const }] }
+    const s2 = { network: 'none' as const, mounts: [{ src: '/tmp/b', dst: '/work', mode: 'ro' as const }] }
+    const r1 = overlaySandboxOverride(reviewer, 'reviewer', 'reviewer', s1)
+    const r2 = overlaySandboxOverride(reviewer, 'reviewer', 'reviewer', s2)
+    expect(r1?.sandbox).toBe(s1)
+    expect(r2?.sandbox).toBe(s2)
+    expect(reviewer.sandbox).toEqual({ network: 'none' })
+  })
+
+  test('no override (undefined) returns the entry unchanged', () => {
+    const result = overlaySandboxOverride(reviewer, 'reviewer', 'reviewer', undefined)
+    expect(result).toBe(reviewer)
   })
 })
 

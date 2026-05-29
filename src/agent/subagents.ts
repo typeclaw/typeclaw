@@ -18,7 +18,7 @@ export type SubagentContext<P = unknown> = {
   payload: P
 }
 
-export type RunSession = (override?: { userPrompt?: string }) => Promise<void>
+export type RunSession = (override?: { userPrompt?: string; sandbox?: true | SandboxOptions }) => Promise<void>
 
 // Fields shared verbatim between the plugin-author-facing `Subagent` in
 // `@/plugin/types` and the runtime-internal `Subagent` below. Every consumer
@@ -113,6 +113,23 @@ export type Subagent<P = unknown> = SubagentShared<P> & {
 
 export type SubagentRegistry = Readonly<Record<string, Subagent<any>>>
 
+// Overlay a per-session sandbox override onto a registry lookup result without
+// mutating the shared registry entry. Applies only when the looked-up name is
+// the spawn's own subagent, so concurrent spawns of the same subagent stay
+// isolated. Used by the bash-tool wrapper's getSubagentByName at execute time.
+export function overlaySandboxOverride<P>(
+  current: Subagent<P> | undefined,
+  lookupName: string,
+  overrideForName: string,
+  sandboxOverride: true | SandboxOptions | undefined,
+): Subagent<P> | undefined {
+  if (current === undefined) return undefined
+  if (lookupName === overrideForName && sandboxOverride !== undefined) {
+    return { ...current, sandbox: sandboxOverride }
+  }
+  return current
+}
+
 // Validate payload against the subagent's schema. Strict: when no schema is
 // declared, a non-undefined payload is rejected to prevent silent drops of
 // caller intent.
@@ -150,6 +167,11 @@ export type CreateSessionForSubagentOptions = {
   parentSessionId?: string
   spawnedByRole?: string
   spawnedByOrigin?: SessionOrigin
+  // Per-spawn sandbox, overriding the subagent's static `sandbox`. Scoped to
+  // this one session so concurrent spawns of the same subagent (e.g. reviewer
+  // staging different PR trees) get isolated mounts without mutating the
+  // shared registry entry.
+  sandboxOverride?: true | SandboxOptions
 }
 export type CreateSessionForSubagent = (
   subagent: Subagent<any>,
@@ -242,8 +264,10 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
   }
 
   const runSession: RunSession = async (override) => {
+    const sessionOptionsForRun: CreateSessionForSubagentOptions =
+      override?.sandbox !== undefined ? { ...sessionOptions, sandboxOverride: override.sandbox } : sessionOptions
     const { session, dispose, hooks, sessionId, agentDir, origin, getTranscriptPath } = normalizeSubagentSession(
-      await createSessionForSubagent(subagent, sessionOptions),
+      await createSessionForSubagent(subagent, sessionOptionsForRun),
     )
     if (options.onSessionCreated !== undefined) {
       options.onSessionCreated({

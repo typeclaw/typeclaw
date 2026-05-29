@@ -84,6 +84,16 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
             'Use background mode for long-running tasks where you want to keep the conversation moving (Mode B) or for parallel fan-out (Mode A).',
         }),
       ),
+      payload: Type.Optional(
+        Type.Object(
+          {},
+          {
+            additionalProperties: true,
+            description:
+              'Structured data passed to the subagent in addition to the prompt, validated against the subagent\'s payload schema. Example: a reviewer accepts { reviewTarget: { kind: "github-pr", owner, repo, pullNumber } }. The reserved keys requestId/prompt/description are always set by the runtime and cannot be overridden here.',
+          },
+        ),
+      ),
     }),
 
     async execute(_toolCallId, params): Promise<ToolReturn> {
@@ -99,8 +109,15 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       const taskId = generateTaskId()
       const subagentName = params.subagent_type
       const background = params.run_in_background === true
-      const payload: Record<string, unknown> = { requestId: taskId, prompt: params.prompt }
-      if (params.description !== undefined) payload.description = params.description
+      const callerPayload =
+        typeof params.payload === 'object' && params.payload !== null && !Array.isArray(params.payload)
+          ? (params.payload as Record<string, unknown>)
+          : {}
+      const reserved: Record<string, unknown> = { requestId: taskId, prompt: params.prompt }
+      if (params.description !== undefined) reserved.description = params.description
+      // Reserved spread LAST so a prompt-injected payload.requestId/prompt cannot
+      // hijack the runtime-owned fields the spawn machinery and live registry rely on.
+      const payload: Record<string, unknown> = { ...callerPayload, ...reserved }
 
       const startedAt = now()
       const { handle, completion } = startSubagent(subagentName, {

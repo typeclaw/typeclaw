@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import { z } from 'zod'
+
 import type { PermissionService } from '@/permissions'
 import { createStream } from '@/stream'
 
@@ -453,5 +455,102 @@ describe('createSpawnSubagentTool — concurrency', () => {
     resolveA()
     resolveB()
     await new Promise((r) => setImmediate(r))
+  })
+})
+
+describe('createSpawnSubagentTool — structured payload forwarding', () => {
+  function reviewerLikeRegistry(captured: { payload?: unknown }): SubagentRegistry {
+    const reviewerLike: Subagent<{ requestId?: string; prompt?: string; reviewTarget?: unknown }> = {
+      systemPrompt: 'You review.',
+      visibility: 'public',
+      payloadSchema: z
+        .object({
+          requestId: z.string().optional(),
+          prompt: z.string().optional(),
+          description: z.string().optional(),
+          reviewTarget: z.unknown().optional(),
+        })
+        .passthrough(),
+      handler: async (toolCtx, runSession) => {
+        captured.payload = toolCtx.payload
+        await runSession()
+      },
+    }
+    return { reviewer: reviewerLike }
+  }
+
+  test('forwards caller payload fields (reviewTarget) to the subagent', async () => {
+    const captured: { payload?: unknown } = {}
+    const { tool } = fixedSpawn({
+      createSession: async () => stubSession(),
+      registry: reviewerLikeRegistry(captured),
+    })
+
+    await tool.execute(
+      'call_1',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        payload: { reviewTarget: { kind: 'github-pr', owner: 'o', repo: 'r', pullNumber: 7 } },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect((captured.payload as { reviewTarget?: unknown }).reviewTarget).toEqual({
+      kind: 'github-pr',
+      owner: 'o',
+      repo: 'r',
+      pullNumber: 7,
+    })
+  })
+
+  test('reserved keys win: caller cannot override requestId or prompt', async () => {
+    const captured: { payload?: unknown } = {}
+    const { tool } = fixedSpawn({
+      createSession: async () => stubSession(),
+      registry: reviewerLikeRegistry(captured),
+    })
+
+    await tool.execute(
+      'call_1',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'real prompt',
+        payload: { requestId: 'EVIL', prompt: 'EVIL' },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    const payload = captured.payload as { requestId?: string; prompt?: string }
+    expect(payload.requestId).toBe('bg_test1')
+    expect(payload.prompt).toBe('real prompt')
+  })
+
+  test('strict (non-passthrough) schema rejects unknown caller payload field', async () => {
+    const strictSub: Subagent<{ requestId?: string; prompt?: string }> = {
+      systemPrompt: 'strict',
+      visibility: 'public',
+      payloadSchema: z.object({ requestId: z.string().optional(), prompt: z.string().optional() }).strict(),
+    }
+    const { tool } = fixedSpawn({
+      createSession: async () => stubSession(),
+      registry: { strict: strictSub },
+    })
+
+    const result = await tool.execute(
+      'call_1',
+      { subagent_type: 'strict', prompt: 'q', payload: { bogus: 'nope' } },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    const details = result.details as { ok: boolean; error?: string }
+    expect(details.ok).toBe(false)
+    expect(details.error ?? '').toMatch(/invalid payload/i)
   })
 })
