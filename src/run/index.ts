@@ -294,6 +294,9 @@ export async function startAgent({
         ...(entry.pluginSubagent.toolResultBudget !== undefined
           ? { toolResultBudget: entry.pluginSubagent.toolResultBudget }
           : {}),
+        ...(entry.pluginSubagent.sandboxPolicy !== undefined
+          ? { sandboxPolicy: entry.pluginSubagent.sandboxPolicy }
+          : {}),
         ...runtimeVersionOpt,
       })
       liveSessionRegistry.register({ sessionId, session: created.session })

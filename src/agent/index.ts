@@ -20,6 +20,7 @@ import type {
 } from '@/plugin'
 import { materializeSkills } from '@/plugin'
 import type { ReloadRegistry } from '@/reload'
+import type { SandboxPolicy } from '@/sandbox'
 import type { Stream } from '@/stream'
 
 import { getAuthFor } from './auth'
@@ -177,6 +178,11 @@ export type CreateSessionOptions = {
   liveSubagentRegistry?: LiveSubagentRegistry
   subagentRegistry?: SubagentRegistry
   createSessionForSubagent?: CreateSessionForSubagent
+  // bwrap sandbox policy for this session's `bash` builtin override. Threaded
+  // from a subagent's `sandboxPolicy` declaration; when present, the bash
+  // command is wrapped via `buildSandboxedCommand` inside the customTools
+  // override path. See `SubagentShared.sandboxPolicy`.
+  sandboxPolicy?: SandboxPolicy
 }
 
 export type CreateSessionResult = {
@@ -335,6 +341,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           sessionId: options.plugins.sessionId,
           hooks: options.plugins.hooks,
           getOrigin,
+          ...(options.sandboxPolicy !== undefined ? { sandboxPolicy: options.sandboxPolicy } : {}),
         })
       : []
   const wrappedCustomSystemTools = wrapSystemTools(customSystemTools, options.plugins, getOrigin)

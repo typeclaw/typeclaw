@@ -1209,3 +1209,106 @@ describe('loop guard integration', () => {
     expect(bFirst.isError).not.toBe(true)
   })
 })
+
+describe('bash sandbox policy', () => {
+  function bashSpy(captured: { command?: unknown }) {
+    return {
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute(_callId: string, params: { command: string }) {
+        captured.command = params.command
+        return { content: [{ type: 'text' as const, text: 'ok' }], details: undefined }
+      },
+    }
+  }
+
+  test('rewrites the bash command through bwrap when a policy is present', async () => {
+    // given: a bash tool wrapped with a sandbox policy
+    const captured: { command?: unknown } = {}
+    const wrapped = wrapAgentToolAsCustomToolDefinition(bashSpy(captured), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks: createHookBus(),
+      sandboxPolicy: {
+        cwd: '/agent',
+        network: 'inherit',
+        mounts: [{ type: 'ro-bind', source: '/agent', dest: '/agent' }],
+      },
+    })
+
+    // when: the model runs `git status`
+    await wrapped.execute('c', { command: 'git status' }, undefined, undefined, {} as never)
+
+    // then: pi's bash receives a bwrap-wrapped command, not the raw one
+    const rewritten = captured.command as string
+    expect(rewritten).not.toBe('git status')
+    expect(rewritten.startsWith('bwrap ')).toBe(true)
+    expect(rewritten).toContain('--unshare-all')
+    expect(rewritten).toContain('--share-net')
+    expect(rewritten).toContain("bash -c 'git status'")
+  })
+
+  test('leaves the bash command untouched when no policy is set', async () => {
+    const captured: { command?: unknown } = {}
+    const wrapped = wrapAgentToolAsCustomToolDefinition(bashSpy(captured), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks: createHookBus(),
+    })
+
+    await wrapped.execute('c', { command: 'git status' }, undefined, undefined, {} as never)
+
+    expect(captured.command).toBe('git status')
+  })
+
+  test('does not sandbox non-bash tools even when a policy is present', async () => {
+    const captured: { path?: unknown } = {}
+    const readSpy = {
+      name: 'read',
+      label: 'read',
+      description: '',
+      parameters: Type.Object({ path: Type.String() }),
+      async execute(_callId: string, params: { path: string }) {
+        captured.path = params.path
+        return { content: [{ type: 'text' as const, text: 'ok' }], details: undefined }
+      },
+    }
+    const wrapped = wrapAgentToolAsCustomToolDefinition(readSpy, {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks: createHookBus(),
+      sandboxPolicy: { cwd: '/agent' },
+    })
+
+    await wrapped.execute('c', { path: '/agent/file.ts' }, undefined, undefined, {} as never)
+
+    expect(captured.path).toBe('/agent/file.ts')
+  })
+
+  test('tool.before guards see the raw command, not the bwrap argv', async () => {
+    // given: a tool.before hook recording the command it inspects
+    const seen: unknown[] = []
+    const captured: { command?: unknown } = {}
+    const hooks = createHookBus()
+    hooks.registerAll('p1', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        seen.push(event.args.command)
+      },
+    })
+    const wrapped = wrapAgentToolAsCustomToolDefinition(bashSpy(captured), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks,
+      sandboxPolicy: { cwd: '/agent' },
+    })
+
+    // when: a command runs under the sandbox
+    await wrapped.execute('c', { command: 'git diff' }, undefined, undefined, {} as never)
+
+    // then: the guard saw the operator command; only the executed arg is wrapped
+    expect(seen[0]).toBe('git diff')
+    expect(captured.command as string).toContain("bash -c 'git diff'")
+  })
+})

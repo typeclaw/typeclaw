@@ -30,6 +30,7 @@ import type {
   ToolContext,
   ToolResult,
 } from '@/plugin'
+import { buildSandboxedCommand, type SandboxPolicy } from '@/sandbox'
 
 import { createLoopGuard, type LoopGuard } from './loop-guard'
 import { checkImageReadRedirect } from './multimodal/read-redirect'
@@ -134,6 +135,11 @@ export type WrapSystemToolOptions = {
   sessionId: string
   hooks: HookBus
   getOrigin?: () => SessionOrigin | undefined
+  // When set, the `bash` builtin override rewrites its `command` argument into
+  // a bwrap-wrapped invocation via `buildSandboxedCommand`. Applied only to
+  // the `bash` tool and only after `tool.before` guards have inspected the
+  // raw command. Other tools ignore it. See `SubagentShared.sandboxPolicy`.
+  sandboxPolicy?: SandboxPolicy
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
@@ -392,6 +398,7 @@ export function wrapAgentToolAsCustomToolDefinition<TParams extends TSchema, TDe
         throw new Error(`blocked: ${readGuardResult.reason}`)
       }
       stripGuardAcknowledgements(mutableArgs)
+      applyBashSandbox(tool.name, mutableArgs, opts.sandboxPolicy)
 
       const result = await tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate)
       const hookResult: ToolResult = {
@@ -415,6 +422,25 @@ export function wrapAgentToolAsCustomToolDefinition<TParams extends TSchema, TDe
       }
     },
   })
+}
+
+// Rewrites the `bash` tool's `command` argument into a bwrap-wrapped shell
+// string when a sandbox policy is present. Runs after `tool.before` guards so
+// `secret-exfil-bash`/`git-exfil` inspect the operator-authored command, not
+// the bwrap argv. pi's bash tool runs `bash -c <command>`, and
+// `buildSandboxedCommand` returns an argv ending in `bash -c <orig>`; feeding
+// the quoted argv back as the new `command` yields one clean extra wrapping
+// layer with no double-execution of the original. No-op for non-bash tools or
+// when the command is absent/non-string.
+function applyBashSandbox(
+  toolName: string,
+  args: Record<string, unknown>,
+  sandboxPolicy: SandboxPolicy | undefined,
+): void {
+  if (sandboxPolicy === undefined || toolName !== 'bash') return
+  const command = args.command
+  if (typeof command !== 'string') return
+  args.command = buildSandboxedCommand(command, sandboxPolicy).commandString
 }
 
 export function defaultBuiltinPiAgentTools(): AgentTool<any, any>[] {

@@ -2,6 +2,7 @@ import type { ToolDefinition } from '@mariozechner/pi-coding-agent'
 import type { z } from 'zod'
 
 import type { HookBus } from '@/plugin'
+import type { SandboxPolicy } from '@/sandbox'
 import type { Stream, Unsubscribe } from '@/stream'
 
 import { type AgentSession, createSession } from './index'
@@ -63,6 +64,15 @@ export type SubagentShared<P = unknown> = {
   // hangs" symptom. Omit for no ceiling (legacy behavior; the spawn waits
   // as long as the provider takes).
   timeoutMs?: number
+  // bwrap sandbox policy applied to this subagent's `bash` commands, wrapped
+  // after `tool.before` guards inspect the raw command and before
+  // pi-coding-agent executes it. Opt-in security boundary, not a visibility
+  // knob: declared by subagents that ingest attacker-controllable input (PR
+  // diffs, fetched web content). Absence is the trusted default — internally
+  // triggered subagents (memory-logger, dreaming, memory-retrieval) operate on
+  // the agent's own transcripts and omit it. Deliberately decoupled from
+  // `visibility`. See docs/internals/sandbox.mdx.
+  sandboxPolicy?: SandboxPolicy
 }
 
 export type Subagent<P = unknown> = SubagentShared<P> & {
@@ -129,6 +139,7 @@ export const defaultCreateSessionForSubagent: CreateSessionForSubagent = (subage
     customTools: subagent.customTools ?? [],
     ...(subagent.profile !== undefined ? { profile: subagent.profile } : {}),
     ...(subagent.toolResultBudget !== undefined ? { toolResultBudget: subagent.toolResultBudget } : {}),
+    ...(subagent.sandboxPolicy !== undefined ? { sandboxPolicy: subagent.sandboxPolicy } : {}),
   })
 
 type NormalizedSubagentSession = {
