@@ -75,14 +75,16 @@ describe('applySubagentSandbox — no-op cases', () => {
     expect(args.command).toBe('cat /agent/.env')
   })
 
-  test('unknown subagent name (registry miss) is unaffected', async () => {
+  test('unknown subagent name (registry miss for a subagent-origin call) fails closed', async () => {
     const args = { command: 'cat /agent/.env' }
-    await applySubagentSandbox({
+    const promise = applySubagentSandbox({
       tool: 'bash',
       args,
       origin: SUBAGENT_ORIGIN,
       getSubagentByName: () => undefined,
     })
+    await expect(promise).rejects.toBeInstanceOf(SandboxBlockedError)
+    await expect(promise).rejects.toThrow(/not in the registry/)
     expect(args.command).toBe('cat /agent/.env')
   })
 
