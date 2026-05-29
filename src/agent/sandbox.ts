@@ -40,16 +40,29 @@ export type ApplySandboxOptions = {
 }
 
 // Rewrites args.command in place when the calling subagent declares a
-// sandbox. No-op for non-bash tools, non-subagent origins, and subagents
-// without a sandbox config. Throws SandboxBlockedError on allowlist or
-// metachar rejection; throws SandboxUnavailableError if bwrap is missing
-// (fail-closed — never falls through to unsandboxed execution because the
-// subagent explicitly opted in to sandboxing).
+// sandbox. No-op for non-bash tools, non-subagent origins, and resolved
+// subagents that intentionally have no sandbox config. Throws
+// SandboxBlockedError on allowlist or metachar rejection, on an unresolvable
+// subagent name (fail-closed — see below), and on a non-string command.
+// Throws SandboxUnavailableError if bwrap is missing (also fail-closed).
+//
+// The unresolvable-subagent path is deliberate. If `origin.kind === 'subagent'`
+// but the registry lookup returns undefined, sandbox enforcement would
+// otherwise depend on wiring being perfect — a typo, a registry-rebuild
+// race during plugin reload, or a missing entry would silently bypass the
+// sandbox for a subagent that should be running inside one. We fail closed
+// instead: callers see a clear block, the model retries or escalates, and
+// silent escape is impossible.
 export async function applySubagentSandbox(opts: ApplySandboxOptions): Promise<void> {
   if (opts.tool !== 'bash') return
   if (opts.origin?.kind !== 'subagent') return
   const subagent = opts.getSubagentByName(opts.origin.subagent)
-  if (!subagent?.sandbox) return
+  if (subagent === undefined) {
+    throw new SandboxBlockedError(
+      `subagent "${opts.origin.subagent}" is not in the registry; refusing to execute bash for an unresolvable subagent origin`,
+    )
+  }
+  if (!subagent.sandbox) return
 
   const cfg: SandboxOptions = subagent.sandbox === true ? {} : subagent.sandbox
   const command = opts.args.command
