@@ -37,9 +37,25 @@ Why delegate: the `reviewer` subagent runs on the `deep` model profile, loads a 
    gh pr view <N> --repo owner/repo --json title,body,baseRefName,headRefOid,files
    ```
 
-2. **Spawn the `reviewer` subagent with the PR target.** Use `run_in_background: true` so you stay responsive while the deep model works. Pass the PR URL (or `owner/repo#N`) plus any context the requester gave you (focus areas, specific files, etc.) so the reviewer knows what the requester cares about.
+2. **Fetch the diff and metadata, then spawn the `reviewer` with a structured `reviewTarget` payload.** The reviewer is sandboxed (no network, no credentials) and cannot call `gh` — YOU fetch the PR content, and the runtime stages the PR-head source tree for the reviewer. Use `run_in_background: true` so you stay responsive while the deep model works.
 
-   The reviewer will fetch the diff itself (`gh pr diff`, `gh api /repos/.../pulls/<n>`), load the matching skill (`code-review` for a code PR; `general` for a mixed-format change), and return a `<review>` block.
+   ```sh
+   gh pr diff <N> --repo owner/repo            # the unified diff to embed in the prompt
+   ```
+
+   Spawn with the structured payload so the runtime can stage the tree credential-blind:
+
+   ```json
+   {
+     "subagent_type": "reviewer",
+     "prompt": "<requester context + the gh pr diff output inline>",
+     "payload": {
+       "reviewTarget": { "kind": "github-pr", "owner": "owner", "repo": "repo", "pullNumber": <N>, "headSha": "<headRefOid>" }
+     }
+   }
+   ```
+
+   The runtime fetches the PR-head tarball and mounts it read-only at `/work` for the reviewer (no `gh`/network/token in the reviewer). The reviewer reads the inline diff for WHAT changed and traces the full staged tree for WHY, loads the matching skill (`code-review` for a code PR; `general` for a mixed-format change), and returns a `<review>` block.
 
 3. **Wait for the completion `<system-reminder>`,** then call `subagent_output({ task_id })` to read the reviewer's final assistant message. The structured payload looks like:
 
@@ -95,7 +111,7 @@ Why delegate: the `reviewer` subagent runs on the `deep` model profile, loads a 
 - **Preserve the reviewer's wording.** Inline comment bodies should reflect the reviewer's `<issue>`, `<evidence>`, and `<suggestion>` verbatim (modulo markdown formatting). Paraphrasing dilutes the analysis — the deep-model reviewer chose those words on purpose.
 - `line` is a line number **in the file**, not a position in the diff. `side: RIGHT` is the new revision (default for additions); `side: LEFT` is the old revision (use for comments on removed lines).
 - For multi-line comments, also set `start_line` and `start_side` (same semantics).
-- If you need to read whole files at the PR's head SHA, use `gh api /repos/owner/repo/contents/<path>?ref=<headRefOid>`. The reviewer can do this itself, but you may need to as well — e.g., when validating a finding's `location` against the actual file before posting.
+- If you need to read whole files at the PR's head SHA, use `gh api /repos/owner/repo/contents/<path>?ref=<headRefOid>` — e.g., when validating a finding's `location` against the actual file before posting. The reviewer cannot do this (it has no `gh`/network); it reads the staged `/work` tree instead.
 - The bundled `agent-browser` is **not** for PR reviews — `gh api` is faster and more reliable. Only use the browser when the API genuinely can't reach what you need.
 - A `review_request_removed` event means the requester un-assigned you. Cancel any in-flight reviewer subagent (`subagent_cancel`) and do not post a partial review.
 

@@ -11,10 +11,8 @@ You have been asked to review code. Apply this guidance on top of the reviewer's
 
 ## How to acquire the target
 
-- **PR review** — the parent fetched the diff, title, body, labels, and linked issues before spawning you and embedded them in the prompt. The bash tool runs sandboxed without network access; \`gh\` is not available. If you need additional PR context, ask the parent to fetch it; do not attempt to call \`gh\` yourself.
-- **Commit SHA in this repo** — \`git show <sha>\` and \`git show <sha> --stat\` against the read-only mount of /agent/.git at /work/.git.
+- **PR review** — the parent fetched the diff, title, body, labels, and linked issues before spawning you and embedded them in the prompt, AND staged the full PR-head source tree read-only at \`/work\` (your bash cwd; also readable via \`read\`/\`grep\`/\`find\` at the absolute path named in the prompt). Use the diff to see WHAT changed; use the staged tree to trace WHY — follow imports, read the callers of a changed function, open the base class a changed method overrides. You are NOT limited to the diff. The bash tool runs sandboxed without network access and without credentials; \`gh\` is not available. A GitHub tarball checkout has no \`.git\`, so use \`find\`/\`grep\`/\`cat\` (not \`git log\`/\`git diff\`) to explore the staged tree. If you need PR context that is neither in the prompt nor in the staged tree, ask the parent to fetch it; do not attempt to call \`gh\` yourself.
 - **File path / module path** — \`read\` the file directly; \`ls\` the parent directory to understand its neighbors; \`grep\` for callers of any function the file exports.
-- **Branch name in this repo** — \`git log <branch> ^main --oneline\` to enumerate commits, then \`git diff main...<branch>\` for the cumulative change. Both run against the local /work/.git mount.
 
 ## How to build context
 
