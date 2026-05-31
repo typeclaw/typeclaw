@@ -37,6 +37,7 @@ import {
   type Scheduler,
 } from '@/cron'
 import { CLI_VERSION } from '@/init/cli-version'
+import { createMcpManager } from '@/mcp'
 import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistry, summarizeLoaded } from '@/plugin'
 import { createPluginLogger } from '@/plugin/context'
 import type { CronHandlerContext } from '@/plugin/types'
@@ -138,6 +139,15 @@ export async function startAgent({
 
   const pluginConfigsByName = loadPluginConfigsSync(cwd)
   const cwdConfig = loadConfigSync(cwd)
+  const mcpManager =
+    cwdConfig.mcpServers.length > 0 ? createMcpManager(cwdConfig.mcpServers, { env: process.env }) : null
+  if (mcpManager !== null) {
+    const results = await mcpManager.connectAll()
+    for (const result of results) {
+      if (!result.ok) console.warn(`[mcp] ${result.name} failed to connect: ${result.error.message}`)
+    }
+  }
+  const mcpManagerOpt = mcpManager !== null ? { mcpManager } : {}
   const pluginsLoaded = await loadPlugins({
     entries: cwdConfig.plugins,
     agentDir: cwd,
@@ -252,6 +262,7 @@ export async function startAgent({
       getCreateSessionForSubagent: () => createSessionForSubagent,
       ...containerNameOpt,
       ...runtimeVersionOpt,
+      ...mcpManagerOpt,
     }),
     permissions: pluginsLoaded.permissions,
     claimHandler: claimController.claimHandler,
@@ -372,6 +383,7 @@ export async function startAgent({
             containerName: containerNameOpt.containerName,
             sessionFactory,
             channelRouter: channelManager.router,
+            ...mcpManagerOpt,
           }),
         subagent: (subName: string, payload?: unknown) =>
           dispatchSpawnSubagent(subName, payload, {
@@ -420,6 +432,7 @@ export async function startAgent({
         createSessionForSubagent,
         ...containerNameOpt,
         ...runtimeVersionOpt,
+        ...mcpManagerOpt,
       })
       liveSessionRegistry.register({ sessionId, session })
       return {
@@ -587,6 +600,7 @@ export async function startAgent({
       outbound,
       sessionFactory,
       channelRouter: channelManager.router,
+      ...mcpManagerOpt,
     })
 
   const server = createServer({
@@ -596,6 +610,7 @@ export async function startAgent({
     sessionFactory,
     stream,
     channelRouter: channelManager.router,
+    ...mcpManagerOpt,
     agentDir: cwd,
     pluginRuntime,
     claimController,
@@ -630,6 +645,7 @@ export async function startAgent({
     subagentCompletionBridge.stop()
     await tunnelManager.stop()
     await channelManager.stop()
+    await mcpManager?.closeAll()
     uninstallCodexFetchObserver()
   }
 

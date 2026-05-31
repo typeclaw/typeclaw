@@ -18,6 +18,7 @@ import { parseSubagentCompletedPayload, renderSubagentCompletionReminder } from 
 import type { CreateSessionForSubagent } from '@/agent/subagents'
 import type { ChannelRouter } from '@/channels/router'
 import { aggregateCronList, type CronListEntry, loadCron } from '@/cron'
+import type { McpManager } from '@/mcp'
 import type { HookBus } from '@/plugin'
 import type { BrokerWsData, ContainerBroker } from '@/portbroker'
 import type { ReloadAllResult, ReloadRegistry } from '@/reload'
@@ -60,6 +61,7 @@ export type ServerOptions = {
   sessionFactory?: SessionFactory
   stream?: Stream
   channelRouter?: ChannelRouter
+  mcpManager?: McpManager
   agentDir?: string
   pluginRuntime?: PluginRuntime
   containerName?: string
@@ -220,6 +222,7 @@ export function createServer({
   sessionFactory,
   stream,
   channelRouter,
+  mcpManager,
   agentDir,
   pluginRuntime,
   containerName,
@@ -470,6 +473,7 @@ export function createServer({
               origin,
               ...(stream ? { stream } : {}),
               ...(channelRouter ? { channelRouter } : {}),
+              ...(mcpManager ? { mcpManager } : {}),
               ...(pluginsWiring ? { plugins: pluginsWiring } : {}),
               ...(containerName !== undefined ? { containerName } : {}),
               ...(runtimeVersion !== undefined ? { runtimeVersion } : {}),

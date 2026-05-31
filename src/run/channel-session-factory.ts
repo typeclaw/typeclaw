@@ -7,6 +7,7 @@ import type { CreateSessionForSubagent, SubagentRegistry } from '@/agent/subagen
 import { capJsonlFileInPlace } from '@/bundled-plugins/tool-result-cap/cap-jsonl'
 import type { CapOptions } from '@/bundled-plugins/tool-result-cap/cap-result'
 import type { CreateSessionForChannel, ChannelRouter } from '@/channels'
+import type { McpManager } from '@/mcp'
 import type { PermissionService, RolesConfig } from '@/permissions'
 import type { ReloadRegistry } from '@/reload'
 import type { SessionFactory } from '@/sessions'
@@ -35,6 +36,7 @@ export type BuildChannelSessionFactoryDeps = {
   // cycle while still ensuring the factory's sessions get the same router
   // their inbound messages came from.
   getChannelRouter: () => ChannelRouter
+  mcpManager?: McpManager
   containerName?: string
   runtimeVersion?: string
   // When set, rehydrating a session JSONL caps oversized tool results in the
@@ -113,6 +115,7 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
       sessionManager,
       stream: deps.stream,
       channelRouter: deps.getChannelRouter(),
+      ...(deps.mcpManager !== undefined ? { mcpManager: deps.mcpManager } : {}),
       origin,
       originRef,
       ...(snap.hasAnyPluginContent

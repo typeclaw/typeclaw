@@ -274,6 +274,25 @@ describe('createResourceLoader', () => {
     expect(prompt).not.toContain('Session started at')
   })
 
+  test('composeSystemPrompt places MCP catalog after origin and before memory', () => {
+    const catalog = '## MCP servers\n\n- files (2 tools): Filesystem tools'
+    const prompt = composeSystemPrompt({
+      self: '# Identity\n\nfoo',
+      origin: { kind: 'tui', sessionId: 'ses_test' },
+      mcpCatalog: catalog,
+      gitNudge: '',
+      memorySection: '## Memory\n\nmemory-marker',
+    })
+
+    const originIndex = prompt.indexOf('## Session origin')
+    const catalogIndex = prompt.indexOf(catalog)
+    const memoryIndex = prompt.indexOf('memory-marker')
+
+    expect(originIndex).toBeGreaterThan(-1)
+    expect(catalogIndex).toBeGreaterThan(originIndex)
+    expect(memoryIndex).toBeGreaterThan(catalogIndex)
+  })
+
   test('memory section is NOT visible to plugin session.prompt hooks (intentional: memory injection is core-owned and runs after all plugin hooks)', async () => {
     // The security plugin's applyPromptInjectionDefense scans `event.prompt`
     // for attack patterns during the session.prompt hook chain. After this PR

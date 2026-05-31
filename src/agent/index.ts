@@ -2,13 +2,21 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createAgentSession, DefaultResourceLoader, SessionManager } from '@mariozechner/pi-coding-agent'
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  defineTool as definePiTool,
+  SessionManager,
+} from '@mariozechner/pi-coding-agent'
 import type { AgentSession, ToolDefinition } from '@mariozechner/pi-coding-agent'
 
 import { loadMemory } from '@/bundled-plugins/memory/load-memory'
 import type { ChannelRouter } from '@/channels/router'
 import { getConfig, resolveModel, resolveProfile } from '@/config'
 import { defaultThinkingLevelForRef, providerForModelRef, type KnownModelRef } from '@/config/providers'
+import { renderMcpCatalog } from '@/mcp/catalog'
+import type { McpManager } from '@/mcp/manager'
+import { createMcpDispatcherTools, MCP_DISPATCHER_TOOL_NAMES } from '@/mcp/tools'
 import type { PermissionService, RolesConfig } from '@/permissions'
 import type {
   BuiltinToolRef,
@@ -33,6 +41,7 @@ import {
   wrapPluginTool,
   wrapSystemAgentTool,
   wrapSystemTool,
+  zodToToolParameters,
 } from './plugin-tools'
 import { createReloadTool } from './reload-tool'
 import { loadSelf } from './self'
@@ -96,6 +105,7 @@ export type CreateSessionOptions = {
   sessionManager?: SessionManager
   stream?: Stream
   channelRouter?: ChannelRouter
+  mcpManager?: McpManager
   // Bypass the file-based resource loader (IDENTITY.md, SOUL.md, MEMORY.md,
   // memory/, bundled skills) and use this string verbatim as the system prompt.
   systemPromptOverride?: string
@@ -230,6 +240,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           ...(options.origin ? { origin: options.origin } : {}),
           ...(options.permissions ? { permissions: options.permissions } : {}),
           ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
+          ...(options.mcpManager !== undefined ? { mcpManager: options.mcpManager } : {}),
         })
 
   const getOrigin: () => SessionOrigin | undefined =
@@ -305,6 +316,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
             websearchTool,
             webfetchTool,
             lookAtTool,
+            ...(options.mcpManager ? buildMcpDispatcherToolDefinitions(options.mcpManager) : []),
             ...(options.reloadRegistry ? [createReloadTool({ registry: options.reloadRegistry })] : []),
             ...(options.stream ? [createStreamSnapshotTool({ stream: options.stream })] : []),
             ...buildChannelTools(options.channelRouter, options.origin, sessionManager.getSessionId()),
@@ -547,6 +559,40 @@ export function buildChannelTools(
   return tools
 }
 
+export function buildMcpDispatcherToolDefinitions(manager: McpManager): ToolDefinition[] {
+  const tools = createMcpDispatcherTools(manager)
+  return [
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[0], tools[0]),
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[1], tools[1]),
+    defineMcpDispatcherTool(MCP_DISPATCHER_TOOL_NAMES[2], tools[2]),
+  ]
+}
+
+function defineMcpDispatcherTool<P>(name: string, tool: PluginTool<P>): ToolDefinition {
+  return definePiTool({
+    name,
+    label: name,
+    description: tool.description,
+    parameters: zodToToolParameters(tool.parameters),
+    async execute(_toolCallId, params, signal) {
+      const validated = tool.parameters.safeParse(params)
+      if (!validated.success) {
+        return {
+          content: [{ type: 'text' as const, text: `invalid arguments: ${validated.error.message}` }],
+          details: null,
+        }
+      }
+      const result = await tool.execute(validated.data, {
+        signal,
+        sessionId: 'mcp-dispatcher',
+        agentDir: process.cwd(),
+        logger: { info() {}, warn() {}, error() {} },
+      })
+      return { content: result.content, details: result.details ?? null }
+    },
+  })
+}
+
 export function buildSubagentOrchestrationTools(opts: {
   liveRegistry: LiveSubagentRegistry | undefined
   registry: SubagentRegistry | undefined
@@ -714,6 +760,7 @@ export type CreateResourceLoaderOptions = {
   plugins?: PluginSessionWiring
   materializedSkills?: MaterializedSkills | null
   origin?: SessionOrigin
+  mcpManager?: McpManager
   permissions?: PermissionService
   runtimeVersion?: string
   // Explicit override for the prompt mode. When omitted, the mode is derived
@@ -777,6 +824,7 @@ export type SystemPromptComposition = {
   runtimeVersion?: string
   origin?: SessionOrigin
   roleContext?: SessionRoleContext
+  mcpCatalog?: string
   gitNudge: string
   memorySection: string
 }
@@ -813,6 +861,9 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   }
   if (parts.origin !== undefined) {
     prompt = `${prompt}\n\n${renderSessionOrigin(parts.origin, Date.now(), parts.roleContext)}`
+  }
+  if (parts.mcpCatalog !== undefined && parts.mcpCatalog !== '') {
+    prompt = `${prompt}\n\n${parts.mcpCatalog}`
   }
   if (parts.gitNudge !== '') {
     prompt = `${prompt}\n\n${parts.gitNudge}`
@@ -893,6 +944,9 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
     ...(options.origin !== undefined ? { origin: options.origin } : {}),
     ...(roleContext !== undefined ? { roleContext } : {}),
+    ...(mode === 'full' && options.mcpManager !== undefined
+      ? { mcpCatalog: renderMcpCatalog(options.mcpManager.listServers()) }
+      : {}),
     gitNudge,
     memorySection,
   })

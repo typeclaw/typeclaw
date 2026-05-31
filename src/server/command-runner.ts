@@ -6,6 +6,7 @@ import {
   type SessionOrigin,
 } from '@/agent'
 import type { ChannelRouter } from '@/channels/router'
+import type { McpManager } from '@/mcp'
 import type { PermissionService } from '@/permissions'
 import type {
   CommandExecResult,
@@ -53,6 +54,7 @@ export type CommandRunnerOptions = {
   // `channelManager.router` via `createSessionForCron`; this is the matching
   // wire for the handler/command path.
   channelRouter: ChannelRouter | undefined
+  mcpManager?: McpManager
 }
 
 type CommandHandle = {
@@ -192,6 +194,7 @@ export function createCommandRunner(opts: CommandRunnerOptions): CommandRunner {
               signal: abortController.signal,
               sessionFactory: opts.sessionFactory,
               channelRouter: opts.channelRouter,
+              ...(opts.mcpManager !== undefined ? { mcpManager: opts.mcpManager } : {}),
             }),
           subagent: (subName, payload) =>
             opts.spawnSubagent(subName, payload, {
@@ -376,6 +379,7 @@ export async function runPromptForCommand(args: {
   // See CommandRunnerOptions.channelRouter. Threaded to createSessionWithDispose
   // so the spawned session exposes `channel_send`.
   channelRouter?: ChannelRouter
+  mcpManager?: McpManager
   // Test seam for the agent-session boundary. Production passes the real
   // `createSessionWithDispose`; tests inject a fake to verify wiring
   // (specifically: the sessionManager handed off must be persisted, not
@@ -402,6 +406,7 @@ export async function runPromptForCommand(args: {
       agentDir: args.agentDir,
     },
     ...(args.channelRouter !== undefined ? { channelRouter: args.channelRouter } : {}),
+    ...(args.mcpManager !== undefined ? { mcpManager: args.mcpManager } : {}),
     ...(args.runtimeVersion !== undefined ? { runtimeVersion: args.runtimeVersion } : {}),
     ...(args.containerName !== undefined ? { containerName: args.containerName } : {}),
   })
