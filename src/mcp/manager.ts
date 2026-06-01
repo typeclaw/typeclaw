@@ -9,25 +9,32 @@ export type McpConnectResult =
   | { ok: false; name: string; error: Error }
 
 export type McpManager = {
-  connectAll(): Promise<McpConnectResult[]>
+  connectAll(opts?: { signal?: AbortSignal }): Promise<McpConnectResult[]>
   getConnection(name: string): McpConnection | undefined
   listServers(): { name: string; description?: string; connected: boolean; toolCount?: number }[]
+  refresh(): Promise<void>
   closeAll(): Promise<void>
 }
 
-export type ConnectMcpServerFn = (server: McpServer, opts: { env: NodeJS.ProcessEnv }) => Promise<McpConnection>
+export type ConnectMcpServerFn = (
+  server: McpServer,
+  opts: { env: NodeJS.ProcessEnv; signal?: AbortSignal },
+) => Promise<McpConnection>
 
 export function createMcpManager(
   servers: McpServer[],
   opts: { env: NodeJS.ProcessEnv; connect?: ConnectMcpServerFn },
 ): McpManager {
+  const activeServers = servers.filter((server) => server.enabled)
   const connect = opts.connect ?? connectMcpServer
   const connections = new Map<string, McpConnection>()
   const toolCounts = new Map<string, number>()
 
   return {
-    async connectAll(): Promise<McpConnectResult[]> {
-      const results = await Promise.all(servers.map((server) => connectOne(server, opts.env, connect)))
+    async connectAll(connectOpts: { signal?: AbortSignal } = {}): Promise<McpConnectResult[]> {
+      const results = await Promise.all(
+        activeServers.map((server) => connectOne(server, opts.env, connect, connectOpts.signal)),
+      )
       for (const result of results) {
         if (!result.ok) continue
         connections.set(result.name, result.connection)
@@ -39,14 +46,21 @@ export function createMcpManager(
       return connections.get(name)
     },
     listServers(): { name: string; description?: string; connected: boolean; toolCount?: number }[] {
-      return servers.map((server) => {
+      return activeServers.map((server) => {
         const toolCount = toolCounts.get(server.name)
         return {
           name: server.name,
           connected: connections.has(server.name),
+          ...(server.description === undefined ? {} : { description: server.description }),
           ...(toolCount === undefined ? {} : { toolCount }),
         }
       })
+    },
+    async refresh(): Promise<void> {
+      const refreshed = await Promise.all(
+        [...connections.entries()].map(async ([name, connection]) => [name, await connection.refresh()] as const),
+      )
+      for (const [name, tools] of refreshed) toolCounts.set(name, tools.length)
     },
     async closeAll(): Promise<void> {
       await Promise.allSettled([...connections.values()].map((connection) => connection.close()))
@@ -61,6 +75,8 @@ export function namespaceToolName(server: string, tool: string): string {
 }
 
 export function parseNamespacedTool(namespaced: string): { server: string; tool: string } | undefined {
+  // Config validation reserves `__` out of server names; splitting on the first
+  // separator is therefore unambiguous even when MCP tool names contain it.
   const separatorIndex = namespaced.indexOf(TOOL_NAMESPACE_SEPARATOR)
   if (separatorIndex <= 0) return undefined
 
@@ -74,10 +90,11 @@ async function connectOne(
   server: McpServer,
   env: NodeJS.ProcessEnv,
   connect: ConnectMcpServerFn,
+  signal: AbortSignal | undefined,
 ): Promise<McpConnectResult> {
   let connection: McpConnection | undefined
   try {
-    connection = await connect(server, { env })
+    connection = await connect(server, { env, signal })
     const tools = await connection.listTools()
     return { ok: true, name: server.name, connection, toolCount: tools.length }
   } catch (cause) {
