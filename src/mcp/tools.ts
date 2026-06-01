@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { defineTool } from '@/plugin/define'
 import type { ContentPart, Tool, ToolResult } from '@/plugin/types'
 
+import type { McpConnection, McpToolInfo } from './client'
 import type { McpManager } from './manager'
 import { namespaceToolName, parseNamespacedTool } from './manager'
 
@@ -29,7 +30,7 @@ function createListToolsTool(manager: McpManager): Tool<McpListToolsArgs> {
       const connection = manager.getConnection(args.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, args.server))
 
-      const tools = await connection.listTools()
+      const tools = await safeListTools(connection)
       if (tools.length === 0) return textResult(`MCP server ${JSON.stringify(args.server)} exposes no tools.`)
 
       const lines = tools.map((tool) => {
@@ -53,7 +54,7 @@ function createDescribeTool(manager: McpManager): Tool<McpDescribeArgs> {
       const connection = manager.getConnection(resolved.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
-      const tools = await connection.listTools()
+      const tools = await safeListTools(connection)
       const tool = tools.find((item) => item.name === resolved.tool)
       if (tool === undefined) {
         const available = tools.map((item) => namespaceToolName(resolved.server, item.name)).join(', ')
@@ -91,7 +92,7 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
       const connection = manager.getConnection(resolved.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
-      const result = await connection.callTool(resolved.tool, args.args ?? {})
+      const result = await safeCallTool(connection, resolved.tool, args.args ?? {})
       return mapCallToolResult(resolved.server, resolved.tool, result)
     },
   })
@@ -111,22 +112,77 @@ function unknownServerMessage(manager: McpManager, server: string): string {
   return `Unknown MCP server ${JSON.stringify(server)}. Available servers: ${available || 'none'}.`
 }
 
+async function safeListTools(connection: McpConnection): Promise<McpToolInfo[]> {
+  try {
+    return await connection.listTools()
+  } catch (cause) {
+    throw new Error(`MCP list tools failed: ${sanitizeMcpError(errorMessage(cause))}`)
+  }
+}
+
+async function safeCallTool(
+  connection: McpConnection,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<CallToolResult> {
+  try {
+    return await connection.callTool(tool, args)
+  } catch (cause) {
+    throw new Error(`MCP call failed: ${sanitizeMcpError(errorMessage(cause))}`)
+  }
+}
+
 function mapCallToolResult(server: string, tool: string, result: CallToolResult): ToolResult {
-  const content = result.content.flatMap((part): ContentPart[] => {
-    if (part.type === 'text' && typeof part.text === 'string') return [{ type: 'text', text: part.text }]
-    return []
-  })
-  const textContent: { type: 'text'; text: string }[] =
-    content.length > 0
-      ? content.filter((part) => part.type === 'text')
-      : [{ type: 'text', text: JSON.stringify(result.content) }]
+  const content = result.content.map(mapMcpContentPart)
   if (result.isError === true) {
     return {
-      content: textContent.map((part) => ({ type: 'text' as const, text: `MCP tool error: ${part.text}` })),
+      content: content.map((part) =>
+        part.type === 'text' ? { type: 'text' as const, text: `MCP tool error: ${sanitizeMcpError(part.text)}` } : part,
+      ),
       details: { server, tool, isError: true },
     }
   }
-  return { content: textContent, details: { server, tool, isError: false } }
+  return { content, details: { server, tool, isError: false } }
+}
+
+function mapMcpContentPart(part: CallToolResult['content'][number]): ContentPart {
+  if (part.type === 'text' && typeof part.text === 'string') return { type: 'text', text: part.text }
+  if (part.type === 'image' && typeof part.data === 'string' && typeof part.mimeType === 'string') {
+    return { type: 'image', mimeType: part.mimeType, data: part.data }
+  }
+  return { type: 'text', text: summarizeUnsupportedPart(part) }
+}
+
+function summarizeUnsupportedPart(part: CallToolResult['content'][number]): string {
+  const type = typeof part.type === 'string' ? part.type : 'unknown'
+  const uri = readNestedString(part, 'resource', 'uri') ?? readString(part, 'uri')
+  if (uri !== undefined) return `[mcp:${type} ${uri}]`
+  const mimeType = readNestedString(part, 'resource', 'mimeType') ?? readString(part, 'mimeType')
+  if (mimeType !== undefined) return `[mcp:${type} ${mimeType}]`
+  return `[mcp:${type} omitted]`
+}
+
+export function sanitizeMcpError(raw: string): string {
+  const scrubbed = raw
+    .replace(/\b([A-Z_][A-Z0-9_]*)=\S+/g, '$1=<redacted>')
+    .replace(/(?:\/[\w.-]+)+/g, '<path>')
+    .replace(/\b[A-Za-z]:\\[^\s]+/g, '<path>')
+  return scrubbed.length <= 500 ? scrubbed : `${scrubbed.slice(0, 497)}...`
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
+}
+
+function readString(value: unknown, key: string): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const found = (value as Record<string, unknown>)[key]
+  return typeof found === 'string' ? found : undefined
+}
+
+function readNestedString(value: unknown, key: string, nestedKey: string): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  return readString((value as Record<string, unknown>)[key], nestedKey)
 }
 
 function textResult(text: string): ToolResult {

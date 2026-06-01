@@ -15,8 +15,9 @@ export function renderMcpCatalog(servers: McpCatalogServer[]): string {
     return `- ${server.name} (${toolCount} tools): ${description}`
   })
 
-  // WHY: this catalog is inserted in the cacheable stable prompt region and is
-  // omitted when empty so agents without MCP keep byte-identical prompts.
+  // WHY: this catalog is boot-stable for prompt-cache locality; MCP
+  // tools/list_changed notifications are intentionally not reflected here until
+  // the manager refresh path is invoked or the session restarts.
   return [
     '## MCP servers',
     '',

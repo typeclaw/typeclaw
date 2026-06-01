@@ -6,7 +6,13 @@ import type { ToolContext } from '@/plugin/types'
 
 import type { McpConnection, McpToolInfo } from './client'
 import type { McpManager } from './manager'
-import { createMcpDispatcherTools, type McpCallArgs, type McpDescribeArgs, type McpListToolsArgs } from './tools'
+import {
+  createMcpDispatcherTools,
+  sanitizeMcpError,
+  type McpCallArgs,
+  type McpDescribeArgs,
+  type McpListToolsArgs,
+} from './tools'
 
 describe('createMcpDispatcherTools', () => {
   test('mcp_list_tools returns namespaced tool names and descriptions', async () => {
@@ -82,6 +88,40 @@ describe('createMcpDispatcherTools', () => {
     })
   })
 
+  test('mcp_call preserves text and image content together', async () => {
+    const manager = fakeManager({
+      files: fakeConnection('files', [], {
+        content: [
+          { type: 'text', text: 'caption' },
+          { type: 'image', mimeType: 'image/png', data: 'base64-image' },
+        ],
+      }),
+    })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const result = await callTool.execute({ server: 'files', tool: 'screenshot' } satisfies McpCallArgs, toolContext())
+
+    expect(result.content).toEqual([
+      { type: 'text', text: 'caption' },
+      { type: 'image', mimeType: 'image/png', data: 'base64-image' },
+    ])
+  })
+
+  test('mcp_call emits summaries for unrepresentable embedded resources', async () => {
+    const manager = fakeManager({
+      files: fakeConnection('files', [], {
+        content: [
+          { type: 'resource', resource: { uri: 'file:///report.pdf', mimeType: 'application/pdf', text: 'pdf' } },
+        ],
+      }),
+    })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const result = await callTool.execute({ server: 'files', tool: 'read' } satisfies McpCallArgs, toolContext())
+
+    expect(result.content).toEqual([{ type: 'text', text: '[mcp:resource file:///report.pdf]' }])
+  })
+
   test('mcp_call surfaces SDK error results as text instead of throwing', async () => {
     const manager = fakeManager({
       files: fakeConnection('files', [], { content: [{ type: 'text', text: 'permission denied' }], isError: true }),
@@ -94,6 +134,38 @@ describe('createMcpDispatcherTools', () => {
       content: [{ type: 'text', text: 'MCP tool error: permission denied' }],
       details: { server: 'files', tool: 'read', isError: true },
     })
+  })
+
+  test('mcp_call sanitizes SDK error result text before surfacing it', async () => {
+    const manager = fakeManager({
+      files: fakeConnection('files', [], {
+        content: [{ type: 'text', text: 'failed at /private/tmp/secret.txt with API_KEY=shh' }],
+        isError: true,
+      }),
+    })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const result = await callTool.execute({ server: 'files', tool: 'read' } satisfies McpCallArgs, toolContext())
+
+    expect(result.content).toEqual([{ type: 'text', text: 'MCP tool error: failed at <path> with API_KEY=<redacted>' }])
+  })
+})
+
+describe('sanitizeMcpError', () => {
+  test('leaves normal short messages intact', () => {
+    expect(sanitizeMcpError('permission denied')).toBe('permission denied')
+  })
+
+  test('truncates long messages', () => {
+    expect(sanitizeMcpError('x'.repeat(600))).toHaveLength(500)
+    expect(sanitizeMcpError('x'.repeat(600))).toEndWith('...')
+  })
+
+  test('redacts absolute paths and env-style assignments', () => {
+    expect(sanitizeMcpError('failed at /tmp/agent/secrets.txt with TOKEN=secret')).toBe(
+      'failed at <path> with TOKEN=<redacted>',
+    )
+    expect(sanitizeMcpError('failed at C:\\agent\\secrets.txt')).toBe('failed at <path>')
   })
 })
 
@@ -113,6 +185,7 @@ function fakeManager(connections: Record<string, McpConnection>): McpManager {
     listServers() {
       return Object.keys(connections).map((name) => ({ name, connected: true, toolCount: 0 }))
     },
+    async refresh() {},
     async closeAll() {},
   }
 }
@@ -121,6 +194,9 @@ function fakeConnection(name: string, tools: McpToolInfo[], result?: CallToolRes
   return {
     name,
     async listTools() {
+      return tools
+    },
+    async refresh() {
       return tools
     },
     async callTool() {
