@@ -47,7 +47,16 @@ export type Mount = z.infer<typeof mountSchema>
 // would make ownership, lifetime, and credential injection ambiguous at boot.
 export const mcpServerSchema = z
   .object({
-    name: z.string().regex(MOUNT_NAME_PATTERN, 'MCP server name must be lowercase alphanumeric with - or _'),
+    name: z
+      .string()
+      .regex(MOUNT_NAME_PATTERN, 'MCP server name must be lowercase alphanumeric with - or _')
+      .refine((name) => !name.includes('__'), {
+        message: "MCP server name must not contain '__' (reserved as the tool-namespace separator)",
+      }),
+    description: z.string().optional(),
+    // Default true so omitting the field keeps the server on; set false to keep config but skip connecting.
+    enabled: z.boolean().default(true),
+    timeoutMs: z.number().int().positive().optional(),
     command: z.string().min(1).optional(),
     args: z.array(z.string()).default([]),
     url: z.string().url().optional(),

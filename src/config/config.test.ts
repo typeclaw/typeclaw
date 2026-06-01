@@ -188,6 +188,7 @@ describe('mcpServerSchema', () => {
     })
     expect(parsed).toEqual({
       name: 'filesystem',
+      enabled: true,
       command: 'bunx',
       args: ['@modelcontextprotocol/server-filesystem'],
       env: {},
@@ -196,7 +197,37 @@ describe('mcpServerSchema', () => {
 
   test('accepts an http server config', () => {
     const parsed = mcpServerSchema.parse({ name: 'remote-docs', url: 'https://mcp.example.com/mcp' })
-    expect(parsed).toEqual({ name: 'remote-docs', args: [], url: 'https://mcp.example.com/mcp', env: {} })
+    expect(parsed).toEqual({
+      name: 'remote-docs',
+      enabled: true,
+      args: [],
+      url: 'https://mcp.example.com/mcp',
+      env: {},
+    })
+  })
+
+  test('defaults enabled to true when omitted', () => {
+    const parsed = mcpServerSchema.parse({ name: 'default-on', command: 'server' })
+
+    expect(parsed.enabled).toBe(true)
+  })
+
+  test('preserves enabled: false', () => {
+    const parsed = mcpServerSchema.parse({ name: 'disabled', enabled: false, command: 'server' })
+
+    expect(parsed.enabled).toBe(false)
+  })
+
+  test('preserves explicit enabled: true', () => {
+    const parsed = mcpServerSchema.parse({ name: 'explicitly-on', enabled: true, command: 'server' })
+
+    expect(parsed.enabled).toBe(true)
+  })
+
+  test('preserves explicit request timeout', () => {
+    const parsed = mcpServerSchema.parse({ name: 'with-timeout', timeoutMs: 1234, command: 'server' })
+
+    expect(parsed.timeoutMs).toBe(1234)
   })
 
   test('rejects a server with both command and url', () => {
@@ -231,6 +262,14 @@ describe('mcpServerSchema', () => {
     expect(() => mcpServerSchema.parse({ name: 'BadName', command: 'server' })).toThrow(/MCP server name/)
     expect(() => mcpServerSchema.parse({ name: '-bad', command: 'server' })).toThrow(/MCP server name/)
   })
+
+  test('rejects double underscore names because the sequence separates MCP tool namespaces', () => {
+    expect(() => mcpServerSchema.parse({ name: 'bad__server', command: 'server' })).toThrow(/must not contain '__'/)
+  })
+
+  test('allows single underscores in server names', () => {
+    expect(() => mcpServerSchema.parse({ name: 'good_server', command: 'server' })).not.toThrow()
+  })
 })
 
 describe('configSchema mcpServers field', () => {
@@ -249,8 +288,14 @@ describe('configSchema mcpServers field', () => {
     })
 
     expect(parsed.mcpServers).toEqual([
-      { name: 'filesystem', command: 'bunx', args: ['@modelcontextprotocol/server-filesystem'], env: {} },
-      { name: 'remote-docs', args: [], url: 'https://mcp.example.com/mcp', env: {} },
+      {
+        name: 'filesystem',
+        enabled: true,
+        command: 'bunx',
+        args: ['@modelcontextprotocol/server-filesystem'],
+        env: {},
+      },
+      { name: 'remote-docs', enabled: true, args: [], url: 'https://mcp.example.com/mcp', env: {} },
     ])
   })
 })
