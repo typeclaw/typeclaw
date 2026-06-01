@@ -33,8 +33,9 @@ You are being asked to review a PR in **either** of these cases — treat them i
 
 - **(A) An explicit review-request inbound.** The message text says **"requested your review on PR #N"** or **"requested a review from team @… on PR #N"**. (You do not need to know how it was triggered — the adapter synthesizes this same text whether a human assigned you as a reviewer or, for a GitHub App that cannot be added to `requested_reviewers`, when the PR was opened. From your side it reads the same.)
 - **(B) A human asks you to review in plain language** in a PR/issue body or any comment — "@bot review this PR", "can you take a look at #123", "review the changes when you get a chance". There is no synthetic request text here; you recognize the intent from the message.
+- **(C) An assignment inbound.** The message text says **"assigned you to PR #N"**. Someone added you as an assignee (not a reviewer). Treat it the same as (A) — it is the assignee-based wake path for a real-user identity that mirrors the review-request path.
 
-Both → run the **PR review flow**. Do not review inline yourself and do not just reply with prose impressions: delegate to the `reviewer` subagent so the analysis runs on the `deep` model, then post its findings as an inline review.
+All three → run the **PR review flow**. Do not review inline yourself and do not just reply with prose impressions: delegate to the `reviewer` subagent so the analysis runs on the `deep` model, then post its findings as an inline review.
 
 A `review_request_removed` inbound ("removed your review request on PR #N") is the inverse: the requester un-assigned you. Cancel any in-flight reviewer subagent (`subagent_cancel`) and do not post a partial review.
 

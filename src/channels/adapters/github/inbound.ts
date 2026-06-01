@@ -181,6 +181,9 @@ export function classifyGithubInbound(
         teamIsBotMember: options?.teamIsBotMember,
       })
     }
+    if (action === 'assigned') {
+      return classifyAssignment({ payload, pr, number, base, selfLogin })
+    }
     // A GitHub App cannot be added to a PR's requested_reviewers, so it never
     // receives a review_requested event targeting itself. The opened event is
     // the only signal it can act on, so in App mode an opened PR is promoted to
@@ -294,6 +297,60 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
     thread: null,
     text,
     externalMessageId,
+    authorId: String(sender.id),
+    authorName: sender.login,
+    authorIsBot: sender.type === 'Bot',
+    isBotMention: true,
+    replyToBotMessageId: null,
+    ts: updatedAt !== '' ? Date.parse(updatedAt) || 0 : 0,
+  }
+}
+
+type AssignmentInput = {
+  payload: Record<string, unknown>
+  pr: Record<string, unknown>
+  number: number
+  base: Pick<InboundMessage, 'adapter' | 'workspace' | 'isDm' | 'mentionsOthers' | 'replyToOtherMessageId'>
+  selfLogin: string | null
+}
+
+// A GitHub App cannot be added as an issue/PR assignee (the assignee API takes
+// usernames and silently ignores App bots), so this path only ever fires for a
+// real user identity — i.e. PAT auth, including the decoy-user setup where a
+// human account shares the App's name/avatar. The App-auth wake path stays
+// classifyOpenedAsReview. Only `assigned` is handled: `unassigned` is omitted
+// on purpose because a new inbound cannot hard-interrupt an in-flight turn (see
+// router.ts — hard interrupt is not part of v1), so waking a session to "stop"
+// would burn a turn the agent cannot reliably act on.
+function classifyAssignment(input: AssignmentInput): InboundMessage | null {
+  const { payload, pr, number, base, selfLogin } = input
+  if (selfLogin === null) return null
+  const sender = readUser(payload.sender)
+  if (sender === null) return null
+  // Self-loop guard: the bot assigning itself would otherwise wake a fresh
+  // session on every self-assign. Mirrors classifyReviewRequest.
+  if (sender.login === selfLogin) return null
+
+  const assignee = readUser(payload.assignee)
+  if (assignee === null || assignee.login !== selfLogin) return null
+
+  const title = readString(pr, 'title') ?? `#${number}`
+  const head = readString(readRecord(pr.head), 'ref')
+  const baseRef = readString(readRecord(pr.base), 'ref')
+  const branchSegment = head !== null && baseRef !== null ? ` Branch: ${head} → ${baseRef}.` : ''
+  const text =
+    `@${sender.login} assigned you to PR #${number}: "${title}".${branchSegment}` +
+    ' Please review the changes line-by-line and post your feedback.'
+
+  const updatedAt = readString(pr, 'updated_at') ?? ''
+  const prId = readNumber(pr, 'id') ?? number
+
+  return {
+    ...base,
+    chat: `pr:${number}`,
+    thread: null,
+    text,
+    externalMessageId: `pr-${prId}-assigned-${updatedAt}`,
     authorId: String(sender.id),
     authorName: sender.login,
     authorIsBot: sender.type === 'Bot',

@@ -141,6 +141,72 @@ describe('classifyGithubInbound', () => {
     })
   })
 
+  describe('pull_request.assigned', () => {
+    it('wakes the bot when it is the assignee', () => {
+      const msg = classifyGithubInbound(
+        'pull_request',
+        assignedPayload({ assigneeLogin: 'typeclaw-bot' }),
+        'typeclaw-bot',
+      )
+      expect(msg?.chat).toBe('pr:7')
+      expect(msg?.thread).toBe(null)
+      expect(msg?.text).toContain('@alice')
+      expect(msg?.text).toContain('assigned you to PR #7')
+      expect(msg?.text).toContain('feat-branch → main')
+      expect(msg?.text).toContain('Please review the changes line-by-line')
+      expect(msg?.isBotMention).toBe(true)
+      expect(msg?.authorName).toBe('alice')
+    })
+
+    it('drops assignments targeting someone else', () => {
+      const msg = classifyGithubInbound(
+        'pull_request',
+        assignedPayload({ assigneeLogin: 'someone-else' }),
+        'typeclaw-bot',
+      )
+      expect(msg).toBe(null)
+    })
+
+    it('drops self-loop when the bot assigned itself', () => {
+      const payload = assignedPayload({ assigneeLogin: 'typeclaw-bot' })
+      ;(payload.sender as Record<string, unknown>).login = 'typeclaw-bot'
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+      expect(msg).toBe(null)
+    })
+
+    it('does NOT treat unassigned as an assignment wake (no bot-mention)', () => {
+      const payload = assignedPayload({ assigneeLogin: 'typeclaw-bot' })
+      payload.action = 'unassigned'
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+      expect(msg?.text).not.toContain('assigned you to PR')
+      expect(msg?.isBotMention).not.toBe(true)
+    })
+
+    it('mints an externalMessageId distinct from a review_requested on the same PR', () => {
+      const assigned = classifyGithubInbound(
+        'pull_request',
+        assignedPayload({ assigneeLogin: 'typeclaw-bot', updatedAt: '2026-01-01T00:00:00Z' }),
+        'typeclaw-bot',
+      )
+      const requested = classifyGithubInbound(
+        'pull_request',
+        reviewRequestedPayload({ reviewerLogin: 'typeclaw-bot', updatedAt: '2026-01-01T00:00:00Z' }),
+        'typeclaw-bot',
+      )
+      expect(assigned?.externalMessageId).not.toBe(requested?.externalMessageId)
+    })
+
+    it('falls back to PR id when title/branch info is absent', () => {
+      const payload = assignedPayload({ assigneeLogin: 'typeclaw-bot' })
+      delete (payload.pull_request as Record<string, unknown>).title
+      delete (payload.pull_request as Record<string, unknown>).head
+      delete (payload.pull_request as Record<string, unknown>).base
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+      expect(msg?.text).toContain('PR #7')
+      expect(msg?.text).not.toContain('Branch:')
+    })
+  })
+
   describe('pull_request.opened', () => {
     it('treats an opened PR as a review request in App mode', () => {
       const msg = classifyGithubInbound('pull_request', openedPayload(), 'typeclaw-bot', { authType: 'app' })
@@ -685,6 +751,16 @@ function reviewRequestedTeamPayload(): Record<string, unknown> {
     repository: repo(),
     pull_request: pullRequestForReview('2026-01-01T00:00:00Z'),
     requested_team: { slug: 'reviewers', id: 5000 },
+    sender: { login: 'alice', id: 10, type: 'User' },
+  }
+}
+
+function assignedPayload(options: { assigneeLogin: string; updatedAt?: string }): Record<string, unknown> {
+  return {
+    action: 'assigned',
+    repository: repo(),
+    pull_request: pullRequestForReview(options.updatedAt ?? '2026-01-01T00:00:00Z'),
+    assignee: { login: options.assigneeLogin, id: 42, type: 'User' },
     sender: { login: 'alice', id: 10, type: 'User' },
   }
 }
