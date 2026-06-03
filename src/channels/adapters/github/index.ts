@@ -21,6 +21,7 @@ import {
   parseListHooksPermissionStatus,
 } from './permission-guidance'
 import { createGithubReactionCallback, createGithubRemoveReactionCallback } from './reactions'
+import { createGithubReviewSubmitter } from './review-submitter'
 import { createGithubReviewThreadResolver } from './review-thread-resolver'
 import { createTeamMembershipChecker } from './team-membership'
 import { deregisterGithubWebhooks, registerGithubWebhooks, type WebhookRegistrationResult } from './webhook-register'
@@ -143,6 +144,11 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     selfLogin: () => selfLogin,
     fetchImpl,
   })
+  const reviewSubmitter = createGithubReviewSubmitter({
+    token: authToken,
+    allowApprove: () => options.configRef().review.approve,
+    fetchImpl,
+  })
   const channelNameResolver = createGithubChannelNameResolver({ token: authToken, fetchImpl })
   // GitHub addresses by `@login`, not the numeric id, so `username` carries
   // the login the model should type; the id is kept for completeness.
@@ -195,6 +201,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       options.router.registerChannelNameResolver('github', channelNameResolver)
       options.router.registerSelfIdentity('github', selfIdentityResolver)
       options.router.registerReviewThreadResolver('github', reviewThreadResolver)
+      options.router.registerReviewSubmitter('github', reviewSubmitter)
       options.router.registerFetchAttachment('github', fetchAttachment)
       try {
         server = (options.httpListenImpl ?? listenWithBun)(options.configRef().webhookPort, handler)
@@ -210,6 +217,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         options.router.unregisterChannelNameResolver('github', channelNameResolver)
         options.router.unregisterSelfIdentity('github', selfIdentityResolver)
         options.router.unregisterReviewThreadResolver('github', reviewThreadResolver)
+        options.router.unregisterReviewSubmitter('github', reviewSubmitter)
         options.router.unregisterFetchAttachment('github', fetchAttachment)
         await auth.dispose()
         delete process.env.GH_TOKEN
@@ -334,6 +342,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       options.router.unregisterChannelNameResolver('github', channelNameResolver)
       options.router.unregisterSelfIdentity('github', selfIdentityResolver)
       options.router.unregisterReviewThreadResolver('github', reviewThreadResolver)
+      options.router.unregisterReviewSubmitter('github', reviewSubmitter)
       options.router.unregisterFetchAttachment('github', fetchAttachment)
       await server?.stop()
       // Detach hooks AFTER closing the listener so any in-flight deliveries
