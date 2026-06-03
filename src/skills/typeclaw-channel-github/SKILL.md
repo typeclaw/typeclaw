@@ -116,12 +116,10 @@ The `reviewer` subagent is the analyst; you are the integration layer between it
 
      This transitions your review to `DISMISSED` and unblocks the PR without an approval. It needs the bot's installation to have **write** access (or to be on the branch's "who can dismiss reviews" list); if the dismissal returns 403, the block cannot be cleared under this policy — post the `<summary>` as a `COMMENT` review and say plainly in the body that the prior changes-request stands until a human dismisses it, rather than implying the PR is unblocked.
 
-   Then submit the review. **Write the JSON payload to a file with the `write` tool, then run a single bare `gh api --input <file>`** — two steps:
-
-   First write `/tmp/review.json` (via the `write` tool, not bash):
+   Then submit the review with the first-class tool:
 
    ```json
-   {
+   post_github_review({
      "event": "COMMENT",
      "body": "<reviewer's <summary> goes here>",
      "comments": [
@@ -133,30 +131,14 @@ The `reviewer` subagent is the analyst; you are the integration layer between it
        },
        { "path": "src/bar.ts", "line": 10, "side": "RIGHT", "body": "..." }
      ]
-   }
+   })
    ```
 
-   Then post it:
+   Anchor mechanics: `line` is a line number **in the file**, not a position in the diff. `side: RIGHT` is the new revision (default for additions); `side: LEFT` is the old revision (use for comments on removed lines). For multi-line comments, also set `start_line` and `start_side` (same semantics). The tool resolves the PR head SHA, validates anchors against the actual PR diff, automatically moves any out-of-diff findings into the top-level `body` (reported back as reanchored), enforces the approval-disabled policy by downgrading `APPROVE` to `COMMENT` when required, posts the formal review, and verifies the returned review `id`/`state`. If the tool reports a failure, do **not** fall back to a top-level `channel_reply` that _claims_ a review was posted — fix the payload or policy issue and resubmit.
 
-   ```sh
-   gh api -X POST /repos/owner/repo/pulls/<N>/reviews --input /tmp/review.json
-   ```
+5. **The decoy reviewer is dropped for you — no action needed.** Under **GitHub App** auth, the adapter automatically removes the decoy reviewer from the PR's requested-reviewers list the moment your formal review lands (it reacts to your own `pull_request_review.submitted` webhook). Why this matters: GitHub auto-adds **you** (the App account) to the PR's reviewers when your review posts, but the **decoy** account would otherwise stay pinned as a perpetual "review requested", as if the review never happened. You do **not** need to issue a `DELETE /requested_reviewers` yourself — and you should not, since it would race the adapter's own cleanup. The removal is self-loop-safe: the adapter's `DELETE` is authenticated as the App, so the `review_request_removed` webhook carries your bot actor (`slug[bot]`) as `sender`, which the classifier drops (see "Self-loop safety" below). This is a no-op under **PAT** auth (no decoy) and for **plain-language**/**team** requests (no decoy user was placed). See [GitHub decoy reviewer](/docs/internals/github-decoy-reviewer).
 
-   **A repo-targeting `gh` command must be a single bare `gh` invocation — no pipes, `;`, `&&`, heredocs, or command substitution.** The `github-cli-auth` plugin injects the GitHub App token into the command's environment, so any sibling/upstream stage in a pipeline would inherit a live token; the runtime blocks those shapes. That is why the old `cat <<'JSON' | gh api --input -` heredoc-pipe no longer works: write the JSON to a file and feed it with `--input <file>` instead. Do **not** use `-f body=...` or `-F 'comments[][body]=...'`: those go through shell argument parsing, so backticks trigger command substitution. The file passes the JSON through untouched — backticks, newlines, and `${...}` all survive verbatim. The same file-then-`--input` pattern applies to any `gh api` POST whose body contains backticks, embedded newlines, or shell metacharacters.
-
-   Anchor mechanics: `line` is a line number **in the file**, not a position in the diff. `side: RIGHT` is the new revision (default for additions); `side: LEFT` is the old revision (use for comments on removed lines). For multi-line comments, also set `start_line` and `start_side` (same semantics). If you need to read whole files at the PR's head SHA to validate an anchor before posting, use `gh api /repos/owner/repo/contents/<path>?ref=<headRefOid>`.
-
-5. **Verify the review actually landed before announcing it.** The `gh api` call can fail silently from the model's perspective — a permission denial, a bad `line` anchor, or a malformed payload returns an error you must not paper over. After submitting, confirm the review exists:
-
-   ```sh
-   gh api /repos/owner/repo/pulls/<N>/reviews --jq '.[-1] | {id, state, user: .user.login}'
-   ```
-
-   The returned `id`/`state` is your proof the formal review posted. If the call errored or the review is absent, do **not** fall back to a top-level `channel_reply` that _claims_ a review was posted — fix the payload (most often a `line` that isn't part of the diff; re-anchor it or move that finding to the top-level `body`) and resubmit. A trace reply that says "Posted review" when no review exists is worse than silence.
-
-6. **The decoy reviewer is dropped for you — no action needed.** Under **GitHub App** auth, the adapter automatically removes the decoy reviewer from the PR's requested-reviewers list the moment your formal review lands (it reacts to your own `pull_request_review.submitted` webhook). Why this matters: GitHub auto-adds **you** (the App account) to the PR's reviewers when your review posts, but the **decoy** account would otherwise stay pinned as a perpetual "review requested", as if the review never happened. You do **not** need to issue a `DELETE /requested_reviewers` yourself — and you should not, since it would race the adapter's own cleanup. The removal is self-loop-safe: the adapter's `DELETE` is authenticated as the App, so the `review_request_removed` webhook carries your bot actor (`slug[bot]`) as `sender`, which the classifier drops (see "Self-loop safety" below). This is a no-op under **PAT** auth (no decoy) and for **plain-language**/**team** requests (no decoy user was placed). See [GitHub decoy reviewer](/docs/internals/github-decoy-reviewer).
-
-7. **End the turn with `skip_response`, not a trace reply.** The formal review from step 4 already landed _in this PR_ — it carries the summary, the verdict, and the inline comments. A `channel_reply` here does **not** go to a separate operator channel; on GitHub it posts another public comment on the same PR. A one-line "Posted review on PR #N: …" narrated into the PR thread is meta-commentary addressed to a phantom operator, and it reads absurdly next to the review it claims to point at. So once step 5 confirms the review exists, call `skip_response({ reason: "review posted via gh api" })` to close the turn silently. Only fall back to `channel_reply` when there was **no** formal review to post — the zero-actionable-findings branch below uses `channel_reply`/issue comments _as_ the substantive reply.
+6. **End the turn with `skip_response`, not a trace reply.** The formal review from step 4 already landed _in this PR_ — it carries the summary, the verdict, and the inline comments. A `channel_reply` here does **not** go to a separate operator channel; on GitHub it posts another public comment on the same PR. A one-line "Posted review on PR #N: …" narrated into the PR thread is meta-commentary addressed to a phantom operator, and it reads absurdly next to the review it claims to point at. So once `post_github_review` returns success, call `skip_response({ reason: "review posted via post_github_review" })` to close the turn silently. Only fall back to `channel_reply` when there was **no** formal review to post — the zero-actionable-findings branch below uses `channel_reply`/issue comments _as_ the substantive reply.
 
 ### Zero actionable findings
 

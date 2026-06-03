@@ -65,6 +65,7 @@ import { createChannelReactTool } from './tools/channel-react'
 import { createChannelReplyTool } from './tools/channel-reply'
 import { createChannelSendTool } from './tools/channel-send'
 import { createGrantRoleTool } from './tools/grant-role'
+import { createPostGithubReviewTool } from './tools/post-github-review'
 import { createRestartTool } from './tools/restart'
 import { createSkipResponseTool } from './tools/skip-response'
 import { createSpawnSubagentTool } from './tools/spawn-subagent'
@@ -596,6 +597,9 @@ export function buildChannelTools(
       thread: origin.thread,
     }
     tools.push(createChannelReplyTool({ router: channelRouter, origin: channelOrigin }))
+    if (origin.adapter === 'github') {
+      tools.push(createPostGithubReviewTool({ router: channelRouter, origin: channelOrigin }))
+    }
     tools.push(createChannelHistoryTool({ router: channelRouter, origin: channelOrigin }))
     tools.push(createChannelSendTool({ router: channelRouter, origin: channelOrigin }))
     tools.push(
