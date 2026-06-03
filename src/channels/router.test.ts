@@ -7426,6 +7426,57 @@ describe('review-thread resolver registry', () => {
   })
 })
 
+describe('review submitter registry', () => {
+  const req = {
+    adapter: 'github' as const,
+    workspace: 'acme/p',
+    chat: 'pr:1',
+    event: 'COMMENT' as const,
+    body: 'summary',
+    comments: [],
+  }
+
+  test('answers unsupported when no submitter is registered', async () => {
+    const { router } = await makeRouter(await tempDir())
+
+    const result = await router.submitReview(req)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.code).toBe('unsupported')
+  })
+
+  test('dispatches to the registered submitter', async () => {
+    const { router } = await makeRouter(await tempDir())
+    router.registerReviewSubmitter('github', async () => ({ ok: true, reviewId: 1, state: 'COMMENTED' }))
+
+    expect((await router.submitReview(req)).ok).toBe(true)
+  })
+
+  test('last-write-wins and a stale unregister does not wipe a fresh submitter', async () => {
+    const { router } = await makeRouter(await tempDir())
+    const first = async () => ({ ok: false as const, error: 'first', code: 'transient' as const })
+    const second = async () => ({ ok: true as const, reviewId: 2, state: 'COMMENTED' })
+    router.registerReviewSubmitter('github', first)
+    router.registerReviewSubmitter('github', second)
+
+    router.unregisterReviewSubmitter('github', first)
+
+    expect((await router.submitReview(req)).ok).toBe(true)
+  })
+
+  test('a thrown submitter becomes a transient failure, not a rejection', async () => {
+    const { router } = await makeRouter(await tempDir())
+    router.registerReviewSubmitter('github', async () => {
+      throw new Error('boom')
+    })
+
+    const result = await router.submitReview(req)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.code).toBe('transient')
+  })
+})
+
 describe('resumeRestartHandoff', () => {
   async function seedMapping(dir: string, sessionId: string, sessionFile: string): Promise<void> {
     await mkdir(join(dir, 'channels'), { recursive: true })

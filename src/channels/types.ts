@@ -382,6 +382,46 @@ export type ReviewThreadResolveResult =
 // support review threads never register one; the router answers `unsupported`.
 export type ReviewThreadResolver = (req: ReviewThreadResolveRequest) => Promise<ReviewThreadResolveResult>
 
+export type ReviewFinding = {
+  path: string
+  line: number
+  side?: 'LEFT' | 'RIGHT'
+  startLine?: number
+  startSide?: 'LEFT' | 'RIGHT'
+  body: string
+}
+
+// First-class PR review submission keeps inline anchors adapter-validated before
+// posting: invalid diff anchors are demoted into the top-level body instead of
+// letting GitHub 422 the whole review and tempting a flat comment fallback.
+export type SubmitReviewRequest = {
+  adapter: AdapterId
+  workspace: string
+  chat: string
+  event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT'
+  body: string
+  comments: ReviewFinding[]
+}
+
+// Approval is policy-gated at the adapter seam, not left to skill prose. When
+// approval is disabled, APPROVE is downgraded to COMMENT while preserving the
+// body and inline/demoted findings so the review still lands visibly.
+export type SubmitReviewResult =
+  | { ok: true; reviewId: number; state: string; downgraded?: boolean; reanchored?: ReviewFinding[] }
+  | { ok: false; error: string; code: SubmitReviewErrorCode }
+
+export type SubmitReviewErrorCode =
+  | 'unsupported'
+  | 'permission-denied'
+  | 'approve-disabled'
+  | 'bad-anchor'
+  | 'not-found'
+  | 'transient'
+
+// Registered per-adapter like review-thread resolution. Adapters without native
+// inline review submission never register one; the router answers `unsupported`.
+export type ReviewSubmitter = (req: SubmitReviewRequest) => Promise<SubmitReviewResult>
+
 export function channelKeyId(key: ChannelKey): string {
   return `${key.adapter}:${key.workspace}:${key.chat}:${key.thread ?? ''}`
 }
