@@ -145,7 +145,7 @@ The `reviewer` subagent is the analyst; you are the integration layer between it
 
    Then submit the review. **Write the JSON payload to a file with the `write` tool, then run a single bare `gh api --input <file>`** — two steps:
 
-   First write `/tmp/review.json` (via the `write` tool, not bash):
+   First write the payload to `workspace/review-<owner>-<repo>-<N>.json` (via the `write` tool, not bash). Use `workspace/`, **not** `/tmp` — the `write` tool's `nonWorkspaceWrite` guard blocks paths outside the agent's free-write zone, so a `/tmp` write is rejected. The PR-scoped filename (`<owner>-<repo>-<N>`) avoids collisions when you review several PRs at once. `workspace/` is gitignored, so the throwaway payload never lands in a commit:
 
    ```json
    {
@@ -166,7 +166,7 @@ The `reviewer` subagent is the analyst; you are the integration layer between it
    Then post it:
 
    ```sh
-   gh api -X POST /repos/owner/repo/pulls/<N>/reviews --input /tmp/review.json
+   gh api -X POST /repos/owner/repo/pulls/<N>/reviews --input workspace/review-<owner>-<repo>-<N>.json
    ```
 
    **A repo-targeting `gh` command must be a single bare `gh` invocation — no pipes, `;`, `&&`, heredocs, or command substitution.** The `github-cli-auth` plugin injects the GitHub App token into the command's environment, so any sibling/upstream stage in a pipeline would inherit a live token; the runtime blocks those shapes. That is why the old `cat <<'JSON' | gh api --input -` heredoc-pipe no longer works: write the JSON to a file and feed it with `--input <file>` instead. Do **not** use `-f body=...` or `-F 'comments[][body]=...'`: those go through shell argument parsing, so backticks trigger command substitution. The file passes the JSON through untouched — backticks, newlines, and `${...}` all survive verbatim. The same file-then-`--input` pattern applies to any `gh api` POST whose body contains backticks, embedded newlines, or shell metacharacters.
