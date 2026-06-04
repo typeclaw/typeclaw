@@ -2900,7 +2900,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         workspace: live.key.workspace,
         chat: live.key.chat,
         thread: live.key.thread,
-        text: assistantText,
+        text: withAutoRecoveryMarker(assistantText),
       },
       { source: 'system' },
     )
@@ -4032,6 +4032,17 @@ function visibleAssistantText(message: AssistantMessage): string {
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('')
+}
+
+// Recovered text is stranded narration the model never sent via channel_reply,
+// so it must not read as a deliberate confirmation. Without this disclosure a
+// narrated action claim ("I posted the review") gets auto-broadcast as if true.
+// A truth-detecting regex was rejected as language-fragile (it would swallow
+// legitimate recovered replies); a neutral marker is language-agnostic.
+export const AUTO_RECOVERY_MARKER = '[auto-recovered: the agent ended its turn without sending this]'
+
+function withAutoRecoveryMarker(text: string): string {
+  return `${AUTO_RECOVERY_MARKER}\n\n${text}`
 }
 
 // Lenient on purpose: distilled / smaller models routinely drift off the

@@ -15,6 +15,7 @@ import type { HookBus, SessionIdleEvent } from '@/plugin'
 
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
 import {
+  AUTO_RECOVERY_MARKER,
   CHANNEL_MAX_OUTPUT_TOKENS,
   createChannelRouter,
   DUPLICATE_SEND_ERROR,
@@ -2141,7 +2142,8 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sendResult?.ok === false ? sendResult.code : '').toBe('skip-locked')
     // ...but recovery surfaces the reply via a system-source send
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('On it — reviewing now.')
+    expect(sent[0]!.text).toContain('On it — reviewing now.')
+    expect(sent[0]!.text).toContain(AUTO_RECOVERY_MARKER)
     expect(logs.some((m) => m.includes('skip_contested_by_send'))).toBe(true)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
     expect(logs.some((m) => m.includes('skipped_by_tool'))).toBe(false)
@@ -2374,7 +2376,9 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toEqual([{ text: 'Empty response from the cache layer, retrying.' }])
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.text).toContain('Empty response from the cache layer, retrying.')
+    expect(sent[0]!.text).toContain(AUTO_RECOVERY_MARKER)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
     expect(logs.some((m) => m.includes('suppressed upstream_empty_response_sentinel'))).toBe(false)
   })
@@ -2594,7 +2598,11 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toEqual([{ chat: 'c1', thread: null, text: 'hi from invisible assistant text' }])
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.chat).toBe('c1')
+    expect(sent[0]!.thread).toBe(null)
+    expect(sent[0]!.text).toContain('hi from invisible assistant text')
+    expect(sent[0]!.text).toContain(AUTO_RECOVERY_MARKER)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
   })
@@ -2626,7 +2634,31 @@ describe('ChannelRouter channel-turn protocol', () => {
       logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=mid-turn')),
     ).toBe(true)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('16배속으로 실행 중! 잠깐 기다렸다가 스크린샷 찍어볼게요!')
+    expect(sent[0]!.text).toContain('16배속으로 실행 중! 잠깐 기다렸다가 스크린샷 찍어볼게요!')
+    expect(sent[0]!.text).toContain(AUTO_RECOVERY_MARKER)
+  })
+
+  test('recovery marks a false action claim so it cannot pose as a confirmed reply', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'did you review it?' }))
+    sessions[0]!.onPrompt = () => {
+      // given: the model narrates an action claim as plain text, never sending it
+      sessions[0]!.setAssistantText('I posted the APPROVED review on PR #310!')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the claim is delivered but prefixed so it reads as unsent, not confirmed
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.text.startsWith(AUTO_RECOVERY_MARKER)).toBe(true)
+    expect(sent[0]!.text).toContain('I posted the APPROVED review on PR #310!')
   })
 
   test('mid-turn recovery: applies the NO_REPLY guard to recovered prose', async () => {
@@ -2851,7 +2883,8 @@ describe('ChannelRouter channel-turn protocol', () => {
       logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=pre-tool')),
     ).toBe(true)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('죄송해요. 크론 이슈는 지금 바로 확인해볼게요.')
+    expect(sent[0]!.text).toContain('죄송해요. 크론 이슈는 지금 바로 확인해볼게요.')
+    expect(sent[0]!.text).toContain(AUTO_RECOVERY_MARKER)
   })
 
   test('pre-tool recovery: still applies NO_REPLY / Kimi-leak / empty-sentinel guards', async () => {
