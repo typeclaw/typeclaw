@@ -1149,8 +1149,9 @@ ${ghKeyringLayer}${toggleAptLayer}${cloudflaredBlock}${claudeCodeBlock}${codexCl
 `
 }
 
-// FROMs oven/bun:1-slim and rebuilds the full heavy stack inline. Used by
-// dev-mode runs (typeclaw installed via file: / link: spec) where the
+// FROMs the pinned oven/bun image (BUN_IMAGE) and rebuilds the full heavy
+// stack inline. Used by dev-mode runs (typeclaw installed via file: / link:
+// spec) where the
 // matching :version GHCR tag does not yet exist, and by the test suite to
 // keep coverage of the full-stack layers independent of GHCR availability.
 function renderInlineHead(
@@ -1296,7 +1297,17 @@ ${renderEntrypointShimLayer()}
 
 const BUILDKIT_HEADER = `# syntax=docker/dockerfile:1.7`
 
-const FROM_AND_WORKDIR = `FROM oven/bun:1-slim
+// Pinned to an exact patch, NOT the floating `1-slim` tag. `1-slim` rolled
+// onto Bun 1.3.14, whose ARM64 Linux regressions abort `bunx`/`bun add`/
+// `bun run <pkg>` with SIGABRT inside the container (a self-referencing
+// symlink in createFakeTemporaryNodeExecutable, oven-sh/bun#30711; plus a
+// require()-of-ESM PAC IB trap, oven-sh/bun#30281). 1.3.13-slim is the last
+// known-good release. Bump to the next stable once oven-sh/bun#30713 lands,
+// and keep it in lockstep with the CI Bun pin in
+// .github/workflows/{ci,release,base-image}.yml.
+const BUN_IMAGE = `oven/bun:1.3.13-slim`
+
+const FROM_AND_WORKDIR = `FROM ${BUN_IMAGE}
 
 WORKDIR /agent
 

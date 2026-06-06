@@ -44,7 +44,10 @@ jobs:
           # to resolve the version, which intermittently 401s under GHA
           # token contention; a pinned version skips that lookup and goes
           # straight to the release download URL.
-          bun-version: 1.3.14
+          # Held at 1.3.13 (not 1.3.14) to match the container Bun pin in
+          # src/init/dockerfile.ts — 1.3.14 SIGABRTs on ARM64 Linux when
+          # launching external packages (oven-sh/bun#30711, #30281).
+          bun-version: 1.3.13
 
       - uses: actions/setup-node@v4
         with:

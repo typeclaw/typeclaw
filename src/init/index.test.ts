@@ -1083,7 +1083,7 @@ describe('writeDockerAssets', () => {
     await writeDockerAssets(root)
 
     const dockerfile = await readFile(join(root, 'Dockerfile'), 'utf8')
-    expect(dockerfile).toContain('FROM oven/bun:1-slim')
+    expect(dockerfile).toContain('FROM oven/bun:1.3.13-slim')
     expect(dockerfile).toContain('WORKDIR /agent')
     expect(dockerfile).toContain('typeclaw')
   })

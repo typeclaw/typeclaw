@@ -39,7 +39,9 @@ jobs:
           # Dockerfile this workflow emits doesn't itself depend on the
           # Bun version (only its TypeScript imports do); matches the pin
           # in ci.yml and release.yml so all three jobs use the same Bun.
-          bun-version: 1.3.14
+          # Held at 1.3.13 — see the dockerfile.ts BUN_IMAGE comment for the
+          # 1.3.14 ARM64 SIGABRT regressions (oven-sh/bun#30711, #30281).
+          bun-version: 1.3.13
 
       - name: Generate base Dockerfile
         # No `bun install` needed — scripts/emit-base-dockerfile.ts only

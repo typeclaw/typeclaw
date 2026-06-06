@@ -687,7 +687,7 @@ describe('refreshDockerfile', () => {
       // then: the on-disk Dockerfile pins the INSTALLED version, not the spec
       const written = await readFile(join(dir, 'Dockerfile'), 'utf8')
       expect(written).toContain('FROM ghcr.io/typeclaw/typeclaw-base:0.1.0')
-      expect(written).not.toContain('FROM oven/bun:1-slim')
+      expect(written).not.toContain('FROM oven/bun:')
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -725,7 +725,7 @@ describe('refreshDockerfile', () => {
       // then: no GHCR pin (dev version doesn't exist on GHCR yet) — inline heavy stack on oven/bun
       const written = await readFile(join(dir, 'Dockerfile'), 'utf8')
       expect(written).not.toContain('ghcr.io/typeclaw/typeclaw-base')
-      expect(written).toContain('FROM oven/bun:1-slim')
+      expect(written).toContain('FROM oven/bun:1.3.13-slim')
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
