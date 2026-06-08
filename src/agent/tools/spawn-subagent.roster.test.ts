@@ -109,6 +109,7 @@ describe('composeSystemPrompt with the registry-rendered roster', () => {
       mode: 'full',
       self: 'IDENTITY',
       subagentRoster: roster,
+      channelsSection: '',
       gitNudge: '',
       memorySection: '',
     })
@@ -126,6 +127,7 @@ describe('composeSystemPrompt with the registry-rendered roster', () => {
       mode: 'slim',
       self: 'IDENTITY',
       subagentRoster: renderPublicSubagentRoster(BUNDLED_PUBLIC),
+      channelsSection: '',
       gitNudge: '',
       memorySection: '',
     })

@@ -61,6 +61,20 @@ describe('dumpSystemPrompt', () => {
     },
   )
 
+  test.each(fullKinds)('%s origin includes the configured-channels block', (kind) => {
+    const out = dumpSystemPrompt(kind)
+    expect(out).toContain('## Channels')
+    expect(out).toContain('**github**')
+  })
+
+  test('cron origin omits the configured-channels block (slim mode)', () => {
+    expect(dumpSystemPrompt('cron')).not.toContain('## Channels')
+  })
+
+  test('subagent origin omits the configured-channels block (override path)', () => {
+    expect(dumpSystemPrompt('subagent')).not.toContain('## Channels')
+  })
+
   test('cron origin omits the tmux shell-work guidance (slim base prompt)', () => {
     expect(dumpSystemPrompt('cron')).not.toContain('## Long-running and interactive shell work')
   })
@@ -178,6 +192,7 @@ describe('dumpSystemPrompt', () => {
       'Runtime block',
       'Session origin',
       'Role context',
+      'Channels',
       'Git nudge',
       'Memory (MEMORY.md + streams)',
     ])
@@ -236,7 +251,8 @@ describe('dumpSystemPrompt', () => {
     expect(idx('## IDENTITY.md')).toBeLessThan(idx('TypeClaw runtime version:'))
     expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('## Session origin'))
     expect(idx('## Session origin')).toBeLessThan(idx('## Your role in this session'))
-    expect(idx('## Your role in this session')).toBeLessThan(idx('git reports 2 uncommitted files'))
+    expect(idx('## Your role in this session')).toBeLessThan(idx('## Channels'))
+    expect(idx('## Channels')).toBeLessThan(idx('git reports 2 uncommitted files'))
     expect(idx('git reports 2 uncommitted files')).toBeLessThan(idx('## MEMORY.md'))
   })
 

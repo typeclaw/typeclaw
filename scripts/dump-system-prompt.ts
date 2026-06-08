@@ -4,6 +4,8 @@ import { parseArgs } from 'node:util'
 
 import { composeSystemPrompt, deriveSystemPromptMode, renderTurnTimeAnchor, type SystemPromptMode } from '@/agent'
 import type { SessionOrigin, SessionRoleContext } from '@/agent/session-origin'
+import { renderChannelsBlock } from '@/agent/system-prompt'
+import { channelsSchema } from '@/channels/schema'
 
 type OriginKind = 'tui' | 'cron' | 'channel' | 'subagent'
 const ALL_KINDS: readonly OriginKind[] = ['tui', 'cron', 'channel', 'subagent'] as const
@@ -41,6 +43,16 @@ const PLACEHOLDER_GIT_NUDGE = [
   '',
   "These are real, current modifications — not advice. Before declaring this session's task done, commit any of these you're responsible for, with `git add <paths>` and `git commit -m \"…\"` per the version-control rules above. If a listed path is from earlier work you didn't touch, leave it alone.",
 ].join('\n')
+
+const PLACEHOLDER_CHANNELS = renderChannelsBlock(
+  channelsSchema.parse({
+    'slack-bot': {},
+    github: {
+      repos: ['<PLACEHOLDER-owner>/<repo-a>', '<PLACEHOLDER-owner>/<repo-b>'],
+      review: { on: 'opened', approve: true },
+    },
+  }),
+)
 
 const PLACEHOLDER_MEMORY = [
   '# Memory',
@@ -263,12 +275,14 @@ function dumpDefaultLoaderPrompt(kind: Exclude<OriginKind, 'subagent'>, options:
   const fixture = buildFixture(kind)
   const mode: SystemPromptMode = deriveSystemPromptMode(fixture.origin)
   const wantGitNudge = options.gitNudge && mode === 'full'
+  const channelsSection = mode === 'full' ? PLACEHOLDER_CHANNELS : ''
   const parts = {
     mode,
     self: PLACEHOLDER_SELF,
     runtimeVersion: PLACEHOLDER_RUNTIME_VERSION,
     origin: fixture.origin,
     roleContext: fixture.roleContext,
+    channelsSection,
     gitNudge: wantGitNudge ? PLACEHOLDER_GIT_NUDGE : '',
     memorySection: fixture.memory,
   } as const
@@ -288,10 +302,26 @@ function dumpDefaultLoaderPrompt(kind: Exclude<OriginKind, 'subagent'>, options:
       extractSection(
         prompt,
         '## Your role in this session',
-        parts.gitNudge !== '' ? '## Uncommitted changes at session start' : '# Memory',
+        parts.channelsSection !== ''
+          ? '## Channels'
+          : parts.gitNudge !== ''
+            ? '## Uncommitted changes at session start'
+            : '# Memory',
       ),
     ),
   ]
+  if (parts.channelsSection !== '') {
+    sections.push(
+      mkSection(
+        'Channels',
+        extractSection(
+          prompt,
+          '## Channels',
+          parts.gitNudge !== '' ? '## Uncommitted changes at session start' : '# Memory',
+        ),
+      ),
+    )
+  }
   if (parts.gitNudge !== '') {
     sections.push(mkSection('Git nudge', parts.gitNudge))
   }

@@ -296,6 +296,7 @@ describe('createResourceLoader', () => {
   test('composeSystemPrompt does not accept or emit a `now` field (removed when the anchor moved to per-turn injection)', () => {
     const prompt = composeSystemPrompt({
       self: '# Identity\n\nfoo',
+      channelsSection: '',
       gitNudge: '',
       memorySection: '',
     })
@@ -309,6 +310,7 @@ describe('createResourceLoader', () => {
       self: '# Identity\n\nfoo',
       origin: { kind: 'tui', sessionId: 'ses_test' },
       mcpCatalog: catalog,
+      channelsSection: '',
       gitNudge: '',
       memorySection: '## Memory\n\nmemory-marker',
     })
@@ -1002,6 +1004,7 @@ describe('composeSystemPrompt slim mode', () => {
     const prompt = composeSystemPrompt({
       mode: 'slim',
       self: '# Identity\n\nfoo',
+      channelsSection: '',
       gitNudge: '',
       memorySection: '# Memory\n\nbar',
     })
@@ -1012,6 +1015,7 @@ describe('composeSystemPrompt slim mode', () => {
   test('uses DEFAULT_SYSTEM_PROMPT when mode is unset (back-compat)', () => {
     const prompt = composeSystemPrompt({
       self: '# Identity\n\nfoo',
+      channelsSection: '',
       gitNudge: '',
       memorySection: '# Memory\n\nbar',
     })
@@ -1022,6 +1026,7 @@ describe('composeSystemPrompt slim mode', () => {
     const prompt = composeSystemPrompt({
       mode: 'slim',
       self: '# Identity\n\nfoo',
+      channelsSection: '',
       gitNudge: '',
       memorySection: '',
     })

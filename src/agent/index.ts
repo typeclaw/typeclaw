@@ -57,6 +57,7 @@ import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
 import {
   buildDefaultSystemPrompt,
   DEFAULT_SUBAGENT_ROSTER,
+  renderChannelsBlock,
   renderRuntimeBlock,
   SLIM_SYSTEM_PROMPT,
 } from './system-prompt'
@@ -995,6 +996,7 @@ export type SystemPromptComposition = {
   origin?: SessionOrigin
   roleContext?: SessionRoleContext
   mcpCatalog?: string
+  channelsSection: string
   gitNudge: string
   memorySection: string
 }
@@ -1037,6 +1039,12 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   }
   if (parts.mcpCatalog !== undefined && parts.mcpCatalog !== '') {
     prompt = `${prompt}\n\n${parts.mcpCatalog}`
+  }
+  // Configured-channels block sits after origin/role (which describe THIS
+  // session) and before gitNudge — stable prefix, gated empty for agents with
+  // no enabled channel so TUI-only setups pay zero bytes.
+  if (parts.channelsSection !== '') {
+    prompt = `${prompt}\n\n${parts.channelsSection}`
   }
   if (parts.gitNudge !== '') {
     prompt = `${prompt}\n\n${parts.gitNudge}`
@@ -1122,6 +1130,11 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
   const gitNudge = unwrapSettled(gitNudgeResult)
   const memorySection = unwrapSettled(memoryResult)
 
+  // Full mode only: cron/subagent (slim) sessions are unattended and the origin
+  // block already scopes their narrow task, so the standing channel roster is
+  // noise there and would erode the slim token budgets the dump tests guard.
+  const channelsSection = mode === 'full' ? renderChannelsBlock(getConfig().channels) : ''
+
   const systemPrompt = composeSystemPrompt({
     mode,
     self,
@@ -1132,6 +1145,7 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     ...(mode === 'full' && options.mcpManager !== undefined
       ? { mcpCatalog: renderMcpCatalog(options.mcpManager.listServers()) }
       : {}),
+    channelsSection,
     gitNudge,
     memorySection,
   })
