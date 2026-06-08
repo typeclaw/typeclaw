@@ -182,6 +182,20 @@ export function createChannelReplyTool({
         }
       }
 
+      // Runs before the resolve so a blocked ack never mutates the thread, and
+      // only when the model did NOT opt in with `continue: true` (matching the
+      // false-receipt / rereview precedent: an explicit keep-alive is trusted).
+      if (!keepTurnAlive) {
+        const droppedFollowupError = committedFollowupWithoutContinueError(text)
+        if (droppedFollowupError) {
+          logger.warn(formatChannelToolFailure('channel_reply', droppedFollowupError))
+          return {
+            content: [{ type: 'text' as const, text: `channel_reply denied: ${droppedFollowupError}` }],
+            details: { ok: false, error: droppedFollowupError },
+          }
+        }
+      }
+
       // Resolve BEFORE posting: a successful channel_reply ends the turn, so a
       // resolve attempted "after" the ack would never run (the exact bug this
       // flag fixes). Resolve-failure blocks the reply so the agent never posts
@@ -373,6 +387,70 @@ function kimiToolCallLeakError(text: string | undefined): string {
     'refusing to forward raw provider tool-call control tokens; these are chat-template ' +
     'delimiters that should have been parsed into a real tool call upstream. ' +
     'Re-issue the intended channel reply as plain user-visible text only.'
+  )
+}
+
+// Same-turn work-commitment markers: a FIRST-PERSON, IMMEDIATE promise to do
+// work right now ("I'll re-check", "let me look", "다시 확인해볼게", "찾아볼게").
+// Deliberately narrow — see the exclusion guards in `promisesSameTurnFollowup`
+// for why conditionals, imperatives-to-the-user, and past-tense statements must
+// NOT match.
+const SAME_TURN_COMMITMENT = [
+  // English: first-person future/immediate work verbs.
+  /\bi(?:'| a)?ll\s+(?:re-?)?(?:check|look|verify|confirm|research|find|search|dig|investigate|fetch|grab|pull|see)\b/i,
+  /\blet me\s+(?:re-?)?(?:check|look|verify|confirm|research|find|search|dig|investigate|fetch|grab|pull|see)\b/i,
+  /\b(?:on it|working on it|hold on|one sec|gimme a sec|gonna (?:check|look|research|find))\b/i,
+  // Korean: first-person immediate-commitment ending `~ㄹ게/~ㄹ게요` on a work
+  // verb (확인/찾아/알아보/검색/조회/볼/해보). Matches `확인해볼게`, `찾아볼게`,
+  // `검색해볼게`, `알아볼게`, `다시 볼게`.
+  /(?:확인|찾아|알아보|알아볼|검색|조회|뒤져|살펴)\S*(?:볼게|볼께|할게|할께|해볼게|해볼께)/,
+  /다시\s*(?:확인|찾아|볼게|볼께|체크)/,
+]
+
+// Past-tense / already-done markers. If the reply states the work is DONE, it
+// is a terminal answer carrying results, not a same-turn commitment — never block.
+// Korean past tense: `~했음/봤음/봄/찾음/완료`. English: "I checked/looked/found".
+const WORK_ALREADY_DONE = [
+  /(?:했음|봤음|찾았|찾아봤|찾아봄|확인했|검색했|알아봤|조회했|완료|끝냈|끝남)/,
+  /\bi\s+(?:already\s+)?(?:checked|looked|found|verified|confirmed|researched|searched|dug)\b/i,
+]
+
+// Imperative-to-the-user markers: the bot is telling the USER to go check, not
+// promising to do it itself. Korean `~해봐/~해보셈/~확인해봐/~체크해`. These are
+// terminal advice, never a same-turn commitment.
+const USER_IMPERATIVE = [/(?:확인해봐|확인해보셈|체크해보셈|체크해봐|해보셈|알아봐|찾아봐|봐바|보셈)/]
+
+// Conditional markers: `~(으)면 ...할게` ("if you ..., I'll ..."). A promise
+// gated on a future user action is not same-turn work — never block.
+const CONDITIONAL = [/(?:면|으면|주면|하면)\s*\S*(?:볼게|볼께|할게|할께|해볼게)/, /\bif you\b/i]
+
+// True only for a BARE ack that promises same-turn work but omits `continue: true`.
+// Without the flag a successful reply ends the turn (router terminal-abort hook),
+// so the work the model just promised never runs — a silently dropped task. We
+// refuse the ack so the model must set `continue: true` or do the work first;
+// the failed reply keeps `details.ok` false, so the turn stays alive. Tuned
+// conservative: false negatives are cheap, false positives (blocking a real final
+// reply) are not. The length/newline test below treats any substantive reply as
+// a real answer, not an ack.
+function promisesSameTurnFollowup(text: string | undefined): boolean {
+  if (text === undefined) return false
+  const trimmed = text.trim()
+  if (trimmed === '') return false
+  if (trimmed.length > 160) return false
+  if (trimmed.includes('\n')) return false
+  if (WORK_ALREADY_DONE.some((re) => re.test(trimmed))) return false
+  if (USER_IMPERATIVE.some((re) => re.test(trimmed))) return false
+  if (CONDITIONAL.some((re) => re.test(trimmed))) return false
+  return SAME_TURN_COMMITMENT.some((re) => re.test(trimmed))
+}
+
+function committedFollowupWithoutContinueError(text: string | undefined): string {
+  if (!promisesSameTurnFollowup(text)) return ''
+  return (
+    'this reply promises follow-up work THIS turn but omits `continue: true`. ' +
+    'A successful reply ends the turn, so the fetch/tool/subagent you just said ' +
+    "you'd do would never run. Either set `continue: true` on this reply and then " +
+    'do the work, or do the work first and reply once with the result.'
   )
 }
 

@@ -398,6 +398,58 @@ describe('createChannelReplyTool', () => {
     })
   })
 
+  describe('committed-followup guard (bare ack that drops same-turn work)', () => {
+    const replyTool = (sent: { count: number }) =>
+      createChannelReplyTool({
+        router: fakeRouter(async () => {
+          sent.count += 1
+          return { ok: true }
+        }),
+        origin: slackThreadOrigin,
+      })
+
+    // The incident: a bare ack promising same-turn work without continue:true
+    // aborts the turn before the work runs. These two are the real production
+    // transcripts that motivated the guard.
+    test.each([
+      'ㅇㅇ 최신으로 다시 확인해볼게 ㅋㅋ',
+      'ㅅㅂ researcher가 죽음 ㅋㅋ 직접 찾아볼게 ㄱㄷ',
+      "I'll re-check the latest now",
+      'let me look into it',
+    ])('blocks the bare commitment %p and never posts it', async (text) => {
+      const sent = { count: 0 }
+      const result = await runTool(replyTool(sent), { text })
+      expect((result.details as { ok: boolean }).ok).toBe(false)
+      expect(sent.count).toBe(0)
+    })
+
+    test('allows the same commitment once continue:true is set (turn stays alive)', async () => {
+      const sent = { count: 0 }
+      const result = await runTool(replyTool(sent), { text: '최신으로 다시 확인해볼게', continue: true })
+      expect(result.details).toEqual({ ok: true, continue: true })
+      expect(sent.count).toBe(1)
+    })
+
+    // Real final replies sampled from production that must NOT be blocked:
+    // past-tense (work done), user-imperatives, conditionals, and substantive
+    // answers. A false positive here is worse than the bug being fixed.
+    test.each([
+      '검색해봤음 ㅇㅇ 6/3 지방선거에서 투표용지 부족 사태는 실제로 있었음',
+      '찾아봤음 ㅇㅇ MCP = Anthropic이 만든 AI용 USB-C 포트임',
+      '이미지 안 봐서 정확히 못 찾겠음 ㅋㅋ 어떤 내용인지 텍스트로 알려주면 찾아볼게 ㅇㅇ',
+      '가격이나 정책은 하루 사이에도 바뀌니까 결제 직전에 각 플랫폼 가격 페이지 한 번 더 확인해봐',
+      'Firepass v2 종료일이 6/9 맞는지도 대시보드에서 직접 체크해보셈',
+      '들어가면 써보면서 다시 평가함 ㅇㅇ',
+      'I already checked — the dedupe is scoped to the per-session turn boundary',
+      'done',
+    ])('does not block the legitimate final reply %p', async (text) => {
+      const sent = { count: 0 }
+      const result = await runTool(replyTool(sent), { text })
+      expect(result.details).toEqual({ ok: true })
+      expect(sent.count).toBe(1)
+    })
+  })
+
   describe('attachments', () => {
     test('forwards attachments and text to router.send', async () => {
       const calls: OutboundMessage[] = []
