@@ -1,3 +1,4 @@
+import type { ChannelsConfig } from '@/channels/schema'
 import { formatLocalDateTime, formatLocalWeekday, resolveLocalTimezoneName } from '@/shared'
 
 // The orchestration roster (the `Briefly: ...` enumeration of public subagents)
@@ -156,6 +157,46 @@ export function renderRuntimeBlock(version: string): string {
   return `## Runtime
 
 TypeClaw runtime version: ${version}.`
+}
+
+// Standing summary of the agent's CONFIGURED channels (typeclaw.json#channels),
+// distinct from the origin block which only describes the CURRENT conversation.
+// Without it, an agent answering in a Slack DM has no idea it also runs a GitHub
+// channel watching specific repos — it hallucinates setups it does not have
+// (e.g. "forward GitHub webhooks to a Slack channel", a flow TypeClaw has no
+// concept of). This block is the ground truth it reasons from.
+//
+// Cache placement: stable prefix. `channels` is `applied` (FIELD_EFFECTS), so a
+// reload updates live config, but this block — like every prompt section — is
+// composed once at session creation and only refreshes when the session is
+// recreated. Same staleness model as origin/identity; acceptable. Returns '' when
+// no channel is enabled so the composer can gate it like gitNudge/memory — a
+// TUI-only agent pays nothing. No secrets here: tokens/signing keys live in
+// .env/secrets.json, never in the `channels` block, so every field is safe to
+// surface verbatim (webhookUrl is deliberately omitted regardless).
+export function renderChannelsBlock(channels: ChannelsConfig): string {
+  const lines: string[] = []
+  for (const [name, cfg] of Object.entries(channels)) {
+    if (cfg === undefined || cfg.enabled === false) continue
+    if (name === 'github' && 'repos' in cfg) {
+      const repos = cfg.repos.length > 0 ? cfg.repos.join(', ') : '(none configured)'
+      const review =
+        cfg.review.on === 'off'
+          ? 'off'
+          : `on \`${cfg.review.on}\`${cfg.review.approve ? ', may approve' : ', comment-only'}`
+      lines.push(`- **github** — repos: ${repos}; review: ${review}`)
+    } else {
+      lines.push(`- **${name}** — enabled`)
+    }
+  }
+  if (lines.length === 0) return ''
+  return `## Channels
+
+These channels are configured for you (from \`typeclaw.json\`). This is your standing setup — the session origin above tells you which one THIS conversation is in.
+
+${lines.join('\n')}
+
+To change them (add/remove repos, toggle review), edit \`typeclaw.json\`; do not invent channels or destinations that are not listed here. This list (including repo names) is internal configuration: only disclose it to a current speaker with owner/trusted authority — if a member or guest asks, decline rather than reciting it.`
 }
 
 // Wall-clock anchor injected into the **user turn**, not the system prompt.

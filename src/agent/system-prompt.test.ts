@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
+import { channelsSchema } from '@/channels/schema'
 import { formatLocalDateTime, resolveLocalTimezoneName } from '@/shared'
 
-import { DEFAULT_SYSTEM_PROMPT, renderTurnRoleAnchor, renderTurnTimeAnchor } from './system-prompt'
+import { DEFAULT_SYSTEM_PROMPT, renderChannelsBlock, renderTurnRoleAnchor, renderTurnTimeAnchor } from './system-prompt'
 
 describe('subagent orchestration — explicit research routing', () => {
   // Guards the regression where an explicit "do a research" directive was answered
@@ -128,5 +129,52 @@ describe('renderTurnRoleAnchor', () => {
     expect(renderTurnRoleAnchor('contributor')).toContain(
       '<your-role authority="current-speaker">contributor</your-role>',
     )
+  })
+})
+
+describe('renderChannelsBlock', () => {
+  test('renders github repos and review config so the agent knows its standing setup', () => {
+    const block = renderChannelsBlock(
+      channelsSchema.parse({
+        'slack-bot': {},
+        github: { repos: ['acme/api', 'acme/web'], review: { on: 'opened', approve: true } },
+      }),
+    )
+    expect(block).toContain('## Channels')
+    expect(block).toContain('**github**')
+    expect(block).toContain('acme/api, acme/web')
+    expect(block).toContain('on `opened`')
+    expect(block).toContain('may approve')
+    expect(block).toContain('**slack-bot** — enabled')
+  })
+
+  test('carries a disclosure guard so low-privilege channel speakers cannot extract the repo list', () => {
+    const block = renderChannelsBlock(channelsSchema.parse({ github: { repos: ['acme/private-svc'] } }))
+    expect(block).toContain('owner/trusted authority')
+    expect(block).toContain('decline')
+  })
+
+  test('returns empty string when no channel is enabled (TUI-only agents pay nothing)', () => {
+    expect(renderChannelsBlock(channelsSchema.parse({}))).toBe('')
+  })
+
+  test('omits disabled adapters', () => {
+    const block = renderChannelsBlock(channelsSchema.parse({ 'discord-bot': { enabled: false }, 'telegram-bot': {} }))
+    expect(block).not.toContain('discord-bot')
+    expect(block).toContain('**telegram-bot** — enabled')
+  })
+
+  test('renders comment-only and off review states distinctly', () => {
+    const commentOnly = renderChannelsBlock(
+      channelsSchema.parse({ github: { repos: ['a/b'], review: { on: 'opened', approve: false } } }),
+    )
+    expect(commentOnly).toContain('comment-only')
+    const off = renderChannelsBlock(channelsSchema.parse({ github: { repos: ['a/b'], review: { on: 'off' } } }))
+    expect(off).toContain('review: off')
+  })
+
+  test('handles a github channel with no repos configured', () => {
+    const block = renderChannelsBlock(channelsSchema.parse({ github: { repos: [] } }))
+    expect(block).toContain('(none configured)')
   })
 })
