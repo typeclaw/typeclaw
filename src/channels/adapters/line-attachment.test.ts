@@ -51,6 +51,18 @@ describe('splitInboundLine', () => {
     expect(result).toEqual({ text: '', attachments: [] })
   })
 
+  test('routes an undecryptable message with a placeholder instead of dropping it', () => {
+    const missingKey = splitInboundLine(
+      event({ content_type: 'NONE', text: null, decryption_error: { code: 'missing_e2ee_key', message: 'no key' } }),
+    )
+    expect(missingKey).toEqual({ text: '[LINE message could not be decrypted: missing E2EE key]', attachments: [] })
+
+    const failed = splitInboundLine(
+      event({ content_type: 'NONE', text: null, decryption_error: { code: 'decrypt_failed', message: 'boom' } }),
+    )
+    expect(failed).toEqual({ text: '[LINE message could not be decrypted]', attachments: [] })
+  })
+
   test('synthesizes a placeholder + ref-free attachment for stickers', () => {
     const result = splitInboundLine(event({ content_type: 'STICKER' }))
     expect(result.text).toBe('[LINE sticker]')

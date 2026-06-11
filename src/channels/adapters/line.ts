@@ -222,6 +222,11 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       logger.info(
         `[line] inbound message_id=${event.message_id} author=${event.author_id} ${inboundTag} content_type=${event.content_type} text_len=${text.length} attachments=${attachments.length}`,
       )
+      if (event.decryption_error !== undefined) {
+        logger.warn(
+          `[line] undecryptable message_id=${event.message_id} code=${event.decryption_error.code} content_type=${event.content_type}`,
+        )
+      }
 
       const verdict = classifyInbound(event, options.configRef(), {
         selfUserId,

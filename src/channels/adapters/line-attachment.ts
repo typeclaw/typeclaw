@@ -57,6 +57,21 @@ const PLACEHOLDER_ONLY_LABEL: Record<string, string> = {
   LOCATION: 'location',
 }
 
+// Letter-Sealing (E2EE) messages this session cannot decrypt arrive as
+// `text: null, content_type: NONE` with a `decryption_error` set — wire-
+// identical to a genuinely empty message. Without surfacing them the agent
+// silently drops real user messages as empty_text and looks dead. Map the
+// codes to a stable, agent-readable phrase instead of forwarding the SDK's
+// verbose/localized message verbatim.
+const DECRYPTION_ERROR_PLACEHOLDER: Record<string, string> = {
+  missing_e2ee_key: '[LINE message could not be decrypted: missing E2EE key]',
+  decrypt_failed: '[LINE message could not be decrypted]',
+}
+
+export function lineDecryptionPlaceholder(code: string): string {
+  return DECRYPTION_ERROR_PLACEHOLDER[code] ?? '[LINE message could not be decrypted]'
+}
+
 export function normalizeLineContentType(raw: string | null | undefined): string {
   if (raw === null || raw === undefined) return 'NONE'
   const trimmed = raw.trim()
@@ -70,6 +85,10 @@ export function normalizeLineContentType(raw: string | null | undefined): string
 }
 
 export function splitInboundLine(event: LinePushMessageEvent, startId = 1): SplitInboundLine {
+  if (event.decryption_error !== undefined) {
+    return { text: lineDecryptionPlaceholder(event.decryption_error.code), attachments: [] }
+  }
+
   const contentType = normalizeLineContentType(event.content_type)
 
   // NONE is LINE text; a blank NONE message stays an `empty_text` drop in the

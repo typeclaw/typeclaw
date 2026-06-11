@@ -203,6 +203,52 @@ describe('createLineAdapter lifecycle', () => {
     expect(router.registered.outbound).toBe(false)
   })
 
+  test('routes an undecryptable inbound with a placeholder and logs it instead of dropping as empty', async () => {
+    const listener = new FakeListener()
+    const routed: InboundMessage[] = []
+    const warnings: string[] = []
+    const router = makeRouterStub((m) => routed.push(m))
+
+    const adapter = createLineAdapter({
+      router,
+      configRef: () => ({}) as ChannelAdapterConfig,
+      logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
+      client: fakeClient(),
+      listenerFactory: () => listener,
+      credentialsStore: {
+        load: async () => ({ current_account: 'U_self', accounts: {} }),
+        getAccount: async () => ({
+          account_id: 'U_self',
+          auth_token: 't',
+          device: 'DESKTOPMAC',
+          created_at: '',
+          updated_at: '',
+        }),
+      },
+    })
+
+    await adapter.start()
+    listener.emit('connected', { account_id: 'U_self' })
+
+    listener.emit('message', {
+      type: 'message' as const,
+      chat_id: 'C1',
+      message_id: 'M_enc',
+      author_id: 'U_other',
+      text: null,
+      content_type: 'NONE',
+      content_metadata: {},
+      decryption_error: { code: 'missing_e2ee_key', message: 'no key' },
+      sent_at: '2025-01-02T00:00:00.000Z',
+    })
+    await waitFor(() => routed.length > 0)
+
+    expect(routed[0]!.text).toBe('[LINE message could not be decrypted: missing E2EE key]')
+    expect(warnings.some((w) => w.includes('undecryptable') && w.includes('missing_e2ee_key'))).toBe(true)
+
+    await adapter.stop()
+  })
+
   test('wires the credentials store as the client credential manager so listener re-login resolves it', async () => {
     // given a store-backed client whose no-arg login() (the LineListener reconnect
     // path) resolves credentials only through its injected credential manager
