@@ -286,19 +286,6 @@ function slugFromSnapshotPath(path: string): string {
   return basename(path, '.md')
 }
 
-function deleteStreamVectorsForDroppedFragments(agentDir: string, droppedFragmentIds: readonly string[]): void {
-  if (droppedFragmentIds.length === 0) return
-  const dbPath = join(agentDir, 'memory', '.vectors', 'index.db')
-  if (!existsSync(dbPath)) return
-
-  const store = VectorStore.open(dbPath)
-  try {
-    store.deleteMany(droppedFragmentIds.map((fragmentId) => `stream:${fragmentId}`))
-  } finally {
-    store.close()
-  }
-}
-
 const EMPTY_ID_SET: ReadonlySet<string> = new Set()
 
 async function loadCitedIds(agentDir: string): Promise<ReadonlyMap<string, ReadonlySet<string>>> {
@@ -1113,7 +1100,6 @@ export function createDreamingSubagent(options: CreateDreamingSubagentOptions = 
           `[dreaming] compaction files=${compaction.filesCompacted} watermarks_dropped=${compaction.watermarksDropped} fragments_dropped=${compaction.fragmentsDropped} fragment_gc=${shardsRewrittenThisRun ? 'on' : 'off'}`,
         )
       }
-      deleteStreamVectorsForDroppedFragments(ctx.payload.agentDir, compaction.droppedFragmentIds)
 
       try {
         await commit(ctx.payload.agentDir)

@@ -666,32 +666,6 @@ describe('dreaming subagent (compaction wiring)', () => {
     expect(warnings.some((w) => w.includes('vector topic sync failed'))).toBe(true)
   })
 
-  test('QA 2.4: deletes stream vectors for fragments dropped by dreaming compaction', async () => {
-    await writeFile(streamFile('2026-04-27'), [fragmentLine('cited'), fragmentLine('drop')].join(''))
-    const store = VectorStore.open(join(agentDir, 'memory', '.vectors', 'index.db'))
-    store.upsert(vectorRow('stream:2026-04-27#f-cited', 'stream', '2026-04-27#f-cited', vector({ 0: 1 }), 'cited'))
-    store.upsert(vectorRow('stream:2026-04-27#f-drop', 'stream', '2026-04-27#f-drop', vector({ 1: 1 }), 'drop'))
-    store.close()
-    const runSession: RunSession = async () => {
-      await writeTopicShard(
-        'kept',
-        shardText('Kept', ['Kept.', '', 'fragments:', '- streams/2026-04-27#f-cited'].join('\n')),
-      )
-    }
-
-    await invokeDreaming(agentDir, { runSession, vectorEmbedFn: async () => [vector({ 2: 1 })] })
-
-    const afterStore = VectorStore.open(join(agentDir, 'memory', '.vectors', 'index.db'))
-    try {
-      expect(afterStore.getByIds(['stream:2026-04-27#f-cited']).map((row) => row.id)).toEqual([
-        'stream:2026-04-27#f-cited',
-      ])
-      expect(afterStore.getByIds(['stream:2026-04-27#f-drop'])).toEqual([])
-    } finally {
-      afterStore.close()
-    }
-  })
-
   test('QA 2.5: compactDailyStreams returns vector keys for dropped fragments', async () => {
     await writeFile(streamFile('2026-04-27'), [fragmentLine('cited'), fragmentLine('drop')].join(''))
     const state = addDreamedIds(emptyState(), '2026-04-27', ['f-cited', 'f-drop'], 'now')
