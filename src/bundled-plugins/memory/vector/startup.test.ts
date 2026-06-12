@@ -20,10 +20,10 @@ afterEach(() => {
 })
 
 describe('buildStartupVectorIndex', () => {
-  it('builds an empty vector index with all topic and stream passages', async () => {
+  it('embeds topics only and never the stream fragment alongside them', async () => {
     const agentDir = createAgentDir()
     writeTopic(agentDir, 'startup-topic', 'Startup Topic', 'This topic is pre-warmed at boot.')
-    writeFragment(agentDir, '2026-06-11', 'frag-1', 'Recent Stream', 'This stream fragment is also indexed.')
+    writeFragment(agentDir, '2026-06-11', 'frag-1', 'Recent Stream', 'This stream fragment is NOT indexed.')
     const embeddedTexts: string[] = []
 
     const result = await buildStartupVectorIndex(agentDir, async (texts, type) => {
@@ -34,13 +34,9 @@ describe('buildStartupVectorIndex', () => {
 
     const store = VectorStore.open(join(agentDir, 'memory', '.vectors', 'index.db'))
     try {
-      expect(result).toEqual({ built: true, pruned: 0, count: 2 })
-      expect(embeddedTexts).toEqual([
-        'Startup Topic\nThis topic is pre-warmed at boot.',
-        'Recent Stream\nThis stream fragment is also indexed.',
-      ])
+      expect(result).toEqual({ built: true, pruned: 0, count: 1 })
+      expect(embeddedTexts).toEqual(['Startup Topic\nThis topic is pre-warmed at boot.'])
       expect(store.getAll().map((stored) => [stored.id, stored.source, stored.key, stored.dims])).toEqual([
-        ['stream:2026-06-11#frag-1', 'stream', '2026-06-11#frag-1', 8],
         ['topic:startup-topic', 'topic', 'startup-topic', 8],
       ])
     } finally {
@@ -127,52 +123,34 @@ describe('buildStartupVectorIndex', () => {
     }
   })
 
-  it('prunes superseded stream rows so they cannot crowd active candidates', async () => {
+  it('prunes legacy stream rows since the index is topic-only', async () => {
     const agentDir = createAgentDir()
-    const activeId = '019e2eca-6fc5-71ef-add9-67a0955a4b35'
-    const supersededId = '019e2ecf-f2d5-70ee-83f6-005fb5451c51'
+    const fragmentId = '019e2eca-6fc5-71ef-add9-67a0955a4b35'
 
-    // given: a topic whose belief switched, citing the new fragment as active and
-    // the old one as superseded; only the active fragment is on the live stream
-    writeTopic(
-      agentDir,
-      'package-manager',
-      'Package Manager',
-      [
-        'User uses pnpm.',
-        'fragments:',
-        `- streams/2026-06-11#${activeId}`,
-        'superseded:',
-        `- streams/2026-06-11#${supersededId}`,
-      ].join('\n'),
-    )
-    writeFragment(agentDir, '2026-06-11', activeId, 'pnpm', 'User installs with pnpm.')
-
-    // and: the superseded fragment already has a vector row from before it was overturned
+    // given: a topic and a leftover stream vector row from before stream embedding was removed
+    writeTopic(agentDir, 'package-manager', 'Package Manager', 'User uses pnpm.')
     const dbPath = join(agentDir, 'memory', '.vectors', 'index.db')
     const seed = VectorStore.open(dbPath)
     seed.upsert({
-      id: `stream:2026-06-11#${supersededId}`,
+      id: `stream:2026-06-11#${fragmentId}`,
       source: 'stream',
-      key: `2026-06-11#${supersededId}`,
+      key: `2026-06-11#${fragmentId}`,
       model: EMBEDDING_MODEL_ID,
       dims: 8,
       embedding: vector({ 0: 1 }),
-      contentHash: 'stale',
+      contentHash: 'legacy',
     })
     seed.close()
 
     // when: startup runs
     const result = await buildStartupVectorIndex(agentDir, async (texts) => texts.map(() => vector({ 1: 1 })))
 
-    // then: the stale superseded row is pruned; only the active passages remain
+    // then: every stream row is pruned; only the topic vector remains
     const store = VectorStore.open(dbPath)
     try {
       expect(result.pruned).toBe(1)
       const ids = store.getAll().map((stored) => stored.id)
-      expect(ids).not.toContain(`stream:2026-06-11#${supersededId}`)
-      expect(ids).toContain(`stream:2026-06-11#${activeId}`)
-      expect(ids).toContain('topic:package-manager')
+      expect(ids).toEqual(['topic:package-manager'])
     } finally {
       store.close()
     }

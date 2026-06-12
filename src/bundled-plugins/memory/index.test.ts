@@ -23,6 +23,7 @@ import { formatLocalDate } from '@/shared'
 import { renderShard } from './frontmatter'
 import memoryPlugin from './index'
 import { streamFilePath, topicShardPath, topicsDir } from './paths'
+import { buildStartupVectorIndex } from './vector/startup'
 
 // Fake timers replace ~10s of real setTimeout waits used to exercise the idle
 // debouncer and spawn-timeout race. Date is included in `toFake` so the
@@ -1518,9 +1519,10 @@ describe('doctor checks', () => {
   })
 
   test('vector-index: when enabled, runs the real index check (ok for an empty agent)', async () => {
-    // Booting with vector enabled opens the store, which creates the index DB,
-    // so the realistic enabled-but-empty agent is healthy (nothing to index).
+    // The startup index build (run/index.ts at boot) creates the DB. Mirror that
+    // here so the realistic enabled-but-empty agent is healthy (nothing to index).
     const { exports } = await bootMemoryPlugin(agentDir, { vector: { enabled: true } })
+    await buildStartupVectorIndex(agentDir)
 
     const check = exports.doctorChecks?.['vector-index']
     expect(check).toBeDefined()
