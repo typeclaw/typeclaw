@@ -177,6 +177,11 @@ describe('memory plugin shape', () => {
     expect(exports.tools?.memory_search).toBeDefined()
   })
 
+  test('exposes store_reference as a main-agent tool for inline verbatim capture', async () => {
+    const { exports } = await bootMemoryPlugin(agentDir, {})
+    expect(exports.tools?.store_reference).toBeDefined()
+  })
+
   test('memory-retrieval declares profile=fast', async () => {
     const { exports } = await bootMemoryPlugin(agentDir, {})
     expect(exports.subagents?.['memory-retrieval']?.profile).toBe('fast')

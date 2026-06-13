@@ -22,6 +22,7 @@ import { loadAllShards } from './load-shards'
 import { createMemoryLoggerSubagent, type MemoryLoggerPayload } from './memory-logger'
 import { createMemoryRetrievalSubagent, type MemoryRetrievalPayload } from './memory-retrieval'
 import { preShardBackupPath, streamFilePath, streamsDir, topicsDir } from './paths'
+import { createStoreReferenceTool } from './references/store-reference-tool'
 import { createMemorySearchTool } from './search-tool'
 import { type InjectedShardState, partitionDirectShards } from './turn-dedup'
 import { vectorConfigSchema } from './vector/config'
@@ -418,6 +419,14 @@ function createMemoryPlugin(deps: MemoryPluginDeps = defaultDeps) {
         },
         tools: {
           memory_search: createMemorySearchTool(),
+          // Inline reference storage for the main agent. Without it, "remember this
+          // verbatim" only persists after the memory-logger idle cycle (idleMs + a
+          // fast-model spawn), so a follow-up in the same turn could not find the
+          // artifact. The on-write hook (when vector is enabled) indexes it
+          // immediately, matching the memory-logger path.
+          store_reference: createStoreReferenceTool(
+            appendVectorStore !== undefined ? makeReferenceStoredHook(appendVectorStore) : undefined,
+          ),
         },
         cronJobs: {
           dreaming: {
