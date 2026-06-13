@@ -60,37 +60,37 @@ describe('embedder bounding', () => {
 })
 
 describe('embedder bounding observability', () => {
-  let warnings: string[]
-  const originalWarn = console.warn
+  let notices: string[]
+  const originalInfo = console.info
 
   beforeEach(() => {
-    warnings = []
-    console.warn = (message?: unknown) => {
-      warnings.push(String(message))
+    notices = []
+    console.info = (message?: unknown) => {
+      notices.push(String(message))
     }
   })
 
   afterEach(() => {
-    console.warn = originalWarn
+    console.info = originalInfo
   })
 
-  test('emits a content-free warning naming the type and count when an input is bounded', async () => {
+  test('emits a content-free notice naming the type and count when an input is bounded', async () => {
     const { embed } = await import('./embedder')
 
     await embed(['in budget', overBudgetText], 'query')
 
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0]).toContain('[memory]')
-    expect(warnings[0]).toContain('query')
-    expect(warnings[0]).toContain('1/2')
-    expect(warnings[0]).not.toContain('word')
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toContain('[memory]')
+    expect(notices[0]).toContain('query')
+    expect(notices[0]).toContain('1/2')
+    expect(notices[0]).not.toContain('word')
   })
 
-  test('does not warn when every input is within budget', async () => {
+  test('does not log when every input is within budget', async () => {
     const { embed } = await import('./embedder')
 
     await embed(['short a', 'short b'], 'passage')
 
-    expect(warnings).toHaveLength(0)
+    expect(notices).toHaveLength(0)
   })
 })

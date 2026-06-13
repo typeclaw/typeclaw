@@ -97,11 +97,14 @@ export async function embed(texts: string[], type: EmbedType): Promise<Float32Ar
 // is observable in logs (the dreaming over_budget table only covers topic
 // shards — this is the only path for queries and stream fragments). Logs counts
 // and the worst estimate only, never the text, so memory content can't leak.
+// Emitted at info, not warn: bounding is the designed, deterministic remediation
+// (dreaming compacts the over-budget topic shards on its own schedule), so a
+// non-zero count on a routine boot index build is expected, not actionable.
 function warnIfBounded(results: readonly BoundedText[], type: EmbedType): void {
   const trimmed = results.filter((r) => r.bounded)
   if (trimmed.length === 0) return
   const worst = trimmed.reduce((max, r) => Math.max(max, r.estimatedTokens), 0)
-  console.warn(
+  console.info(
     `[memory] vector embedding: bounded ${trimmed.length}/${results.length} ${type} input(s) to the ` +
       `${MAX_MODEL_TOKENS}-token model limit (worst ~${worst} est. tokens); their tail is not embedded`,
   )
@@ -110,6 +113,26 @@ function warnIfBounded(results: readonly BoundedText[], type: EmbedType): void {
 function configureTransformers(env: TransformersEnv): void {
   env.localModelPath = modelCachePath()
   env.allowRemoteModels = false
+  // Silence onnxruntime's "cpuid_info warning: Unknown CPU vendor" at every
+  // boot index build. It fires when cpuinfo initializes but can't match the
+  // CPUID vendor string — the norm for our container under emulated/virtualized
+  // CPUs (Rosetta/QEMU on Apple Silicon hosts). The vendor string is purely
+  // informational: SIMD kernel dispatch (AVX/NEON/...) is detected on an
+  // independent codepath, so vendor=unknown has no perf or correctness impact.
+  // onnxruntime itself already suppresses this same warning on wasm.
+  // onnxruntime-node reads this onnxruntime-common env at session creation —
+  // inside pipeline() below, AFTER this runs — so 'error' takes effect before
+  // the cpuid probe fires. Guarded because the backend object is absent under
+  // the test mock; setLogLevel mirrors the level so it lands regardless of
+  // which hook the installed build honors. Tradeoff: 'error' also hides the
+  // separate "cpuinfo init FAILED — perf degradation" warning, acceptable
+  // because that one does not fire here (vendor=0 means init succeeded), and
+  // real session/inference errors still surface.
+  const onnx = env.backends?.onnx
+  if (onnx) {
+    onnx.logLevel = 'error'
+    onnx.setLogLevel?.(3)
+  }
 }
 
 function modelCachePath(): string {
