@@ -161,6 +161,34 @@ export async function analyzeGitCommand(
   return { kind: 'inject', repoSlug: representativeSlug }
 }
 
+// True when any `git` invocation in the command is a `push` — the credential-
+// requiring write the misconfig block targets. analyzeGitCommand has already
+// confirmed the command resolves to a github.com repo, so this only narrows the
+// remote subcommand to push (clone/fetch/pull/ls-remote return false). Reuses
+// the same cd-prefix-strip and `&&`-chain split so `cd x && git push` and
+// `git status && git push origin main` both match.
+export function isGitPushCommand(command: string): boolean {
+  const stripped = stripSafeCdPrefix(command)
+  if (stripped.unsafe) return commandHasGitPush(command)
+  const rest = stripped.cdDir !== null ? stripped.rest : command
+  return commandHasGitPush(rest)
+}
+
+function commandHasGitPush(command: string): boolean {
+  const chain = extractGitInvocationChain(command)
+  if (chain !== null) return chain.some((seg) => isPushInvocation(seg.args))
+  const single = extractSingleGitInvocation(command)
+  return single !== null && isPushInvocation(single.args)
+}
+
+// A `push` that actually contacts the remote — NOT `git push --help`/`-h`, which
+// only prints docs and needs no credential, so it must not trigger the misconfig
+// block. `git --help push` also resolves its subcommand to a help page.
+function isPushInvocation(args: readonly string[]): boolean {
+  if (findSubcommand(args) !== 'push') return false
+  return !args.includes('--help') && !args.includes('-h')
+}
+
 // The single-git `cd <path> && git …` shortcut. Kept separate (and single-git
 // only) so the cwd rewrite stays simple: the token-bearing command becomes one
 // bare `git -C <path> …`, with no sibling inheriting the env. A `cd` in a

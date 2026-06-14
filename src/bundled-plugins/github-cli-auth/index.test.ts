@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -8,6 +8,7 @@ import type { GithubTokenResolveResult } from '@/channels/github-token-bridge'
 import { noopPermissionService, type PermissionService } from '@/permissions'
 import type { PluginContext, PluginLogger, ToolBeforeEvent } from '@/plugin'
 
+import { resetGithubChannelAuthStateCacheForTests } from './channel-misconfig'
 import { resetGitAskPassHelperForTests } from './git-askpass'
 import githubCliAuthPlugin from './index'
 
@@ -31,7 +32,7 @@ afterEach(() => {
   else process.env.GITHUB_TOKEN = originalGithubToken
 })
 
-type HookOpts = { permissions?: PermissionService; logger?: PluginLogger }
+type HookOpts = { permissions?: PermissionService; logger?: PluginLogger; agentDir?: string }
 
 function pluginContext(
   resolve: (repoSlug: string) => Promise<GithubTokenResolveResult>,
@@ -41,7 +42,7 @@ function pluginContext(
   return {
     name: 'github-cli-auth',
     version: undefined,
-    agentDir: '/agent',
+    agentDir: opts.agentDir ?? '/agent',
     config: undefined,
     logger: opts.logger ?? noopLogger,
     permissions: opts.permissions ?? noopPermissionService,
@@ -877,5 +878,141 @@ describe('github-cli-auth plugin — git path', () => {
 
     expect(result).toBeUndefined()
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+})
+
+describe('github-cli-auth plugin — channels.github configured but no credentials', () => {
+  // A real agentDir on disk: the misconfig detector reads typeclaw.json +
+  // secrets.json from ctx.agentDir. No env token and no minter so the
+  // no-managed-auth branch is reached; the agentDir state then decides block vs
+  // warn. Cache is reset each test so the per-agentDir memo doesn't leak.
+  function makeAgentDir(files: { typeclawJson?: string; secretsJson?: string }): string {
+    const dir = mkdtempSync(join(tmpdir(), 'typeclaw-misconfig-'))
+    if (files.typeclawJson !== undefined) writeFileSync(join(dir, 'typeclaw.json'), files.typeclawJson)
+    if (files.secretsJson !== undefined) writeFileSync(join(dir, 'secrets.json'), files.secretsJson)
+    return dir
+  }
+
+  const githubChannelConfig = JSON.stringify({ channels: { github: { repos: ['acme/widgets'], webhookPort: 8975 } } })
+
+  afterEach(() => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    resetGithubChannelAuthStateCacheForTests()
+  })
+
+  async function noAuthHookFor(agentDir: string) {
+    return hookFor(tokenResolver('ghs_minted'), false, { agentDir })
+  }
+
+  const ctxFor = (agentDir: string) => ({ agentDir, pluginName: 'github-cli-auth', logger: noopLogger })
+
+  test('git push (configured-without-credentials): blocks with the precise misconfig reason', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('git push https://github.com/acme/widgets.git main'), ctxFor(agentDir))
+
+    expect(result).toMatchObject({ block: true })
+    const reason = (result as { reason: string }).reason
+    expect(reason).toContain('channels.github')
+    expect(reason).toContain('secrets.json#channels.github')
+  })
+
+  test('gh pr create (configured-without-credentials): blocks with the precise misconfig reason', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('gh pr create -R acme/widgets --title x --body y'), ctxFor(agentDir))
+
+    expect(result).toMatchObject({ block: true })
+    expect((result as { reason: string }).reason).toContain('misconfigured')
+  })
+
+  test('git clone (configured-without-credentials): NOT blocked — read op falls back to warn-and-pass-through', async () => {
+    delete process.env.GH_TOKEN
+    const warnings: string[] = []
+    const logger = { info: () => {}, warn: (m: string) => warnings.push(m), error: () => {} }
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { agentDir, logger })
+
+    const result = await hook(bashEvent('git clone https://github.com/acme/widgets.git'), ctxFor(agentDir))
+
+    expect(result).toBeUndefined()
+    expect(warnings.length).toBe(1)
+  })
+
+  test('gh pr view (configured-without-credentials): NOT blocked — read op warns and passes through', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('gh pr view -R acme/widgets'), ctxFor(agentDir))
+
+    expect(result).toBeUndefined()
+  })
+
+  test('gh auth status (configured-without-credentials): NOT blocked — repo-less command passes through', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('gh auth status'), ctxFor(agentDir))
+
+    expect(result).toBeUndefined()
+  })
+
+  test('git push to a NON-github remote (configured-without-credentials): NOT blocked', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('git push https://gitlab.com/acme/widgets.git main'), ctxFor(agentDir))
+
+    expect(result).toBeUndefined()
+  })
+
+  test('git push (channel configured WITH valid PAT secrets): NOT blocked by misconfig path', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({
+      typeclawJson: githubChannelConfig,
+      secretsJson: JSON.stringify({
+        version: 2,
+        channels: { github: { auth: { type: 'pat', token: 'ghp_x' }, webhookSecret: 'whsec_x' } },
+      }),
+    })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('git push https://github.com/acme/widgets.git main'), ctxFor(agentDir))
+
+    // Credentials ARE present on disk, so this is not the misconfig case; the
+    // generic no-resolver path warns and passes through (no block).
+    expect(result).toBeUndefined()
+  })
+
+  test('git push (NO github channel configured): NOT blocked — generic warn-and-pass-through', async () => {
+    delete process.env.GH_TOKEN
+    const warnings: string[] = []
+    const logger = { info: () => {}, warn: (m: string) => warnings.push(m), error: () => {} }
+    const agentDir = makeAgentDir({ typeclawJson: JSON.stringify({ channels: {} }) })
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { agentDir, logger })
+
+    const result = await hook(bashEvent('git push https://github.com/acme/widgets.git main'), ctxFor(agentDir))
+
+    expect(result).toBeUndefined()
+    expect(warnings.length).toBe(1)
+  })
+
+  test('git push (malformed secrets.json with github channel): NOT blocked — cannot confirm absence', async () => {
+    delete process.env.GH_TOKEN
+    const agentDir = makeAgentDir({ typeclawJson: githubChannelConfig, secretsJson: '{ not valid json' })
+    const hook = await noAuthHookFor(agentDir)
+
+    const result = await hook(bashEvent('git push https://github.com/acme/widgets.git main'), ctxFor(agentDir))
+
+    // Indeterminate auth state must not produce a false misconfig block.
+    expect(result).toBeUndefined()
   })
 })

@@ -4,10 +4,15 @@ import { definePlugin } from '@/plugin'
 import { resolveHiddenPaths } from '@/sandbox'
 
 import { createApproveIdempotencyGuard } from './approve-idempotency'
+import { getGithubChannelAuthState } from './channel-misconfig'
 import { createGithubEffectiveApprovalResolver, createGithubHeadShaResolver } from './effective-approval'
-import { analyzeGhCommand, effectiveGhTokensForAuthenticatedUserEndpoint } from './gh-command'
+import {
+  analyzeGhCommand,
+  effectiveGhTokensForAuthenticatedUserEndpoint,
+  isGhCredentialRequiringWrite,
+} from './gh-command'
 import { ensureGitAskPassHelper } from './git-askpass'
-import { analyzeGitCommand, defaultGitResolvers } from './git-command'
+import { analyzeGitCommand, defaultGitResolvers, isGitPushCommand } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, effectiveProcessPat, shouldMintAppToken } from './token-class'
@@ -72,6 +77,35 @@ export default definePlugin({
           '`gh auth login`, or an SSH remote). To enable TypeClaw-managed auth, set GH_TOKEN/GITHUB_TOKEN ' +
           'in .env for roles allowed to receive it, or configure channels.github App authentication.',
       )
+    }
+
+    // The one high-confidence misconfiguration (see channel-misconfig.ts): a
+    // configured `channels.github` with no usable credential, so a github.com
+    // write WILL fail. This is the only no-managed-auth case worth surfacing to
+    // the AGENT (a block reason reaches the tool result; logger.warn does not),
+    // because here — unlike the generic case — we know auth is both intended and
+    // missing rather than possibly supplied out-of-band.
+    const channelMisconfigBlockReason =
+      'TypeClaw GitHub auth is misconfigured for this agent, so this credential-requiring command was blocked.\n' +
+      'Detected:\n' +
+      '- typeclaw.json has channels.github configured\n' +
+      '- GH_TOKEN/GITHUB_TOKEN are unset\n' +
+      '- no TypeClaw GitHub token resolver is active\n' +
+      '- secrets.json#channels.github has no usable auth credentials\n' +
+      'Fix: add GitHub credentials to secrets.json#channels.github (PAT or App), or set GH_TOKEN/GITHUB_TOKEN, ' +
+      'then restart the agent/container. If you intended to use your own ambient GitHub auth, remove the ' +
+      'channels.github block so TypeClaw does not treat this as a managed GitHub setup.'
+
+    // Resolves a repo-targeting, no-managed-auth command: block with the precise
+    // misconfig reason ONLY for a credential-requiring write to github.com when
+    // the channel is configured-without-credentials; otherwise fall back to the
+    // generic warn-and-pass-through (ambient auth may still carry it).
+    const resolveNoManagedAuth = (isCredentialRequiringWrite: boolean): HookResult => {
+      if (isCredentialRequiringWrite && getGithubChannelAuthState(ctx.agentDir) === 'configured-without-credentials') {
+        return { block: true, reason: channelMisconfigBlockReason }
+      }
+      warnNoManagedAuthOnce()
+      return
     }
     // `/user` resolves the caller's USER identity. An App installation token is not
     // a user, so GitHub rejects it on a token-class basis (403, or no-token error in
@@ -189,11 +223,12 @@ export default definePlugin({
       // seeded so `gh` fails honestly rather than us guessing a token. The
       // sandboxed-PAT mint path bypasses this PAT-class re-check via the flag.
       // `decision` is necessarily `inject` here (block/pass-through returned
-      // above), i.e. a repo-targeting gh with no managed credential — warn so the
-      // pass-through is diagnosable, then let it run unchanged.
+      // above), i.e. a repo-targeting gh with no managed credential. Block with
+      // the precise misconfig reason for a credential-requiring write (gh pr
+      // create) when the channel is configured-without-credentials; otherwise
+      // warn so the pass-through is diagnosable, then let it run unchanged.
       if (!mintForSandboxedPat && !shouldMintAppToken(processPat, hasAppTokenResolver())) {
-        warnNoManagedAuthOnce()
-        return
+        return resolveNoManagedAuth(isGhCredentialRequiringWrite(command))
       }
 
       const result = await resolveTokenForRepo(decision.repoSlug)
@@ -250,9 +285,12 @@ export default definePlugin({
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
+      // `decision` is `inject` here (a repo-targeting github command). A push is
+      // the credential-requiring write that gets the precise misconfig block when
+      // the channel is configured-without-credentials; clone/fetch/pull fall back
+      // to the generic warn-and-pass-through.
       if (noManagedAuth) {
-        warnNoManagedAuthOnce()
-        return
+        return resolveNoManagedAuth(isGitPushCommand(command))
       }
 
       // The unsandboxed-PAT path uses the PAT directly; otherwise mint a per-repo

@@ -1,8 +1,35 @@
 import { describe, expect, test } from 'bun:test'
 
-import { analyzeGitCommand, type GitResolvers, parseGithubRepoFromGitUrl } from './git-command'
+import { analyzeGitCommand, type GitResolvers, isGitPushCommand, parseGithubRepoFromGitUrl } from './git-command'
 
 const CWD = '/agent'
+
+describe('isGitPushCommand', () => {
+  test('true for a bare git push', () => {
+    expect(isGitPushCommand('git push origin main')).toBe(true)
+    expect(isGitPushCommand('git push https://github.com/o/r.git main')).toBe(true)
+  })
+
+  test('true for a push inside a cd-prefix or && chain', () => {
+    expect(isGitPushCommand('cd /repo && git push origin main')).toBe(true)
+    expect(isGitPushCommand('git status && git push origin main')).toBe(true)
+  })
+
+  test('false for non-push git subcommands', () => {
+    expect(isGitPushCommand('git clone https://github.com/o/r.git')).toBe(false)
+    expect(isGitPushCommand('git fetch origin')).toBe(false)
+    expect(isGitPushCommand('git status')).toBe(false)
+  })
+
+  test('false for help invocations (no credential needed)', () => {
+    expect(isGitPushCommand('git push --help')).toBe(false)
+    expect(isGitPushCommand('git push -h')).toBe(false)
+  })
+
+  test('false for a non-git command', () => {
+    expect(isGitPushCommand('ls -la')).toBe(false)
+  })
+})
 
 function resolvers(overrides: Partial<GitResolvers> = {}): GitResolvers {
   return {

@@ -3,8 +3,32 @@ import { describe, expect, it } from 'bun:test'
 import {
   analyzeGhCommand,
   effectiveGhTokensForAuthenticatedUserEndpoint,
+  isGhCredentialRequiringWrite,
   usesGhApiAuthenticatedUserEndpoint,
 } from './gh-command'
+
+describe('isGhCredentialRequiringWrite', () => {
+  it('true for gh pr create (with or without flags)', () => {
+    expect(isGhCredentialRequiringWrite('gh pr create')).toBe(true)
+    expect(isGhCredentialRequiringWrite('gh pr create -R o/r --title x --body y')).toBe(true)
+  })
+
+  it('false for read-only and other gh subcommands', () => {
+    expect(isGhCredentialRequiringWrite('gh pr view -R o/r')).toBe(false)
+    expect(isGhCredentialRequiringWrite('gh pr list')).toBe(false)
+    expect(isGhCredentialRequiringWrite('gh auth status')).toBe(false)
+    expect(isGhCredentialRequiringWrite('gh api /repos/o/r')).toBe(false)
+  })
+
+  it('false for gh pr create --help / -h (no credential needed)', () => {
+    expect(isGhCredentialRequiringWrite('gh pr create --help')).toBe(false)
+    expect(isGhCredentialRequiringWrite('gh pr create -h')).toBe(false)
+  })
+
+  it('false for a non-gh command', () => {
+    expect(isGhCredentialRequiringWrite('git push origin main')).toBe(false)
+  })
+})
 
 describe('analyzeGhCommand', () => {
   it('passes through commands that do not invoke gh', () => {

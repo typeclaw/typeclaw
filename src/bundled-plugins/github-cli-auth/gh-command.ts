@@ -159,6 +159,27 @@ export function analyzeGhCommand(command: string): GhCommandDecision {
   return { kind: 'block', reason: COMPOSITION_REASON }
 }
 
+// True for a `gh pr create` invocation — the canonical credential-requiring
+// write the misconfig block targets. Scans every gh invocation (an `&&` chain
+// could carry it) for the `pr` subcommand followed by `create`, skipping flags
+// and their values so `gh pr create --title x` still matches. Read-only `gh`
+// (pr view/list, auth status) returns false and is never blocked.
+export function isGhCredentialRequiringWrite(command: string): boolean {
+  const tokens = tokenize(command)
+  const ghStarts = findGhInvocations(tokens)
+  for (let i = 0; i < ghStarts.length; i++) {
+    const start = ghStarts[i] as number
+    const end = ghStarts[i + 1] ?? tokens.length
+    const args = tokens.slice(start + 1, end)
+    // `gh pr create --help`/`-h` only prints docs and needs no credential, so it
+    // must not trigger the misconfig block.
+    if (args.includes('--help') || args.includes('-h')) continue
+    const positionals = args.filter((t) => !t.startsWith('-'))
+    if (positionals[0] === 'pr' && positionals[1] === 'create') return true
+  }
+  return false
+}
+
 // stdin-only readers whose only sink is stdout (back to the agent, who already
 // has gh's output) — they cannot open their own network/file/process sink, so a
 // `gh <repo> | <reader>` pipeline cannot exfiltrate the minted token to a third
