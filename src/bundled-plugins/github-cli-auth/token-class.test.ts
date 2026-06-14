@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import { classifyGhToken, shouldMintAppToken } from './token-class'
+import { classifyGhToken, effectiveProcessPat, shouldMintAppToken } from './token-class'
 
 describe('classifyGhToken', () => {
   it('classifies a classic PAT as cross-owner', () => {
@@ -43,5 +43,21 @@ describe('shouldMintAppToken', () => {
   it('never re-mints for classic or fine-grained PATs, even with a live minter', () => {
     expect(shouldMintAppToken('ghp_classic', true)).toBe(false)
     expect(shouldMintAppToken('github_pat_xyz', true)).toBe(false)
+  })
+})
+
+describe('effectiveProcessPat', () => {
+  it('prefers GH_TOKEN over GITHUB_TOKEN (gh precedence)', () => {
+    expect(effectiveProcessPat({ GH_TOKEN: 'ghp_a', GITHUB_TOKEN: 'ghp_b' })).toBe('ghp_a')
+  })
+
+  it('falls back to GITHUB_TOKEN when GH_TOKEN is absent or empty', () => {
+    expect(effectiveProcessPat({ GITHUB_TOKEN: 'ghp_b' })).toBe('ghp_b')
+    expect(effectiveProcessPat({ GH_TOKEN: '', GITHUB_TOKEN: 'ghp_b' })).toBe('ghp_b')
+  })
+
+  it('is undefined when neither is set or both are empty', () => {
+    expect(effectiveProcessPat({})).toBeUndefined()
+    expect(effectiveProcessPat({ GH_TOKEN: '', GITHUB_TOKEN: '' })).toBeUndefined()
   })
 })

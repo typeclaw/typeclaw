@@ -1,5 +1,19 @@
 export type GhTokenClass = 'cross-owner' | 'fine-grained-pat' | 'app' | 'none'
 
+// The PAT `gh`/`git` would actually use from the process env, following gh's own
+// precedence (`GH_TOKEN` over `GITHUB_TOKEN`). git has no native support for
+// either, but the plugin's askpass path injects this value, so both CLIs end up
+// honoring the same token. Used everywhere a process-env credential is
+// classified or checked for presence so a `GITHUB_TOKEN`-only env is not misread
+// as "no auth".
+export function effectiveProcessPat(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const ghToken = env.GH_TOKEN
+  if (ghToken !== undefined && ghToken !== '') return ghToken
+  const githubToken = env.GITHUB_TOKEN
+  if (githubToken !== undefined && githubToken !== '') return githubToken
+  return undefined
+}
+
 export function classifyGhToken(token: string | undefined): GhTokenClass {
   if (token === undefined || token === '') return 'none'
   if (token.startsWith('ghp_')) return 'cross-owner'

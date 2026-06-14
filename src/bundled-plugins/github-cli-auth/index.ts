@@ -10,7 +10,7 @@ import { ensureGitAskPassHelper } from './git-askpass'
 import { analyzeGitCommand, defaultGitResolvers } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
-import { classifyGhToken, shouldMintAppToken } from './token-class'
+import { classifyGhToken, effectiveProcessPat, shouldMintAppToken } from './token-class'
 
 export default definePlugin({
   plugin: async (ctx) => {
@@ -141,10 +141,14 @@ export default definePlugin({
         event.args.command = decision.rewrittenCommand
       }
 
-      const tokenClass = classifyGhToken(process.env.GH_TOKEN)
+      // The PAT gh/git would use, honoring gh precedence (GH_TOKEN over
+      // GITHUB_TOKEN). Keyed once and reused for every PAT branch so a
+      // GITHUB_TOKEN-only env is classified and injected like a GH_TOKEN one.
+      const processPat = effectiveProcessPat()
+      const tokenClass = classifyGhToken(processPat)
 
       // PAT classes (classic = cross-owner, fine-grained) are not re-minted per
-      // repo; the seeded GH_TOKEN is the only token we have. App minting, when
+      // repo; the seeded PAT is the only token we have. App minting, when
       // available, is still preferred for SANDBOXED roles (the PAT can't reach
       // them), so a PAT must NOT suppress minting there — only for unsandboxed
       // execution does the PAT win. Unsandboxed: the PAT already rides inherited
@@ -152,18 +156,19 @@ export default definePlugin({
       // GH_TOKEN explicit and consistent with the git path. Sandboxed PAT-only:
       // block with guidance instead of failing silently.
       // Set when a sandboxed PAT falls through to App minting: the tail's
-      // shouldMintAppToken(process.env.GH_TOKEN) re-check would see the PAT and
-      // bail, so this flag forces the mint that the PAT must not suppress.
+      // shouldMintAppToken(processPat) re-check would see the PAT and bail, so
+      // this flag forces the mint that the PAT must not suppress.
       let mintForSandboxedPat = false
       if (tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat') {
         // Unsandboxed: the PAT authenticates directly (it already rides inherited
         // process.env). For a repo-targeting command we re-assert it in the
-        // overlay so behavior is explicit and matches the git path; otherwise we
-        // pass through. The App-oriented missing-repo / multi-owner BLOCK does
-        // NOT apply — a PAT needs no per-repo mint — so we never surface it here.
+        // overlay as GH_TOKEN (the higher-precedence name) so behavior is explicit
+        // and matches the git path; otherwise we pass through. The App-oriented
+        // missing-repo / multi-owner BLOCK does NOT apply — a PAT needs no per-repo
+        // mint — so we never surface it here.
         if (runsUnsandboxed(event.origin)) {
           if (decision.kind === 'inject') {
-            event.args[TYPECLAW_INTERNAL_BASH_ENV] = { GH_TOKEN: process.env.GH_TOKEN as string }
+            event.args[TYPECLAW_INTERNAL_BASH_ENV] = { GH_TOKEN: processPat as string }
           }
           return
         }
@@ -180,13 +185,13 @@ export default definePlugin({
 
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
-      // No App auth (no App-class GH_TOKEN and no live minter): leave whatever
-      // is seeded so `gh` fails honestly rather than us guessing a token. The
+      // No App auth (no App-class PAT and no live minter): leave whatever is
+      // seeded so `gh` fails honestly rather than us guessing a token. The
       // sandboxed-PAT mint path bypasses this PAT-class re-check via the flag.
       // `decision` is necessarily `inject` here (block/pass-through returned
       // above), i.e. a repo-targeting gh with no managed credential — warn so the
       // pass-through is diagnosable, then let it run unchanged.
-      if (!mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())) {
+      if (!mintForSandboxedPat && !shouldMintAppToken(processPat, hasAppTokenResolver())) {
         warnNoManagedAuthOnce()
         return
       }
@@ -206,7 +211,11 @@ export default definePlugin({
       agentDir: string
     }): Promise<HookResult> => {
       const { event, command, agentDir } = params
-      const tokenClass = classifyGhToken(process.env.GH_TOKEN)
+      // Same effective PAT (GH_TOKEN over GITHUB_TOKEN) the gh path keys off, so a
+      // GITHUB_TOKEN-only env authenticates git too — git has no native support
+      // for either name, but the askpass path below injects this value.
+      const processPat = effectiveProcessPat()
+      const tokenClass = classifyGhToken(processPat)
       const isPat = tokenClass === 'cross-owner' || tokenClass === 'fine-grained-pat'
 
       // A PAT is not re-mintable per repo. For unsandboxed roles it rides the
@@ -235,8 +244,7 @@ export default definePlugin({
       // flag forces minting past this PAT-class re-check. We still run the analyzer
       // first so a repo-targeting command (which WOULD have needed a token) warns
       // before passing through; a non-repo / non-github command stays silent.
-      const noManagedAuth =
-        !useEnvPat && !mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())
+      const noManagedAuth = !useEnvPat && !mintForSandboxedPat && !shouldMintAppToken(processPat, hasAppTokenResolver())
 
       const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
       if (decision.kind === 'pass-through') return
@@ -252,7 +260,7 @@ export default definePlugin({
       // never argv/config.
       let gitToken: string
       if (useEnvPat) {
-        gitToken = process.env.GH_TOKEN as string
+        gitToken = processPat as string
       } else {
         const result = await resolveTokenForRepo(decision.repoSlug)
         if (result.kind === 'unavailable') return { block: true, reason: result.reason }

@@ -234,6 +234,49 @@ describe('github-cli-auth plugin', () => {
     expect(resolverCalled).toBe(false)
   })
 
+  test('GITHUB_TOKEN-only PAT (unsandboxed): repo-targeting gh injects it as GH_TOKEN, no warning, no mint', async () => {
+    delete process.env.GH_TOKEN
+    process.env.GITHUB_TOKEN = 'ghp_via_github_token'
+    let resolverCalled = false
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(
+      async () => {
+        resolverCalled = true
+        return { kind: 'token', token: 'ghs_minted' }
+      },
+      false,
+      { permissions: unsandboxedPermissions, logger },
+    )
+    const event = bashEvent('gh pr view -R acme/widgets')
+
+    const result = await hook(event, hookCtx)
+
+    // gh natively honors GITHUB_TOKEN, so this IS auth — the warning must not fire.
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghp_via_github_token' })
+    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(0)
+  })
+
+  test('GH_TOKEN beats GITHUB_TOKEN (unsandboxed): gh overlay uses GH_TOKEN', async () => {
+    process.env.GH_TOKEN = 'ghp_primary'
+    process.env.GITHUB_TOKEN = 'ghp_secondary'
+    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: unsandboxedPermissions })
+    const event = bashEvent('gh pr view -R acme/widgets')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghp_primary' })
+  })
+
   test('App auth: strips a redundant -R on a literal-path gh api call AND injects the minted token', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(tokenResolver('ghs_minted'))
@@ -627,6 +670,80 @@ describe('github-cli-auth plugin — git path', () => {
     expect(result).toBeUndefined()
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
     expect(warnings.length).toBe(0)
+  })
+
+  test('GITHUB_TOKEN-only PAT (unsandboxed): repo-targeting git injects it via askpass, no warning, no mint', async () => {
+    delete process.env.GH_TOKEN
+    process.env.GITHUB_TOKEN = 'ghp_via_github_token'
+    let resolverCalled = false
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(
+      async () => {
+        resolverCalled = true
+        return { kind: 'token', token: 'ghs_minted' }
+      },
+      false,
+      { permissions: unsandboxedPermissions, logger },
+    )
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    // git has no native GITHUB_TOKEN support, but the askpass path supplies it,
+    // so this is real auth — no false warning, and the token rides askpass.
+    expect(result).toBeUndefined()
+    const overlay = event.args[TYPECLAW_INTERNAL_BASH_ENV] as Record<string, string>
+    expect(overlay.TYPECLAW_GIT_TOKEN).toBe('ghp_via_github_token')
+    expect(overlay.GIT_ASKPASS).toBeDefined()
+    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(0)
+  })
+
+  test('GH_TOKEN beats GITHUB_TOKEN (unsandboxed): git askpass uses GH_TOKEN', async () => {
+    process.env.GH_TOKEN = 'ghp_primary'
+    process.env.GITHUB_TOKEN = 'ghp_secondary'
+    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: unsandboxedPermissions })
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    const overlay = event.args[TYPECLAW_INTERNAL_BASH_ENV] as Record<string, string>
+    expect(overlay.TYPECLAW_GIT_TOKEN).toBe('ghp_primary')
+  })
+
+  test('GITHUB_TOKEN-only PAT (sandboxed) + App minter: mints an App token instead of the withheld PAT', async () => {
+    delete process.env.GH_TOKEN
+    process.env.GITHUB_TOKEN = 'ghp_via_github_token'
+    const hook = await hookFor(tokenResolver('ghs_minted'), true)
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    const overlay = event.args[TYPECLAW_INTERNAL_BASH_ENV] as Record<string, string>
+    expect(overlay.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+    expect(overlay.GIT_ASKPASS).toBeDefined()
+  })
+
+  test('GITHUB_TOKEN-only PAT (sandboxed) + no App minter: blocks git with the withheld-PAT guidance', async () => {
+    delete process.env.GH_TOKEN
+    process.env.GITHUB_TOKEN = 'ghp_via_github_token'
+    const hook = await hookFor(tokenResolver('ghs_minted'), false)
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    expect((result as { reason: string }).reason).toContain('sandboxed')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
   test('App auth: blocks when the bridge is unavailable', async () => {
