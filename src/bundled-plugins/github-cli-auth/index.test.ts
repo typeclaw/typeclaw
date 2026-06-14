@@ -126,20 +126,56 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
   })
 
-  test('no App auth (GH_TOKEN unseeded, no minter): passes through without minting', async () => {
+  test('no managed auth (GH_TOKEN unseeded, no minter): repo-targeting gh passes through and warns once', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false
-    const hook = await hookFor(async () => {
-      resolverCalled = true
-      return { kind: 'token', token: 'ghs_minted' }
-    }, false)
-    const event = bashEvent('gh pr view -R acme/widgets')
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(
+      async () => {
+        resolverCalled = true
+        return { kind: 'token', token: 'ghs_minted' }
+      },
+      false,
+      { logger },
+    )
 
-    const result = await hook(event, { agentDir: '/agent', pluginName: 'github-cli-auth', logger: noopLogger })
+    const first = await hook(bashEvent('gh pr view -R acme/widgets'), hookCtx)
+    const second = await hook(bashEvent('gh pr view -R acme/other'), hookCtx)
+
+    // The command must still run (we cannot see the user's own ambient auth), but
+    // the formerly-silent pass-through now emits one diagnostic warning.
+    expect(first).toBeUndefined()
+    expect(second).toBeUndefined()
+    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(1)
+    expect(warnings[0]).toContain('TypeClaw-managed GitHub credentials')
+  })
+
+  test('no managed auth: a repo-less gh command passes through silently (no warning)', async () => {
+    delete process.env.GH_TOKEN
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { logger })
+    const event = bashEvent('gh auth status')
+
+    const result = await hook(event, hookCtx)
 
     expect(result).toBeUndefined()
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(0)
   })
 
   test('classic PAT (unsandboxed): injects the PAT for a repo-targeting gh, does not mint', async () => {
@@ -521,20 +557,76 @@ describe('github-cli-auth plugin — git path', () => {
     expect(overlay.GIT_ASKPASS).toBeDefined()
   })
 
-  test('no App auth (GH_TOKEN unseeded, no minter): git push passes through without minting', async () => {
+  test('no managed auth (GH_TOKEN unseeded, no minter): repo-targeting git push passes through and warns once', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false
-    const hook = await hookFor(async () => {
-      resolverCalled = true
-      return { kind: 'token', token: 'ghs_minted' }
-    }, false)
-    const event = bashEvent('git push https://github.com/acme/widgets.git main')
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(
+      async () => {
+        resolverCalled = true
+        return { kind: 'token', token: 'ghs_minted' }
+      },
+      false,
+      { logger },
+    )
+
+    const firstEvent = bashEvent('git push https://github.com/acme/widgets.git main')
+    const first = await hook(firstEvent, hookCtx)
+    const second = await hook(bashEvent('git push https://github.com/acme/other.git main'), hookCtx)
+
+    expect(first).toBeUndefined()
+    expect(second).toBeUndefined()
+    expect(firstEvent.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(1)
+    expect(warnings[0]).toContain('TypeClaw-managed GitHub credentials')
+  })
+
+  test('no managed auth: a non-remote git command passes through silently (no warning)', async () => {
+    delete process.env.GH_TOKEN
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { logger })
+    const event = bashEvent('git status')
 
     const result = await hook(event, hookCtx)
 
     expect(result).toBeUndefined()
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(resolverCalled).toBe(false)
+    expect(warnings.length).toBe(0)
+  })
+
+  test('no managed auth: a non-github git push passes through silently (no warning)', async () => {
+    delete process.env.GH_TOKEN
+    const warnings: string[] = []
+    const logger = {
+      info: () => {},
+      warn: (m: string): void => {
+        warnings.push(m)
+      },
+      error: () => {},
+    }
+    const hook = await hookFor(tokenResolver('ghs_minted'), false, { logger })
+    const event = bashEvent('git push https://gitlab.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(warnings.length).toBe(0)
   })
 
   test('App auth: blocks when the bridge is unavailable', async () => {

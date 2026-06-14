@@ -50,6 +50,29 @@ export default definePlugin({
           'for per-repo tokens that work in sandboxed roles.',
       )
     }
+
+    // A repo-targeting git/gh command reached us with NO TypeClaw-managed
+    // credential to inject: no .env PAT (cleared or unset), no sandboxed-PAT mint
+    // path, and no GitHub App resolver. We deliberately do NOT block — the agent
+    // may have configured its own auth we cannot observe (a credential helper,
+    // ~/.netrc, an in-container `gh auth login`, mounted gh config, or an SSH
+    // remote that needs no token). Blocking would break those legitimate flows.
+    // But a silent pass-through is what made the original failure undiagnosable
+    // ("could not read Username" with no hint), so we emit a one-shot warning
+    // that names the real situation and both TypeClaw remedies, then let the
+    // command run unchanged so honest success or honest failure can follow.
+    let warnedNoManagedAuth = false
+    const warnNoManagedAuthOnce = (): void => {
+      if (warnedNoManagedAuth) return
+      warnedNoManagedAuth = true
+      ctx.logger.warn(
+        'No TypeClaw-managed GitHub credentials are available for a repo-targeting git/gh command, ' +
+          'so TypeClaw cannot inject auth. The command runs unchanged and may still succeed if you ' +
+          'configured GitHub auth yourself inside the container (credential helper, ~/.netrc, ' +
+          '`gh auth login`, or an SSH remote). To enable TypeClaw-managed auth, set GH_TOKEN/GITHUB_TOKEN ' +
+          'in .env for roles allowed to receive it, or configure channels.github App authentication.',
+      )
+    }
     // `/user` resolves the caller's USER identity. An App installation token is not
     // a user, so GitHub rejects it on a token-class basis (403, or no-token error in
     // the sandbox) no matter how valid the token is. We block-and-guide so the agent
@@ -160,7 +183,13 @@ export default definePlugin({
       // No App auth (no App-class GH_TOKEN and no live minter): leave whatever
       // is seeded so `gh` fails honestly rather than us guessing a token. The
       // sandboxed-PAT mint path bypasses this PAT-class re-check via the flag.
-      if (!mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())) return
+      // `decision` is necessarily `inject` here (block/pass-through returned
+      // above), i.e. a repo-targeting gh with no managed credential — warn so the
+      // pass-through is diagnosable, then let it run unchanged.
+      if (!mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())) {
+        warnNoManagedAuthOnce()
+        return
+      }
 
       const result = await resolveTokenForRepo(decision.repoSlug)
       if (result.kind === 'unavailable') return { block: true, reason: result.reason }
@@ -203,12 +232,20 @@ export default definePlugin({
       // fails honestly rather than us guessing a token. App auth is detected by
       // the live minter too, not just an App-class GH_TOKEN: multi-owner /
       // no-repos App configs never seed GH_TOKEN yet can mint. The mintForSandboxedPat
-      // flag forces minting past this PAT-class re-check.
-      if (!useEnvPat && !mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())) return
+      // flag forces minting past this PAT-class re-check. We still run the analyzer
+      // first so a repo-targeting command (which WOULD have needed a token) warns
+      // before passing through; a non-repo / non-github command stays silent.
+      const noManagedAuth =
+        !useEnvPat && !mintForSandboxedPat && !shouldMintAppToken(process.env.GH_TOKEN, hasAppTokenResolver())
 
       const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
+
+      if (noManagedAuth) {
+        warnNoManagedAuthOnce()
+        return
+      }
 
       // The unsandboxed-PAT path uses the PAT directly; otherwise mint a per-repo
       // App token. Both ride TYPECLAW_GIT_TOKEN (read by the askpass helper),
