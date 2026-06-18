@@ -7,6 +7,10 @@ import { GITKEEP_FILE, PACKAGES_DIR } from './paths'
 export const PACKAGE_FILE = 'package.json'
 export const WORKSPACES_GLOB = `${PACKAGES_DIR}/*`
 
+const BUN_COMPATIBLE_OVERRIDES: Record<string, string> = {
+  bson: '6.10.4',
+}
+
 export type PackageJsonRefreshResult = {
   changed: boolean
   files: string[]
@@ -29,7 +33,7 @@ export async function refreshPackageJson(cwd: string): Promise<PackageJsonRefres
   const pkgPath = join(cwd, PACKAGE_FILE)
 
   if (existsSync(pkgPath)) {
-    const updated = await ensureWorkspacesField(pkgPath)
+    const updated = await ensureManagedPackageJsonFields(pkgPath)
     if (updated) changed.push(PACKAGE_FILE)
   }
 
@@ -44,7 +48,7 @@ export async function refreshPackageJson(cwd: string): Promise<PackageJsonRefres
   return { changed: changed.length > 0, files: changed }
 }
 
-async function ensureWorkspacesField(pkgPath: string): Promise<boolean> {
+async function ensureManagedPackageJsonFields(pkgPath: string): Promise<boolean> {
   let raw: string
   try {
     raw = await readFile(pkgPath, 'utf8')
@@ -61,16 +65,38 @@ async function ensureWorkspacesField(pkgPath: string): Promise<boolean> {
     return false
   }
 
-  if ('workspaces' in pkg) return false
+  let next = pkg
+  let changed = false
 
-  // Insertion order matters: place `workspaces` right after `type` (or after
-  // top-of-object metadata if `type` is absent) so the diff reads cleanly
-  // alongside the buildPackageJson template's field order. Without this, a
-  // freshly-migrated package.json has `workspaces` at the bottom — visually
-  // jarring and harder to spot on review.
-  const next = insertAfterKey(pkg, 'type', 'workspaces', [WORKSPACES_GLOB])
+  if (!('workspaces' in next)) {
+    // Insertion order matters: place `workspaces` right after `type` (or after
+    // top-of-object metadata if `type` is absent) so the diff reads cleanly
+    // alongside the buildPackageJson template's field order. Without this, a
+    // freshly-migrated package.json has `workspaces` at the bottom — visually
+    // jarring and harder to spot on review.
+    next = insertAfterKey(next, 'type', 'workspaces', [WORKSPACES_GLOB])
+    changed = true
+  }
+
+  const overrides = next.overrides
+  if (overrides === undefined) {
+    next = insertAfterKey(next, 'dependencies', 'overrides', BUN_COMPATIBLE_OVERRIDES)
+    changed = true
+  } else if (isPlainObject(overrides)) {
+    const missing = Object.entries(BUN_COMPATIBLE_OVERRIDES).filter(([name]) => !(name in overrides))
+    if (missing.length > 0) {
+      next = { ...next, overrides: { ...overrides, ...Object.fromEntries(missing) } }
+      changed = true
+    }
+  }
+
+  if (!changed) return false
   await writeFile(pkgPath, `${JSON.stringify(next, null, 2)}\n`)
   return true
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function insertAfterKey(

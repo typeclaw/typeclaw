@@ -56,6 +56,7 @@ describe('refreshPackageJson', () => {
       private: true,
       type: 'module',
       workspaces: ['custom/*', 'libs/*'],
+      overrides: { bson: '6.10.4' },
     })
 
     const result = await refreshPackageJson(root)
@@ -64,6 +65,32 @@ describe('refreshPackageJson', () => {
     expect(pkg.workspaces).toEqual(['custom/*', 'libs/*'])
     // package.json is unchanged, but .gitkeep may still be created if missing
     expect(result.files).not.toContain('package.json')
+  })
+
+  test('adds Bun-compatible dependency overrides to existing agents', async () => {
+    await writePkg({ name: 'agent', private: true, type: 'module', dependencies: { typeclaw: 'file:../typeclaw' } })
+
+    const result = await refreshPackageJson(root)
+
+    const pkg = await readPkg()
+    expect(result.files).toContain('package.json')
+    expect(pkg.overrides).toEqual({ bson: '6.10.4' })
+  })
+
+  test('preserves existing overrides while adding missing Bun-compatible dependency overrides', async () => {
+    await writePkg({
+      name: 'agent',
+      private: true,
+      type: 'module',
+      workspaces: ['packages/*'],
+      overrides: { 'left-pad': '1.3.0' },
+    })
+
+    const result = await refreshPackageJson(root)
+
+    const pkg = await readPkg()
+    expect(result.files).toContain('package.json')
+    expect(pkg.overrides).toEqual({ 'left-pad': '1.3.0', bson: '6.10.4' })
   })
 
   test('preserves all other top-level fields (name, deps, scripts, custom keys)', async () => {

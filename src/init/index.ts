@@ -632,6 +632,17 @@ function addCustomModel(
 // two installs of the same CLI and a skew is silent. Enforced by a guard test
 // in packagejson.test.ts.
 export const AGENT_BROWSER_VERSION = '^0.27.0'
+
+// agent-messenger currently depends on bson ^7.2.0, whose ESM entrypoint
+// probes node:v8 startupSnapshot.isBuildingSnapshot(). Bun exposes the
+// function but throws ERR_NOT_IMPLEMENTED when bson calls it during module
+// initialization, which crashes freshly-hatched agents before the websocket
+// server can bind. Keep scaffolded agents on the last Bun-compatible BSON 6.x
+// until upstream stops importing that probe at startup.
+export const BUN_COMPATIBLE_OVERRIDES: Record<string, string> = {
+  bson: '6.10.4',
+}
+
 function buildPackageJson(root: string, name: string): Record<string, unknown> {
   return {
     name,
@@ -643,6 +654,7 @@ function buildPackageJson(root: string, name: string): Record<string, unknown> {
       'agent-browser': AGENT_BROWSER_VERSION,
       [GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE]: GWS_MULTI_ACCOUNT_PLUGIN_VERSION,
     },
+    overrides: BUN_COMPATIBLE_OVERRIDES,
     typeclaw: {
       managedPlugins: {
         [GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE]: GWS_MULTI_ACCOUNT_PLUGIN_VERSION,

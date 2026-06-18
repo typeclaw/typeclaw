@@ -76,6 +76,9 @@
   "peerDependencies": {
     "typescript": "^5"
   },
+  "overrides": {
+    "bson": "6.10.4"
+  },
   "engines": {
     "bun": ">=1.1.0"
   }

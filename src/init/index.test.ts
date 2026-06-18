@@ -930,6 +930,15 @@ describe('scaffold', () => {
     expect(pkg.workspaces).toEqual(['packages/*'])
   })
 
+  test('package.json pins Bun-compatible transitive overrides for runtime dependencies', async () => {
+    await scaffold(root)
+
+    const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as {
+      overrides?: Record<string, string>
+    }
+    expect(pkg.overrides?.bson).toBe('6.10.4')
+  })
+
   test('package.json bundles agent-browser so the agent-browser skill can shell out to the CLI', async () => {
     await scaffold(root)
 
