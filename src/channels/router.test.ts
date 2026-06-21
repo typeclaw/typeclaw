@@ -416,6 +416,30 @@ describe('ChannelRouter session lifecycle', () => {
     expect(phaseLogs[doneIdx]).toContain('cold-start')
   })
 
+  test('webex log lines decode the base64 room id while keyId stays the raw rest id', async () => {
+    // given a webex inbound whose chat is the opaque base64 REST id
+    //   (base64url of ciscospark://us/ROOM/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)
+    const roomId = 'Y2lzY29zcGFyazovL3VzL1JPT00vYWFhYWFhYWEtYmJiYi1jY2NjLWRkZGQtZWVlZWVlZWVlZWVl'
+    const webexKey: ChannelKey = { adapter: 'webex', workspace: '@dm', chat: roomId, thread: null }
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs })
+
+    // when a first inbound triggers cold-start ensureLive
+    await router.route(inbound({ adapter: 'webex', workspace: '@dm', chat: roomId }))
+    await router.__testing!.flushDebounce(webexKey)
+
+    // then the log lines show the decoded room ref, never the base64 blob
+    const channelLogs = logs.filter((l) => l.includes('[channels]') && l.includes('webex:'))
+    expect(channelLogs.length).toBeGreaterThan(0)
+    expect(channelLogs.some((l) => l.includes('webex:@dm:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:'))).toBe(true)
+    expect(channelLogs.some((l) => l.includes('ensureLive begin'))).toBe(true)
+    for (const line of channelLogs) expect(line).not.toContain(roomId)
+
+    // and the returned keyId is still the canonical raw REST id (map/identity currency)
+    expect(router.clearSticky(webexKey).keyId).toBe(`webex:@dm:${roomId}:`)
+  })
+
   test('rehydrate path logs `ensureLive begin (rehydrate)` after restart', async () => {
     // given a persisted mapping from a prior run
     const dir = await tempDir()

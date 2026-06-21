@@ -1,3 +1,4 @@
+import { readableChannelId } from './adapters/webex-id-ref'
 import type { AdapterId } from './schema'
 
 export type ChannelKey = {
@@ -426,4 +427,12 @@ export type ReviewStateResolver = (req: ReviewStateRequest) => Promise<ReviewSta
 
 export function channelKeyId(key: { adapter: string; workspace: string; chat: string; thread: string | null }): string {
   return `${key.adapter}:${key.workspace}:${key.chat}:${key.thread ?? ''}`
+}
+
+// Display-only sibling of `channelKeyId` for log lines: identical shape, but the
+// chat component is decoded for Webex so operators see `ciscospark://`'s trailing
+// ref instead of the opaque base64 blob. NEVER use as a map key or persisted id —
+// `channelKeyId` stays the canonical identity.
+export function channelKeyLabel(key: ChannelKey): string {
+  return `${key.adapter}:${key.workspace}:${readableChannelId(key.adapter, key.chat)}:${key.thread ?? ''}`
 }

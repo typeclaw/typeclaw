@@ -8,7 +8,7 @@ import {
   type MembershipResolverResult,
 } from './membership'
 import type { ChannelKey } from './types'
-import { channelKeyId } from './types'
+import { channelKeyId, channelKeyLabel } from './types'
 
 export type MembershipCacheRead =
   | { kind: 'hit'; membership: MembershipCount | null }
@@ -76,7 +76,7 @@ export function createMembershipCache(options: MembershipCacheOptions): Membersh
     try {
       result = await options.resolver(key)
     } catch (err) {
-      options.logger?.warn(`[channels] membership resolver threw for ${keyId}: ${describe(err)}`)
+      options.logger?.warn(`[channels] membership resolver threw for ${channelKeyLabel(key)}: ${describe(err)}`)
       result = { kind: 'transient' }
     }
     entries.set(keyId, { result, expiresAt: now() + ttlFor(result), servedStale: false })

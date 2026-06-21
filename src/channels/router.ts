@@ -26,6 +26,7 @@ import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 
 import { extractMentionedUserIds } from './adapters/mention-hints'
+import { readableChannelId } from './adapters/webex-id-ref'
 import { formatChannelCommandHelp } from './commands'
 import { detectContinuationWillingness } from './continuation-willingness'
 import {
@@ -91,7 +92,7 @@ import type {
   SendResult,
   TypingCallback,
 } from './types'
-import { channelKeyId } from './types'
+import { channelKeyId, channelKeyLabel } from './types'
 
 export const INITIAL_DEBOUNCE_MS = 600
 export const HOT_DEBOUNCE_MS = 1500
@@ -429,8 +430,8 @@ export const ENSURE_LIVE_TIMEOUT_MS = 30_000
 // outcome: a message that arrived mid-reload is cheap to drop, far cheaper
 // than answering it through a session built with the stale role.
 export class StaleLiveSessionError extends Error {
-  constructor(keyId: string) {
-    super(`[channels] ${keyId}: live session creation raced a teardown; discarded`)
+  constructor(keyLabel: string) {
+    super(`[channels] ${keyLabel}: live session creation raced a teardown; discarded`)
     this.name = 'StaleLiveSessionError'
   }
 }
@@ -573,6 +574,9 @@ type TimedAttachment = { ts: number; attachment: InboundAttachment }
 type LiveSession = {
   key: ChannelKey
   keyId: string
+  // Display-only variant of `keyId` for log lines (Webex chat id decoded). Never
+  // a map key — `keyId` stays the identity. See `channelKeyLabel`.
+  keyLabel: string
   session: AgentSession
   // The session's creation-time thinking level, captured once. A later escalated
   // turn moves `session.thinkingLevel` to `high`, so the live getter can't be the
@@ -1387,14 +1391,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const result = await raceWithTimeout(
           resolver(key),
           resolveChannelNamesTimeoutMs,
-          `[channels] ${channelKeyId(key)}: name resolver`,
+          `[channels] ${channelKeyLabel(key)}: name resolver`,
         )
         if (result.chatName !== undefined && merged.chatName === undefined) merged.chatName = result.chatName
         if (result.workspaceName !== undefined && merged.workspaceName === undefined) {
           merged.workspaceName = result.workspaceName
         }
       } catch (err) {
-        logger.warn(`[channels] name resolver threw for ${channelKeyId(key)}: ${describe(err)}`)
+        logger.warn(`[channels] name resolver threw for ${channelKeyLabel(key)}: ${describe(err)}`)
       }
     }
     return merged
@@ -1445,7 +1449,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (cached.kind === 'hit') return cached.membership
     if (cached.kind === 'stale') {
       void cache.warmUp(live.key).catch((err) => {
-        logger.warn(`[channels] membership refresh failed for ${live.keyId}: ${describe(err)}`)
+        logger.warn(`[channels] membership refresh failed for ${live.keyLabel}: ${describe(err)}`)
       })
       return cached.membership
     }
@@ -1465,7 +1469,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.draining) return false
     if (idleMs <= SESSION_FRESHNESS_TTL_MS) return false
     if (idleMs > SESSION_GRACE_HARD_TTL_MS) {
-      logger.info(`[channels] ${live.keyId}: stale-rollover (live: ${idleMs}ms idle, past grace cap)`)
+      logger.info(`[channels] ${live.keyLabel}: stale-rollover (live: ${idleMs}ms idle, past grace cap)`)
       return true
     }
     const transcriptPath = live.getTranscriptPath?.()
@@ -1473,12 +1477,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const transcriptDeltaBytes = Math.max(0, transcriptBytes - live.baseContextBytes)
     if (isGraceWorthReusing(live.baseContextBytes, transcriptDeltaBytes)) {
       logger.info(
-        `[channels] ${live.keyId}: grace-reuse (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
+        `[channels] ${live.keyLabel}: grace-reuse (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
       )
       return false
     }
     logger.info(
-      `[channels] ${live.keyId}: stale-rollover (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
+      `[channels] ${live.keyLabel}: stale-rollover (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
     )
     return true
   }
@@ -1496,6 +1500,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     resumeTarget?: { sessionId: string; sessionFile: string },
   ): Promise<LiveSession> => {
     const keyId = channelKeyId(key)
+    const keyLabel = channelKeyLabel(key)
     const existing = liveSessions.get(keyId)
     if (existing && !existing.destroyed) {
       // A resume that finds the key already live is a no-op for reopening: the
@@ -1550,7 +1555,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         now() - (record.lastInboundAt ?? 0) > SESSION_FRESHNESS_TTL_MS
       ) {
         const idleMs = now() - (record.lastInboundAt ?? 0)
-        logger.info(`[channels] ${keyId}: stale-rollover (persisted: ${idleMs}ms idle)`)
+        logger.info(`[channels] ${keyLabel}: stale-rollover (persisted: ${idleMs}ms idle)`)
         resolvedRecord = {
           adapter: record.adapter,
           workspace: record.workspace,
@@ -1589,13 +1594,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
       }
       const phase = resolvedRecord?.sessionId === undefined ? 'cold-start' : 'rehydrate'
-      logger.info(`[channels] ${keyId}: ensureLive begin (${phase})`)
+      logger.info(`[channels] ${keyLabel}: ensureLive begin (${phase})`)
       const participants = (resolvedRecord?.participants ?? []) as ChannelParticipant[]
       const membershipFetch = warmMembership(key)
       const resolvedNames = await resolveChannelNames(key)
-      logger.info(`[channels] ${keyId}: ensureLive resolved-names`)
+      logger.info(`[channels] ${keyLabel}: ensureLive resolved-names`)
       const membership = await membershipForPrompt(key, membershipFetch)
-      logger.info(`[channels] ${keyId}: ensureLive resolved-membership`)
+      logger.info(`[channels] ${keyLabel}: ensureLive resolved-membership`)
       // The session-creation origin is what the resource loader sees when it
       // renders the role/permissions block into the system prompt. It must
       // include the triggering author so author-scoped roles
@@ -1632,7 +1637,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         origin,
         originRef,
       })
-      logger.info(`[channels] ${keyId}: ensureLive session-created sessionId=${created.sessionId}`)
+      logger.info(`[channels] ${keyLabel}: ensureLive session-created sessionId=${created.sessionId}`)
 
       const transcriptPath = created.getTranscriptPath?.()
       const persistedRecord: ChannelSessionRecord = {
@@ -1663,6 +1668,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const live: LiveSession = {
         key,
         keyId,
+        keyLabel,
         session: created.session,
         turnThinkingDefault: created.session.thinkingLevel,
         sessionId: created.sessionId,
@@ -1745,7 +1751,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // both dedupes the retry storm AND prevents a stranded false-failure
       // notice above a successful reply. See `pendingProviderError`.
       live.unsubProviderErrors = subscribeProviderErrors(created.session, (err) => {
-        logger.error(`[channels] ${live.keyId}: LLM call failed: ${err.message}`)
+        logger.error(`[channels] ${live.keyLabel}: LLM call failed: ${err.message}`)
         if (live.pendingProviderError?.turnSeq === live.turnSeq) return
         live.pendingProviderError = { turnSeq: live.turnSeq, safeMessage: err.safeMessage }
       })
@@ -1758,7 +1764,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           turnId: live.sessionId,
           stopReason: usage.stopReason,
           ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
-        }).catch((err) => logger.error(`[channels] ${live.keyId}: todo outcome capture failed: ${describe(err)}`))
+        }).catch((err) => logger.error(`[channels] ${live.keyLabel}: todo outcome capture failed: ${describe(err)}`))
       })
       live.unsubTypingActivity = subscribeTypingActivity(created.session, live)
       installChannelReplyTerminalHook(live)
@@ -1769,10 +1775,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // installing — installing here is the exact window the race exploits.
       if (generation !== liveGeneration) {
         logger.info(
-          `[channels] ${keyId}: discarding session created across a teardown (gen ${generation} → ${liveGeneration})`,
+          `[channels] ${keyLabel}: discarding session created across a teardown (gen ${generation} → ${liveGeneration})`,
         )
         await tearDownLive(live)
-        throw new StaleLiveSessionError(keyId)
+        throw new StaleLiveSessionError(keyLabel)
       }
       liveSessions.set(keyId, live)
 
@@ -1780,7 +1786,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const adapterConfig = options.configForAdapter(key.adapter)
         if (adapterConfig) {
           await prefetchChannelContext(live, adapterConfig, triggeringMessageId)
-          logger.info(`[channels] ${keyId}: ensureLive prefetched-context`)
+          logger.info(`[channels] ${keyLabel}: ensureLive prefetched-context`)
         }
       }
 
@@ -1793,13 +1799,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.baseContextBytes = measureTranscriptBytes(transcriptPathForBase)
       }
 
-      logger.info(`[channels] ${keyId}: ensureLive done (${phase})`)
+      logger.info(`[channels] ${keyLabel}: ensureLive done (${phase})`)
       return live
     })()
 
     creating.set(keyId, promise)
     try {
-      return await raceWithTimeout(promise, ensureLiveTimeoutMs, `[channels] ${keyId} ensureLive`)
+      return await raceWithTimeout(promise, ensureLiveTimeoutMs, `[channels] ${keyLabel} ensureLive`)
     } catch (err) {
       // The orphaned `promise` may still settle eventually; that's OK because
       // the only side effect it produces post-timeout is a `liveSessions.set`,
@@ -1807,7 +1813,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // ensureLive will treat as a usable warm session — strictly better than
       // a permanent silent drop. The caller (route() in this file, ultimately
       // the adapter's outer catch) sees the timeout error and logs it.
-      logger.error(`[channels] ${keyId}: ensureLive failed: ${describe(err)}`)
+      logger.error(`[channels] ${keyLabel}: ensureLive failed: ${describe(err)}`)
       throw err
     } finally {
       // Owner-checked delete: only clear the in-flight marker if it still points
@@ -1845,7 +1851,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
 
     if (!result.ok) {
-      logger.warn(`[channels] ${live.keyId}: prefetch skipped (history fetch failed: ${result.error})`)
+      logger.warn(`[channels] ${live.keyLabel}: prefetch skipped (history fetch failed: ${result.error})`)
       return
     }
 
@@ -1896,7 +1902,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // normal. We push into contextBuffer (not promptQueue) because these are
     // background context for the model, not turns it must respond to.
     live.contextBuffer.push(...observed)
-    logger.info(`[channels] ${live.keyId}: prefetched ${observed.length} context messages`)
+    logger.info(`[channels] ${live.keyLabel}: prefetched ${observed.length} context messages`)
   }
 
   const persistParticipants = async (live: LiveSession): Promise<void> => {
@@ -1931,7 +1937,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await Promise.all(
       snapshot.map((cb) =>
         cb(target).catch((err) => {
-          logger.warn(`[channels] typing callback threw for ${live.keyId}: ${describe(err)}`)
+          logger.warn(`[channels] typing callback threw for ${live.keyLabel}: ${describe(err)}`)
         }),
       ),
     )
@@ -2043,7 +2049,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const succeeded = context.toolCall.name === 'channel_reply' && !context.isError && details?.ok === true
       const keepTurnAlive = details?.continue === true
       if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true) {
-        logger.info(`[channels] ${live.keyId} terminal_after_channel_reply`)
+        logger.info(`[channels] ${live.keyLabel} terminal_after_channel_reply`)
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
         live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
         agent.abort()
@@ -2091,7 +2097,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       if (now() - live.typingStartedAt >= MAX_TYPING_HEARTBEAT_MS) {
         logger.warn(
-          `[channels] ${live.keyId}: typing indicator paused after ${MAX_TYPING_HEARTBEAT_MS}ms with no activity; prompt still in flight`,
+          `[channels] ${live.keyLabel}: typing indicator paused after ${MAX_TYPING_HEARTBEAT_MS}ms with no activity; prompt still in flight`,
         )
         live.typingTimedOut = true
         void stopTypingHeartbeat(live)
@@ -2129,9 +2135,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       origin: buildLiveOrigin(live),
     })
     try {
-      await raceWithTimeout(work, sessionIdleTimeoutMs, `[channels] ${live.keyId} session.idle`)
+      await raceWithTimeout(work, sessionIdleTimeoutMs, `[channels] ${live.keyLabel} session.idle`)
     } catch (err) {
-      logger.warn(`[channels] session.idle hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.idle hook threw for ${live.keyLabel}: ${describe(err)}`)
     }
   }
 
@@ -2139,7 +2145,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await recordTurnStart({ agentDir: options.agentDir, origin: buildLiveOrigin(live), isRealUserTurn })
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: todo turn-start failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyLabel}: todo turn-start failed: ${describe(err)}`)
     }
   }
 
@@ -2161,7 +2167,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         },
       })
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: todo continuation failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyLabel}: todo continuation failed: ${describe(err)}`)
     }
   }
 
@@ -2177,7 +2183,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         retrievalContext,
       })
     } catch (err) {
-      logger.warn(`[channels] session.turn.start hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.turn.start hook threw for ${live.keyLabel}: ${describe(err)}`)
     }
     return retrievalContext
   }
@@ -2191,7 +2197,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         origin: buildLiveOrigin(live),
       })
     } catch (err) {
-      logger.warn(`[channels] session.turn.end hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.turn.end hook threw for ${live.keyLabel}: ${describe(err)}`)
     }
   }
 
@@ -2232,7 +2238,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await live.hooks.runSessionEnd({ sessionId: live.sessionId })
     } catch (err) {
-      logger.warn(`[channels] session.end hook threw for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] session.end hook threw for ${live.keyLabel}: ${describe(err)}`)
     }
   }
 
@@ -2245,9 +2251,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await stopTypingHeartbeat(live)
     try {
       await live.session.abort()
-      logger.info(`[channels] ${live.keyId}: command /stop aborted current turn`)
+      logger.info(`[channels] ${live.keyLabel}: command /stop aborted current turn`)
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describe(err)}`)
+      logger.warn(`[channels] ${live.keyLabel}: command /stop abort failed: ${describe(err)}`)
     }
   }
 
@@ -2293,11 +2299,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       },
       { source: 'system' },
     ).catch((sendErr) => {
-      logger.warn(`[channels] ${live.keyId}: provider-error notice send threw: ${describe(sendErr)}`)
+      logger.warn(`[channels] ${live.keyLabel}: provider-error notice send threw: ${describe(sendErr)}`)
       return null
     })
     if (result !== null && !result.ok) {
-      logger.warn(`[channels] ${live.keyId}: provider-error notice send failed: ${result.error}`)
+      logger.warn(`[channels] ${live.keyLabel}: provider-error notice send failed: ${result.error}`)
     }
   }
 
@@ -2389,7 +2395,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // Bracketing logs around the LLM call so a hung prompt() is
         // diagnosable from logs alone (we see prompting without prompted).
         // text length is a proxy for "did we send something at all".
-        logger.info(`[channels] ${live.keyId} prompting batch=${batch.length} text_len=${text.length}`)
+        logger.info(`[channels] ${live.keyLabel} prompting batch=${batch.length} text_len=${text.length}`)
         const promptStart = now()
         const successfulSendsBeforePrompt = live.successfulChannelSends
         const emptyTurnRetriesBeforePrompt = live.emptyTurnRetries
@@ -2410,9 +2416,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           await live.session.prompt(promptText)
           await validateChannelTurn(live, successfulSendsBeforePrompt)
           live.consecutiveAborts = 0
-          logger.info(`[channels] ${live.keyId} prompted elapsed_ms=${now() - promptStart}`)
+          logger.info(`[channels] ${live.keyLabel} prompted elapsed_ms=${now() - promptStart}`)
         } catch (err) {
-          logger.error(`[channels] ${live.keyId}: prompt threw: ${describe(err)}`)
+          logger.error(`[channels] ${live.keyLabel}: prompt threw: ${describe(err)}`)
           live.consecutiveSends.clear()
           live.lastSentText.clear()
           live.lastSendLeafId = null
@@ -2563,7 +2569,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (outcome.kind !== 'fallthrough') {
         publishInbound(event, 'claim')
         logger.info(
-          `[channels] ${channelKeyId(key)}: claim ${outcome.kind} author=${event.authorId} id=${event.externalMessageId}`,
+          `[channels] ${channelKeyLabel(key)}: claim ${outcome.kind} author=${event.authorId} id=${event.externalMessageId}`,
         )
         await send(
           {
@@ -2601,7 +2607,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (isChannelRespondDenied(event)) {
       publishInbound(event, 'denied')
       logger.info(
-        `[channels] ${channelKeyId(key)}: denied by permissions (channel.respond) author=${event.authorId} id=${event.externalMessageId}`,
+        `[channels] ${channelKeyLabel(key)}: denied by permissions (channel.respond) author=${event.authorId} id=${event.externalMessageId}`,
       )
       return
     }
@@ -2610,14 +2616,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // Commands are control traffic, not engaged inbounds; if the session is stale,
       // the next engaged inbound will perform the rollover before prompting.
       const keyId = channelKeyId(key)
+      const keyLabel = channelKeyLabel(key)
       if (commandInfo === undefined) {
-        logger.info(`[channels] ${keyId}: ignoring unknown command /${parsedCommand.name}`)
+        logger.info(`[channels] ${keyLabel}: ignoring unknown command /${parsedCommand.name}`)
         return
       }
       const requiredPermission = commandPermissionString(commandInfo.permission)
       if (requiredPermission !== null && !permissions.has(inboundAuthorOrigin(event), requiredPermission)) {
         logger.info(
-          `[channels] ${keyId}: denied command /${parsedCommand.name} by permissions (${requiredPermission}) author=${event.authorId}`,
+          `[channels] ${keyLabel}: denied command /${parsedCommand.name} by permissions (${requiredPermission}) author=${event.authorId}`,
         )
         return
       }
@@ -2629,7 +2636,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (commandInfo.requiresLiveSession) {
         existingLive = liveSessions.get(keyId) ?? null
         if (existingLive === null || existingLive.destroyed) {
-          logger.info(`[channels] ${keyId}: ignoring command /${parsedCommand.name} with no live session`)
+          logger.info(`[channels] ${keyLabel}: ignoring command /${parsedCommand.name} with no live session`)
           return
         }
       } else if (commandInfo.wantsLiveSession) {
@@ -2670,7 +2677,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (cache !== undefined) {
         cache.invalidate(live.key)
         void cache.warmUp(live.key).catch((err) => {
-          logger.warn(`[channels] membership warmup after new author failed for ${live.keyId}: ${describe(err)}`)
+          logger.warn(`[channels] membership warmup after new author failed for ${live.keyLabel}: ${describe(err)}`)
         })
       }
     }
@@ -2697,7 +2704,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // Log every observe so an unanswered mention is diagnosable from logs
       // alone instead of "routed but no prompting" silence. The bracketed
       // shape mirrors `prompting batch=` so log scraping can pair them.
-      logger.info(`[channels] ${live.keyId} observed id=${event.externalMessageId}`)
+      logger.info(`[channels] ${live.keyLabel} observed id=${event.externalMessageId}`)
       observe(live, event)
       return
     }
@@ -2960,11 +2967,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     void addResult
       .then((result) => {
         if (!result.ok && result.code !== 'unsupported') {
-          logger.info(`[channels] engage-react failed adapter=${event.adapter} chat=${event.chat}: ${result.error}`)
+          logger.info(
+            `[channels] engage-react failed adapter=${event.adapter} chat=${readableChannelId(event.adapter, event.chat)}: ${result.error}`,
+          )
         }
       })
       .catch((err) => {
-        logger.info(`[channels] engage-react threw adapter=${event.adapter} chat=${event.chat}: ${describe(err)}`)
+        logger.info(
+          `[channels] engage-react threw adapter=${event.adapter} chat=${readableChannelId(event.adapter, event.chat)}: ${describe(err)}`,
+        )
       })
     return addReactionRef
   }
@@ -3349,7 +3360,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const count = (live.policyDeniedToolSendsThisTurn.get(sendKey) ?? 0) + 1
         live.policyDeniedToolSendsThisTurn.set(sendKey, count)
         if (count >= MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN) {
-          logger.warn(`[channels] ${live.keyId}: aborting turn — ${count} policy-denied channel sends (last: ${code})`)
+          logger.warn(
+            `[channels] ${live.keyLabel}: aborting turn — ${count} policy-denied channel sends (last: ${code})`,
+          )
           if (live.session.agent.signal?.aborted !== true) live.session.agent.abort()
         }
         return { ok: false, error, code }
@@ -3480,7 +3493,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const warn = rateCount >= SEND_RATE_WARN_THRESHOLD ? ' send_rate_warning' : ''
       const textLen = text !== undefined ? text.length : 0
       const fields = `source=${source} turn=${turnCount} rate=${rateCount}/${SEND_RATE_WINDOW_MS}ms text_len=${textLen}`
-      logger[level](`[channels] ${live.keyId} send ${fields}${warn}`)
+      logger[level](`[channels] ${live.keyLabel} send ${fields}${warn}`)
     }
 
     return { ok: true }
@@ -3501,7 +3514,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (!detectContinuationWillingness(record.text)) return
     live.willingnessNudges++
     logger.info(
-      `[channels] ${live.keyId} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
+      `[channels] ${live.keyLabel} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
     )
     live.pendingSystemReminders.push(WILLINGNESS_NUDGE)
   }
@@ -3523,16 +3536,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.skippedTurn !== null && live.skippedTurn.turnSeq === live.turnSeq && !skipContested) {
       const { reason } = live.skippedTurn
       live.skippedTurn = null
-      logger.info(`[channels] ${live.keyId} skipped_by_tool reason=${JSON.stringify(reason)}`)
+      logger.info(`[channels] ${live.keyLabel} skipped_by_tool reason=${JSON.stringify(reason)}`)
       return
     }
     if (live.skippedTurn !== null && live.skippedTurn.turnSeq === live.turnSeq) {
       // Clear the now-contested skip so it can't leak into a later turn's check.
       live.skippedTurn = null
-      logger.info(`[channels] ${live.keyId} skip_contested_by_send recovering reply`)
+      logger.info(`[channels] ${live.keyLabel} skip_contested_by_send recovering reply`)
     }
     const postEmptyTurnFallback = async (cause: string): Promise<void> => {
-      logger.warn(`[channels] ${live.keyId} empty_turn_fallback cause=${cause}`)
+      logger.warn(`[channels] ${live.keyLabel} empty_turn_fallback cause=${cause}`)
       const result = await send(
         {
           adapter: live.key.adapter,
@@ -3544,7 +3557,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         { source: 'system' },
       )
       if (!result.ok) {
-        logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+        logger.warn(`[channels] ${live.keyLabel}: empty-turn fallback send failed: ${result.error}`)
       }
     }
 
@@ -3587,7 +3600,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (live.willingnessNudges < MAX_WILLINGNESS_NUDGES) {
           live.willingnessNudges++
           logger.warn(
-            `[channels] ${live.keyId} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
+            `[channels] ${live.keyLabel} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
               `cause=empty_stop_after_send_ack`,
           )
           live.pendingSystemReminders.push(SEND_WILLINGNESS_NUDGE)
@@ -3615,7 +3628,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
             live.emptyTurnRetries++
             logger.warn(
-              `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
+              `[channels] ${live.keyLabel} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
                 `cause=stranded_toolUse_after_send`,
             )
             live.pendingSystemReminders.push(EMPTY_TURN_RETRY_NUDGE)
@@ -3684,7 +3697,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // misleading "I got stuck" notice. Return early so the provider-error path
       // owns this turn's surface.
       if (leafStopReason === 'error') {
-        logger.warn(`[channels] ${live.keyId} provider_error_turn deferring to provider-error notice`)
+        logger.warn(`[channels] ${live.keyLabel} provider_error_turn deferring to provider-error notice`)
         return
       }
 
@@ -3702,7 +3715,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // gets the fallback. Distinct log line keeps production signal.
       if (skipLockedThisTurn) {
         logger.warn(
-          `[channels] ${live.keyId} skip_locked_send_thrash_suppressed ` +
+          `[channels] ${live.keyLabel} skip_locked_send_thrash_suppressed ` +
             `denied_targets=${live.policyDeniedToolSendsThisTurn.size}`,
         )
         return
@@ -3715,7 +3728,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // assistant message at all) keeps the historical silent bail —
       // re-prompting it would manufacture replies to nothing.
       if (live.currentTurnAuthorId === null || leafStopReason === undefined) {
-        logger.info(`[channels] ${live.keyId}: no recoverable assistant text in branch`)
+        logger.info(`[channels] ${live.keyLabel}: no recoverable assistant text in branch`)
         return
       }
       if (!attemptedSendThisTurn && live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
@@ -3730,7 +3743,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.nextPromptMaxTokens = CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS
         }
         logger.warn(
-          `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
+          `[channels] ${live.keyLabel} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
             `max_tokens=${live.nextPromptMaxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS}`,
         )
         live.pendingSystemReminders.push(EMPTY_TURN_RETRY_NUDGE)
@@ -3765,7 +3778,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
           live.emptyTurnRetries++
           logger.warn(
-            `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
+            `[channels] ${live.keyLabel} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
               `cause=cold_start_solo_bare_empty`,
           )
           live.pendingSystemReminders.push(COLD_START_REPLY_NUDGE)
@@ -3775,19 +3788,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         return
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
-      logger.info(`[channels] ${live.keyId} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
+      logger.info(`[channels] ${live.keyLabel} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
       return
     }
 
     if (isUpstreamEmptyResponseSentinel(assistantText)) {
       logger.warn(
-        `[channels] ${live.keyId}: suppressed upstream_empty_response_sentinel text_len=${assistantText.length}`,
+        `[channels] ${live.keyLabel}: suppressed upstream_empty_response_sentinel text_len=${assistantText.length}`,
       )
       return
     }
 
     if (isLikelyKimiChannelToolLeak(assistantText)) {
-      logger.warn(`[channels] ${live.keyId}: suppressed kimi_tool_call_leak text_len=${assistantText.length}`)
+      logger.warn(`[channels] ${live.keyLabel}: suppressed kimi_tool_call_leak text_len=${assistantText.length}`)
       return
     }
 
@@ -3801,7 +3814,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const plainTextToolCallKind = getPlainTextChannelToolCallKind(assistantText)
     if (plainTextToolCallKind === 'skip') {
       logger.warn(
-        `[channels] ${live.keyId}: suppressed plain_text_channel_skip_response text_len=${assistantText.length}`,
+        `[channels] ${live.keyLabel}: suppressed plain_text_channel_skip_response text_len=${assistantText.length}`,
       )
       return
     }
@@ -3811,7 +3824,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // back to the historical safe behavior — drop it rather than leak plumbing.
       if (extracted === null) {
         logger.warn(
-          `[channels] ${live.keyId}: suppressed unextractable_plain_text_channel_tool_call text_len=${assistantText.length}`,
+          `[channels] ${live.keyLabel}: suppressed unextractable_plain_text_channel_tool_call text_len=${assistantText.length}`,
         )
         return
       }
@@ -3825,12 +3838,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         isLikelyPlainTextChannelToolCall(extracted)
       ) {
         logger.warn(
-          `[channels] ${live.keyId}: suppressed plain_text_channel_tool_call (unsafe extracted text) text_len=${extracted.length}`,
+          `[channels] ${live.keyLabel}: suppressed plain_text_channel_tool_call (unsafe extracted text) text_len=${extracted.length}`,
         )
         return
       }
       logger.warn(
-        `[channels] ${live.keyId}: recovered plain_text_channel_tool_call kind=${plainTextToolCallKind} text_len=${extracted.length}`,
+        `[channels] ${live.keyLabel}: recovered plain_text_channel_tool_call kind=${plainTextToolCallKind} text_len=${extracted.length}`,
       )
       assistantText = extracted
     }
@@ -3864,7 +3877,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const recoveryBlock = await evaluateRecoveryReviewGuards(live, assistantText)
     if (recoveryBlock !== null) {
       logger.warn(
-        `[channels] ${live.keyId}: suppressed recovery (github review guard) reason=${JSON.stringify(recoveryBlock)} text_len=${assistantText.length}`,
+        `[channels] ${live.keyLabel}: suppressed recovery (github review guard) reason=${JSON.stringify(recoveryBlock)} text_len=${assistantText.length}`,
       )
       return
     }
@@ -3879,12 +3892,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // sends, so it never matches when nothing was sent.
     const sendKey = consecutiveSendKey(live.key.chat, live.key.thread)
     if (live.lastSentText.get(sendKey) === normalizeSendText(assistantText)) {
-      logger.info(`[channels] ${live.keyId}: suppressed recovery (duplicate of reply already sent this turn)`)
+      logger.info(`[channels] ${live.keyLabel}: suppressed recovery (duplicate of reply already sent this turn)`)
       return
     }
 
     logger.warn(
-      `[channels] ${live.keyId}: recovering assistant_text_without_channel_tool source=${source} text_len=${assistantText.length}`,
+      `[channels] ${live.keyLabel}: recovering assistant_text_without_channel_tool source=${source} text_len=${assistantText.length}`,
     )
     const result = await send(
       {
@@ -3897,7 +3910,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       { source: 'system' },
     )
     if (!result.ok) {
-      logger.warn(`[channels] ${live.keyId}: recovery send failed: ${result.error}`)
+      logger.warn(`[channels] ${live.keyLabel}: recovery send failed: ${result.error}`)
     }
   }
 
@@ -3988,13 +4001,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       await live.session.abort()
     } catch (err) {
-      logger.warn(`[channels] abort failed for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] abort failed for ${live.keyLabel}: ${describe(err)}`)
     }
     await fireSessionEnd(live)
     try {
       await live.dispose()
     } catch (err) {
-      logger.warn(`[channels] dispose failed for ${live.keyId}: ${describe(err)}`)
+      logger.warn(`[channels] dispose failed for ${live.keyLabel}: ${describe(err)}`)
     }
   }
 
@@ -4018,7 +4031,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     for (const live of victims) {
       liveSessions.delete(live.keyId)
-      logger.info(`[channels] ${live.keyId} idle_gc evicting after ${t - live.lastInboundAt}ms idle`)
+      logger.info(`[channels] ${live.keyLabel} idle_gc evicting after ${t - live.lastInboundAt}ms idle`)
       await tearDownLive(live)
     }
   }
@@ -4099,9 +4112,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       thread: handoff.origin.key.thread,
     }
     const keyId = channelKeyId(key)
+    const keyLabel = channelKeyLabel(key)
 
     if (options.configForAdapter(key.adapter) === undefined) {
-      logger.warn(`[channels] ${keyId}: restart-resume skipped — adapter not configured`)
+      logger.warn(`[channels] ${keyLabel}: restart-resume skipped — adapter not configured`)
       return null
     }
 
@@ -4130,7 +4144,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const record = mappings ? findRecord(mappings, key) : undefined
         if (record?.sessionId !== handoff.originatingSessionId) {
           logger.warn(
-            `[channels] ${keyId}: restart-resume skipped — persisted session ` +
+            `[channels] ${keyLabel}: restart-resume skipped — persisted session ` +
               `${record?.sessionId ?? '<none>'} no longer matches handoff ${handoff.originatingSessionId}`,
           )
           rejectGate(new StaleLiveSessionError(keyId))
@@ -4144,7 +4158,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sessionFile: handoff.originatingSessionFile,
           })
         } catch (err) {
-          logger.warn(`[channels] ${keyId}: restart-resume ensureLive failed: ${describe(err)}`)
+          logger.warn(`[channels] ${keyLabel}: restart-resume ensureLive failed: ${describe(err)}`)
           rejectGate(err)
           return
         }
@@ -4152,7 +4166,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
         if (live.sessionId !== handoff.originatingSessionId) {
           logger.warn(
-            `[channels] ${keyId}: restart-resume reopened a different session ` +
+            `[channels] ${keyLabel}: restart-resume reopened a different session ` +
               `(${live.sessionId} != ${handoff.originatingSessionId}); skipping wake`,
           )
           return
@@ -4162,16 +4176,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // wake. Adding the synthetic "I'm back" turn on top would duplicate
         // work / stack a spurious turn, so skip it and let the inbound drain.
         if (reservation.sawInbound) {
-          logger.info(`[channels] ${keyId}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
+          logger.info(`[channels] ${keyLabel}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
           return
         }
 
         await armRestartKickForOrigin(options.agentDir, buildLiveOrigin(live)).catch((err) =>
-          logger.error(`[channels] ${keyId}: restart-resume arm restart-kick failed: ${describe(err)}`),
+          logger.error(`[channels] ${keyLabel}: restart-resume arm restart-kick failed: ${describe(err)}`),
         )
 
         live.pendingSystemReminders.push(RESTART_RESUME_WAKE_REMINDER)
-        logger.info(`[channels] ${keyId}: restart-resume waking session ${live.sessionId}`)
+        logger.info(`[channels] ${keyLabel}: restart-resume waking session ${live.sessionId}`)
         void drain(live)
       },
     }
@@ -4278,7 +4292,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // subagent_output window so an earlier premature-polling streak can't
     // hard-block that legitimate fetch.
     forgetSharedLoopGuardTool(live.sessionId, SUBAGENT_OUTPUT_TOOL_NAME)
-    logger.info(`[channels] ${live.keyId}: subagent-completion reminder queued task=${args.taskId} ok=${args.ok}`)
+    logger.info(`[channels] ${live.keyLabel}: subagent-completion reminder queued task=${args.taskId} ok=${args.ok}`)
     // Wake the drain loop. If a turn is already in flight, the wakeup is
     // a no-op because drain() will pick up the reminder on its next
     // iteration (it now gates on promptQueue OR pendingSystemReminders).
@@ -4348,7 +4362,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // agentic loop: denied a clean silent exit the model re-sends, gets
         // re-denied, and repeats until the per-turn send cap trips. Logged here
         // since `validateChannelTurn` won't see a `skippedTurn` for it.
-        logger.info(`[channels] ${live.keyId} skip_after_send reason=${JSON.stringify(args.reason)}`)
+        logger.info(`[channels] ${live.keyLabel} skip_after_send reason=${JSON.stringify(args.reason)}`)
         return { kind: 'recorded-after-send', keyId: live.keyId }
       }
       live.skippedTurn = { turnSeq: live.turnSeq, reason: args.reason }
@@ -4359,6 +4373,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const clearSticky = (key: ChannelKey): { keyId: string; cleared: number } => {
     const keyId = channelKeyId(key)
+    const keyLabel = channelKeyLabel(key)
     const cleared = stickyLedger.clear(keyId)
     // Arm the same-turn re-grant guard so a subsequent ack reply this turn does
     // not re-grant the credit just cleared (see `disengagedTurn`). No-op when
@@ -4368,7 +4383,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.disengagedTurn = live.turnSeq
       reactOnDisengage(live)
     }
-    logger.info(`[channels] ${keyId} sticky cleared count=${cleared}`)
+    logger.info(`[channels] ${keyLabel} sticky cleared count=${cleared}`)
     return { keyId, cleared }
   }
 
@@ -4468,7 +4483,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         if (now() - live.typingStartedAt >= MAX_TYPING_HEARTBEAT_MS) {
           logger.warn(
-            `[channels] ${live.keyId}: typing indicator paused after ${MAX_TYPING_HEARTBEAT_MS}ms with no activity; prompt still in flight`,
+            `[channels] ${live.keyLabel}: typing indicator paused after ${MAX_TYPING_HEARTBEAT_MS}ms with no activity; prompt still in flight`,
           )
           live.typingTimedOut = true
           await stopTypingHeartbeat(live)
@@ -5103,7 +5118,7 @@ async function withMembershipTimeout(
   const timeout = new Promise<null>((resolve) => {
     timer = setTimeout(() => {
       logger.warn(
-        `[channels] ${channelKeyId(key)}: membership cold fetch timed out after ${MEMBERSHIP_COLD_FETCH_TIMEOUT_MS}ms`,
+        `[channels] ${channelKeyLabel(key)}: membership cold fetch timed out after ${MEMBERSHIP_COLD_FETCH_TIMEOUT_MS}ms`,
       )
       resolve(null)
     }, MEMBERSHIP_COLD_FETCH_TIMEOUT_MS)
