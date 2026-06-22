@@ -2,8 +2,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 
-import { resolveScaffoldVersion } from '@/init/cli-version'
-import { editDependencySpec, type ParsedPackage, writeDependencySpec } from '@/init/packagejson-edit'
+import { CLI_VERSION } from '@/init/cli-version'
+import { type ParsedPackage, writeDependencySpec } from '@/init/packagejson-edit'
 
 const PACKAGE_FILE = 'package.json'
 const TYPECLAW = 'typeclaw'
@@ -71,7 +71,7 @@ export async function switchTypeclawDependency(options: SwitchTypeclawDepOptions
           options.localPath,
           options.findRunningCliCheckout ?? findRunningCliCheckout,
         )
-      : resolveNpmSpec(options.version)
+      : resolveNpmSpec(agentRoot, options.version)
 
   if (newSpec === oldSpec) {
     return { changed: false, oldSpec, newSpec, packageJsonPath, committed: false }
@@ -126,25 +126,41 @@ function deriveLocalCheckout(oldSpec: string, agentRoot: string, findCheckout: (
   return findCheckout()
 }
 
-function resolveNpmSpec(version: string | undefined): string {
-  const resolved = version ?? stripCaret(resolveScaffoldVersion())
+function resolveNpmSpec(agentRoot: string, version: string | undefined): string {
+  if (version !== undefined) {
+    const normalized = normalizeVersion(version)
+    if (normalized === null) throw new DevDepError({ kind: 'invalid-version', version })
+    return `^${normalized}`
+  }
+
+  // Default chain works from a source checkout too (where the npm-only
+  // resolveScaffoldVersion() returns null): the agent's installed package
+  // version is the most accurate target, then the running CLI's own version.
+  const resolved = readInstalledTypeclawVersion(agentRoot) ?? normalizeVersion(CLI_VERSION)
   if (resolved === null) throw new DevDepError({ kind: 'version-unresolved' })
 
-  const normalized = normalizeVersion(resolved)
-  if (normalized === null) throw new DevDepError({ kind: 'invalid-version', version: resolved })
-
-  return `^${normalized}`
+  return `^${resolved}`
 }
 
-// Validates the agent folder is a git repo with no unrelated staged changes,
-// returning a marker the caller uses to decide whether to commit post-write.
-// Throws on blockers (unrelated staged files); returns null for a non-repo.
+function readInstalledTypeclawVersion(agentRoot: string): string | null {
+  try {
+    const raw = readFileSync(join(agentRoot, 'node_modules', TYPECLAW, PACKAGE_FILE), 'utf8')
+    const parsed = JSON.parse(raw) as { version?: string }
+    if (typeof parsed.version === 'string') return normalizeVersion(parsed.version)
+  } catch {}
+  return null
+}
+
+// Run BEFORE the write so the commit can contain ONLY this command's own
+// dependency edit. Blocks on any pre-existing change — a dirty package.json
+// (staged or in the worktree) would otherwise get bundled wholesale by the
+// later `git commit -- package.json`, and any other staged file would ride
+// along in the same commit. Throws on blockers; returns null for a non-repo.
 async function resolveCommitContext(agentRoot: string, spawnGit: SpawnGit): Promise<{ ok: true } | null> {
   const repoCheck = await spawnGit(['rev-parse', '--is-inside-work-tree'], agentRoot)
   if (repoCheck.exitCode !== 0 || repoCheck.stdout.trim() !== 'true') return null
 
-  const staged = await stagedFiles(agentRoot, spawnGit)
-  const blockers = staged.filter((f) => f !== PACKAGE_FILE)
+  const blockers = await dirtyPaths(agentRoot, spawnGit)
   if (blockers.length > 0) throw new DevDepError({ kind: 'commit-blocked-dirty', files: blockers })
 
   return { ok: true }
@@ -158,16 +174,17 @@ async function commitPackageJson(agentRoot: string, subject: string, spawnGit: S
   return commit.exitCode === 0
 }
 
-// Files already staged in the index, excluding our own package.json edit. We
-// refuse to commit when other staged changes exist so the dep switch never
-// silently bundles unrelated work into its commit.
-async function stagedFiles(agentRoot: string, spawnGit: SpawnGit): Promise<string[]> {
-  const res = await spawnGit(['diff', '--cached', '--name-only'], agentRoot)
+// Every path with a staged or worktree change, per `git status --porcelain`.
+// The porcelain format is `XY <path>` where X is the index status and Y the
+// worktree status; we take the path regardless of which side is dirty so a
+// pre-existing package.json edit is caught even when only the worktree differs.
+async function dirtyPaths(agentRoot: string, spawnGit: SpawnGit): Promise<string[]> {
+  const res = await spawnGit(['status', '--porcelain', '--untracked-files=no'], agentRoot)
   if (res.exitCode !== 0) return []
   return res.stdout
     .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+    .map((line) => line.slice(3).trim())
+    .filter((path) => path.length > 0)
 }
 
 async function readPackageJson(path: string): Promise<ParsedPackage | null> {
@@ -215,12 +232,6 @@ function toFileSpec(rel: string): string {
   return rel.split(/[\\/]/).join('/')
 }
 
-function stripCaret(scaffold: string | null): string | null {
-  if (scaffold === null) return null
-  const m = scaffold.match(/^\^?(\d+\.\d+\.\d+)$/)
-  return m ? (m[1] ?? null) : null
-}
-
 function normalizeVersion(version: string): string | null {
   const m = version.trim().match(/^[\^~=]?(\d+\.\d+\.\d+)$/)
   return m ? (m[1] ?? null) : null
@@ -241,7 +252,7 @@ function describeError(detail: SwitchTypeclawDepError): string {
     case 'invalid-version':
       return `Invalid version "${detail.version}". Expected X.Y.Z.`
     case 'commit-blocked-dirty':
-      return `Refusing to commit: unrelated staged changes present (${detail.files.join(', ')}). Commit or unstage them, or pass --no-commit.`
+      return `Refusing to commit: uncommitted changes present (${detail.files.join(', ')}). Commit or stash them, or pass --no-commit.`
   }
 }
 

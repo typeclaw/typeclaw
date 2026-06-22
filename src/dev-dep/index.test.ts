@@ -43,8 +43,9 @@ async function readSpec(): Promise<string | undefined> {
 }
 
 // Records git invocations and answers from a scripted state machine so commit
-// behavior is testable without a real repo.
-function fakeGit(opts: { isRepo: boolean; stagedFiles?: string[] }): {
+// behavior is testable without a real repo. `dirtyFiles` is emitted in
+// `git status --porcelain` shape (`XY <path>`) so the gate parser is exercised.
+function fakeGit(opts: { isRepo: boolean; dirtyFiles?: string[] }): {
   spawnGit: SpawnGit
   calls: string[][]
 } {
@@ -54,7 +55,7 @@ function fakeGit(opts: { isRepo: boolean; stagedFiles?: string[] }): {
     const ok = (stdout = ''): GitResult => ({ exitCode: 0, stdout, stderr: '' })
     if (args[0] === 'rev-parse')
       return opts.isRepo ? ok('true\n') : { exitCode: 128, stdout: '', stderr: 'not a git repository' }
-    if (args[0] === 'diff') return ok((opts.stagedFiles ?? []).join('\n'))
+    if (args[0] === 'status') return ok((opts.dirtyFiles ?? []).map((f) => ` M ${f}`).join('\n'))
     if (args[0] === 'add') return ok()
     if (args[0] === 'commit') return ok()
     return ok()
@@ -148,13 +149,34 @@ describe('switchTypeclawDependency — npm mode', () => {
       switchTypeclawDependency({ agentRoot, mode: 'npm', version: 'latest', commit: false }),
     ).rejects.toMatchObject({ detail: { kind: 'invalid-version' } })
   })
+
+  test('defaults to the agent installed version when no --version is given (source-checkout safe)', async () => {
+    await setupAgent('file:../typeclaw')
+    await mkdir(join(agentRoot, 'node_modules', 'typeclaw'))
+    await writeFile(
+      join(agentRoot, 'node_modules', 'typeclaw', 'package.json'),
+      JSON.stringify({ name: 'typeclaw', version: '0.41.0' }),
+    )
+
+    const result = await switchTypeclawDependency({ agentRoot, mode: 'npm', commit: false })
+
+    expect(result.newSpec).toBe('^0.41.0')
+  })
+
+  test('falls back to a release ^version when no --version and no installed package (CLI_VERSION)', async () => {
+    await setupAgent('file:../typeclaw')
+
+    const result = await switchTypeclawDependency({ agentRoot, mode: 'npm', commit: false })
+
+    expect(result.newSpec).toMatch(/^\^\d+\.\d+\.\d+$/)
+  })
 })
 
 describe('switchTypeclawDependency — commit safety', () => {
-  test('refuses to commit and leaves package.json unchanged when unrelated staged changes exist', async () => {
+  test('refuses to commit and leaves package.json unchanged when unrelated changes exist', async () => {
     await setupAgent('^0.39.0')
     await setupLocalCheckout()
-    const git = fakeGit({ isRepo: true, stagedFiles: ['other.ts'] })
+    const git = fakeGit({ isRepo: true, dirtyFiles: ['other.ts'] })
 
     await expect(
       switchTypeclawDependency({ agentRoot, mode: 'local', localPath: localCheckout, spawnGit: git.spawnGit }),
@@ -164,19 +186,17 @@ describe('switchTypeclawDependency — commit safety', () => {
     expect(git.calls.some((c) => c[0] === 'commit')).toBe(false)
   })
 
-  test('ignores a staged package.json (our own pending edit) and commits', async () => {
+  test('refuses to commit a pre-existing package.json change so it is not bundled', async () => {
     await setupAgent('^0.39.0')
     await setupLocalCheckout()
-    const git = fakeGit({ isRepo: true, stagedFiles: ['package.json'] })
+    const git = fakeGit({ isRepo: true, dirtyFiles: ['package.json'] })
 
-    const result = await switchTypeclawDependency({
-      agentRoot,
-      mode: 'local',
-      localPath: localCheckout,
-      spawnGit: git.spawnGit,
-    })
+    await expect(
+      switchTypeclawDependency({ agentRoot, mode: 'local', localPath: localCheckout, spawnGit: git.spawnGit }),
+    ).rejects.toMatchObject({ detail: { kind: 'commit-blocked-dirty' } })
 
-    expect(result.committed).toBe(true)
+    expect(await readSpec()).toBe('^0.39.0')
+    expect(git.calls.some((c) => c[0] === 'commit')).toBe(false)
   })
 
   test('writes package.json but does not commit in a non-git folder', async () => {
