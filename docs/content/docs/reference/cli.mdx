@@ -170,6 +170,23 @@ Auto-detection recognizes these layouts:
 
 `--manager` always overrides the detected manager. The scope (global or not) still follows the detected install layout, so `--manager=npm` against a local install runs `npm install typeclaw@latest` (no `-g`), not a stealth global update. Source checkouts have no detectable layout and fall back to a global update — pass `--manager` to pick the registry side.
 
+## Dev dependency
+
+Switches the agent's `package.json` `typeclaw` dependency between a local source checkout and the published npm package. Useful when iterating on TypeClaw itself: point an agent at your working tree, then flip it back to npm when you're done.
+
+```sh
+typeclaw dev-dep local --path ../typeclaw          # point at a local checkout (file: spec)
+typeclaw dev-dep local                             # reuse an existing file: spec or the running CLI's checkout
+typeclaw dev-dep npm                               # pin ^<installed-or-CLI-version>
+typeclaw dev-dep npm --version 0.40.0              # pin a specific ^X.Y.Z
+typeclaw dev-dep local --no-commit                 # update package.json without committing
+```
+
+- **`local`** writes `file:<relative-path>` after verifying the target's `package.json#name` is `typeclaw`. Without `--path`, it reuses an existing `file:` spec or the source checkout the running CLI itself lives in (skipped for npm-installed CLIs).
+- **`npm`** writes `^<version>`, defaulting to the installed package version or the running CLI's version when `--version` is omitted.
+- By default the change is **committed** as `deps: switch typeclaw to {local,npm}`, touching only `package.json`. The commit is skipped (with a notice) outside a git repo, and **refused** when unrelated staged changes are present — pass `--no-commit` to opt out.
+- Only the declared dependency changes; `bun install` is not run. Follow up with `typeclaw start --build` to materialize the switch in the container.
+
 ## Usage
 
 ```sh

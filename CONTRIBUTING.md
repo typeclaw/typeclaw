@@ -68,6 +68,17 @@ bun unlink                # unregisters the global shim
 bun add -g typeclaw       # reinstalls from npm
 ```
 
+### Switching an existing agent between local and npm
+
+`bun link` controls the global `typeclaw` shim, but an already-scaffolded agent folder still pins `typeclaw` in its own `package.json` (`file:../typeclaw` for dev, `^X.Y.Z` for npm). To flip a single agent folder between the two without re-running `init`, use `dev-dep` from inside that folder:
+
+```sh
+typeclaw dev-dep local --path ../typeclaw   # point this agent at your checkout
+typeclaw dev-dep npm                         # flip it back to the published package
+```
+
+It rewrites only `dependencies.typeclaw`, commits the change (`deps: switch typeclaw to {local,npm}`), and refuses to commit if you have unrelated staged work. Run `typeclaw start --build` afterward to rebuild the container against the new spec. See [CLI reference → Dev dependency](https://typeclaw.dev/docs/reference/cli#dev-dependency).
+
 ## Pre-commit checks
 
 All three must pass before every commit. No exceptions, no `--no-verify`:
