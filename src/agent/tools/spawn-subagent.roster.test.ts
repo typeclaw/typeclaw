@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { createDeepSubagent } from '@/bundled-plugins/deep/deep'
 import { createExplorerSubagent } from '@/bundled-plugins/explorer/explorer'
 import { createOperatorSubagent } from '@/bundled-plugins/operator/operator'
 import { createPlannerSubagent } from '@/bundled-plugins/planner/planner'
@@ -32,6 +33,7 @@ const BUNDLED_PUBLIC: SubagentRegistry = {
   researcher: toInternal(createResearcherSubagent()),
   reviewer: toInternal(createReviewerSubagent()),
   operator: toInternal(createOperatorSubagent()),
+  deep: toInternal(createDeepSubagent()),
   planner: toInternal(createPlannerSubagent()),
 }
 

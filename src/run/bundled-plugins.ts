@@ -1,6 +1,7 @@
 import agentBrowserPlugin from '@/bundled-plugins/agent-browser'
 import backupPlugin from '@/bundled-plugins/backup'
 import bunHygienePlugin from '@/bundled-plugins/bun-hygiene'
+import deepPlugin from '@/bundled-plugins/deep'
 import docRenderPlugin from '@/bundled-plugins/doc-render'
 import explorerPlugin from '@/bundled-plugins/explorer'
 import githubCliAuthPlugin from '@/bundled-plugins/github-cli-auth'
@@ -66,4 +67,5 @@ export const BUNDLED_PLUGINS: ResolvedPlugin[] = [
   { name: 'researcher', version: undefined, source: '<bundled>', defined: researcherPlugin },
   { name: 'planner', version: undefined, source: '<bundled>', defined: plannerPlugin },
   { name: 'operator', version: undefined, source: '<bundled>', defined: operatorPlugin },
+  { name: 'deep', version: undefined, source: '<bundled>', defined: deepPlugin },
 ]

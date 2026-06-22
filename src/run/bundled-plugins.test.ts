@@ -31,6 +31,7 @@ describe('BUNDLED_PLUGINS', () => {
       'researcher',
       'planner',
       'operator',
+      'deep',
     ])
   })
 
