@@ -44,8 +44,9 @@ async function readSpec(): Promise<string | undefined> {
 
 // Records git invocations and answers from a scripted state machine so commit
 // behavior is testable without a real repo. `dirtyFiles` is emitted in
-// `git status --porcelain` shape (`XY <path>`) so the gate parser is exercised.
-function fakeGit(opts: { isRepo: boolean; dirtyFiles?: string[] }): {
+// `git status --porcelain` shape (`XY <path>`) so the gate parser is exercised;
+// `packageJsonTracked` controls the `git ls-files --error-unmatch` probe.
+function fakeGit(opts: { isRepo: boolean; dirtyFiles?: string[]; packageJsonTracked?: boolean }): {
   spawnGit: SpawnGit
   calls: string[][]
 } {
@@ -56,6 +57,8 @@ function fakeGit(opts: { isRepo: boolean; dirtyFiles?: string[] }): {
     if (args[0] === 'rev-parse')
       return opts.isRepo ? ok('true\n') : { exitCode: 128, stdout: '', stderr: 'not a git repository' }
     if (args[0] === 'status') return ok((opts.dirtyFiles ?? []).map((f) => ` M ${f}`).join('\n'))
+    if (args[0] === 'ls-files')
+      return (opts.packageJsonTracked ?? true) ? ok('package.json\n') : { exitCode: 1, stdout: '', stderr: '' }
     if (args[0] === 'add') return ok()
     if (args[0] === 'commit') return ok()
     return ok()
@@ -194,6 +197,19 @@ describe('switchTypeclawDependency — commit safety', () => {
     await expect(
       switchTypeclawDependency({ agentRoot, mode: 'local', localPath: localCheckout, spawnGit: git.spawnGit }),
     ).rejects.toMatchObject({ detail: { kind: 'commit-blocked-dirty' } })
+
+    expect(await readSpec()).toBe('^0.39.0')
+    expect(git.calls.some((c) => c[0] === 'commit')).toBe(false)
+  })
+
+  test('refuses to commit when package.json is untracked (would be staged wholesale)', async () => {
+    await setupAgent('^0.39.0')
+    await setupLocalCheckout()
+    const git = fakeGit({ isRepo: true, packageJsonTracked: false })
+
+    await expect(
+      switchTypeclawDependency({ agentRoot, mode: 'local', localPath: localCheckout, spawnGit: git.spawnGit }),
+    ).rejects.toMatchObject({ detail: { kind: 'commit-blocked-dirty', files: ['package.json'] } })
 
     expect(await readSpec()).toBe('^0.39.0')
     expect(git.calls.some((c) => c[0] === 'commit')).toBe(false)

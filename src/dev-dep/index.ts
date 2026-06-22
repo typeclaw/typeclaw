@@ -155,15 +155,27 @@ function readInstalledTypeclawVersion(agentRoot: string): string | null {
 // dependency edit. Blocks on any pre-existing change — a dirty package.json
 // (staged or in the worktree) would otherwise get bundled wholesale by the
 // later `git commit -- package.json`, and any other staged file would ride
-// along in the same commit. Throws on blockers; returns null for a non-repo.
+// along in the same commit. An UNTRACKED package.json is also a blocker: a
+// later `git add -- package.json` would stage the whole pre-existing file. We
+// deliberately ignore other untracked files, since an agent folder legitimately
+// carries untracked content (workspace/, mounts/, etc.). Throws on blockers;
+// returns null for a non-repo.
 async function resolveCommitContext(agentRoot: string, spawnGit: SpawnGit): Promise<{ ok: true } | null> {
   const repoCheck = await spawnGit(['rev-parse', '--is-inside-work-tree'], agentRoot)
   if (repoCheck.exitCode !== 0 || repoCheck.stdout.trim() !== 'true') return null
 
   const blockers = await dirtyPaths(agentRoot, spawnGit)
+  if (!(await isPackageJsonTracked(agentRoot, spawnGit)) && !blockers.includes(PACKAGE_FILE)) {
+    blockers.push(PACKAGE_FILE)
+  }
   if (blockers.length > 0) throw new DevDepError({ kind: 'commit-blocked-dirty', files: blockers })
 
   return { ok: true }
+}
+
+async function isPackageJsonTracked(agentRoot: string, spawnGit: SpawnGit): Promise<boolean> {
+  const res = await spawnGit(['ls-files', '--error-unmatch', '--', PACKAGE_FILE], agentRoot)
+  return res.exitCode === 0
 }
 
 async function commitPackageJson(agentRoot: string, subject: string, spawnGit: SpawnGit): Promise<boolean> {
