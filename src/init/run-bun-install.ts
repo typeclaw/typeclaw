@@ -1,3 +1,5 @@
+import { isWindows } from '../shared/platform'
+
 export type InstallResult = { ok: true } | { ok: false; reason: string }
 
 const INSTALL_TIMEOUT_MS = 300_000
@@ -11,6 +13,24 @@ export type InstallRunnerOptions = {
   force?: boolean
   timeoutMs?: number
   spawn?: typeof Bun.spawn
+  // Defaults to `process.platform`; tests inject it to assert the backend
+  // argv without mutating the read-only `process.platform`.
+  platform?: NodeJS.Platform
+}
+
+// On Windows, Bun's default install backend is `hardlink` (CreateHardLinkW).
+// When the hardlink fails — cross-context copies, locked files, antivirus
+// (Defender) real-time scanning of the cache or destination — Bun's per-file
+// path falls back to CopyFileW, but if that ALSO fails it aborts the whole
+// install: the outer hardlink→copyfile fallback in Bun is `#[cfg(not(windows))]`,
+// so Windows has no recovery and surfaces "EPERM: failed copying files from
+// cache to destination". This bites the `bun link` dev workflow hardest, where
+// a `file:` typeclaw dep copies the whole source tree (including `.git/`) into
+// <agent>/node_modules. `--backend=copyfile` skips CreateHardLinkW entirely and
+// uses CopyFileW directly, which sidesteps the hardlink-permission failure.
+// POSIX keeps Bun's default (hardlink on Linux, clonefile on macOS).
+function bunInstallBackendArgs(platform?: NodeJS.Platform): string[] {
+  return isWindows(platform ?? process.platform) ? ['--backend=copyfile'] : []
 }
 
 // Signature for the function `runInit` uses to materialize the agent folder's
@@ -38,8 +58,11 @@ export async function runBunInstall(cwd: string, opts?: InstallRunnerOptions): P
     // deps re-copy their current on-disk source into node_modules. Bun's
     // file-dep cache is keyed on name+version, so without --force, edits to
     // a `file:..` typeclaw never reach the container after the first install.
+    const backend = bunInstallBackendArgs(opts?.platform)
     return await runTimedBunProcess({
-      cmd: opts?.force ? ['bun', 'install', '--linker=hoisted', '--force'] : ['bun', 'install', '--linker=hoisted'],
+      cmd: opts?.force
+        ? ['bun', 'install', '--linker=hoisted', ...backend, '--force']
+        : ['bun', 'install', '--linker=hoisted', ...backend],
       cwd,
       timeoutMs: opts?.timeoutMs ?? INSTALL_TIMEOUT_MS,
       spawn: opts?.spawn ?? bun.spawn,
@@ -57,7 +80,7 @@ export async function runBunInstall(cwd: string, opts?: InstallRunnerOptions): P
 // install` would no-op when the existing lockfile entry already satisfies
 // an in-range spec — which is the exact regression auto-upgrade exists to
 // prevent).
-export type UpdateRunnerOptions = Pick<InstallRunnerOptions, 'timeoutMs' | 'spawn'>
+export type UpdateRunnerOptions = Pick<InstallRunnerOptions, 'timeoutMs' | 'spawn' | 'platform'>
 
 export type UpdateRunner = (cwd: string, pkg: string, opts?: UpdateRunnerOptions) => Promise<InstallResult>
 
@@ -73,7 +96,7 @@ export async function runBunUpdate(cwd: string, pkg: string, opts?: UpdateRunner
     // `--linker=hoisted` for the same Bun 1.3.x deadlock reason as
     // runBunInstall above.
     return await runTimedBunProcess({
-      cmd: ['bun', 'update', pkg, '--latest', '--linker=hoisted'],
+      cmd: ['bun', 'update', pkg, '--latest', '--linker=hoisted', ...bunInstallBackendArgs(opts?.platform)],
       cwd,
       timeoutMs: opts?.timeoutMs ?? INSTALL_TIMEOUT_MS,
       spawn: opts?.spawn ?? bun.spawn,
