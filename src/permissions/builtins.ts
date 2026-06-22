@@ -29,6 +29,7 @@ export const CORE_PERMISSIONS = {
   subagentCancel: 'subagent.cancel',
   subagentOutput: 'subagent.output',
   subagentSpawnOperator: 'subagent.spawn.operator',
+  subagentSpawnDeep: 'subagent.spawn.deep',
   // Phrased as capabilities to SEE, not to hide, so the role tower stays
   // monotonic (a higher tier sees a strict superset of a lower tier).
   // resolveHiddenPaths masks whatever the resolved role lacks: fsSeePrivate
@@ -84,6 +85,7 @@ export const BUILTIN_ROLES: Readonly<Record<BuiltinRoleName, BuiltinRoleSpec>> =
       CORE_PERMISSIONS.subagentCancel,
       CORE_PERMISSIONS.subagentOutput,
       CORE_PERMISSIONS.subagentSpawnOperator,
+      CORE_PERMISSIONS.subagentSpawnDeep,
       CORE_PERMISSIONS.fsSeePrivate,
       CORE_PERMISSIONS.fsSeeSecrets,
       'security.bypass.low',
@@ -103,6 +105,7 @@ export const BUILTIN_ROLES: Readonly<Record<BuiltinRoleName, BuiltinRoleSpec>> =
       CORE_PERMISSIONS.subagentCancel,
       CORE_PERMISSIONS.subagentOutput,
       CORE_PERMISSIONS.subagentSpawnOperator,
+      CORE_PERMISSIONS.subagentSpawnDeep,
       CORE_PERMISSIONS.fsSeePrivate,
       CORE_PERMISSIONS.fsSeeSecrets,
       'security.bypass.low',

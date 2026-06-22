@@ -18,11 +18,12 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
     expect(BUILTIN_ROLES.owner.permissions).toContain('security.bypass.high')
   })
 
-  test('owner carries all three subagent permissions (spawn / cancel / output) AND the operator-specific spawn permission', () => {
+  test('owner carries all three subagent permissions (spawn / cancel / output) AND the write-capable subagent spawn permissions', () => {
     expect(BUILTIN_ROLES.owner.permissions).toContain('subagent.spawn')
     expect(BUILTIN_ROLES.owner.permissions).toContain('subagent.cancel')
     expect(BUILTIN_ROLES.owner.permissions).toContain('subagent.output')
     expect(BUILTIN_ROLES.owner.permissions).toContain('subagent.spawn.operator')
+    expect(BUILTIN_ROLES.owner.permissions).toContain('subagent.spawn.deep')
   })
 
   test('trusted has empty default match and core perms + fs.see.private + fs.see.secrets + bypass.low + bypass.medium + subagent perms + operator-specific spawn', () => {
@@ -39,6 +40,7 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
       'subagent.cancel',
       'subagent.output',
       'subagent.spawn',
+      'subagent.spawn.deep',
       'subagent.spawn.operator',
     ])
   })
@@ -86,6 +88,10 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
 
   test('member does NOT carry the operator-specific spawn permission (write-capable subagents are owner+trusted only)', () => {
     expect([...BUILTIN_ROLES.member.permissions]).not.toContain('subagent.spawn.operator')
+  })
+
+  test('member does NOT carry the deep-specific spawn permission (write-capable subagents are owner+trusted only)', () => {
+    expect([...BUILTIN_ROLES.member.permissions]).not.toContain('subagent.spawn.deep')
   })
 
   test('member does NOT carry bypass.medium or bypass.high (low tier only)', () => {
