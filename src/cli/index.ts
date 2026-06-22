@@ -38,6 +38,7 @@ const main = defineCommand({
     doctor: () => import('./doctor').then((m) => m.doctorCommand),
     usage: () => import('./usage').then((m) => m.usageCommand),
     update: () => import('./update').then((m) => m.updateCommand),
+    'dev-dep': () => import('./dev-dep').then((m) => m.devDepCommand),
     _hostd: () => import('./hostd').then((m) => m.hostdCommand),
   },
 })
