@@ -20,6 +20,17 @@ bun run format
 
 No exceptions. No `--no-verify`. No partial fixes.
 
+## Dependencies
+
+**Never demote a real runtime dependency to `devDependencies` to dodge an install failure.** Consumers do not receive a package's `devDependencies`, so this silently removes the feature for _every_ published install (`bun add -g typeclaw`) — on macOS/Linux too, not just the platform you were trying to unblock. It looks like it "fixes" the install only because the broken dependency is no longer there; it is a UX regression, not a fix. `agent-messenger` is a runtime dependency and stays in `dependencies`.
+
+When a transitive **native** module (e.g. `agent-messenger` → `better-sqlite3`) fails to build on a host without a C++ toolchain (Windows without VS Build Tools), `bun add -g typeclaw` aborts the whole install — bun aborts on any failed lifecycle script. The fix is to make that native module **not need a host compiler at all**, at its source — not to hide its parent:
+
+- The clean fix is **upstream**: the owning package should not force a from-source native build on consumers. Prefer a dependency that ships **ABI-stable (N-API) prebuilds** for all target platforms (like `classic-level`, which never recompiles on a new Node), or read SQLite via the runtime built-ins (`bun:sqlite` / `node:sqlite`) instead of a node-gyp module like `better-sqlite3`. `better-sqlite3` ships no in-package prebuilds and is keyed to the exact Node ABI, so a brand-new Node or bun finds no prebuilt and compiles from source — the actual failure.
+- `optionalDependencies` is NOT a real fix: it only lets the install _skip_ a failed build, leaving the feature dead with no recovery path for anyone who needs it. And it does not even apply to a _required_ child of an _optional_ parent — bun still runs and aborts on `better-sqlite3`'s build script under an optional `agent-messenger`. Only the failing package being _itself_ optional is non-fatal.
+- `overrides`, `resolutions`, `trustedDependencies`, `patchedDependencies`, and `bunfig.toml install.ignoreScripts` are all **root-project-only** — they are ignored when typeclaw is installed as someone else's dependency, so typeclaw cannot use them to neutralize a transitive native build for its own consumers.
+- Container-only native deps may additionally be seeded into the image in `src/init/dockerfile.ts` (the `WORKDIR /` "survives-the-/agent-bind-mount" pattern), but that addresses the container, not the host install.
+
 ## Debugging the system prompt
 
 `bun run debug:prompt` dumps the rendered system prompt for each session-origin kind (`tui`, `cron`, `channel`, `subagent`) with placeholder values, plus a per-section token/char/byte breakdown.
