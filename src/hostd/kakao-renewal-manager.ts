@@ -1,4 +1,4 @@
-import { renewCurrentAccount, type AttemptLoginFn } from '@/secrets/kakao-renewal'
+import { renewAllAccounts, type AttemptLoginFn } from '@/secrets/kakao-renewal'
 import { createKeyStore, type KeyStore } from '@/secrets/keys'
 
 import { keysDir } from './paths'
@@ -84,62 +84,64 @@ export function createKakaoRenewalManager(opts: KakaoRenewalManagerOptions = {})
   const runTick = async (input: KakaoRenewalStartInput): Promise<void> => {
     log({ kind: 'kakao-renewal-tick-start', containerName: input.containerName })
     try {
-      const result = await renewCurrentAccount({
+      const results = await renewAllAccounts({
         containerName: input.containerName,
         agentDir: input.cwd,
         keyStore,
         ...(opts.attemptLogin ? { attemptLogin: opts.attemptLogin } : {}),
       })
-      if (result.kind === 'skipped') {
-        log({
-          kind: 'kakao-renewal-tick-skipped',
-          containerName: input.containerName,
-          reason: result.reason,
-          ...(result.ageMs !== undefined ? { ageMs: result.ageMs } : {}),
-        })
-      } else if (result.kind === 'ok') {
-        log({
-          kind: 'kakao-renewal-tick-ok',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          previousUpdatedAt: result.previousUpdatedAt,
-        })
-        if (opts.onRenewalOk) {
+      for (const result of results) {
+        if (result.kind === 'skipped') {
           log({
-            kind: 'kakao-renewal-restart-scheduled',
+            kind: 'kakao-renewal-tick-skipped',
+            containerName: input.containerName,
+            reason: result.reason,
+            ...(result.ageMs !== undefined ? { ageMs: result.ageMs } : {}),
+          })
+        } else if (result.kind === 'ok') {
+          log({
+            kind: 'kakao-renewal-tick-ok',
             containerName: input.containerName,
             accountId: result.account_id,
+            previousUpdatedAt: result.previousUpdatedAt,
           })
-          try {
-            await opts.onRenewalOk({
-              containerName: input.containerName,
-              cwd: input.cwd,
-              accountId: result.account_id,
-            })
-          } catch (err) {
+          if (opts.onRenewalOk) {
             log({
-              kind: 'kakao-renewal-restart-failed',
+              kind: 'kakao-renewal-restart-scheduled',
               containerName: input.containerName,
               accountId: result.account_id,
-              reason: err instanceof Error ? err.message : String(err),
             })
+            try {
+              await opts.onRenewalOk({
+                containerName: input.containerName,
+                cwd: input.cwd,
+                accountId: result.account_id,
+              })
+            } catch (err) {
+              log({
+                kind: 'kakao-renewal-restart-failed',
+                containerName: input.containerName,
+                accountId: result.account_id,
+                reason: err instanceof Error ? err.message : String(err),
+              })
+            }
           }
+        } else if (result.kind === 'reauth_required') {
+          log({
+            kind: 'kakao-renewal-tick-reauth-required',
+            containerName: input.containerName,
+            accountId: result.account_id,
+            reason: result.reason,
+            message: result.message,
+          })
+        } else {
+          log({
+            kind: 'kakao-renewal-tick-transient-failure',
+            containerName: input.containerName,
+            accountId: result.account_id,
+            reason: result.reason,
+          })
         }
-      } else if (result.kind === 'reauth_required') {
-        log({
-          kind: 'kakao-renewal-tick-reauth-required',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          reason: result.reason,
-          message: result.message,
-        })
-      } else {
-        log({
-          kind: 'kakao-renewal-tick-transient-failure',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          reason: result.reason,
-        })
       }
     } catch (err) {
       // Defensive: renewCurrentAccount's contract is to return a structured

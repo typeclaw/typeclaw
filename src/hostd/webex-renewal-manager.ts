@@ -1,5 +1,5 @@
 import { createKeyStore, type KeyStore } from '@/secrets/keys'
-import { renewCurrentAccount, type LoginWithPasswordFn } from '@/secrets/webex-renewal'
+import { renewAllAccounts, type LoginWithPasswordFn } from '@/secrets/webex-renewal'
 
 import { keysDir } from './paths'
 
@@ -74,69 +74,71 @@ export function createWebexRenewalManager(opts: WebexRenewalManagerOptions = {})
   const runTick = async (input: WebexRenewalStartInput): Promise<void> => {
     log({ kind: 'webex-renewal-tick-start', containerName: input.containerName })
     try {
-      const result = await renewCurrentAccount({
+      const results = await renewAllAccounts({
         containerName: input.containerName,
         agentDir: input.cwd,
         keyStore,
         ...(opts.loginWithPassword ? { loginWithPassword: opts.loginWithPassword } : {}),
       })
-      if (result.kind === 'skipped') {
-        log({
-          kind: 'webex-renewal-tick-skipped',
-          containerName: input.containerName,
-          reason: result.reason,
-          ...(result.expiresInMs !== undefined ? { expiresInMs: result.expiresInMs } : {}),
-        })
-      } else if (result.kind === 'ok') {
-        log({
-          kind: 'webex-renewal-tick-ok',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          nextExpiresAt: result.nextExpiresAt,
-        })
-        // A tick that started before stop()/drain() (deregister, shutdown) or
-        // before a re-register with a different cwd can finish the slow login
-        // here. Restarting a container that is no longer the current
-        // registration would resurrect a just-deregistered agent or fight a
-        // shutdown, so skip onRenewalOk unless this container+cwd is still the
-        // live registration.
-        const current = latestInput.get(input.containerName)
-        if (opts.onRenewalOk && current?.cwd === input.cwd) {
+      for (const result of results) {
+        if (result.kind === 'skipped') {
           log({
-            kind: 'webex-renewal-restart-scheduled',
+            kind: 'webex-renewal-tick-skipped',
+            containerName: input.containerName,
+            reason: result.reason,
+            ...(result.expiresInMs !== undefined ? { expiresInMs: result.expiresInMs } : {}),
+          })
+        } else if (result.kind === 'ok') {
+          log({
+            kind: 'webex-renewal-tick-ok',
             containerName: input.containerName,
             accountId: result.account_id,
+            nextExpiresAt: result.nextExpiresAt,
           })
-          try {
-            await opts.onRenewalOk({
-              containerName: input.containerName,
-              cwd: input.cwd,
-              accountId: result.account_id,
-            })
-          } catch (err) {
+          // A tick that started before stop()/drain() (deregister, shutdown) or
+          // before a re-register with a different cwd can finish the slow login
+          // here. Restarting a container that is no longer the current
+          // registration would resurrect a just-deregistered agent or fight a
+          // shutdown, so skip onRenewalOk unless this container+cwd is still the
+          // live registration.
+          const current = latestInput.get(input.containerName)
+          if (opts.onRenewalOk && current?.cwd === input.cwd) {
             log({
-              kind: 'webex-renewal-restart-failed',
+              kind: 'webex-renewal-restart-scheduled',
               containerName: input.containerName,
               accountId: result.account_id,
-              reason: err instanceof Error ? err.message : String(err),
             })
+            try {
+              await opts.onRenewalOk({
+                containerName: input.containerName,
+                cwd: input.cwd,
+                accountId: result.account_id,
+              })
+            } catch (err) {
+              log({
+                kind: 'webex-renewal-restart-failed',
+                containerName: input.containerName,
+                accountId: result.account_id,
+                reason: err instanceof Error ? err.message : String(err),
+              })
+            }
           }
+        } else if (result.kind === 'reauth_required') {
+          log({
+            kind: 'webex-renewal-tick-reauth-required',
+            containerName: input.containerName,
+            accountId: result.account_id,
+            reason: result.reason,
+            message: result.message,
+          })
+        } else {
+          log({
+            kind: 'webex-renewal-tick-transient-failure',
+            containerName: input.containerName,
+            accountId: result.account_id,
+            reason: result.reason,
+          })
         }
-      } else if (result.kind === 'reauth_required') {
-        log({
-          kind: 'webex-renewal-tick-reauth-required',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          reason: result.reason,
-          message: result.message,
-        })
-      } else {
-        log({
-          kind: 'webex-renewal-tick-transient-failure',
-          containerName: input.containerName,
-          accountId: result.account_id,
-          reason: result.reason,
-        })
       }
     } catch (err) {
       log({

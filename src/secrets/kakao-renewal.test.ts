@@ -4,7 +4,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { encrypt, generateKey } from './encryption'
-import { type AttemptLoginFn, decideRenewal, RENEWAL_THRESHOLD_MS, renewCurrentAccount } from './kakao-renewal'
+import {
+  type AttemptLoginFn,
+  decideRenewal,
+  RENEWAL_THRESHOLD_MS,
+  renewAllAccounts,
+  renewCurrentAccount,
+} from './kakao-renewal'
 import { KeyStoreError, type KeyStore } from './keys'
 import { type KakaoChannelBlock, type KakaoEncryptedPassword } from './schema'
 
@@ -240,6 +246,51 @@ describe('renewCurrentAccount', () => {
       expect(persisted.email).toBe('u@e.com')
       expect(persisted.encryptedPassword?.kid).toBe(encryptedPassword.kid)
       expect(Date.parse(persisted.updated_at)).toBeGreaterThan(Date.parse(block.accounts['u-1']!.updated_at))
+    })
+  })
+
+  test('renews every stale account in the block, not only currentAccount', async () => {
+    await withAgentDir(async (agentDir) => {
+      const key = generateKey()
+      const encryptedA = encrypt('pw-a', key, { containerName: 'kakao', accountId: 'u-a' })
+      const encryptedB = encrypt('pw-b', key, { containerName: 'kakao', accountId: 'u-b' })
+      const blockA = buildBlock({ accountId: 'u-a', ageDays: 6, email: 'a@example.com', encryptedPassword: encryptedA })
+      const blockB = buildBlock({ accountId: 'u-b', ageDays: 6, email: 'b@example.com', encryptedPassword: encryptedB })
+      const block: KakaoChannelBlock = {
+        currentAccount: 'u-a',
+        accounts: { ...blockA.accounts, ...blockB.accounts },
+      }
+      await seedSecrets(agentDir, block)
+      const calls: Array<{ email: string; password: string }> = []
+
+      const results = await renewAllAccounts({
+        containerName: 'kakao',
+        agentDir,
+        keyStore: fakeKeyStore({ containerName: 'kakao', key }),
+        attemptLogin: async (email, password, deviceUuid, deviceType) => {
+          calls.push({ email, password })
+          const userId = email.startsWith('a') ? 'u-a' : 'u-b'
+          return {
+            authenticated: true,
+            credentials: {
+              access_token: `fresh-${userId}`,
+              refresh_token: `refresh-${userId}`,
+              user_id: userId,
+              device_uuid: deviceUuid,
+              device_type: deviceType,
+            },
+          }
+        },
+      })
+
+      expect(results.map((result) => result.kind)).toEqual(['ok', 'ok'])
+      expect(calls).toEqual([
+        { email: 'a@example.com', password: 'pw-a' },
+        { email: 'b@example.com', password: 'pw-b' },
+      ])
+      const raw = JSON.parse(await readFile(join(agentDir, 'secrets.json'), 'utf8'))
+      expect(raw.channels.kakaotalk.accounts['u-a'].oauth_token).toBe('fresh-u-a')
+      expect(raw.channels.kakaotalk.accounts['u-b'].oauth_token).toBe('fresh-u-b')
     })
   })
 

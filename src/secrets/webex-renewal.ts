@@ -39,6 +39,10 @@ export type WebexRenewalAttempt =
   | { kind: 'reauth_required'; account_id: string; reason: string; message: string }
   | { kind: 'transient_failure'; account_id: string; reason: string }
 
+export type WebexRenewalResult =
+  | WebexRenewalAttempt
+  | { kind: 'skipped'; account_id: string; reason: string; expiresInMs?: number }
+
 export type LoginWithPasswordFn = typeof upstreamLoginWithPassword
 
 export type WebexRenewalContext = {
@@ -55,6 +59,15 @@ export async function decideRenewal(block: WebexChannelBlock, ctx: WebexRenewalC
   if (!accountId) return { kind: 'skip', reason: 'no_account' }
   const account = block.accounts[accountId]
   if (!account) return { kind: 'skip', reason: 'no_account' }
+
+  return decideRenewalForAccount(account, ctx)
+}
+
+export async function decideRenewalForAccount(
+  account: WebexChannelBlock['accounts'][string],
+  ctx: WebexRenewalContext,
+): Promise<WebexRenewalDecision> {
+  const accountId = account.account_id
 
   const now = (ctx.now ?? Date.now)()
   const expiresInMs = account.expires_at - now
@@ -100,18 +113,54 @@ export async function decideRenewal(block: WebexChannelBlock, ctx: WebexRenewalC
   }
 }
 
-export async function renewCurrentAccount(
-  ctx: WebexRenewalContext,
-): Promise<WebexRenewalAttempt | { kind: 'skipped'; reason: string; expiresInMs?: number }> {
+export async function renewCurrentAccount(ctx: WebexRenewalContext): Promise<WebexRenewalResult> {
   const secretsPath = join(ctx.agentDir, 'secrets.json')
   const backend = new SecretsBackend(secretsPath)
   const block = backend.readChannelsSync()?.webex
   const parsed = parseBlockOrEmpty(block)
   const decision = await decideRenewal(parsed, ctx)
+  const accountId = parsed.currentAccount ?? ''
+  const previousExpiresAt = accountId !== '' ? (parsed.accounts[accountId]?.expires_at ?? 0) : 0
 
+  return await applyRenewalDecision({ ctx, secretsPath, accountId, previousExpiresAt, decision })
+}
+
+export async function renewAllAccounts(ctx: WebexRenewalContext): Promise<WebexRenewalResult[]> {
+  const secretsPath = join(ctx.agentDir, 'secrets.json')
+  const backend = new SecretsBackend(secretsPath)
+  const block = backend.readChannelsSync()?.webex
+  const parsed = parseBlockOrEmpty(block)
+  const entries = Object.values(parsed.accounts)
+  if (entries.length === 0) return [{ kind: 'skipped', account_id: '', reason: 'no_account' }]
+
+  const results: WebexRenewalResult[] = []
+  for (const account of entries) {
+    const decision = await decideRenewalForAccount(account, ctx)
+    results.push(
+      await applyRenewalDecision({
+        ctx,
+        secretsPath,
+        accountId: account.account_id,
+        previousExpiresAt: account.expires_at,
+        decision,
+      }),
+    )
+  }
+  return results
+}
+
+async function applyRenewalDecision(input: {
+  ctx: WebexRenewalContext
+  secretsPath: string
+  accountId: string
+  previousExpiresAt: number
+  decision: WebexRenewalDecision
+}): Promise<WebexRenewalResult> {
+  const { ctx, secretsPath, accountId, previousExpiresAt, decision } = input
   if (decision.kind === 'skip') {
     return {
       kind: 'skipped',
+      account_id: accountId,
       reason: decision.reason,
       ...(decision.expiresInMs !== undefined ? { expiresInMs: decision.expiresInMs } : {}),
     }
@@ -119,7 +168,7 @@ export async function renewCurrentAccount(
   if (decision.kind === 'reauth_required') {
     return {
       kind: 'reauth_required',
-      account_id: parsed.currentAccount ?? '',
+      account_id: accountId,
       reason: decision.reason,
       message: decision.message,
     }
@@ -141,7 +190,6 @@ export async function renewCurrentAccount(
   // updating it. `setAccount` merges and preserves email/encryptedPassword.
   const store = new SecretsWebexCredentialStore({ mode: 'host', secretsPath })
   const nowIso = new Date().toISOString()
-  const previousExpiresAt = parsed.accounts[decision.account.account_id]?.expires_at ?? 0
   await store.setAccount({
     account_id: decision.account.account_id,
     access_token: result.accessToken,

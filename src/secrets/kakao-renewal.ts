@@ -34,6 +34,8 @@ export type RenewalAttempt =
   | { kind: 'reauth_required'; account_id: string; reason: string; message: string }
   | { kind: 'transient_failure'; account_id: string; reason: string }
 
+export type RenewalResult = RenewalAttempt | { kind: 'skipped'; account_id: string; reason: string; ageMs?: number }
+
 export type AttemptLoginFn = typeof upstreamAttemptLogin
 
 export type RenewalContext = {
@@ -49,6 +51,15 @@ export async function decideRenewal(block: KakaoChannelBlock, ctx: RenewalContex
   if (!accountId) return { kind: 'skip', reason: 'no_account' }
   const account = block.accounts[accountId]
   if (!account) return { kind: 'skip', reason: 'no_account' }
+
+  return decideRenewalForAccount(account, ctx)
+}
+
+export async function decideRenewalForAccount(
+  account: KakaoChannelBlock['accounts'][string],
+  ctx: RenewalContext,
+): Promise<RenewalDecision> {
+  const accountId = account.account_id
 
   const now = (ctx.now ?? Date.now)()
   const ageMs = now - Date.parse(account.updated_at)
@@ -96,18 +107,44 @@ export async function decideRenewal(block: KakaoChannelBlock, ctx: RenewalContex
   }
 }
 
-export async function renewCurrentAccount(
-  ctx: RenewalContext,
-): Promise<RenewalAttempt | { kind: 'skipped'; reason: string; ageMs?: number }> {
+export async function renewCurrentAccount(ctx: RenewalContext): Promise<RenewalResult> {
   const secretsPath = join(ctx.agentDir, 'secrets.json')
   const backend = new SecretsBackend(secretsPath)
   const block = backend.readChannelsSync()?.kakaotalk
   const parsed = parseBlockOrEmpty(block)
   const decision = await decideRenewal(parsed, ctx)
+  const accountId = parsed.currentAccount ?? ''
 
+  return await applyRenewalDecision({ ctx, secretsPath, accountId, decision })
+}
+
+export async function renewAllAccounts(ctx: RenewalContext): Promise<RenewalResult[]> {
+  const secretsPath = join(ctx.agentDir, 'secrets.json')
+  const backend = new SecretsBackend(secretsPath)
+  const block = backend.readChannelsSync()?.kakaotalk
+  const parsed = parseBlockOrEmpty(block)
+  const entries = Object.values(parsed.accounts)
+  if (entries.length === 0) return [{ kind: 'skipped', account_id: '', reason: 'no_account' }]
+
+  const results: RenewalResult[] = []
+  for (const account of entries) {
+    const decision = await decideRenewalForAccount(account, ctx)
+    results.push(await applyRenewalDecision({ ctx, secretsPath, accountId: account.account_id, decision }))
+  }
+  return results
+}
+
+async function applyRenewalDecision(input: {
+  ctx: RenewalContext
+  secretsPath: string
+  accountId: string
+  decision: RenewalDecision
+}): Promise<RenewalResult> {
+  const { ctx, secretsPath, accountId, decision } = input
   if (decision.kind === 'skip') {
     return {
       kind: 'skipped',
+      account_id: accountId,
       reason: decision.reason,
       ...(decision.ageMs !== undefined ? { ageMs: decision.ageMs } : {}),
     }
@@ -115,7 +152,7 @@ export async function renewCurrentAccount(
   if (decision.kind === 'reauth_required') {
     return {
       kind: 'reauth_required',
-      account_id: parsed.currentAccount ?? '',
+      account_id: accountId,
       reason: decision.reason,
       message: decision.message,
     }

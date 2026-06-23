@@ -6,7 +6,13 @@ import { join } from 'node:path'
 import { encrypt, generateKey } from './encryption'
 import { KeyStoreError, type KeyStore } from './keys'
 import { type WebexEncryptedPassword, type WebexChannelBlock } from './schema'
-import { type LoginWithPasswordFn, decideRenewal, RENEWAL_WINDOW_MS, renewCurrentAccount } from './webex-renewal'
+import {
+  type LoginWithPasswordFn,
+  decideRenewal,
+  RENEWAL_WINDOW_MS,
+  renewAllAccounts,
+  renewCurrentAccount,
+} from './webex-renewal'
 
 const HOUR_MS = 60 * 60 * 1000
 
@@ -249,6 +255,52 @@ describe('renewCurrentAccount', () => {
       expect(persisted.email).toBe('u@e.com')
       expect(persisted.encryptedPassword?.kid).toBe(encryptedPassword.kid)
       expect(persisted.expires_at).toBeGreaterThan(block.accounts['u-1']!.expires_at)
+    })
+  })
+
+  test('renews every stale account in the block, not only currentAccount', async () => {
+    await withAgentDir(async (agentDir) => {
+      const key = generateKey()
+      const encryptedA = encrypt('pw-a', key, { containerName: 'webex', accountId: 'u-a' })
+      const encryptedB = encrypt('pw-b', key, { containerName: 'webex', accountId: 'u-b' })
+      const blockA = buildBlock({
+        accountId: 'u-a',
+        expiresInHours: 1,
+        email: 'a@example.com',
+        encryptedPassword: encryptedA,
+      })
+      const blockB = buildBlock({
+        accountId: 'u-b',
+        expiresInHours: 1,
+        email: 'b@example.com',
+        encryptedPassword: encryptedB,
+      })
+      const block: WebexChannelBlock = {
+        currentAccount: 'u-a',
+        accounts: { ...blockA.accounts, ...blockB.accounts },
+      }
+      await seedSecrets(agentDir, block)
+      const calls: Array<{ email: string; password: string }> = []
+
+      const results = await renewAllAccounts({
+        containerName: 'webex',
+        agentDir,
+        keyStore: fakeKeyStore({ containerName: 'webex', key }),
+        loginWithPassword: async (email, password) => {
+          calls.push({ email, password })
+          const suffix = email.startsWith('a') ? 'a' : 'b'
+          return { ...freshLoginResult(), accessToken: `fresh-${suffix}`, refreshToken: `refresh-${suffix}` }
+        },
+      })
+
+      expect(results.map((result) => result.kind)).toEqual(['ok', 'ok'])
+      expect(calls).toEqual([
+        { email: 'a@example.com', password: 'pw-a' },
+        { email: 'b@example.com', password: 'pw-b' },
+      ])
+      const raw = JSON.parse(await readFile(join(agentDir, 'secrets.json'), 'utf8'))
+      expect(raw.channels.webex.accounts['u-a'].access_token).toBe('fresh-a')
+      expect(raw.channels.webex.accounts['u-b'].access_token).toBe('fresh-b')
     })
   })
 
