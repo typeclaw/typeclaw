@@ -542,7 +542,11 @@ class FakeRouter {
     unregisterOutbound: () => this.unregistered.push('outbound'),
     registerChannelNameResolver: () => this.registered.push('channelNameResolver'),
     unregisterChannelNameResolver: () => this.unregistered.push('channelNameResolver'),
-    registerSelfIdentity: (_adapter: string, cb: (workspace: string) => { id: string; username?: string } | null) => {
+    registerSelfIdentity: (
+      _adapter: string,
+      _workspace: string,
+      cb: (workspace: string) => { id: string; username?: string } | null,
+    ) => {
       this.selfIdentity = cb
       this.registered.push('selfIdentity')
     },

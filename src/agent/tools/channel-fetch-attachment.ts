@@ -89,7 +89,7 @@ export function createChannelFetchAttachmentTool({
       }
       const ref = found.ref
       const filename = params.filename ?? found.filename
-      const result = await router.fetchAttachment(adapter, {
+      const result = await router.fetchAttachment(adapter, origin.workspace, {
         ref,
         ...(filename !== undefined ? { filename } : {}),
       })

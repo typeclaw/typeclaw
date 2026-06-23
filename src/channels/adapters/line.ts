@@ -391,9 +391,11 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       // Registration happens AFTER listener.start() resolves so a start
       // failure cannot leave the router pointing at callbacks for a
       // half-initialized adapter. stop() unregisters in inverse order.
-      options.router.registerOutbound('line', outboundCallback)
-      options.router.registerChannelNameResolver('line', channelResolver.resolve)
-      options.router.registerHistory('line', historyCallback)
+      for (const workspace of ['@line-dm', '@line-group', '@line-square']) {
+        options.router.registerOutbound('line', workspace, outboundCallback)
+        options.router.registerChannelNameResolver('line', workspace, channelResolver.resolve)
+        options.router.registerHistory('line', workspace, historyCallback)
+      }
     },
 
     async stop(): Promise<void> {
@@ -403,9 +405,11 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
         clearTimeout(refreshTimer)
         refreshTimer = null
       }
-      options.router.unregisterOutbound('line', outboundCallback)
-      options.router.unregisterChannelNameResolver('line', channelResolver.resolve)
-      options.router.unregisterHistory('line', historyCallback)
+      for (const workspace of ['@line-dm', '@line-group', '@line-square']) {
+        options.router.unregisterOutbound('line', workspace, outboundCallback)
+        options.router.unregisterChannelNameResolver('line', workspace, channelResolver.resolve)
+        options.router.unregisterHistory('line', workspace, historyCallback)
+      }
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)

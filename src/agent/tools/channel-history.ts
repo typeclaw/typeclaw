@@ -78,7 +78,7 @@ export function createChannelHistoryTool({
         return { content: [{ type: 'text' as const, text }], details }
       }
 
-      const result = await router.fetchHistory(origin.adapter, {
+      const result = await router.fetchHistory(origin.adapter, origin.workspace, {
         chat: origin.chat,
         thread: scope === 'thread' ? origin.thread : null,
         limit,

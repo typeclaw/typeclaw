@@ -14,7 +14,7 @@ import {
   type MembershipResolverResult,
 } from '@/channels/membership'
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
-import type { ChannelRouter } from '@/channels/router'
+import { ROUTE_WORKSPACE_ANY, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
@@ -296,6 +296,23 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
   })
   const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger, fetchImpl })
+  const registerCallbacks = (): void => {
+    options.router.registerOutbound('webex-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerChannelNameResolver('webex-bot', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.registerSelfIdentity('webex-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.registerHistory('webex-bot', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.registerFetchAttachment('webex-bot', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.registerMembership('webex-bot', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
+
+  const unregisterCallbacks = (): void => {
+    options.router.unregisterOutbound('webex-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterChannelNameResolver('webex-bot', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.unregisterSelfIdentity('webex-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.unregisterHistory('webex-bot', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.unregisterFetchAttachment('webex-bot', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.unregisterMembership('webex-bot', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
 
   const handleMessage = async (event: WebexInboundMessage): Promise<void> => {
     inflightInbounds++
@@ -373,20 +390,10 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
         void handleMessage(event)
       })
 
-      options.router.registerOutbound('webex-bot', outboundCallback)
-      options.router.registerChannelNameResolver('webex-bot', channelResolver)
-      options.router.registerSelfIdentity('webex-bot', selfIdentityResolver)
-      options.router.registerHistory('webex-bot', historyCallback)
-      options.router.registerFetchAttachment('webex-bot', fetchAttachmentCallback)
-      options.router.registerMembership('webex-bot', membershipResolver)
+      registerCallbacks()
 
       const rollbackStart = (reason: string, cause: Error): never => {
-        options.router.unregisterOutbound('webex-bot', outboundCallback)
-        options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
-        options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
-        options.router.unregisterHistory('webex-bot', historyCallback)
-        options.router.unregisterFetchAttachment('webex-bot', fetchAttachmentCallback)
-        options.router.unregisterMembership('webex-bot', membershipResolver)
+        unregisterCallbacks()
         listener?.stop()
         listener = null
         botPerson = null
@@ -412,12 +419,7 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('webex-bot', outboundCallback)
-      options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
-      options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
-      options.router.unregisterHistory('webex-bot', historyCallback)
-      options.router.unregisterFetchAttachment('webex-bot', fetchAttachmentCallback)
-      options.router.unregisterMembership('webex-bot', membershipResolver)
+      unregisterCallbacks()
       listener?.stop()
       listener = null
       connected = false

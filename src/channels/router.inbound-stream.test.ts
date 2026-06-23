@@ -199,7 +199,7 @@ describe('router publishes channel-inbound broadcasts', () => {
         dispose: async () => {},
       }),
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })

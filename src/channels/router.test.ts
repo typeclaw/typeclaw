@@ -32,6 +32,7 @@ import {
   MAX_TYPING_HEARTBEAT_MS,
   MAX_WILLINGNESS_NUDGES,
   OUTBOUND_FLOOD_ERROR,
+  ROUTE_WORKSPACE_ANY,
   SEND_RATE_WARN_THRESHOLD,
   SEND_RATE_WINDOW_MS,
   SEND_WILLINGNESS_NUDGE,
@@ -400,7 +401,7 @@ describe('ChannelRouter session lifecycle', () => {
   test('includes registered self-identity in the session-creation origin', async () => {
     const dir = await tempDir()
     const { router, origins } = makeRouter(dir)
-    router.registerSelfIdentity('discord-bot', () => ({ id: 'BOT_SELF_ID' }))
+    router.registerSelfIdentity('discord-bot', 'g1', () => ({ id: 'BOT_SELF_ID' }))
 
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
@@ -1432,7 +1433,7 @@ describe('ChannelRouter engagement and prompt composition', () => {
   test('registered membership resolver gates first cold inbound before sticky can start', async () => {
     const dir = await tempDir()
     const { router, sessions, origins } = makeRouter(dir)
-    router.registerMembership('discord-bot', async () => ({
+    router.registerMembership('discord-bot', 'g1', async () => ({
       humans: 5,
       bots: 2,
       fetchedAt: Date.now(),
@@ -1449,7 +1450,7 @@ describe('ChannelRouter engagement and prompt composition', () => {
   test('membership resolver failure preserves legacy null fallback', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerMembership('discord-bot', async () => ({ kind: 'transient' }))
+    router.registerMembership('discord-bot', 'g1', async () => ({ kind: 'transient' }))
 
     await router.route(inbound({ isBotMention: false, text: 'solo hello' }))
     await router.__testing!.flushDebounce(KEY)
@@ -1461,7 +1462,7 @@ describe('ChannelRouter engagement and prompt composition', () => {
   test('large approximate membership counts still quiet plain chatter', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerMembership('discord-bot', async () => ({
+    router.registerMembership('discord-bot', 'g1', async () => ({
       humans: 30,
       bots: 5,
       fetchedAt: Date.now(),
@@ -1478,7 +1479,7 @@ describe('ChannelRouter engagement and prompt composition', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let resolverCalls = 0
-    router.registerMembership('discord-bot', async () => {
+    router.registerMembership('discord-bot', 'g1', async () => {
       resolverCalls++
       return { humans: 1, bots: 0, fetchedAt: Date.now(), truncated: false }
     })
@@ -1503,7 +1504,7 @@ describe('ChannelRouter engagement and prompt composition', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let resolverCalls = 0
-    router.registerMembership('discord-bot', async () => {
+    router.registerMembership('discord-bot', 'g1', async () => {
       resolverCalls++
       return { humans: 1, bots: 1, fetchedAt: Date.now(), truncated: false }
     })
@@ -1645,7 +1646,7 @@ describe('ChannelRouter sticky credits', () => {
     expect(sessions[0]!.prompts).toHaveLength(1)
 
     nowRef.value = 1500
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     const result = await router.send({
       adapter: 'discord-bot',
       workspace: 'g1',
@@ -1667,7 +1668,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
     await router.__testing!.flushDebounce(KEY)
     nowRef.value = 1200
@@ -1701,7 +1702,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
     await router.__testing!.flushDebounce(KEY)
     nowRef.value = 1200
@@ -1742,7 +1743,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
     await router.__testing!.flushDebounce(KEY)
     nowRef.value = 1200
@@ -1776,7 +1777,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
     await router.__testing!.flushDebounce(KEY)
     nowRef.value = 1200
@@ -1815,7 +1816,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(
       inbound({ authorId: '111', authorName: 'alice', externalMessageId: 'p1', isBotMention: true, text: 'bot hi' }),
     )
@@ -1871,7 +1872,7 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(
       inbound({ authorId: '111', authorName: 'alice', externalMessageId: 'p1', isBotMention: true, text: 'bot hi' }),
     )
@@ -1921,8 +1922,8 @@ describe('ChannelRouter sticky credits', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
-    router.registerSelfIdentity('discord-bot', () => ({ id: '999' }))
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerSelfIdentity('discord-bot', 'g1', () => ({ id: '999' }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(
       inbound({ authorId: '111', authorName: 'alice', externalMessageId: 'p1', isBotMention: true, text: 'bot hi' }),
     )
@@ -1966,7 +1967,7 @@ describe('ChannelRouter outbound', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: { chat: string; text: string } = { chat: '', text: '' }
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       captured.chat = msg.chat
       captured.text = msg.text ?? ''
       return { ok: true }
@@ -1986,7 +1987,7 @@ describe('ChannelRouter outbound', () => {
     const { router } = makeRouter(dir)
     let capturedTypingThread: string | undefined
     let capturedThread: string | null | undefined
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       capturedTypingThread = msg.typingThread
       capturedThread = msg.thread
       return { ok: true }
@@ -2001,7 +2002,7 @@ describe('ChannelRouter outbound', () => {
   test('returns ok:false with adapter error when callback denies', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: false, error: 'denied by allow rules' }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: false, error: 'denied by allow rules' }))
     const result = await router.send({
       adapter: 'discord-bot',
       workspace: 'g1',
@@ -2016,7 +2017,7 @@ describe('ChannelRouter outbound', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let captured = ''
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       captured = msg.text ?? ''
       return { ok: true }
     })
@@ -2034,7 +2035,7 @@ describe('ChannelRouter outbound', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let capturedText: string | undefined = 'UNSET'
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       capturedText = msg.text
       return { ok: true }
     })
@@ -2094,7 +2095,7 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
-    router.registerReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', 'g1', async (req) => {
       captured.push(req)
       return { ok: true }
     })
@@ -2110,7 +2111,7 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
-    router.registerReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => {
       called = true
       return { ok: true }
     })
@@ -2125,11 +2126,11 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
-    router.registerReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => {
       called = true
       return { ok: true }
     })
-    router.setTypingCapability('discord-bot', true)
+    router.setTypingCapability('discord-bot', 'g1', true)
 
     await router.route(inbound({ reactionRef: REACTION_REF }))
     await router.__testing!.flushDebounce(KEY)
@@ -2141,12 +2142,12 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
-    router.registerReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', 'g1', async (req) => {
       captured.push(req)
       return { ok: true }
     })
-    router.setTypingCapability('discord-bot', true)
-    router.setTypingCapability('discord-bot', false)
+    router.setTypingCapability('discord-bot', 'g1', true)
+    router.setTypingCapability('discord-bot', 'g1', false)
 
     await router.route(inbound({ reactionRef: REACTION_REF }))
 
@@ -2159,12 +2160,12 @@ describe('ChannelRouter auto-react on engage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const captured: ReactionRequest[] = []
-    router.registerReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', 'g1', async (req) => {
       captured.push(req)
       return { ok: true }
     })
     // given a different adapter declares typing
-    router.setTypingCapability('slack-bot', true)
+    router.setTypingCapability('slack-bot', 'g1', true)
 
     await router.route(inbound({ reactionRef: REACTION_REF }))
 
@@ -2176,11 +2177,11 @@ describe('ChannelRouter auto-react on engage', () => {
   test('a throwing reaction callback never blocks engagement (session still created, reply still sends)', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => {
       throw new Error('reaction api exploded')
     })
     const outbound: string[] = []
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       outbound.push(msg.text ?? '')
       return { ok: true }
     })
@@ -2213,7 +2214,7 @@ describe('ChannelRouter auto-react on engage', () => {
   test('react() refuses a ref whose adapter does not match the request adapter', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerReaction('discord-bot', async () => ({ ok: true }))
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: true }))
     const result = await router.react({
       adapter: 'discord-bot',
       workspace: 'g1',
@@ -2228,7 +2229,7 @@ describe('ChannelRouter auto-react on engage', () => {
   test('react() converts a throwing callback into a transient failure result, not a rejection', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => {
       throw new Error('reaction api exploded')
     })
 
@@ -2253,13 +2254,13 @@ describe('ChannelRouter react on disengage', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const captured: ReactionRequest[] = []
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     // when the model disengages during the turn (callback registered here so the
     // engage :eyes: added during route() is not captured)
     await router.route(inbound({ reactionRef: REACTION_REF }))
     sessions[0]!.onPrompt = async () => {
-      router.registerReaction('discord-bot', async (req) => {
+      router.registerReaction('discord-bot', 'g1', async (req) => {
         captured.push(req)
         return { ok: true }
       })
@@ -2281,7 +2282,7 @@ describe('ChannelRouter react on disengage', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let called = false
-    router.registerReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => {
       called = true
       return { ok: true }
     })
@@ -2295,11 +2296,11 @@ describe('ChannelRouter react on disengage', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     let called = false
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound())
     sessions[0]!.onPrompt = async () => {
-      router.registerReaction('discord-bot', async () => {
+      router.registerReaction('discord-bot', 'g1', async () => {
         called = true
         return { ok: true }
       })
@@ -2313,12 +2314,12 @@ describe('ChannelRouter react on disengage', () => {
   test('a throwing disengage reaction never blocks clearSticky', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: REACTION_REF }))
     let cleared: { keyId: string; cleared: number } | null = null
     sessions[0]!.onPrompt = async () => {
-      router.registerReaction('discord-bot', async () => {
+      router.registerReaction('discord-bot', 'g1', async () => {
         throw new Error('reaction api exploded')
       })
       cleared = router.clearSticky(KEY)
@@ -2349,12 +2350,12 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', 'g1', async (req) => {
       removed.push(req)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
     sessions[0]!.onPrompt = async () => {
@@ -2375,15 +2376,15 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
       'msg-b': { adapter: 'discord-bot', value: 'instance-b' },
     }
     const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async (req) => ({
+    router.registerReaction('discord-bot', 'g1', async (req) => ({
       ok: true,
       reactionRef: instanceFor[req.reactionRef.value]!,
     }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('discord-bot', 'g1', async (req) => {
       removed.push(req)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     // when both arrive before the debounce flush, then the agent replies once
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-a' } }))
@@ -2402,8 +2403,8 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const removed: RemoveReactionRequest[] = []
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', 'g1', async (req) => {
       removed.push(req)
       return { ok: true }
     })
@@ -2424,16 +2425,17 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     let resolveAdd: ((ref: ReactionRef) => void) | undefined
     router.registerReaction(
       'discord-bot',
+      'g1',
       async () =>
         await new Promise((resolve: (result: { ok: true; reactionRef: ReactionRef }) => void) => {
           resolveAdd = (ref) => resolve({ ok: true, reactionRef: ref })
         }),
     )
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('discord-bot', 'g1', async (req) => {
       removed.push(req)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
     sessions[0]!.onPrompt = async () => {
@@ -2451,12 +2453,12 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     let removed = false
-    router.registerReaction('discord-bot', async () => ({ ok: true }))
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: true }))
+    router.registerRemoveReaction('discord-bot', 'g1', async () => {
       removed = true
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
     sessions[0]!.onPrompt = async () => {
@@ -2471,12 +2473,12 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     let removed = false
-    router.registerReaction('discord-bot', async () => ({ ok: false, error: 'nope', code: 'unsupported' }))
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: false, error: 'nope', code: 'unsupported' }))
+    router.registerRemoveReaction('discord-bot', 'g1', async () => {
       removed = true
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
     sessions[0]!.onPrompt = async () => {
@@ -2491,10 +2493,18 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
-    router.registerRemoveReaction('discord-bot', async () => ({ ok: false, error: 'already gone', code: 'not-found' }))
-    router.registerRemoveReaction('discord-bot', async () => ({ ok: false, error: 'unsupported', code: 'unsupported' }))
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerReaction('discord-bot', 'g1', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', 'g1', async () => ({
+      ok: false,
+      error: 'already gone',
+      code: 'not-found',
+    }))
+    router.registerRemoveReaction('discord-bot', 'g1', async () => ({
+      ok: false,
+      error: 'unsupported',
+      code: 'unsupported',
+    }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ reactionRef: TARGET_REF }))
     sessions[0]!.onPrompt = async () => {
@@ -2521,7 +2531,7 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
       code: 'unsupported',
     })
 
-    router.registerRemoveReaction('discord-bot', async () => {
+    router.registerRemoveReaction('discord-bot', 'g1', async () => {
       throw new Error('remove api exploded')
     })
     const mismatch = await router.removeReaction({
@@ -2563,7 +2573,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2584,7 +2594,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2623,7 +2633,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2653,7 +2663,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2677,7 +2687,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2697,7 +2707,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2717,7 +2727,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2742,7 +2752,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2767,7 +2777,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2787,7 +2797,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2807,7 +2817,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2830,7 +2840,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2850,7 +2860,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2874,7 +2884,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2898,7 +2908,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2930,7 +2940,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2961,7 +2971,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -2987,7 +2997,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3024,7 +3034,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3048,7 +3058,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3088,7 +3098,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3126,7 +3136,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3151,7 +3161,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3192,7 +3202,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3234,7 +3244,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3267,7 +3277,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3307,7 +3317,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3335,7 +3345,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3356,7 +3366,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3379,7 +3389,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3404,7 +3414,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3426,7 +3436,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3451,7 +3461,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3472,7 +3482,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3493,7 +3503,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3514,7 +3524,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3535,7 +3545,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ chat: string; text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ chat: msg.chat, text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3557,7 +3567,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3578,7 +3588,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3599,7 +3609,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3618,7 +3628,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3638,7 +3648,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3659,7 +3669,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3680,7 +3690,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3803,7 +3813,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
     const sent: Array<{ chat: string; thread: string | null | undefined; text: string }> = []
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ chat: msg.chat, thread: msg.thread, text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3831,7 +3841,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3854,7 +3864,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3875,7 +3885,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3905,11 +3915,15 @@ describe('ChannelRouter channel-turn protocol', () => {
     const sent: Array<{ text: string }> = []
     const githubKey: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('github', async (msg) => {
+    router.registerOutbound('github', 'acme/repo', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewStateResolver('github', 'acme/repo', async () => ({
+      ok: true,
+      selfBlocking: true,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -3931,11 +3945,15 @@ describe('ChannelRouter channel-turn protocol', () => {
     const sent: Array<{ text: string }> = []
     const githubKey: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('github', async (msg) => {
+    router.registerOutbound('github', 'acme/repo', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: false, approve: true }))
+    router.registerReviewStateResolver('github', 'acme/repo', async () => ({
+      ok: true,
+      selfBlocking: false,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -3955,7 +3973,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -3977,7 +3995,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4008,7 +4026,7 @@ describe('ChannelRouter channel-turn protocol', () => {
       const logs: string[] = []
       const sent: Array<{ text: string }> = []
       const { router, sessions } = makeRouter(dir, { logs })
-      router.registerOutbound('discord-bot', async (msg) => {
+      router.registerOutbound('discord-bot', 'g1', async (msg) => {
         sent.push({ text: msg.text ?? '' })
         return { ok: true }
       })
@@ -4029,7 +4047,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4067,7 +4085,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4117,7 +4135,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4156,7 +4174,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4190,7 +4208,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4222,7 +4240,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4266,7 +4284,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4289,7 +4307,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4327,7 +4345,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'ambiguous thing' }))
     let attempt = 0
@@ -4363,7 +4381,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4385,7 +4403,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4419,7 +4437,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4438,7 +4456,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'ambiguous thing' }))
     const budgetsPerPrompt: Array<number | undefined> = []
@@ -4470,7 +4488,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4500,7 +4518,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4527,7 +4545,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4553,7 +4571,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4582,7 +4600,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4605,7 +4623,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4631,7 +4649,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4655,7 +4673,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4676,7 +4694,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: false, error: 'denied by adapter' }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: false, error: 'denied by adapter' }))
 
     await router.route(inbound({ text: 'say hi' }))
     sessions[0]!.onPrompt = () => {
@@ -4692,7 +4710,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'say hi' }))
     sessions[0]!.onPrompt = async () => {
@@ -4716,7 +4734,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4785,7 +4803,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4853,7 +4871,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4889,7 +4907,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -4985,7 +5003,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -5018,7 +5036,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -5048,7 +5066,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -5070,7 +5088,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -5165,7 +5183,7 @@ describe('ChannelRouter consecutive-send accounting', () => {
   test('increments per successful send to the session origin', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5180,7 +5198,7 @@ describe('ChannelRouter consecutive-send accounting', () => {
   test('does not increment on failed delivery', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: false, error: 'nope' }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: false, error: 'nope' }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5191,7 +5209,7 @@ describe('ChannelRouter consecutive-send accounting', () => {
   test('does not increment for cross-post (no live session at target keyId)', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5203,7 +5221,7 @@ describe('ChannelRouter consecutive-send accounting', () => {
   test('resets on the next user batch being drained into the model', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
 
@@ -5222,7 +5240,7 @@ describe('ChannelRouter consecutive-send accounting', () => {
   test('keys per (chat:thread): different threads in the same chat count independently', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ thread: 't-A', externalMessageId: 'mA' }))
     await router.__testing!.flushDebounce({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't-A' })
     await router.route(inbound({ thread: 't-B', externalMessageId: 'mB' }))
@@ -5246,7 +5264,7 @@ describe('ChannelRouter duplicate-send guard', () => {
     const dir = await tempDir()
     let delivered = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       delivered++
       return { ok: true }
     })
@@ -5264,7 +5282,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('lets a different body through after a recent dup', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5276,7 +5294,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('passes the adapter messageId/messageIds through to the send result', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true, messageId: 'm1', messageIds: ['m1', 'm2'] }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true, messageId: 'm1', messageIds: ['m1', 'm2'] }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5287,7 +5305,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('omits messageId when the adapter does not report one', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5299,7 +5317,7 @@ describe('ChannelRouter duplicate-send guard', () => {
     const dir = await tempDir()
     let attempts = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       attempts++
       return attempts === 1 ? { ok: false, error: 'transient' } : { ok: true }
     })
@@ -5315,7 +5333,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('resets on the next user batch so across-turn repeats are not blocked', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
 
@@ -5331,7 +5349,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('scopes per (chat:thread): same text to a different thread is not flagged', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ thread: 't-A', externalMessageId: 'mA' }))
     await router.__testing!.flushDebounce({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't-A' })
     await router.route(inbound({ thread: 't-B', externalMessageId: 'mB' }))
@@ -5351,7 +5369,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('attachments-only sends (text undefined) do not poison the dup tracker', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5374,7 +5392,7 @@ describe('ChannelRouter duplicate-send guard', () => {
   test('empty string text is normalized — does not block a follow-up empty-text send', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5399,7 +5417,7 @@ describe('ChannelRouter duplicate-send guard', () => {
     const dir = await tempDir()
     let delivered = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       // simulate a tiny adapter latency so all 10 sends are in flight at the same time
       await new Promise((resolve) => setTimeout(resolve, 5))
       delivered++
@@ -5425,7 +5443,7 @@ describe('ChannelRouter duplicate-send guard', () => {
     const dir = await tempDir()
     let delivered = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       delivered++
       return { ok: true }
     })
@@ -5447,7 +5465,7 @@ describe('ChannelRouter outbound flood guard', () => {
     const dir = await tempDir()
     let delivered = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       delivered++
       return { ok: true }
     })
@@ -5475,7 +5493,7 @@ describe('ChannelRouter outbound flood guard', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -5505,7 +5523,7 @@ describe('ChannelRouter per-turn send cap', () => {
   test('blocks the (cap+1)th tool send with code=turn-cap', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5525,7 +5543,7 @@ describe('ChannelRouter per-turn send cap', () => {
   test('cap resets on the next user batch', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
 
@@ -5542,7 +5560,7 @@ describe('ChannelRouter per-turn send cap', () => {
   test('system-source bypasses the cap', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5560,7 +5578,7 @@ describe('ChannelRouter per-turn send cap', () => {
     const dir = await tempDir()
     let delivered = 0
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       await new Promise((resolve) => setTimeout(resolve, 5))
       delivered++
       return { ok: true }
@@ -5596,7 +5614,7 @@ describe('ChannelRouter getSendRate', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5612,7 +5630,7 @@ describe('ChannelRouter getSendRate', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5626,7 +5644,7 @@ describe('ChannelRouter getSendRate', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
 
@@ -5643,7 +5661,7 @@ describe('ChannelRouter getSendRate', () => {
   test('scopes per (chat:thread): different threads count independently', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound({ thread: 't-A', externalMessageId: 'mA' }))
     await router.__testing!.flushDebounce({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't-A' })
     await router.route(inbound({ thread: 't-B', externalMessageId: 'mB' }))
@@ -5661,7 +5679,7 @@ describe('ChannelRouter getSendRate', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5680,7 +5698,7 @@ describe('ChannelRouter getSendRate', () => {
     const nowRef = { value: 1000 }
     const logs: string[] = []
     const { router } = makeRouter(dir, { nowRef, logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5702,7 +5720,7 @@ describe('ChannelRouter getSendRate', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
 
@@ -5717,7 +5735,7 @@ describe('ChannelRouter cross-tool sharing', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let delivered = 0
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       delivered++
       return { ok: true }
     })
@@ -5750,7 +5768,7 @@ describe('ChannelRouter stop', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: number[] = []
-    router.registerTyping('discord-bot', async () => {
+    router.registerTyping('discord-bot', 'g1', async () => {
       calls.push(1)
     })
     await router.route(inbound())
@@ -5822,7 +5840,7 @@ describe('ChannelRouter commands', () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -6042,7 +6060,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: Array<{ chat: string }> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       calls.push({ chat: target.chat })
     })
     // Prime with carol (mention) so alice's next plain message hits the
@@ -6059,7 +6077,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: Array<{ chat: string; thread: string | null | undefined }> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       calls.push({ chat: target.chat, thread: target.thread })
     })
     await router.route(inbound({ text: 'hi bot' }))
@@ -6072,7 +6090,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: number[] = []
-    router.registerTyping('discord-bot', async () => {
+    router.registerTyping('discord-bot', 'g1', async () => {
       calls.push(1)
     })
     await router.route(inbound({ text: 'hi bot' }))
@@ -6085,7 +6103,7 @@ describe('ChannelRouter typing indicator', () => {
   test('stops the heartbeat after drain completes', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerTyping('discord-bot', async () => {})
+    router.registerTyping('discord-bot', 'g1', async () => {})
     await router.route(inbound({ text: 'hi bot' }))
     expect(router.__testing!.isTypingActive(KEY)).toBe(true)
     await router.__testing!.flushDebounce(KEY)
@@ -6096,7 +6114,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: Array<{ chat: string; thread: string | null | undefined }> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       calls.push({ chat: target.chat, thread: target.thread })
     })
     await router.route(inbound({ thread: 'thread-7', text: 'hi bot' }))
@@ -6107,7 +6125,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const calls: Array<{ chat: string; thread: string | null | undefined; typingThread: string | undefined }> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       calls.push({ chat: target.chat, thread: target.thread, typingThread: target.typingThread })
     })
     await router.route(inbound({ isDm: true, thread: null, typingThread: 'dm-ts-1', text: 'hi bot' }))
@@ -6117,7 +6135,7 @@ describe('ChannelRouter typing indicator', () => {
   test('typing-callback rejection does not crash route', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerTyping('discord-bot', async () => {
+    router.registerTyping('discord-bot', 'g1', async () => {
       throw new Error('discord 503')
     })
     await router.route(inbound({ text: 'hi bot' }))
@@ -6140,10 +6158,10 @@ describe('ChannelRouter typing indicator', () => {
     const cb = async () => {
       calls.push(1)
     }
-    router.registerTyping('discord-bot', cb)
+    router.registerTyping('discord-bot', 'g1', cb)
     await router.route(inbound({ text: 'hi bot' }))
     expect(calls).toHaveLength(1)
-    router.unregisterTyping('discord-bot', cb)
+    router.unregisterTyping('discord-bot', 'g1', cb)
     await router.__testing!.fireTypingHeartbeat(KEY)
     expect(calls).toHaveLength(1)
   })
@@ -6152,7 +6170,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const phases: Array<'tick' | 'stop'> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
     // when
@@ -6170,7 +6188,7 @@ describe('ChannelRouter typing indicator', () => {
     const phases: Array<'tick' | 'stop'> = []
     let releaseStop: (() => void) | undefined
     let flushResolved = false
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
       if (target.phase === 'stop') {
         await new Promise<void>((resolve) => {
@@ -6200,7 +6218,7 @@ describe('ChannelRouter typing indicator', () => {
     let releasePrompt: (() => void) | undefined
     let releaseStop: (() => void) | undefined
     let flushResolved = false
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       if (target.phase === 'stop') {
         await new Promise<void>((resolve) => {
           releaseStop = resolve
@@ -6237,7 +6255,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6269,7 +6287,7 @@ describe('ChannelRouter typing indicator', () => {
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
     let promptCount = 0
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6300,10 +6318,10 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir)
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'long task' }))
     sessions[0]!.onPrompt = async () => {
@@ -6329,10 +6347,10 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir)
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'long task' }))
     sessions[0]!.onPrompt = async () => {
@@ -6360,10 +6378,10 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir)
     const events: string[] = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       events.push(`typing:${target.phase}`)
     })
-    router.registerOutbound('discord-bot', async () => {
+    router.registerOutbound('discord-bot', 'g1', async () => {
       events.push('outbound:cb')
       return { ok: true }
     })
@@ -6389,10 +6407,10 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir)
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
-    router.registerOutbound('discord-bot', async (_msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (_msg) => {
       // simulate teardown happening during the outbound: the heartbeat is
       // stopped after the adapter accepted the send but before send()
       // returns. The re-arm guard must suppress the post-send tick so we
@@ -6423,7 +6441,7 @@ describe('ChannelRouter typing indicator', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const stopTargets: Array<{ chat: string; thread: string | null | undefined }> = []
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       if (target.phase === 'stop') stopTargets.push({ chat: target.chat, thread: target.thread })
     })
     await router.route(inbound({ thread: 'thread-7', text: 'hi bot' }))
@@ -6438,7 +6456,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6474,7 +6492,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6510,7 +6528,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6545,7 +6563,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6580,7 +6598,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6609,7 +6627,7 @@ describe('ChannelRouter typing indicator', () => {
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async () => {})
+    router.registerTyping('discord-bot', 'g1', async () => {})
 
     await router.route(inbound({ text: 'multi-tool task' }))
     sessions[0]!.onPrompt = async () => {
@@ -6644,7 +6662,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6680,7 +6698,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6725,7 +6743,7 @@ describe('ChannelRouter typing indicator', () => {
     let stopCount = 0
     // Block ONLY the cap-trip 'stop' so the revival race window stays open;
     // the turn-end 'stop' (after the prompt resolves) must pass through freely.
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
       if (target.phase === 'stop' && ++stopCount === 1) {
         await new Promise<void>((resolve) => {
@@ -6777,7 +6795,7 @@ describe('ChannelRouter typing indicator', () => {
     let stopCount = 0
     // Block ONLY the cap-trip 'stop' so a revival can be queued behind it while
     // the turn finishes; the turn-end 'stop' must pass through.
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
       if (target.phase === 'stop' && ++stopCount === 1) {
         await new Promise<void>((resolve) => {
@@ -6821,7 +6839,7 @@ describe('ChannelRouter typing indicator', () => {
     const { router, sessions } = makeRouter(dir, { nowRef, logs })
     const phases: Array<'tick' | 'stop'> = []
     let releasePrompt: (() => void) | undefined
-    router.registerTyping('discord-bot', async (target) => {
+    router.registerTyping('discord-bot', 'g1', async (target) => {
       phases.push(target.phase)
     })
 
@@ -6859,7 +6877,7 @@ describe('ChannelRouter typing indicator', () => {
     let releaseFirstPrompt: (() => void) | undefined
     let releaseSecondPrompt: (() => void) | undefined
     let promptCount = 0
-    router.registerTyping('discord-bot', async () => {})
+    router.registerTyping('discord-bot', 'g1', async () => {})
 
     await router.route(inbound({ text: 'first' }))
     sessions[0]!.onPrompt = async () => {
@@ -7151,7 +7169,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
         }
       },
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7196,7 +7214,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
         }
       },
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7225,7 +7243,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7260,7 +7278,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7304,7 +7322,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7349,7 +7367,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const logs: string[] = []
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7387,7 +7405,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const logs: string[] = []
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -7533,7 +7551,7 @@ describe('ChannelRouter channel name resolver', () => {
     const dir = await tempDir()
     const { router, origins } = makeRouter(dir)
     const calls: ChannelKey[] = []
-    router.registerChannelNameResolver('discord-bot', async (key) => {
+    router.registerChannelNameResolver('discord-bot', 'g1', async (key) => {
       calls.push(key)
       return { chatName: 'general', workspaceName: 'Acme Guild' }
     })
@@ -7565,7 +7583,7 @@ describe('ChannelRouter channel name resolver', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, origins } = makeRouter(dir, { logs })
-    router.registerChannelNameResolver('discord-bot', async () => {
+    router.registerChannelNameResolver('discord-bot', 'g1', async () => {
       throw new Error('rate limited')
     })
 
@@ -7583,11 +7601,11 @@ describe('ChannelRouter channel name resolver', () => {
     const { router } = makeRouter(dir)
     let discordCalls = 0
     let slackCalls = 0
-    router.registerChannelNameResolver('discord-bot', async () => {
+    router.registerChannelNameResolver('discord-bot', 'g1', async () => {
       discordCalls++
       return {}
     })
-    router.registerChannelNameResolver('slack-bot', async () => {
+    router.registerChannelNameResolver('slack-bot', 'g1', async () => {
       slackCalls++
       return {}
     })
@@ -7602,7 +7620,7 @@ describe('ChannelRouter channel name resolver', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let calls = 0
-    router.registerChannelNameResolver('discord-bot', async () => {
+    router.registerChannelNameResolver('discord-bot', 'g1', async () => {
       calls++
       return { chatName: 'general', workspaceName: 'Acme' }
     })
@@ -7640,7 +7658,7 @@ describe('ChannelRouter channel name resolver', () => {
         }
       },
     })
-    router.registerChannelNameResolver('discord-bot', () => new Promise(() => {}))
+    router.registerChannelNameResolver('discord-bot', 'g1', () => new Promise(() => {}))
 
     // when an inbound triggers ensureLive
     const start = Date.now()
@@ -7896,12 +7914,12 @@ describe('ChannelRouter history dispatch', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const seen: FetchHistoryArgs[] = []
-    router.registerHistory('discord-bot', async (args) => {
+    router.registerHistory('discord-bot', 'g1', async (args) => {
       seen.push(args)
       return { ok: true, messages: [] }
     })
 
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: 't1', limit: 5, cursor: 'cur' })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: 't1', limit: 5, cursor: 'cur' })
 
     expect(result).toEqual({ ok: true, messages: [] })
     expect(seen).toEqual([{ chat: 'c1', thread: 't1', limit: 5, cursor: 'cur' }])
@@ -7911,7 +7929,7 @@ describe('ChannelRouter history dispatch', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
 
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 1 })
 
     expect(result).toEqual({ ok: false, error: 'history-not-supported' })
   })
@@ -7920,7 +7938,7 @@ describe('ChannelRouter history dispatch', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     let secondCalled = false
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         {
@@ -7934,12 +7952,12 @@ describe('ChannelRouter history dispatch', () => {
         },
       ],
     }))
-    router.registerHistory('discord-bot', async () => {
+    router.registerHistory('discord-bot', 'g1', async () => {
       secondCalled = true
       return { ok: false, error: 'second' }
     })
 
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 5 })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 5 })
 
     expect(result.ok).toBe(true)
     expect(secondCalled).toBe(false)
@@ -7948,10 +7966,10 @@ describe('ChannelRouter history dispatch', () => {
   test('surfaces the last error verbatim when every callback returns ok: false', async () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => ({ ok: false, error: 'first-failed' }))
-    router.registerHistory('discord-bot', async () => ({ ok: false, error: 'second-failed' }))
+    router.registerHistory('discord-bot', 'g1', async () => ({ ok: false, error: 'first-failed' }))
+    router.registerHistory('discord-bot', 'g1', async () => ({ ok: false, error: 'second-failed' }))
 
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 1 })
 
     expect(result).toEqual({ ok: false, error: 'second-failed' })
   })
@@ -7960,10 +7978,10 @@ describe('ChannelRouter history dispatch', () => {
     const dir = await tempDir()
     const { router } = makeRouter(dir)
     const cb: HistoryCallback = async () => ({ ok: true, messages: [] })
-    router.registerHistory('discord-bot', cb)
-    router.unregisterHistory('discord-bot', cb)
+    router.registerHistory('discord-bot', 'g1', cb)
+    router.unregisterHistory('discord-bot', 'g1', cb)
 
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 1 })
 
     expect(result).toEqual({ ok: false, error: 'history-not-supported' })
   })
@@ -7973,16 +7991,16 @@ describe('ChannelRouter history dispatch', () => {
     const { router } = makeRouter(dir)
     let discordCalls = 0
     let slackCalls = 0
-    router.registerHistory('discord-bot', async () => {
+    router.registerHistory('discord-bot', 'g1', async () => {
       discordCalls++
       return { ok: true, messages: [] }
     })
-    router.registerHistory('slack-bot', async () => {
+    router.registerHistory('slack-bot', 'g1', async () => {
       slackCalls++
       return { ok: true, messages: [] }
     })
 
-    await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
+    await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 1 })
 
     expect(discordCalls).toBe(1)
     expect(slackCalls).toBe(0)
@@ -8005,17 +8023,87 @@ describe('ChannelRouter history dispatch', () => {
         error: (m) => logs.push(`error:${m}`),
       },
     })
-    router.registerHistory('discord-bot', () => new Promise(() => {}))
+    router.registerHistory('discord-bot', 'g1', () => new Promise(() => {}))
 
     // when fetchHistory is invoked
     const start = Date.now()
-    const result = await router.fetchHistory('discord-bot', { chat: 'c1', thread: null, limit: 1 })
+    const result = await router.fetchHistory('discord-bot', 'g1', { chat: 'c1', thread: null, limit: 1 })
     const elapsed = Date.now() - start
 
     // then it returns the not-supported degraded result and logs the timeout
     expect(elapsed).toBeLessThan(500)
     expect(result.ok).toBe(false)
     expect(logs.some((l) => l.includes('history fetch threw') && l.includes('timed out after 50ms'))).toBe(true)
+  })
+})
+
+describe('ChannelRouter route-key dispatch', () => {
+  test('catch-all registration supports proactive outbound without prior inbound', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const sent: string[] = []
+
+    router.registerOutbound('discord', ROUTE_WORKSPACE_ANY, async (msg) => {
+      sent.push(`${msg.workspace}:${msg.chat}:${msg.text ?? ''}`)
+      return { ok: true }
+    })
+
+    const result = await router.send({ adapter: 'discord', workspace: 'guild_999', chat: 'C', text: 'hi' })
+
+    expect(result).toEqual({ ok: true })
+    expect(sent).toEqual(['guild_999:C:hi'])
+  })
+
+  test('exact workspace registration wins over catch-all fallback', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const sent: string[] = []
+
+    router.registerOutbound('slack', ROUTE_WORKSPACE_ANY, async () => {
+      sent.push('catch-all')
+      return { ok: true }
+    })
+    router.registerOutbound('slack', 'WS_A', async () => {
+      sent.push('exact')
+      return { ok: true }
+    })
+
+    await router.send({ adapter: 'slack', workspace: 'WS_A', chat: 'C1', text: 'exact route' })
+    await router.send({ adapter: 'slack', workspace: 'WS_unknown', chat: 'C1', text: 'fallback route' })
+
+    expect(sent).toEqual(['exact', 'catch-all'])
+  })
+
+  test('isolates outbound callbacks and self identity by adapter workspace route key', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const sent: string[] = []
+
+    router.registerOutbound('slack', 'WS_A', async () => {
+      sent.push('WS_A')
+      return { ok: true }
+    })
+    router.registerOutbound('slack', 'WS_B', async () => {
+      sent.push('WS_B')
+      return { ok: true }
+    })
+    router.registerSelfIdentity('slack', 'WS_A', () => ({ id: 'SELF_A' }))
+    router.registerSelfIdentity('slack', 'WS_B', () => ({ id: 'SELF_B' }))
+
+    const result = await router.send({ adapter: 'slack', workspace: 'WS_A', chat: 'C1', text: 'hello' })
+
+    expect(result.ok).toBe(true)
+    expect(sent).toEqual(['WS_A'])
+    expect(
+      router.__testing!.resolveSelfIdentity({ adapter: 'slack', workspace: 'WS_A', chat: 'C1', thread: null }),
+    ).toEqual({
+      id: 'SELF_A',
+    })
+    expect(
+      router.__testing!.resolveSelfIdentity({ adapter: 'slack', workspace: 'WS_B', chat: 'C1', thread: null }),
+    ).toEqual({
+      id: 'SELF_B',
+    })
   })
 })
 
@@ -8101,7 +8189,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     // given: a thread cold start with default windows (head=3, tail=10)
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({ externalMessageId: 'older1', text: 'thread-opener', authorName: 'Alice' }),
@@ -8134,8 +8222,8 @@ describe('ChannelRouter cold-start prefetch', () => {
     // not "some bot spoke here".
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerSelfIdentity('discord-bot', () => ({ id: 'BOT_SELF_ID' }))
-    router.registerHistory('discord-bot', async () => ({
+    router.registerSelfIdentity('discord-bot', 'g1', () => ({ id: 'BOT_SELF_ID' }))
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({
@@ -8176,8 +8264,8 @@ describe('ChannelRouter cold-start prefetch', () => {
     // being dropped by the replyToOtherMessageId suppressor.
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerSelfIdentity('discord-bot', () => ({ id: 'BOT_SELF_ID' }))
-    router.registerHistory('discord-bot', async () => ({
+    router.registerSelfIdentity('discord-bot', 'g1', () => ({ id: 'BOT_SELF_ID' }))
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({
@@ -8211,7 +8299,7 @@ describe('ChannelRouter cold-start prefetch', () => {
   test('prefetches channel scrollback (tail-only) when session is not in a thread', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({ externalMessageId: 'h1', text: 'channel-msg-1' }),
@@ -8243,7 +8331,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     ])
     let historyCalls = 0
     const { router, sessions } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => {
+    router.registerHistory('discord-bot', 'g1', async () => {
       historyCalls++
       return { ok: true, messages: [historyMessage({ text: 'should-not-appear' })] }
     })
@@ -8355,7 +8443,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerHistory('discord-bot', async () => ({ ok: false, error: 'rate-limited' }))
+    router.registerHistory('discord-bot', 'g1', async () => ({ ok: false, error: 'rate-limited' }))
 
     await router.route(inbound({ externalMessageId: 'engage', text: 'still works' }))
     await router.__testing!.flushDebounce(KEY)
@@ -8383,7 +8471,7 @@ describe('ChannelRouter cold-start prefetch', () => {
   test('drops the engaging message itself from prefetched history (dedup by externalMessageId)', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({ externalMessageId: 'older', text: 'before-engage' }),
@@ -8407,7 +8495,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     // given: a thread root that carried an image, fetched via prefetch
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({
@@ -8448,7 +8536,7 @@ describe('ChannelRouter cold-start prefetch', () => {
         history: { prefetch: { thread: { head: 1, tail: 1 }, channel: { tail: 0 } } },
       },
     })
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({ externalMessageId: 'h1', text: 'oldest-of-three' }),
@@ -8477,7 +8565,7 @@ describe('ChannelRouter cold-start prefetch', () => {
         history: { prefetch: { thread: { head: 0, tail: 0 }, channel: { tail: 0 } } },
       },
     })
-    router.registerHistory('discord-bot', async () => {
+    router.registerHistory('discord-bot', 'g1', async () => {
       historyCalls++
       return { ok: true, messages: [historyMessage({ text: 'never-fetched' })] }
     })
@@ -8499,7 +8587,7 @@ describe('ChannelRouter cold-start prefetch', () => {
         history: { prefetch: { thread: { head: 2, tail: 5 }, channel: { tail: 8 } } },
       },
     })
-    router.registerHistory('discord-bot', async (args) => {
+    router.registerHistory('discord-bot', 'g1', async (args) => {
       captured.push(args)
       return { ok: true, messages: [] }
     })
@@ -8907,7 +8995,7 @@ describe('ChannelRouter channel.respond gate', () => {
     const sent: Array<{ text: string }> = []
     const permissions = buildPermissions({ stranger: ['channel.respond'] })
     const { router } = makeRouter(dir, { permissions })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -8926,7 +9014,7 @@ describe('ChannelRouter channel.respond gate', () => {
     // so it must still answer rather than being dropped by the respond gate.
     const permissions = buildPermissions({})
     const { router, sessions } = makeRouter(dir, { permissions })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -8945,7 +9033,7 @@ describe('ChannelRouter channel.respond gate', () => {
     const sent: Array<{ text: string }> = []
     const permissions = buildPermissions({})
     const { router } = makeRouter(dir, { permissions, logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -8963,7 +9051,7 @@ describe('ChannelRouter channel.respond gate', () => {
     const sent: Array<{ text: string }> = []
     const permissions = buildPermissions({})
     const { router } = makeRouter(dir, { permissions, logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -8981,7 +9069,7 @@ describe('ChannelRouter channel.respond gate', () => {
     const sent: Array<{ text: string }> = []
     const permissions = buildPermissions({})
     const { router } = makeRouter(dir, { permissions })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -8997,7 +9085,7 @@ describe('ChannelRouter channel.respond gate', () => {
     const sent: Array<{ text: string }> = []
     const permissions = buildPermissions({ alice: ['channel.respond', 'session.control'] })
     const { router } = makeRouter(dir, { permissions })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -9076,7 +9164,7 @@ describe('ChannelRouter /reload and /restart (session.admin gate)', () => {
 
   const captureOutbound = (router: ChannelRouter): Array<{ text: string }> => {
     const sent: Array<{ text: string }> = []
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
@@ -9328,7 +9416,7 @@ describe('ChannelRouter role-claim bypass', () => {
       permissions: denyAllPermissions,
       claimHandler,
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ adapter: msg.adapter, chat: msg.chat, text: msg.text })
       return { ok: true }
     })
@@ -9356,7 +9444,7 @@ describe('ChannelRouter role-claim bypass', () => {
       permissions: denyAllPermissions,
       claimHandler,
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ adapter: msg.adapter, chat: msg.chat, text: msg.text })
       return { ok: true }
     })
@@ -9414,7 +9502,7 @@ describe('ChannelRouter role-claim bypass', () => {
       permissions: denyAllPermissions,
       claimHandler,
     })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ adapter: msg.adapter, chat: msg.chat, text: msg.text })
       return { ok: true }
     })
@@ -9983,7 +10071,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10001,11 +10089,11 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [
         historyMessage({ externalMessageId: 'h1', text: 'old chatter 1' }),
@@ -10026,7 +10114,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10044,7 +10132,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('slack-bot', async (msg) => {
+    router.registerOutbound('slack-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10076,7 +10164,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('slack-bot', async (msg) => {
+    router.registerOutbound('slack-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10107,7 +10195,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: OutboundMessage[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('telegram-bot', async (msg) => {
+    router.registerOutbound('telegram-bot', 'g1', async (msg) => {
       sent.push(msg)
       return { ok: true }
     })
@@ -10148,7 +10236,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: OutboundMessage[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('telegram-bot', async (msg) => {
+    router.registerOutbound('telegram-bot', 'g1', async (msg) => {
       sent.push(msg)
       return { ok: true }
     })
@@ -10175,7 +10263,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: OutboundMessage[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg)
       return { ok: true }
     })
@@ -10207,7 +10295,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('slack-bot', async (msg) => {
+    router.registerOutbound('slack-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10240,7 +10328,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: string[] = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('slack-bot', async (msg) => {
+    router.registerOutbound('slack-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10306,7 +10394,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
       quotedReply: { enabled: false, queueDelayMs: 0 },
     }
     const { router } = makeRouter(dir, { nowRef, config })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10324,7 +10412,7 @@ describe('ChannelRouter quote-anchor on outbound', () => {
     const nowRef = { value: 1_000_000 }
     const sent: Array<{ text: string | undefined; attachments: unknown }> = []
     const { router } = makeRouter(dir, { nowRef })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push({ text: msg.text, attachments: msg.attachments })
       return { ok: true }
     })
@@ -10524,7 +10612,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
     const dir = await tempDir()
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10550,7 +10638,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
   test('does NOT queue a nudge for a final reply with no continuation intent', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: '리뷰해줘' }))
     sessions[0]!.onPrompt = async () => {
@@ -10564,7 +10652,7 @@ describe('ChannelRouter continuation willingness nudge', () => {
   test('nudges at most once per logical turn even if the second reply also promises to continue', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: '확인해봐' }))
     sessions[0]!.onPrompt = async () => {
@@ -10604,7 +10692,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
     const logs: string[] = []
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10641,7 +10729,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: '결과 알려줘' }))
     sessions[0]!.onPrompt = async () => {
@@ -10666,7 +10754,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('discord-bot', 'g1', async () => ({ ok: true }))
 
     await router.route(inbound({ text: '확인 좀' }))
     sessions[0]!.onPrompt = async () => {
@@ -10694,7 +10782,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
     const logs: string[] = []
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10722,7 +10810,7 @@ describe('ChannelRouter channel_send willingness nudge', () => {
     const logs: string[] = []
     const sent: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
+    router.registerOutbound('discord-bot', 'g1', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
@@ -10851,7 +10939,7 @@ describe('ChannelRouter history attachment registry', () => {
 
   test('a live current-turn #1 still wins over a registered history #1', async () => {
     const { router, sessions } = makeRouter(await tempDir())
-    router.registerHistory('discord-bot', async () => ({
+    router.registerHistory('discord-bot', 'g1', async () => ({
       ok: true,
       messages: [],
     }))
@@ -10946,7 +11034,7 @@ describe('review-thread resolver registry', () => {
 
   test('dispatches to the registered resolver', async () => {
     const { router } = await makeRouter(await tempDir())
-    router.registerReviewThreadResolver('github', async () => ({ ok: true }))
+    router.registerReviewThreadResolver('github', 'acme/p', async () => ({ ok: true }))
 
     expect((await router.resolveReviewThread(req)).ok).toBe(true)
   })
@@ -10955,17 +11043,17 @@ describe('review-thread resolver registry', () => {
     const { router } = await makeRouter(await tempDir())
     const first = async () => ({ ok: false as const, error: 'first', code: 'transient' as const })
     const second = async () => ({ ok: true as const })
-    router.registerReviewThreadResolver('github', first)
-    router.registerReviewThreadResolver('github', second)
+    router.registerReviewThreadResolver('github', 'acme/p', first)
+    router.registerReviewThreadResolver('github', 'acme/p', second)
 
-    router.unregisterReviewThreadResolver('github', first)
+    router.unregisterReviewThreadResolver('github', 'acme/p', first)
 
     expect((await router.resolveReviewThread(req)).ok).toBe(true)
   })
 
   test('a thrown resolver becomes a transient failure, not a rejection', async () => {
     const { router } = await makeRouter(await tempDir())
-    router.registerReviewThreadResolver('github', async () => {
+    router.registerReviewThreadResolver('github', 'acme/p', async () => {
       throw new Error('boom')
     })
 

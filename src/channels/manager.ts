@@ -439,9 +439,9 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
 
     async start(): Promise<void> {
       const cfg = options.channelsConfigRef()
-      // Safe to fan out: `live` and every router registry are keyed by adapter
-      // name, so concurrent starts never collide. Serial start would otherwise pay
-      // the sum of each adapter's connect latency instead of just the slowest.
+      // Safe to fan out: router registries are keyed by route key
+      // (adapter:workspace), so different instances do not collide. Serial start
+      // would otherwise pay the sum of each adapter's connect latency.
       const starts = ADAPTER_IDS.flatMap((name) => {
         const adapterCfg = cfg[name]
         return adapterCfg === undefined ? [] : [runSerially(name, () => startAdapter(name, adapterCfg))]

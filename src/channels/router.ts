@@ -959,6 +959,10 @@ export const SKIP_RESPONSE_LOCK_ERROR =
   'Channel sends are blocked for the rest of this turn. End your turn now; if you have ' +
   'something to say, send it on the next turn.'
 
+// Adapter-wide catch-all route key suffix. No real workspace uses `*`; adapters
+// with workspace-agnostic callbacks register here and exact workspace keys win.
+export const ROUTE_WORKSPACE_ANY = '*'
+
 export type ChannelRouter = {
   route: (event: InboundMessage) => Promise<void>
   send: (msg: OutboundMessage, opts?: SendOptions) => Promise<SendResult>
@@ -974,56 +978,96 @@ export type ChannelRouter = {
     chat: string
     thread?: string | null
   }) => { count: number; windowMs: number }
-  registerOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
-  unregisterOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
+  registerOutbound: (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback) => void
+  unregisterOutbound: (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback) => void
   // Reaction support is opt-in per adapter: an adapter that never calls
   // registerReaction makes `react` resolve to `code: 'unsupported'`, and
   // auto-react-on-engage becomes a silent no-op for it. Kept separate from
   // the outbound path on purpose — reactions are best-effort side effects, not
   // messages, so they must not flow through send()'s flood/cap/dup/sticky guards.
-  registerReaction: (adapter: ChannelKey['adapter'], cb: ReactionCallback) => void
-  unregisterReaction: (adapter: ChannelKey['adapter'], cb: ReactionCallback) => void
+  registerReaction: (adapter: ChannelKey['adapter'], workspace: string, cb: ReactionCallback) => void
+  unregisterReaction: (adapter: ChannelKey['adapter'], workspace: string, cb: ReactionCallback) => void
   react: (req: ReactionRequest) => Promise<ReactionResult>
-  registerRemoveReaction: (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback) => void
-  unregisterRemoveReaction: (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback) => void
+  registerRemoveReaction: (adapter: ChannelKey['adapter'], workspace: string, cb: RemoveReactionCallback) => void
+  unregisterRemoveReaction: (adapter: ChannelKey['adapter'], workspace: string, cb: RemoveReactionCallback) => void
   removeReaction: (req: RemoveReactionRequest) => Promise<ReactionResult>
-  registerTyping: (adapter: ChannelKey['adapter'], cb: TypingCallback) => void
-  unregisterTyping: (adapter: ChannelKey['adapter'], cb: TypingCallback) => void
+  registerTyping: (adapter: ChannelKey['adapter'], workspace: string, cb: TypingCallback) => void
+  unregisterTyping: (adapter: ChannelKey['adapter'], workspace: string, cb: TypingCallback) => void
   // Deliberately separate from registerTyping: github registers a no-op typing
   // callback (no typing API) yet must stay typing-less, so "has a callback" is
   // the wrong signal. autoReactOnEngage reads this to post :eyes: only as a
   // fallback when no visible typing exists. Unset defaults to false.
-  setTypingCapability: (adapter: ChannelKey['adapter'], supported: boolean) => void
-  registerChannelNameResolver: (adapter: ChannelKey['adapter'], resolver: ChannelNameResolver) => void
-  unregisterChannelNameResolver: (adapter: ChannelKey['adapter'], resolver: ChannelNameResolver) => void
+  setTypingCapability: (adapter: ChannelKey['adapter'], workspace: string, supported: boolean) => void
+  registerChannelNameResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelNameResolver,
+  ) => void
+  unregisterChannelNameResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelNameResolver,
+  ) => void
   // Self-identity is a per-adapter singleton (one bot account per adapter),
   // so unlike the multi-resolver registries above this is last-write-wins:
   // register overwrites, unregister clears only if the current resolver is
   // the one being removed (guards against a late stop() of a replaced adapter
   // wiping a fresh registration).
-  registerSelfIdentity: (adapter: ChannelKey['adapter'], resolver: ChannelSelfIdentityResolver) => void
-  unregisterSelfIdentity: (adapter: ChannelKey['adapter'], resolver: ChannelSelfIdentityResolver) => void
-  registerMembership: (adapter: ChannelKey['adapter'], resolver: MembershipResolver) => void
-  unregisterMembership: (adapter: ChannelKey['adapter'], resolver: MembershipResolver) => void
-  registerHistory: (adapter: ChannelKey['adapter'], cb: HistoryCallback) => void
-  unregisterHistory: (adapter: ChannelKey['adapter'], cb: HistoryCallback) => void
-  fetchHistory: (adapter: ChannelKey['adapter'], args: FetchHistoryArgs) => Promise<FetchHistoryResult>
-  registerFetchAttachment: (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback) => void
-  unregisterFetchAttachment: (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback) => void
-  fetchAttachment: (adapter: ChannelKey['adapter'], args: FetchAttachmentArgs) => Promise<FetchAttachmentResult>
+  registerSelfIdentity: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelSelfIdentityResolver,
+  ) => void
+  unregisterSelfIdentity: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelSelfIdentityResolver,
+  ) => void
+  registerMembership: (adapter: ChannelKey['adapter'], workspace: string, resolver: MembershipResolver) => void
+  unregisterMembership: (adapter: ChannelKey['adapter'], workspace: string, resolver: MembershipResolver) => void
+  registerHistory: (adapter: ChannelKey['adapter'], workspace: string, cb: HistoryCallback) => void
+  unregisterHistory: (adapter: ChannelKey['adapter'], workspace: string, cb: HistoryCallback) => void
+  fetchHistory: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    args: FetchHistoryArgs,
+  ) => Promise<FetchHistoryResult>
+  registerFetchAttachment: (adapter: ChannelKey['adapter'], workspace: string, cb: FetchAttachmentCallback) => void
+  unregisterFetchAttachment: (adapter: ChannelKey['adapter'], workspace: string, cb: FetchAttachmentCallback) => void
+  fetchAttachment: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    args: FetchAttachmentArgs,
+  ) => Promise<FetchAttachmentResult>
   // Review-thread resolution is opt-in per adapter and last-write-wins (one
   // bot account per adapter, like self-identity). An adapter that never calls
   // registerReviewThreadResolver makes `resolveReviewThread` answer
   // `unsupported`. Kept off the outbound path: resolving is a side-effect close-
   // out, not a message, so it bypasses send()'s flood/cap/dup/sticky guards.
-  registerReviewThreadResolver: (adapter: ChannelKey['adapter'], resolver: ReviewThreadResolver) => void
-  unregisterReviewThreadResolver: (adapter: ChannelKey['adapter'], resolver: ReviewThreadResolver) => void
+  registerReviewThreadResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewThreadResolver,
+  ) => void
+  unregisterReviewThreadResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewThreadResolver,
+  ) => void
   resolveReviewThread: (req: ReviewThreadResolveRequest) => Promise<ReviewThreadResolveResult>
   // Re-review stranding guard support: answers whether the bot still holds a
   // blocking CHANGES_REQUESTED on a PR. Opt-in per adapter like the thread
   // resolver; `getReviewState` answers `unsupported` when none is registered.
-  registerReviewStateResolver: (adapter: ChannelKey['adapter'], resolver: ReviewStateResolver) => void
-  unregisterReviewStateResolver: (adapter: ChannelKey['adapter'], resolver: ReviewStateResolver) => void
+  registerReviewStateResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewStateResolver,
+  ) => void
+  unregisterReviewStateResolver: (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewStateResolver,
+  ) => void
   getReviewState: (req: ReviewStateRequest) => Promise<ReviewStateResult>
   lookupInboundAttachment: (args: ChannelKey & { id: number }) => InboundAttachment | null
   listInboundAttachmentIds: (args: ChannelKey) => readonly number[]
@@ -1136,6 +1180,7 @@ export type ChannelRouter = {
     fireTypingInterval: (key: ChannelKey) => Promise<void>
     isTypingActive: (key: ChannelKey) => boolean
     stopTyping: (key: ChannelKey) => Promise<void>
+    resolveSelfIdentity: (key: ChannelKey) => ChannelSelfIdentity | undefined
     runIdleGc: () => Promise<void>
     // Returns the seeded author state on the live session matching
     // `key`, or undefined when no live session exists. Tests use this
@@ -1299,6 +1344,27 @@ const GRANT_ALL_PERMISSIONS: PermissionService = {
 }
 
 export function createChannelRouter(options: CreateChannelRouterOptions): ChannelRouter {
+  const routeKeyId = (adapter: ChannelKey['adapter'], workspace: string): string => `${adapter}:${workspace}`
+  const resolveRouteKey = <T>(
+    map: Map<string, T>,
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+  ): string | null => {
+    const exact = routeKeyId(adapter, workspace)
+    if (map.has(exact)) return exact
+    const catchAll = routeKeyId(adapter, ROUTE_WORKSPACE_ANY)
+    return map.has(catchAll) ? catchAll : null
+  }
+  const resolveRouteEntry = <T>(
+    map: Map<string, T>,
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+  ): T | undefined => {
+    return map.get(routeKeyId(adapter, workspace)) ?? map.get(routeKeyId(adapter, ROUTE_WORKSPACE_ANY))
+  }
+  const routeSetHas = (set: Set<string>, adapter: ChannelKey['adapter'], workspace: string): boolean => {
+    return set.has(routeKeyId(adapter, workspace)) || set.has(routeKeyId(adapter, ROUTE_WORKSPACE_ANY))
+  }
   const logger = options.logger ?? consoleLogger
   const now = options.now ?? Date.now
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
@@ -1330,19 +1396,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // installing — otherwise it would reintroduce the very staleness the
   // teardown was meant to clear.
   let liveGeneration = 0
-  const outboundCallbacks = new Map<ChannelKey['adapter'], Set<OutboundCallback>>()
-  const reactionCallbacks = new Map<ChannelKey['adapter'], Set<ReactionCallback>>()
-  const removeReactionCallbacks = new Map<ChannelKey['adapter'], Set<RemoveReactionCallback>>()
-  const typingCallbacks = new Map<ChannelKey['adapter'], Set<TypingCallback>>()
-  const typingCapableAdapters = new Set<ChannelKey['adapter']>()
-  const channelNameResolvers = new Map<ChannelKey['adapter'], Set<ChannelNameResolver>>()
-  const membershipResolvers = new Map<ChannelKey['adapter'], Set<MembershipResolver>>()
-  const selfIdentityResolvers = new Map<ChannelKey['adapter'], ChannelSelfIdentityResolver>()
-  const membershipCaches = new Map<ChannelKey['adapter'], MembershipCache>()
-  const historyCallbacks = new Map<ChannelKey['adapter'], Set<HistoryCallback>>()
-  const fetchAttachmentCallbacks = new Map<ChannelKey['adapter'], Set<FetchAttachmentCallback>>()
-  const reviewThreadResolvers = new Map<ChannelKey['adapter'], ReviewThreadResolver>()
-  const reviewStateResolvers = new Map<ChannelKey['adapter'], ReviewStateResolver>()
+  // Adapter registries are keyed by route key `${adapter}:${workspace}`, not bare adapter.
+  const outboundCallbacks = new Map<string, Set<OutboundCallback>>()
+  const reactionCallbacks = new Map<string, Set<ReactionCallback>>()
+  const removeReactionCallbacks = new Map<string, Set<RemoveReactionCallback>>()
+  const typingCallbacks = new Map<string, Set<TypingCallback>>()
+  const typingCapableAdapters = new Set<string>()
+  const channelNameResolvers = new Map<string, Set<ChannelNameResolver>>()
+  const membershipResolvers = new Map<string, Set<MembershipResolver>>()
+  const selfIdentityResolvers = new Map<string, ChannelSelfIdentityResolver>()
+  const membershipCaches = new Map<string, MembershipCache>()
+  const historyCallbacks = new Map<string, Set<HistoryCallback>>()
+  const fetchAttachmentCallbacks = new Map<string, Set<FetchAttachmentCallback>>()
+  const reviewThreadResolvers = new Map<string, ReviewThreadResolver>()
+  const reviewStateResolvers = new Map<string, ReviewStateResolver>()
   const stickyLedger = new StickyLedger()
   // The /help handler reads the live registry to enumerate commands, so it
   // forward-references `commands`. Safe at runtime — the handler only runs on
@@ -1476,7 +1543,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
 
   const resolveChannelNames = async (key: ChannelKey): Promise<ResolvedChannelNames> => {
-    const resolvers = channelNameResolvers.get(key.adapter)
+    const resolvers = resolveRouteEntry(channelNameResolvers, key.adapter, key.workspace)
     if (!resolvers || resolvers.size === 0) return {}
     const snapshot = Array.from(resolvers)
     const merged: ResolvedChannelNames = {}
@@ -1500,18 +1567,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const readMembership = (key: ChannelKey): MembershipCount | null => {
     if (key.workspace === '@dm') return dmMembership(now())
-    return membershipCaches.get(key.adapter)?.get(key) ?? null
+    const cacheKey = resolveRouteKey(membershipCaches, key.adapter, key.workspace)
+    return cacheKey !== null ? (membershipCaches.get(cacheKey)?.get(key) ?? null) : null
   }
 
   const warmMembership = (key: ChannelKey): Promise<MembershipCount | null> | null => {
     if (key.workspace === '@dm') return Promise.resolve(dmMembership(now()))
-    const cache = membershipCaches.get(key.adapter)
+    const cacheKey = resolveRouteKey(membershipCaches, key.adapter, key.workspace)
+    const cache = cacheKey !== null ? membershipCaches.get(cacheKey) : undefined
     if (cache === undefined) return null
     return cache.warmUp(key)
   }
 
   const resolveThroughRegisteredMembership = async (key: ChannelKey): Promise<MembershipResolverResult> => {
-    const resolvers = membershipResolvers.get(key.adapter)
+    const resolvers = resolveRouteEntry(membershipResolvers, key.adapter, key.workspace)
     if (!resolvers || resolvers.size === 0) return { kind: 'transient' }
     const snapshot = Array.from(resolvers)
     let lastFailure: MembershipResolverResult = { kind: 'transient' }
@@ -1536,7 +1605,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const membershipForEngagement = async (live: LiveSession): Promise<MembershipCount | null> => {
     if (live.key.workspace === '@dm') return dmMembership(now())
-    const cache = membershipCaches.get(live.key.adapter)
+    const cacheKey = resolveRouteKey(membershipCaches, live.key.adapter, live.key.workspace)
+    const cache = cacheKey !== null ? membershipCaches.get(cacheKey) : undefined
     if (cache === undefined) return null
 
     const cached = cache.read(live.key)
@@ -1995,7 +2065,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // by one (head + tail + 1) so we can detect "exactly head + tail" without
     // emitting a misleading elision marker for a zero-length gap.
     const requested = head + tail + 1
-    const result = await fetchHistory(live.key.adapter, {
+    const result = await fetchHistory(live.key.adapter, live.key.workspace, {
       chat: live.key.chat,
       thread: live.key.thread,
       limit: requested,
@@ -2073,7 +2143,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const fireTyping = async (live: LiveSession, phase: 'tick' | 'stop'): Promise<void> => {
-    const callbacks = typingCallbacks.get(live.key.adapter)
+    const callbacks = resolveRouteEntry(typingCallbacks, live.key.adapter, live.key.workspace)
     if (!callbacks || callbacks.size === 0) return
     // Snapshot before iterating: a callback could unregister mid-call.
     const snapshot = Array.from(callbacks)
@@ -2858,7 +2928,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // *next* turn sees fresh data, but the current turn still gets a
     // fast answer (cache miss → cold fetch with timeout, or stale-ok).
     if (isNewAuthor && live.key.workspace !== '@dm') {
-      const cache = membershipCaches.get(live.key.adapter)
+      const cacheKey = resolveRouteKey(membershipCaches, live.key.adapter, live.key.workspace)
+      const cache = cacheKey !== null ? membershipCaches.get(cacheKey) : undefined
       if (cache !== undefined) {
         cache.invalidate(live.key)
         void cache.warmUp(live.key).catch((err) => {
@@ -3049,46 +3120,57 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (event.typingThread !== undefined) live.currentTurnTypingThread = event.typingThread
   }
 
-  const registerOutbound = (adapter: ChannelKey['adapter'], cb: OutboundCallback): void => {
-    let set = outboundCallbacks.get(adapter)
+  const registerOutbound = (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = outboundCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      outboundCallbacks.set(adapter, set)
+      outboundCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const registerReaction = (adapter: ChannelKey['adapter'], cb: ReactionCallback): void => {
-    let set = reactionCallbacks.get(adapter)
+  const registerReaction = (adapter: ChannelKey['adapter'], workspace: string, cb: ReactionCallback): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = reactionCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      reactionCallbacks.set(adapter, set)
+      reactionCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const unregisterReaction = (adapter: ChannelKey['adapter'], cb: ReactionCallback): void => {
-    reactionCallbacks.get(adapter)?.delete(cb)
+  const unregisterReaction = (adapter: ChannelKey['adapter'], workspace: string, cb: ReactionCallback): void => {
+    reactionCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
-  const registerRemoveReaction = (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback): void => {
-    let set = removeReactionCallbacks.get(adapter)
+  const registerRemoveReaction = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    cb: RemoveReactionCallback,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = removeReactionCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      removeReactionCallbacks.set(adapter, set)
+      removeReactionCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const unregisterRemoveReaction = (adapter: ChannelKey['adapter'], cb: RemoveReactionCallback): void => {
-    removeReactionCallbacks.get(adapter)?.delete(cb)
+  const unregisterRemoveReaction = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    cb: RemoveReactionCallback,
+  ): void => {
+    removeReactionCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
   const react = async (req: ReactionRequest): Promise<ReactionResult> => {
     if (req.reactionRef.adapter !== req.adapter) {
       return { ok: false, error: 'reaction ref adapter mismatch', code: 'unsupported' }
     }
-    const callbacks = reactionCallbacks.get(req.adapter)
+    const callbacks = resolveRouteEntry(reactionCallbacks, req.adapter, req.workspace)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: `adapter "${req.adapter}" does not support reactions`, code: 'unsupported' }
     }
@@ -3112,7 +3194,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (req.reactionRef.adapter !== req.adapter) {
       return { ok: false, error: 'reaction ref adapter mismatch', code: 'unsupported' }
     }
-    const callbacks = removeReactionCallbacks.get(req.adapter)
+    const callbacks = resolveRouteEntry(removeReactionCallbacks, req.adapter, req.workspace)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: `adapter "${req.adapter}" does not support reaction removal`, code: 'unsupported' }
     }
@@ -3139,7 +3221,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // (synthetic inbounds, reaction-less adapters) = silent skip.
   const autoReactOnEngage = (event: InboundMessage): Promise<ReactionRef | null> | null => {
     if (event.reactionRef === undefined) return null
-    if (typingCapableAdapters.has(event.adapter)) return null
+    if (routeSetHas(typingCapableAdapters, event.adapter, event.workspace)) return null
     const addResult = react({
       adapter: event.adapter,
       workspace: event.workspace,
@@ -3191,94 +3273,126 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       })
   }
 
-  const unregisterOutbound = (adapter: ChannelKey['adapter'], cb: OutboundCallback): void => {
-    outboundCallbacks.get(adapter)?.delete(cb)
+  const unregisterOutbound = (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback): void => {
+    outboundCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
-  const registerTyping = (adapter: ChannelKey['adapter'], cb: TypingCallback): void => {
-    let set = typingCallbacks.get(adapter)
+  const registerTyping = (adapter: ChannelKey['adapter'], workspace: string, cb: TypingCallback): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = typingCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      typingCallbacks.set(adapter, set)
+      typingCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const unregisterTyping = (adapter: ChannelKey['adapter'], cb: TypingCallback): void => {
-    typingCallbacks.get(adapter)?.delete(cb)
+  const unregisterTyping = (adapter: ChannelKey['adapter'], workspace: string, cb: TypingCallback): void => {
+    typingCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
-  const setTypingCapability = (adapter: ChannelKey['adapter'], supported: boolean): void => {
-    if (supported) typingCapableAdapters.add(adapter)
-    else typingCapableAdapters.delete(adapter)
+  const setTypingCapability = (adapter: ChannelKey['adapter'], workspace: string, supported: boolean): void => {
+    const rk = routeKeyId(adapter, workspace)
+    if (supported) typingCapableAdapters.add(rk)
+    else typingCapableAdapters.delete(rk)
   }
 
-  const registerChannelNameResolver = (adapter: ChannelKey['adapter'], resolver: ChannelNameResolver): void => {
-    let set = channelNameResolvers.get(adapter)
+  const registerChannelNameResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelNameResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = channelNameResolvers.get(rk)
     if (!set) {
       set = new Set()
-      channelNameResolvers.set(adapter, set)
+      channelNameResolvers.set(rk, set)
     }
     set.add(resolver)
   }
 
-  const unregisterChannelNameResolver = (adapter: ChannelKey['adapter'], resolver: ChannelNameResolver): void => {
-    channelNameResolvers.get(adapter)?.delete(resolver)
+  const unregisterChannelNameResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelNameResolver,
+  ): void => {
+    channelNameResolvers.get(routeKeyId(adapter, workspace))?.delete(resolver)
   }
 
-  const registerSelfIdentity = (adapter: ChannelKey['adapter'], resolver: ChannelSelfIdentityResolver): void => {
-    selfIdentityResolvers.set(adapter, resolver)
+  const registerSelfIdentity = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelSelfIdentityResolver,
+  ): void => {
+    selfIdentityResolvers.set(routeKeyId(adapter, workspace), resolver)
   }
 
-  const unregisterSelfIdentity = (adapter: ChannelKey['adapter'], resolver: ChannelSelfIdentityResolver): void => {
-    if (selfIdentityResolvers.get(adapter) === resolver) {
-      selfIdentityResolvers.delete(adapter)
+  const unregisterSelfIdentity = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ChannelSelfIdentityResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    if (selfIdentityResolvers.get(rk) === resolver) {
+      selfIdentityResolvers.delete(rk)
     }
   }
 
   const resolveSelfIdentity = (key: ChannelKey): ChannelSelfIdentity | undefined => {
-    const resolver = selfIdentityResolvers.get(key.adapter)
+    const resolver = resolveRouteEntry(selfIdentityResolvers, key.adapter, key.workspace)
     if (resolver === undefined) return undefined
     return resolver(key.workspace) ?? undefined
   }
 
-  const registerMembership = (adapter: ChannelKey['adapter'], resolver: MembershipResolver): void => {
-    let set = membershipResolvers.get(adapter)
+  const registerMembership = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: MembershipResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = membershipResolvers.get(rk)
     if (!set) {
       set = new Set()
-      membershipResolvers.set(adapter, set)
+      membershipResolvers.set(rk, set)
     }
     set.add(resolver)
-    if (!membershipCaches.has(adapter)) {
-      membershipCaches.set(
-        adapter,
-        createMembershipCache({ resolver: resolveThroughRegisteredMembership, now, logger }),
-      )
+    if (!membershipCaches.has(rk)) {
+      membershipCaches.set(rk, createMembershipCache({ resolver: resolveThroughRegisteredMembership, now, logger }))
     }
   }
 
-  const unregisterMembership = (adapter: ChannelKey['adapter'], resolver: MembershipResolver): void => {
-    membershipResolvers.get(adapter)?.delete(resolver)
-    if ((membershipResolvers.get(adapter)?.size ?? 0) === 0) {
-      membershipCaches.delete(adapter)
+  const unregisterMembership = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: MembershipResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    membershipResolvers.get(rk)?.delete(resolver)
+    if ((membershipResolvers.get(rk)?.size ?? 0) === 0) {
+      membershipCaches.delete(rk)
     }
   }
 
-  const registerHistory = (adapter: ChannelKey['adapter'], cb: HistoryCallback): void => {
-    let set = historyCallbacks.get(adapter)
+  const registerHistory = (adapter: ChannelKey['adapter'], workspace: string, cb: HistoryCallback): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = historyCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      historyCallbacks.set(adapter, set)
+      historyCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const unregisterHistory = (adapter: ChannelKey['adapter'], cb: HistoryCallback): void => {
-    historyCallbacks.get(adapter)?.delete(cb)
+  const unregisterHistory = (adapter: ChannelKey['adapter'], workspace: string, cb: HistoryCallback): void => {
+    historyCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
-  const fetchHistory = async (adapter: ChannelKey['adapter'], args: FetchHistoryArgs): Promise<FetchHistoryResult> => {
-    const callbacks = historyCallbacks.get(adapter)
+  const fetchHistory = async (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    args: FetchHistoryArgs,
+  ): Promise<FetchHistoryResult> => {
+    const callbacks = resolveRouteEntry(historyCallbacks, adapter, workspace)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: 'history-not-supported' }
     }
@@ -3299,24 +3413,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return lastError
   }
 
-  const registerFetchAttachment = (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback): void => {
-    let set = fetchAttachmentCallbacks.get(adapter)
+  const registerFetchAttachment = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    cb: FetchAttachmentCallback,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    let set = fetchAttachmentCallbacks.get(rk)
     if (!set) {
       set = new Set()
-      fetchAttachmentCallbacks.set(adapter, set)
+      fetchAttachmentCallbacks.set(rk, set)
     }
     set.add(cb)
   }
 
-  const unregisterFetchAttachment = (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback): void => {
-    fetchAttachmentCallbacks.get(adapter)?.delete(cb)
+  const unregisterFetchAttachment = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    cb: FetchAttachmentCallback,
+  ): void => {
+    fetchAttachmentCallbacks.get(routeKeyId(adapter, workspace))?.delete(cb)
   }
 
   const fetchAttachment = async (
     adapter: ChannelKey['adapter'],
+    workspace: string,
     args: FetchAttachmentArgs,
   ): Promise<FetchAttachmentResult> => {
-    const callbacks = fetchAttachmentCallbacks.get(adapter)
+    const callbacks = resolveRouteEntry(fetchAttachmentCallbacks, adapter, workspace)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: `no fetchAttachment callback registered for "${adapter}"` }
     }
@@ -3339,18 +3463,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return lastError
   }
 
-  const registerReviewThreadResolver = (adapter: ChannelKey['adapter'], resolver: ReviewThreadResolver): void => {
-    reviewThreadResolvers.set(adapter, resolver)
+  const registerReviewThreadResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewThreadResolver,
+  ): void => {
+    reviewThreadResolvers.set(routeKeyId(adapter, workspace), resolver)
   }
 
-  const unregisterReviewThreadResolver = (adapter: ChannelKey['adapter'], resolver: ReviewThreadResolver): void => {
-    if (reviewThreadResolvers.get(adapter) === resolver) {
-      reviewThreadResolvers.delete(adapter)
+  const unregisterReviewThreadResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewThreadResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    if (reviewThreadResolvers.get(rk) === resolver) {
+      reviewThreadResolvers.delete(rk)
     }
   }
 
   const resolveReviewThread = async (req: ReviewThreadResolveRequest): Promise<ReviewThreadResolveResult> => {
-    const resolver = reviewThreadResolvers.get(req.adapter)
+    const resolver = resolveRouteEntry(reviewThreadResolvers, req.adapter, req.workspace)
     if (resolver === undefined) {
       return {
         ok: false,
@@ -3363,18 +3496,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
   }
 
-  const registerReviewStateResolver = (adapter: ChannelKey['adapter'], resolver: ReviewStateResolver): void => {
-    reviewStateResolvers.set(adapter, resolver)
+  const registerReviewStateResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewStateResolver,
+  ): void => {
+    reviewStateResolvers.set(routeKeyId(adapter, workspace), resolver)
   }
 
-  const unregisterReviewStateResolver = (adapter: ChannelKey['adapter'], resolver: ReviewStateResolver): void => {
-    if (reviewStateResolvers.get(adapter) === resolver) {
-      reviewStateResolvers.delete(adapter)
+  const unregisterReviewStateResolver = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+    resolver: ReviewStateResolver,
+  ): void => {
+    const rk = routeKeyId(adapter, workspace)
+    if (reviewStateResolvers.get(rk) === resolver) {
+      reviewStateResolvers.delete(rk)
     }
   }
 
   const getReviewState = async (req: ReviewStateRequest): Promise<ReviewStateResult> => {
-    const resolver = reviewStateResolvers.get(req.adapter)
+    const resolver = resolveRouteEntry(reviewStateResolvers, req.adapter, req.workspace)
     if (resolver === undefined) {
       return { ok: false, error: `adapter "${req.adapter}" does not support review-state lookup`, code: 'unsupported' }
     }
@@ -3451,7 +3593,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const send = async (msg: OutboundMessage, opts?: SendOptions): Promise<SendResult> => {
     const source: SendSource = opts?.source ?? 'tool'
-    const callbacks = outboundCallbacks.get(msg.adapter)
+    const callbacks = resolveRouteEntry(outboundCallbacks, msg.adapter, msg.workspace)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: `no adapter registered for "${msg.adapter}"`, code: 'no-adapter' }
     }
@@ -4725,6 +4867,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         await fireTyping(live, 'tick')
       },
+      resolveSelfIdentity,
       isTypingActive: (key: ChannelKey) => {
         const live = liveSessions.get(channelKeyId(key))
         return live?.typingTimer !== null && live?.typingTimer !== undefined

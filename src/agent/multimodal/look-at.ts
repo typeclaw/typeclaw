@@ -121,7 +121,7 @@ export function createChannelLookAtTool(router: ChannelRouter, origin: ChannelLo
           { count: 0, prompt: params.prompt },
         )
       }
-      const result = await router.fetchAttachment(origin.adapter, {
+      const result = await router.fetchAttachment(origin.adapter, origin.workspace, {
         ref: found.ref,
         ...(found.filename !== undefined ? { filename: found.filename } : {}),
       })

@@ -66,7 +66,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [userMessage()] }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -85,7 +85,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [] }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackChannelRootOrigin })
 
     // when
@@ -104,7 +104,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [] }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackChannelRootOrigin })
 
     // when
@@ -125,7 +125,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [] }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -157,7 +157,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [], nextCursor: 'next-page' }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -175,7 +175,7 @@ describe('createChannelHistoryTool', () => {
       nextCursor: 'cur-2',
     })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -191,7 +191,7 @@ describe('createChannelHistoryTool', () => {
     // given
     const cb: HistoryCallback = async () => ({ ok: true, messages: [userMessage()] })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -214,7 +214,7 @@ describe('createChannelHistoryTool', () => {
       ],
     })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -240,7 +240,7 @@ describe('createChannelHistoryTool', () => {
       ],
     })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -256,7 +256,7 @@ describe('createChannelHistoryTool', () => {
     // given
     const cb: HistoryCallback = async () => ({ ok: true, messages: [] })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -275,7 +275,7 @@ describe('createChannelHistoryTool', () => {
       return { ok: true, messages: [] }
     }
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when
@@ -289,7 +289,7 @@ describe('createChannelHistoryTool', () => {
     // given
     const cb: HistoryCallback = async () => ({ ok: false, error: 'channel_not_found' })
     const router = await makeRouter()
-    router.registerHistory('slack-bot', cb)
+    router.registerHistory('slack-bot', 'T0', cb)
     const tool = createChannelHistoryTool({ router, origin: slackThreadOrigin })
 
     // when

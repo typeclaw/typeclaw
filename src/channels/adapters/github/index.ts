@@ -1,5 +1,5 @@
 import type { GithubTokenBridge } from '@/channels/github-token-bridge'
-import type { ChannelRouter } from '@/channels/router'
+import { ROUTE_WORKSPACE_ANY, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig, GithubAdapterConfig } from '@/channels/schema'
 import type { ChannelSelfIdentityResolver, InboundMessage } from '@/channels/types'
 import { resolveSecret } from '@/secrets/resolve'
@@ -177,6 +177,32 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const fetchAttachment = createGithubFetchAttachmentCallback()
   // No-op typing callback: GitHub has no typing indicator API.
   const typing = async (): Promise<void> => {}
+  const registerCallbacks = (): void => {
+    options.router.registerOutbound('github', ROUTE_WORKSPACE_ANY, outbound)
+    options.router.registerReaction('github', ROUTE_WORKSPACE_ANY, reaction)
+    options.router.registerRemoveReaction('github', ROUTE_WORKSPACE_ANY, removeReaction)
+    options.router.registerTyping('github', ROUTE_WORKSPACE_ANY, typing)
+    options.router.registerHistory('github', ROUTE_WORKSPACE_ANY, history)
+    options.router.registerMembership('github', ROUTE_WORKSPACE_ANY, membership)
+    options.router.registerChannelNameResolver('github', ROUTE_WORKSPACE_ANY, channelNameResolver)
+    options.router.registerSelfIdentity('github', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.registerReviewThreadResolver('github', ROUTE_WORKSPACE_ANY, reviewThreadResolver)
+    options.router.registerReviewStateResolver('github', ROUTE_WORKSPACE_ANY, reviewStateResolver)
+    options.router.registerFetchAttachment('github', ROUTE_WORKSPACE_ANY, fetchAttachment)
+  }
+  const unregisterCallbacks = (): void => {
+    options.router.unregisterOutbound('github', ROUTE_WORKSPACE_ANY, outbound)
+    options.router.unregisterReaction('github', ROUTE_WORKSPACE_ANY, reaction)
+    options.router.unregisterRemoveReaction('github', ROUTE_WORKSPACE_ANY, removeReaction)
+    options.router.unregisterTyping('github', ROUTE_WORKSPACE_ANY, typing)
+    options.router.unregisterHistory('github', ROUTE_WORKSPACE_ANY, history)
+    options.router.unregisterMembership('github', ROUTE_WORKSPACE_ANY, membership)
+    options.router.unregisterChannelNameResolver('github', ROUTE_WORKSPACE_ANY, channelNameResolver)
+    options.router.unregisterSelfIdentity('github', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.unregisterReviewThreadResolver('github', ROUTE_WORKSPACE_ANY, reviewThreadResolver)
+    options.router.unregisterReviewStateResolver('github', ROUTE_WORKSPACE_ANY, reviewStateResolver)
+    options.router.unregisterFetchAttachment('github', ROUTE_WORKSPACE_ANY, fetchAttachment)
+  }
   const dedup = createDeliveryDedup()
   const isBotInTeam = createTeamMembershipChecker({ token: authToken, fetchImpl })
   // Shared inbound entry. Both the live webhook handler and the startup
@@ -217,33 +243,13 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       selfLogin = self.login
       // Register all callbacks before binding the HTTP listener so the router
       // is fully wired before any webhook can arrive.
-      options.router.registerOutbound('github', outbound)
-      options.router.registerReaction('github', reaction)
-      options.router.registerRemoveReaction('github', removeReaction)
-      options.router.registerTyping('github', typing)
-      options.router.registerHistory('github', history)
-      options.router.registerMembership('github', membership)
-      options.router.registerChannelNameResolver('github', channelNameResolver)
-      options.router.registerSelfIdentity('github', selfIdentityResolver)
-      options.router.registerReviewThreadResolver('github', reviewThreadResolver)
-      options.router.registerReviewStateResolver('github', reviewStateResolver)
-      options.router.registerFetchAttachment('github', fetchAttachment)
+      registerCallbacks()
       try {
         server = (options.httpListenImpl ?? listenWithBun)(options.configRef().webhookPort, handler)
       } catch (err) {
         // Listener failed — roll back all registrations so stop() is a no-op
         // and the manager can report the failure cleanly.
-        options.router.unregisterOutbound('github', outbound)
-        options.router.unregisterReaction('github', reaction)
-        options.router.unregisterRemoveReaction('github', removeReaction)
-        options.router.unregisterTyping('github', typing)
-        options.router.unregisterHistory('github', history)
-        options.router.unregisterMembership('github', membership)
-        options.router.unregisterChannelNameResolver('github', channelNameResolver)
-        options.router.unregisterSelfIdentity('github', selfIdentityResolver)
-        options.router.unregisterReviewThreadResolver('github', reviewThreadResolver)
-        options.router.unregisterReviewStateResolver('github', reviewStateResolver)
-        options.router.unregisterFetchAttachment('github', fetchAttachment)
+        unregisterCallbacks()
         await auth.dispose()
         delete process.env.GH_TOKEN
         selfId = null
@@ -407,17 +413,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         deliveryRecoveryTimer.clear()
         deliveryRecoveryTimer = null
       }
-      options.router.unregisterOutbound('github', outbound)
-      options.router.unregisterReaction('github', reaction)
-      options.router.unregisterRemoveReaction('github', removeReaction)
-      options.router.unregisterTyping('github', typing)
-      options.router.unregisterHistory('github', history)
-      options.router.unregisterMembership('github', membership)
-      options.router.unregisterChannelNameResolver('github', channelNameResolver)
-      options.router.unregisterSelfIdentity('github', selfIdentityResolver)
-      options.router.unregisterReviewThreadResolver('github', reviewThreadResolver)
-      options.router.unregisterReviewStateResolver('github', reviewStateResolver)
-      options.router.unregisterFetchAttachment('github', fetchAttachment)
+      unregisterCallbacks()
       await server?.stop()
       // Detach hooks AFTER closing the listener so any in-flight deliveries
       // from GitHub no longer hit a live receiver while we're tearing down.

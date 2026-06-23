@@ -14,7 +14,7 @@ const fakeCtx = {} as Parameters<ReturnType<typeof createChannelFetchAttachmentT
 
 type FakeRouterOptions = {
   attachments?: readonly InboundAttachment[]
-  fetch?: (adapter: AdapterId, args: FetchAttachmentArgs) => Promise<FetchAttachmentResult>
+  fetch?: (adapter: AdapterId, workspace: string, args: FetchAttachmentArgs) => Promise<FetchAttachmentResult>
 }
 
 function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
@@ -92,7 +92,7 @@ describe('channel_fetch_attachment', () => {
     const calls: Array<{ adapter: AdapterId; args: FetchAttachmentArgs }> = []
     const router = makeRouter({
       attachments: [{ id: 1, kind: 'file', ref: 'F12345', filename: 'diagram.png', mimetype: 'image/png' }],
-      fetch: async (adapter, args) => {
+      fetch: async (adapter, _workspace, args) => {
         calls.push({ adapter, args })
         return {
           ok: true,
@@ -119,7 +119,7 @@ describe('channel_fetch_attachment', () => {
     const calls: FetchAttachmentArgs[] = []
     const router = makeRouter({
       attachments: [{ id: 1, kind: 'file', ref: 'F1', filename: 'original.bin' }],
-      fetch: async (_adapter, args) => {
+      fetch: async (_adapter, _workspace, args) => {
         calls.push(args)
         return { ok: true, buffer: Buffer.from('z'), filename: args.filename ?? 'fallback.bin', size: 1 }
       },

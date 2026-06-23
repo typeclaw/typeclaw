@@ -1248,16 +1248,17 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         })
       })
 
-      options.router.registerOutbound('slack-bot', outboundCallback)
-      options.router.registerReaction('slack-bot', reactionCallback)
-      options.router.registerRemoveReaction('slack-bot', removeReactionCallback)
-      options.router.registerTyping('slack-bot', typingCallback)
-      options.router.setTypingCapability('slack-bot', true)
-      options.router.registerChannelNameResolver('slack-bot', channelResolver)
-      options.router.registerSelfIdentity('slack-bot', selfIdentityResolver)
-      options.router.registerHistory('slack-bot', historyCallback)
-      options.router.registerFetchAttachment('slack-bot', fetchAttachmentCallback)
-      options.router.registerMembership('slack-bot', membershipResolver)
+      const workspace = teamId
+      options.router.registerOutbound('slack-bot', workspace, outboundCallback)
+      options.router.registerReaction('slack-bot', workspace, reactionCallback)
+      options.router.registerRemoveReaction('slack-bot', workspace, removeReactionCallback)
+      options.router.registerTyping('slack-bot', workspace, typingCallback)
+      options.router.setTypingCapability('slack-bot', workspace, true)
+      options.router.registerChannelNameResolver('slack-bot', workspace, channelResolver)
+      options.router.registerSelfIdentity('slack-bot', workspace, selfIdentityResolver)
+      options.router.registerHistory('slack-bot', workspace, historyCallback)
+      options.router.registerFetchAttachment('slack-bot', workspace, fetchAttachmentCallback)
+      options.router.registerMembership('slack-bot', workspace, membershipResolver)
 
       try {
         await listener.start()
@@ -1266,16 +1267,16 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         // failed start leaves no router state behind (stop() returns early on
         // !started and would otherwise skip cleanup), mirroring the github
         // adapter's rollback path.
-        options.router.unregisterOutbound('slack-bot', outboundCallback)
-        options.router.unregisterReaction('slack-bot', reactionCallback)
-        options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
-        options.router.unregisterTyping('slack-bot', typingCallback)
-        options.router.setTypingCapability('slack-bot', false)
-        options.router.unregisterChannelNameResolver('slack-bot', channelResolver)
-        options.router.unregisterSelfIdentity('slack-bot', selfIdentityResolver)
-        options.router.unregisterHistory('slack-bot', historyCallback)
-        options.router.unregisterFetchAttachment('slack-bot', fetchAttachmentCallback)
-        options.router.unregisterMembership('slack-bot', membershipResolver)
+        options.router.unregisterOutbound('slack-bot', workspace, outboundCallback)
+        options.router.unregisterReaction('slack-bot', workspace, reactionCallback)
+        options.router.unregisterRemoveReaction('slack-bot', workspace, removeReactionCallback)
+        options.router.unregisterTyping('slack-bot', workspace, typingCallback)
+        options.router.setTypingCapability('slack-bot', workspace, false)
+        options.router.unregisterChannelNameResolver('slack-bot', workspace, channelResolver)
+        options.router.unregisterSelfIdentity('slack-bot', workspace, selfIdentityResolver)
+        options.router.unregisterHistory('slack-bot', workspace, historyCallback)
+        options.router.unregisterFetchAttachment('slack-bot', workspace, fetchAttachmentCallback)
+        options.router.unregisterMembership('slack-bot', workspace, membershipResolver)
         listener = null
         botUserId = null
         teamId = null
@@ -1288,16 +1289,19 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('slack-bot', outboundCallback)
-      options.router.unregisterReaction('slack-bot', reactionCallback)
-      options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
-      options.router.unregisterTyping('slack-bot', typingCallback)
-      options.router.setTypingCapability('slack-bot', false)
-      options.router.unregisterChannelNameResolver('slack-bot', channelResolver)
-      options.router.unregisterSelfIdentity('slack-bot', selfIdentityResolver)
-      options.router.unregisterHistory('slack-bot', historyCallback)
-      options.router.unregisterFetchAttachment('slack-bot', fetchAttachmentCallback)
-      options.router.unregisterMembership('slack-bot', membershipResolver)
+      const workspace = teamId
+      if (workspace !== null) {
+        options.router.unregisterOutbound('slack-bot', workspace, outboundCallback)
+        options.router.unregisterReaction('slack-bot', workspace, reactionCallback)
+        options.router.unregisterRemoveReaction('slack-bot', workspace, removeReactionCallback)
+        options.router.unregisterTyping('slack-bot', workspace, typingCallback)
+        options.router.setTypingCapability('slack-bot', workspace, false)
+        options.router.unregisterChannelNameResolver('slack-bot', workspace, channelResolver)
+        options.router.unregisterSelfIdentity('slack-bot', workspace, selfIdentityResolver)
+        options.router.unregisterHistory('slack-bot', workspace, historyCallback)
+        options.router.unregisterFetchAttachment('slack-bot', workspace, fetchAttachmentCallback)
+        options.router.unregisterMembership('slack-bot', workspace, membershipResolver)
+      }
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)

@@ -528,22 +528,22 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
         void handleMessage(event)
       })
 
-      options.router.registerOutbound('telegram-bot', outboundCallback)
-      options.router.registerTyping('telegram-bot', typingCallback)
-      options.router.setTypingCapability('telegram-bot', true)
-      options.router.registerChannelNameResolver('telegram-bot', channelResolver)
-      options.router.registerSelfIdentity('telegram-bot', selfIdentityResolver)
-      options.router.registerFetchAttachment('telegram-bot', fetchAttachmentCallback)
-      options.router.registerMembership('telegram-bot', membershipResolver)
+      options.router.registerOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+      options.router.registerTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
+      options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, true)
+      options.router.registerChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)
+      options.router.registerSelfIdentity('telegram-bot', TELEGRAM_WORKSPACE, selfIdentityResolver)
+      options.router.registerFetchAttachment('telegram-bot', TELEGRAM_WORKSPACE, fetchAttachmentCallback)
+      options.router.registerMembership('telegram-bot', TELEGRAM_WORKSPACE, membershipResolver)
 
       const rollbackStart = (reason: string, cause: Error): never => {
-        options.router.unregisterOutbound('telegram-bot', outboundCallback)
-        options.router.unregisterTyping('telegram-bot', typingCallback)
-        options.router.setTypingCapability('telegram-bot', false)
-        options.router.unregisterChannelNameResolver('telegram-bot', channelResolver)
-        options.router.unregisterSelfIdentity('telegram-bot', selfIdentityResolver)
-        options.router.unregisterFetchAttachment('telegram-bot', fetchAttachmentCallback)
-        options.router.unregisterMembership('telegram-bot', membershipResolver)
+        options.router.unregisterOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+        options.router.unregisterTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
+        options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, false)
+        options.router.unregisterChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)
+        options.router.unregisterSelfIdentity('telegram-bot', TELEGRAM_WORKSPACE, selfIdentityResolver)
+        options.router.unregisterFetchAttachment('telegram-bot', TELEGRAM_WORKSPACE, fetchAttachmentCallback)
+        options.router.unregisterMembership('telegram-bot', TELEGRAM_WORKSPACE, membershipResolver)
         listener?.stop()
         listener = null
         botUser = null
@@ -566,13 +566,13 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('telegram-bot', outboundCallback)
-      options.router.unregisterTyping('telegram-bot', typingCallback)
-      options.router.setTypingCapability('telegram-bot', false)
-      options.router.unregisterChannelNameResolver('telegram-bot', channelResolver)
-      options.router.unregisterSelfIdentity('telegram-bot', selfIdentityResolver)
-      options.router.unregisterFetchAttachment('telegram-bot', fetchAttachmentCallback)
-      options.router.unregisterMembership('telegram-bot', membershipResolver)
+      options.router.unregisterOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+      options.router.unregisterTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
+      options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, false)
+      options.router.unregisterChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)
+      options.router.unregisterSelfIdentity('telegram-bot', TELEGRAM_WORKSPACE, selfIdentityResolver)
+      options.router.unregisterFetchAttachment('telegram-bot', TELEGRAM_WORKSPACE, fetchAttachmentCallback)
+      options.router.unregisterMembership('telegram-bot', TELEGRAM_WORKSPACE, membershipResolver)
       // Stop the listener BEFORE waiting for inflight handlers. The SDK's
       // `stop()` aborts the in-flight `getUpdates` long-poll and
       // increments its generation counter so any pending dispatch is

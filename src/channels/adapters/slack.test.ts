@@ -74,12 +74,12 @@ function router(): ChannelRouter & {
     route: async (msg: InboundMessage) => {
       routed.push(msg)
     },
-    registerOutbound: (adapter: string, cb: OutboundCallback) => {
+    registerOutbound: (adapter: string, _workspace: string, cb: OutboundCallback) => {
       registered.push(`outbound:${adapter}`)
       r.outbound = cb
     },
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),
-    setTypingCapability: (adapter: string, supported: boolean) =>
+    setTypingCapability: (adapter: string, _workspace: string, supported: boolean) =>
       registered.push(`typing-cap:${adapter}=${String(supported)}`),
     registerChannelNameResolver: (adapter: string) => registered.push(`names:${adapter}`),
     unregisterChannelNameResolver: (adapter: string) => unregistered.push(`names:${adapter}`),

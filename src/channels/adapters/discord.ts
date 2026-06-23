@@ -7,7 +7,7 @@ import {
 
 import type { MembershipResolver, MembershipResolverResult } from '@/channels/membership'
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
-import type { ChannelRouter } from '@/channels/router'
+import { ROUTE_WORKSPACE_ANY, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
@@ -201,6 +201,29 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   })
   const reactionCallback = createDiscordReactionCallback({ client })
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
+  function registerCallbacks(router: ChannelRouter): void {
+    router.registerOutbound('discord', ROUTE_WORKSPACE_ANY, outboundCallback)
+    router.setTypingCapability('discord', ROUTE_WORKSPACE_ANY, false)
+    router.registerChannelNameResolver('discord', ROUTE_WORKSPACE_ANY, channelResolver)
+    router.registerSelfIdentity('discord', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    router.registerHistory('discord', ROUTE_WORKSPACE_ANY, historyCallback)
+    router.registerFetchAttachment('discord', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    router.registerMembership('discord', ROUTE_WORKSPACE_ANY, membershipResolver)
+    router.registerReaction('discord', ROUTE_WORKSPACE_ANY, reactionCallback)
+    router.registerRemoveReaction('discord', ROUTE_WORKSPACE_ANY, removeReactionCallback)
+  }
+
+  function unregisterCallbacks(router: ChannelRouter): void {
+    router.unregisterOutbound('discord', ROUTE_WORKSPACE_ANY, outboundCallback)
+    router.setTypingCapability('discord', ROUTE_WORKSPACE_ANY, false)
+    router.unregisterChannelNameResolver('discord', ROUTE_WORKSPACE_ANY, channelResolver)
+    router.unregisterSelfIdentity('discord', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    router.unregisterHistory('discord', ROUTE_WORKSPACE_ANY, historyCallback)
+    router.unregisterFetchAttachment('discord', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    router.unregisterMembership('discord', ROUTE_WORKSPACE_ANY, membershipResolver)
+    router.unregisterReaction('discord', ROUTE_WORKSPACE_ANY, reactionCallback)
+    router.unregisterRemoveReaction('discord', ROUTE_WORKSPACE_ANY, removeReactionCallback)
+  }
 
   const handleMessage = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
     inflightInbounds++
@@ -341,30 +364,6 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
     isConnected(): boolean {
       return started && selfUserId !== null && connected
     },
-  }
-
-  function registerCallbacks(router: ChannelRouter): void {
-    router.registerOutbound('discord', outboundCallback)
-    router.setTypingCapability('discord', false)
-    router.registerChannelNameResolver('discord', channelResolver)
-    router.registerSelfIdentity('discord', selfIdentityResolver)
-    router.registerHistory('discord', historyCallback)
-    router.registerFetchAttachment('discord', fetchAttachmentCallback)
-    router.registerMembership('discord', membershipResolver)
-    router.registerReaction('discord', reactionCallback)
-    router.registerRemoveReaction('discord', removeReactionCallback)
-  }
-
-  function unregisterCallbacks(router: ChannelRouter): void {
-    router.unregisterOutbound('discord', outboundCallback)
-    router.setTypingCapability('discord', false)
-    router.unregisterChannelNameResolver('discord', channelResolver)
-    router.unregisterSelfIdentity('discord', selfIdentityResolver)
-    router.unregisterHistory('discord', historyCallback)
-    router.unregisterFetchAttachment('discord', fetchAttachmentCallback)
-    router.unregisterMembership('discord', membershipResolver)
-    router.unregisterReaction('discord', reactionCallback)
-    router.unregisterRemoveReaction('discord', removeReactionCallback)
   }
 }
 

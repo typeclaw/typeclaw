@@ -15,7 +15,7 @@ import {
   type MembershipResolverResult,
 } from '@/channels/membership'
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
-import type { ChannelRouter } from '@/channels/router'
+import { ROUTE_WORKSPACE_ANY, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
@@ -897,6 +897,31 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
 
   const reactionCallback = createDiscordReactionCallback({ client })
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
+  const registerCallbacks = (): void => {
+    options.router.registerOutbound('discord-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerReaction('discord-bot', ROUTE_WORKSPACE_ANY, reactionCallback)
+    options.router.registerRemoveReaction('discord-bot', ROUTE_WORKSPACE_ANY, removeReactionCallback)
+    options.router.registerTyping('discord-bot', ROUTE_WORKSPACE_ANY, typingCallback)
+    options.router.setTypingCapability('discord-bot', ROUTE_WORKSPACE_ANY, true)
+    options.router.registerChannelNameResolver('discord-bot', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.registerSelfIdentity('discord-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.registerHistory('discord-bot', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.registerFetchAttachment('discord-bot', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.registerMembership('discord-bot', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
+
+  const unregisterCallbacks = (): void => {
+    options.router.unregisterOutbound('discord-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterReaction('discord-bot', ROUTE_WORKSPACE_ANY, reactionCallback)
+    options.router.unregisterRemoveReaction('discord-bot', ROUTE_WORKSPACE_ANY, removeReactionCallback)
+    options.router.unregisterTyping('discord-bot', ROUTE_WORKSPACE_ANY, typingCallback)
+    options.router.setTypingCapability('discord-bot', ROUTE_WORKSPACE_ANY, false)
+    options.router.unregisterChannelNameResolver('discord-bot', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.unregisterSelfIdentity('discord-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.unregisterHistory('discord-bot', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.unregisterFetchAttachment('discord-bot', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.unregisterMembership('discord-bot', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
 
   const interactionHandler = createInteractionHandler({
     router: options.router,
@@ -1034,16 +1059,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         void handleInteractionCreate(event)
       })
 
-      options.router.registerOutbound('discord-bot', outboundCallback)
-      options.router.registerReaction('discord-bot', reactionCallback)
-      options.router.registerRemoveReaction('discord-bot', removeReactionCallback)
-      options.router.registerTyping('discord-bot', typingCallback)
-      options.router.setTypingCapability('discord-bot', true)
-      options.router.registerChannelNameResolver('discord-bot', channelResolver)
-      options.router.registerSelfIdentity('discord-bot', selfIdentityResolver)
-      options.router.registerHistory('discord-bot', historyCallback)
-      options.router.registerFetchAttachment('discord-bot', fetchAttachmentCallback)
-      options.router.registerMembership('discord-bot', membershipResolver)
+      registerCallbacks()
 
       try {
         await listener.start()
@@ -1052,16 +1068,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         // failed start leaves no router state behind (stop() returns early on
         // !started and would otherwise skip cleanup), mirroring the github
         // adapter's rollback path.
-        options.router.unregisterOutbound('discord-bot', outboundCallback)
-        options.router.unregisterReaction('discord-bot', reactionCallback)
-        options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
-        options.router.unregisterTyping('discord-bot', typingCallback)
-        options.router.setTypingCapability('discord-bot', false)
-        options.router.unregisterChannelNameResolver('discord-bot', channelResolver)
-        options.router.unregisterSelfIdentity('discord-bot', selfIdentityResolver)
-        options.router.unregisterHistory('discord-bot', historyCallback)
-        options.router.unregisterFetchAttachment('discord-bot', fetchAttachmentCallback)
-        options.router.unregisterMembership('discord-bot', membershipResolver)
+        unregisterCallbacks()
         listener = null
         botUserId = null
         started = false
@@ -1073,16 +1080,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('discord-bot', outboundCallback)
-      options.router.unregisterReaction('discord-bot', reactionCallback)
-      options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
-      options.router.unregisterTyping('discord-bot', typingCallback)
-      options.router.setTypingCapability('discord-bot', false)
-      options.router.unregisterChannelNameResolver('discord-bot', channelResolver)
-      options.router.unregisterSelfIdentity('discord-bot', selfIdentityResolver)
-      options.router.unregisterHistory('discord-bot', historyCallback)
-      options.router.unregisterFetchAttachment('discord-bot', fetchAttachmentCallback)
-      options.router.unregisterMembership('discord-bot', membershipResolver)
+      unregisterCallbacks()
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)

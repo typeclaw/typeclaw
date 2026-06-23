@@ -16,7 +16,7 @@ import {
   type MembershipResolverResult,
 } from '@/channels/membership'
 import { deriveMembershipFromHistory } from '@/channels/membership-from-history'
-import type { ChannelRouter } from '@/channels/router'
+import { ROUTE_WORKSPACE_ANY, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
@@ -353,6 +353,27 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
   const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
   const typingCallback = createTypingCallback({ client, logger, formatChannelTag })
   const fetchAttachmentCallback = createFetchAttachmentCallback({ tokenRef: () => currentToken, logger, fetchImpl })
+  const registerCallbacks = (): void => {
+    options.router.registerOutbound('webex', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerTyping('webex', ROUTE_WORKSPACE_ANY, typingCallback)
+    options.router.setTypingCapability('webex', ROUTE_WORKSPACE_ANY, true)
+    options.router.registerChannelNameResolver('webex', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.registerSelfIdentity('webex', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.registerHistory('webex', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.registerFetchAttachment('webex', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.registerMembership('webex', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
+
+  const unregisterCallbacks = (): void => {
+    options.router.unregisterOutbound('webex', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterTyping('webex', ROUTE_WORKSPACE_ANY, typingCallback)
+    options.router.setTypingCapability('webex', ROUTE_WORKSPACE_ANY, false)
+    options.router.unregisterChannelNameResolver('webex', ROUTE_WORKSPACE_ANY, channelResolver)
+    options.router.unregisterSelfIdentity('webex', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
+    options.router.unregisterHistory('webex', ROUTE_WORKSPACE_ANY, historyCallback)
+    options.router.unregisterFetchAttachment('webex', ROUTE_WORKSPACE_ANY, fetchAttachmentCallback)
+    options.router.unregisterMembership('webex', ROUTE_WORKSPACE_ANY, membershipResolver)
+  }
 
   const handleMessage = async (event: WebexInboundMessage): Promise<void> => {
     inflightInbounds++
@@ -437,24 +458,10 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
         void handleMessage(event)
       })
 
-      options.router.registerOutbound('webex', outboundCallback)
-      options.router.registerTyping('webex', typingCallback)
-      options.router.setTypingCapability('webex', true)
-      options.router.registerChannelNameResolver('webex', channelResolver)
-      options.router.registerSelfIdentity('webex', selfIdentityResolver)
-      options.router.registerHistory('webex', historyCallback)
-      options.router.registerFetchAttachment('webex', fetchAttachmentCallback)
-      options.router.registerMembership('webex', membershipResolver)
+      registerCallbacks()
 
       const rollbackStart = (reason: string, cause: Error): never => {
-        options.router.unregisterOutbound('webex', outboundCallback)
-        options.router.unregisterTyping('webex', typingCallback)
-        options.router.setTypingCapability('webex', false)
-        options.router.unregisterChannelNameResolver('webex', channelResolver)
-        options.router.unregisterSelfIdentity('webex', selfIdentityResolver)
-        options.router.unregisterHistory('webex', historyCallback)
-        options.router.unregisterFetchAttachment('webex', fetchAttachmentCallback)
-        options.router.unregisterMembership('webex', membershipResolver)
+        unregisterCallbacks()
         listener?.stop()
         listener = null
         botPerson = null
@@ -481,14 +488,7 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('webex', outboundCallback)
-      options.router.unregisterTyping('webex', typingCallback)
-      options.router.setTypingCapability('webex', false)
-      options.router.unregisterChannelNameResolver('webex', channelResolver)
-      options.router.unregisterSelfIdentity('webex', selfIdentityResolver)
-      options.router.unregisterHistory('webex', historyCallback)
-      options.router.unregisterFetchAttachment('webex', fetchAttachmentCallback)
-      options.router.unregisterMembership('webex', membershipResolver)
+      unregisterCallbacks()
       listener?.stop()
       listener = null
       connected = false

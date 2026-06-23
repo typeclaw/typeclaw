@@ -667,21 +667,25 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // belonging to a half-initialized adapter (the listener is closed,
       // but outboundCallback would still send via a dead client). Stop()
       // unregisters in the inverse order.
-      options.router.registerOutbound('kakaotalk', outboundCallback)
-      options.router.registerChannelNameResolver('kakaotalk', channelResolver.resolve)
-      options.router.registerHistory('kakaotalk', historyCallback)
-      options.router.registerFetchAttachment('kakaotalk', fetchAttachmentCallback)
-      options.router.registerMembership('kakaotalk', membershipResolver)
+      for (const workspace of ['@kakao-dm', '@kakao-group', '@kakao-open']) {
+        options.router.registerOutbound('kakaotalk', workspace, outboundCallback)
+        options.router.registerChannelNameResolver('kakaotalk', workspace, channelResolver.resolve)
+        options.router.registerHistory('kakaotalk', workspace, historyCallback)
+        options.router.registerFetchAttachment('kakaotalk', workspace, fetchAttachmentCallback)
+        options.router.registerMembership('kakaotalk', workspace, membershipResolver)
+      }
     },
 
     async stop(): Promise<void> {
       if (!started) return
       started = false
-      options.router.unregisterOutbound('kakaotalk', outboundCallback)
-      options.router.unregisterChannelNameResolver('kakaotalk', channelResolver.resolve)
-      options.router.unregisterHistory('kakaotalk', historyCallback)
-      options.router.unregisterFetchAttachment('kakaotalk', fetchAttachmentCallback)
-      options.router.unregisterMembership('kakaotalk', membershipResolver)
+      for (const workspace of ['@kakao-dm', '@kakao-group', '@kakao-open']) {
+        options.router.unregisterOutbound('kakaotalk', workspace, outboundCallback)
+        options.router.unregisterChannelNameResolver('kakaotalk', workspace, channelResolver.resolve)
+        options.router.unregisterHistory('kakaotalk', workspace, historyCallback)
+        options.router.unregisterFetchAttachment('kakaotalk', workspace, fetchAttachmentCallback)
+        options.router.unregisterMembership('kakaotalk', workspace, membershipResolver)
+      }
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)
