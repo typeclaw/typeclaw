@@ -529,6 +529,7 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
       })
 
       options.router.registerOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+      options.router.registerConfig('telegram-bot', TELEGRAM_WORKSPACE, options.configRef)
       options.router.registerTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
       options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, true)
       options.router.registerChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)
@@ -538,6 +539,7 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
 
       const rollbackStart = (reason: string, cause: Error): never => {
         options.router.unregisterOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+        options.router.unregisterConfig('telegram-bot', TELEGRAM_WORKSPACE, options.configRef)
         options.router.unregisterTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
         options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, false)
         options.router.unregisterChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)
@@ -567,6 +569,7 @@ export function createTelegramBotAdapter(options: TelegramBotAdapterOptions): Te
       if (!started) return
       started = false
       options.router.unregisterOutbound('telegram-bot', TELEGRAM_WORKSPACE, outboundCallback)
+      options.router.unregisterConfig('telegram-bot', TELEGRAM_WORKSPACE, options.configRef)
       options.router.unregisterTyping('telegram-bot', TELEGRAM_WORKSPACE, typingCallback)
       options.router.setTypingCapability('telegram-bot', TELEGRAM_WORKSPACE, false)
       options.router.unregisterChannelNameResolver('telegram-bot', TELEGRAM_WORKSPACE, channelResolver)

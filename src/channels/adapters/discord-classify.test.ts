@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test'
 
 import type { DiscordGatewayMessageCreateEvent } from 'agent-messenger/discord'
 
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 
 import { classifyInbound } from './discord-classify'
 
-const config = channelsSchema.parse({ discord: {} }).discord!
+const config = defaultChannelAdapterConfig()
 const context = { selfUserId: '100000000000000001', selfAliases: ['typeclaw', '타입클로'] }
 
 function event(overrides: Partial<DiscordGatewayMessageCreateEvent> = {}): DiscordGatewayMessageCreateEvent {

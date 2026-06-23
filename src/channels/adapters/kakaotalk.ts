@@ -120,6 +120,7 @@ export type KakaotalkAdapterOptions = {
   logger?: KakaotalkAdapterLogger
   selfAliasesRef?: () => readonly string[]
   credentialsStore?: KakaoCredentialStore
+  accountId?: string
   // Deprecated compatibility path for old tests/callers. Production uses
   // credentialsStore so secrets.json remains the credential source of truth.
   credentialsDir?: string
@@ -505,7 +506,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
           options.credentialsStore ??
           (options.credentialsDir !== undefined ? new KakaoCredentialManager(options.credentialsDir) : null)
         if (credentialStore !== null) {
-          const account = await credentialStore.getAccount()
+          const account = await credentialStore.getAccount(options.accountId)
           if (account === null) {
             throw new Error(
               options.credentialsDir !== undefined
@@ -669,6 +670,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // unregisters in the inverse order.
       for (const workspace of ['@kakao-dm', '@kakao-group', '@kakao-open']) {
         options.router.registerOutbound('kakaotalk', workspace, outboundCallback)
+        options.router.registerConfig('kakaotalk', workspace, options.configRef)
         options.router.registerChannelNameResolver('kakaotalk', workspace, channelResolver.resolve)
         options.router.registerHistory('kakaotalk', workspace, historyCallback)
         options.router.registerFetchAttachment('kakaotalk', workspace, fetchAttachmentCallback)
@@ -681,6 +683,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       started = false
       for (const workspace of ['@kakao-dm', '@kakao-group', '@kakao-open']) {
         options.router.unregisterOutbound('kakaotalk', workspace, outboundCallback)
+        options.router.unregisterConfig('kakaotalk', workspace, options.configRef)
         options.router.unregisterChannelNameResolver('kakaotalk', workspace, channelResolver.resolve)
         options.router.unregisterHistory('kakaotalk', workspace, historyCallback)
         options.router.unregisterFetchAttachment('kakaotalk', workspace, fetchAttachmentCallback)

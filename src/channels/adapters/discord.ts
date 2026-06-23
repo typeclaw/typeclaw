@@ -51,6 +51,7 @@ export type DiscordAdapterOptions = {
   logger?: DiscordAdapterLogger
   selfAliasesRef?: () => readonly string[]
   credentialsStore?: DiscordCredentialStore
+  accountId?: string
   createClient?: () => DiscordClient
   createListener?: (client: DiscordClient) => DiscordListener
   fetchImpl?: typeof fetch
@@ -203,6 +204,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
   function registerCallbacks(router: ChannelRouter): void {
     router.registerOutbound('discord', ROUTE_WORKSPACE_ANY, outboundCallback)
+    router.registerConfig('discord', ROUTE_WORKSPACE_ANY, options.configRef)
     router.setTypingCapability('discord', ROUTE_WORKSPACE_ANY, false)
     router.registerChannelNameResolver('discord', ROUTE_WORKSPACE_ANY, channelResolver)
     router.registerSelfIdentity('discord', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
@@ -215,6 +217,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
 
   function unregisterCallbacks(router: ChannelRouter): void {
     router.unregisterOutbound('discord', ROUTE_WORKSPACE_ANY, outboundCallback)
+    router.unregisterConfig('discord', ROUTE_WORKSPACE_ANY, options.configRef)
     router.setTypingCapability('discord', ROUTE_WORKSPACE_ANY, false)
     router.unregisterChannelNameResolver('discord', ROUTE_WORKSPACE_ANY, channelResolver)
     router.unregisterSelfIdentity('discord', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
@@ -271,7 +274,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
       if (started) return
       started = true
       try {
-        const account = await (options.credentialsStore ?? null)?.getAccount()
+        const account = await (options.credentialsStore ?? null)?.getAccount(options.accountId)
         if (account === null || account === undefined) {
           throw new Error('no Discord account in secrets.json#channels.discord (run typeclaw init to authenticate)')
         }

@@ -60,6 +60,7 @@ export type SlackAdapterOptions = {
   logger?: SlackAdapterLogger
   selfAliasesRef?: () => readonly string[]
   credentialsStore?: SlackCredentialStore
+  accountId?: string
   createClient?: () => SlackClient
   createListener?: (client: SlackClient) => SlackListener
 }
@@ -259,7 +260,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       if (started) return
       started = true
       try {
-        const account = await (options.credentialsStore ?? null)?.getAccount()
+        const account = await (options.credentialsStore ?? null)?.getAccount(options.accountId)
         if (account === null || account === undefined) {
           throw new Error('no Slack account in secrets.json#channels.slack (run typeclaw init to authenticate)')
         }
@@ -300,6 +301,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       listener.on('reaction_removed', (event) => handleReaction('removed', event))
 
       options.router.registerOutbound('slack', teamId, outboundCallback)
+      options.router.registerConfig('slack', teamId, options.configRef)
       options.router.setTypingCapability('slack', teamId, false)
       options.router.registerChannelNameResolver('slack', teamId, channelResolver)
       options.router.registerSelfIdentity('slack', teamId, selfIdentityResolver)
@@ -311,6 +313,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
 
       const rollbackStart = (reason: string, cause: Error): never => {
         options.router.unregisterOutbound('slack', teamId, outboundCallback)
+        options.router.unregisterConfig('slack', teamId, options.configRef)
         options.router.setTypingCapability('slack', teamId, false)
         options.router.unregisterChannelNameResolver('slack', teamId, channelResolver)
         options.router.unregisterSelfIdentity('slack', teamId, selfIdentityResolver)
@@ -345,6 +348,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       if (!started) return
       started = false
       options.router.unregisterOutbound('slack', teamId, outboundCallback)
+      options.router.unregisterConfig('slack', teamId, options.configRef)
       options.router.setTypingCapability('slack', teamId, false)
       options.router.unregisterChannelNameResolver('slack', teamId, channelResolver)
       options.router.unregisterSelfIdentity('slack', teamId, selfIdentityResolver)

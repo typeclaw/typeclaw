@@ -908,6 +908,145 @@ describe('channel manager — reload detects missing tokens and stops adapter', 
     await mgr.stop()
   })
 
+  test('routes two slack instances by resolved workspace and forwards per-instance account ids', async () => {
+    const slackCfg = enabledAdapterCfg()
+    const instances: ChannelInstanceConfig[] = [
+      { adapter: 'slack', instanceId: 'team-a', account: 'acct-a', config: slackCfg },
+      { adapter: 'slack', instanceId: 'team-b', account: 'acct-b', config: slackCfg },
+    ]
+    cfg.slack = {
+      instances: [
+        { ...slackCfg, id: 'team-a', account: 'acct-a' },
+        { ...slackCfg, id: 'team-b', account: 'acct-b' },
+      ],
+    }
+    const capturedAccounts: Array<string | undefined> = []
+    const outboundByWorkspace: Record<string, string[]> = { WS_A: [], WS_B: [] }
+    const sessionKeys: string[] = []
+    const prompts: string[] = []
+    const fakeSession = {
+      prompt: async (text: string) => {
+        prompts.push(text)
+      },
+      abort: async () => {},
+      agent: { streamFn: () => undefined, abort: () => {} },
+      sessionManager: { getLeafEntry: () => undefined },
+      subscribe: () => () => {},
+    } as unknown as AgentSession
+    const workspaces = ['WS_A', 'WS_B']
+    await writeFile(
+      join(agentDir, 'secrets.json'),
+      JSON.stringify({
+        version: 2,
+        providers: {},
+        channels: {
+          slack: {
+            currentAccount: 'acct-a',
+            accounts: {
+              'acct-a': {
+                account_id: 'acct-a',
+                token: 'xoxc-a',
+                cookie: 'xoxd-a',
+                workspace_id: 'WS_A',
+                workspace_name: 'Team A',
+                created_at: '2026-01-01T00:00:00.000Z',
+                updated_at: '2026-01-01T00:00:00.000Z',
+              },
+              'acct-b': {
+                account_id: 'acct-b',
+                token: 'xoxc-b',
+                cookie: 'xoxd-b',
+                workspace_id: 'WS_B',
+                workspace_name: 'Team B',
+                created_at: '2026-01-01T00:00:00.000Z',
+                updated_at: '2026-01-01T00:00:00.000Z',
+              },
+            },
+          },
+        },
+      }),
+    )
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      normalizeChannelsOverride: () => instances,
+      env: {
+        TYPECLAW_HOSTD_URL: 'http://host.docker.internal:8974',
+        TYPECLAW_HOSTD_TOKEN: 'restart-token',
+        TYPECLAW_CONTAINER_NAME: 'typeclaw-test',
+      },
+      createSessionForChannel: async (key) => {
+        sessionKeys.push(`${key.key.workspace}:${key.key.chat}`)
+        return { session: fakeSession, sessionId: `ses_${key.key.workspace}`, dispose: async () => {} }
+      },
+      createSlackUserAdapter: (opts) => {
+        const workspace = workspaces.shift()
+        if (workspace === undefined) throw new Error('unexpected slack adapter')
+        capturedAccounts.push(opts.accountId)
+        return {
+          start: async () => {
+            opts.router.registerOutbound('slack', workspace, async (msg) => {
+              outboundByWorkspace[workspace]!.push(msg.text ?? '')
+              return { ok: true }
+            })
+          },
+          stop: async () => {},
+          isConnected: () => true,
+        }
+      },
+    })
+
+    await mgr.start()
+    await mgr.router.route({
+      adapter: 'slack',
+      workspace: 'WS_A',
+      chat: 'C_A',
+      thread: '1.0',
+      externalMessageId: 'm-a',
+      authorId: 'U_A',
+      authorName: 'Alice',
+      authorIsBot: false,
+      text: 'hello bot',
+      isBotMention: true,
+      replyToBotMessageId: null,
+      mentionsOthers: false,
+      replyToOtherMessageId: null,
+      isDm: false,
+      ts: Date.parse('2026-06-01T00:00:00.000Z'),
+    })
+    await mgr.router.__testing!.flushDebounce({ adapter: 'slack', workspace: 'WS_A', chat: 'C_A', thread: '1.0' })
+    await mgr.router.route({
+      adapter: 'slack',
+      workspace: 'WS_B',
+      chat: 'C_B',
+      thread: '2.0',
+      externalMessageId: 'm-b',
+      authorId: 'U_B',
+      authorName: 'Bob',
+      authorIsBot: false,
+      text: '안녕하세요 봇',
+      isBotMention: true,
+      replyToBotMessageId: null,
+      mentionsOthers: false,
+      replyToOtherMessageId: null,
+      isDm: false,
+      ts: Date.parse('2026-06-01T00:01:00.000Z'),
+    })
+    await mgr.router.__testing!.flushDebounce({ adapter: 'slack', workspace: 'WS_B', chat: 'C_B', thread: '2.0' })
+
+    const sendA = await mgr.router.send({ adapter: 'slack', workspace: 'WS_A', chat: 'C_A', text: 'reply A' })
+    const sendB = await mgr.router.send({ adapter: 'slack', workspace: 'WS_B', chat: 'C_B', text: 'reply B' })
+
+    expect(capturedAccounts).toEqual(['acct-a', 'acct-b'])
+    expect(sessionKeys).toEqual(['WS_A:C_A', 'WS_B:C_B'])
+    expect(prompts[prompts.length - 1]).toContain('안녕하세요 봇')
+    expect(sendA.ok).toBe(true)
+    expect(sendB.ok).toBe(true)
+    expect(outboundByWorkspace).toEqual({ WS_A: ['reply A'], WS_B: ['reply B'] })
+
+    await mgr.stop()
+  })
+
   test('stops discord adapter when DISCORD_BOT_TOKEN disappears (parity with slack)', async () => {
     cfg['discord-bot'] = enabledAdapterCfg()
     const fake = makeFakeAdapter()

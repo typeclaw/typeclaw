@@ -22,6 +22,8 @@ function fakeRouter(
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
     registerOutbound: () => {},
     unregisterOutbound: () => {},
+    registerConfig: () => {},
+    unregisterConfig: () => {},
     registerReaction: () => {},
     unregisterReaction: () => {},
     react: async () => ({ ok: true }),

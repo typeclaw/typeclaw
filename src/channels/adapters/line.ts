@@ -83,6 +83,7 @@ export type LineAdapterOptions = {
   logger?: LineAdapterLogger
   selfAliasesRef?: () => readonly string[]
   credentialsStore?: LineCredentialStore
+  accountId?: string
   client?: LineClient
   clientFactory?: (credManager?: LineCredentialManager) => LineClient
   listenerFactory?: (client: LineClient) => LineListener
@@ -225,7 +226,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
     const store = options.credentialsStore
     if (!store?.setAccount) return
     try {
-      const account = await store.getAccount()
+      const account = await store.getAccount(options.accountId)
       if (account === null) return
       await store.setAccount({ ...account, auth_token: authToken, updated_at: new Date(now()).toISOString() })
       lastPersistedToken = authToken
@@ -323,7 +324,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       try {
         const credentialStore = options.credentialsStore ?? null
         if (credentialStore !== null) {
-          const account = await credentialStore.getAccount()
+          const account = await credentialStore.getAccount(options.accountId)
           if (account === null) {
             throw new Error('no LINE account in secrets.json#channels.line (run typeclaw init to authenticate)')
           }
@@ -393,6 +394,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       // half-initialized adapter. stop() unregisters in inverse order.
       for (const workspace of ['@line-dm', '@line-group', '@line-square']) {
         options.router.registerOutbound('line', workspace, outboundCallback)
+        options.router.registerConfig('line', workspace, options.configRef)
         options.router.registerChannelNameResolver('line', workspace, channelResolver.resolve)
         options.router.registerHistory('line', workspace, historyCallback)
       }
@@ -407,6 +409,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       }
       for (const workspace of ['@line-dm', '@line-group', '@line-square']) {
         options.router.unregisterOutbound('line', workspace, outboundCallback)
+        options.router.unregisterConfig('line', workspace, options.configRef)
         options.router.unregisterChannelNameResolver('line', workspace, channelResolver.resolve)
         options.router.unregisterHistory('line', workspace, historyCallback)
       }

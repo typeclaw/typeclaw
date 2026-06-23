@@ -22,9 +22,11 @@ describe('channelsSchema', () => {
       kakaotalk: {},
     })
     for (const id of ['discord-bot', 'slack-bot', 'telegram-bot', 'webex-bot', 'line', 'kakaotalk'] as const) {
-      expect(parsed[id]?.enabled).toBe(true)
-      expect(parsed[id]?.engagement.trigger).toEqual(['mention', 'reply', 'dm'])
-      expect(parsed[id]?.engagement.stickiness).toEqual({
+      const block = parsed[id]
+      if (block === undefined || 'instances' in block) throw new Error(`expected flat config for ${id}`)
+      expect(block.enabled).toBe(true)
+      expect(block.engagement.trigger).toEqual(['mention', 'reply', 'dm'])
+      expect(block.engagement.stickiness).toEqual({
         perReply: { window: STICKY_DEFAULT_WINDOW_MS },
       })
     }
@@ -56,6 +58,53 @@ describe('channelsSchema', () => {
   test('allows enabled: false', () => {
     const parsed = channelsSchema.parse({ 'discord-bot': { enabled: false } })
     expect(parsed['discord-bot']?.enabled).toBe(false)
+  })
+
+  test('parses legacy flat user-mode adapter configs unchanged', () => {
+    const parsed = channelsSchema.parse({ slack: { enabled: false } })
+    expect(parsed.slack).toEqual({
+      enabled: false,
+      engagement: {
+        trigger: ['mention', 'reply', 'dm'],
+        stickiness: { perReply: { window: STICKY_DEFAULT_WINDOW_MS } },
+      },
+      history: { prefetch: { thread: { head: 3, tail: 10 }, channel: { tail: 10 } } },
+      quotedReply: { enabled: true, queueDelayMs: 10_000 },
+    })
+  })
+
+  test('parses user-mode instances configs with per-entry defaults', () => {
+    const parsed = channelsSchema.parse({ slack: { instances: [{ id: 'team-a', account: 'T_A' }, { id: 'team-b' }] } })
+    expect(parsed.slack).toEqual({
+      instances: [
+        {
+          id: 'team-a',
+          account: 'T_A',
+          enabled: true,
+          engagement: {
+            trigger: ['mention', 'reply', 'dm'],
+            stickiness: { perReply: { window: STICKY_DEFAULT_WINDOW_MS } },
+          },
+          history: { prefetch: { thread: { head: 3, tail: 10 }, channel: { tail: 10 } } },
+          quotedReply: { enabled: true, queueDelayMs: 10_000 },
+        },
+        {
+          id: 'team-b',
+          enabled: true,
+          engagement: {
+            trigger: ['mention', 'reply', 'dm'],
+            stickiness: { perReply: { window: STICKY_DEFAULT_WINDOW_MS } },
+          },
+          history: { prefetch: { thread: { head: 3, tail: 10 }, channel: { tail: 10 } } },
+          quotedReply: { enabled: true, queueDelayMs: 10_000 },
+        },
+      ],
+    })
+  })
+
+  test('keeps bot-token adapters flat only', () => {
+    const parsed = channelsSchema.parse({ 'slack-bot': { instances: [{ id: 'ignored' }] } })
+    expect((parsed['slack-bot'] as Record<string, unknown>).instances).toBeUndefined()
   })
 
   test('accepts github channel config with webhookUrl omitted', () => {

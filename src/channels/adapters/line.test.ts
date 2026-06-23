@@ -458,6 +458,8 @@ function makeRouterStub(onRoute: (m: InboundMessage) => void) {
     unregisterOutbound: () => {
       registered.outbound = false
     },
+    registerConfig: () => {},
+    unregisterConfig: () => {},
     registerHistory: () => {
       registered.history = true
     },

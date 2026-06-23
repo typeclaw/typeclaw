@@ -128,6 +128,21 @@ const adapterSchema = z.object({
   quotedReply: quotedReplySchema.optional(),
 })
 
+const instanceConfigSchema = adapterSchema.extend({
+  id: z.string().min(1),
+  account: z.string().optional(),
+})
+
+const multiInstanceSchema = z.object({
+  instances: z.array(instanceConfigSchema),
+})
+
+const userModeAdapterSchema = z.union([multiInstanceSchema, adapterSchema])
+
+export function defaultChannelAdapterConfig(): ChannelAdapterConfig {
+  return adapterSchema.parse({})
+}
+
 export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [
   'issue_comment.created',
   'pull_request_review_comment.created',
@@ -263,19 +278,19 @@ const githubChannelSchema = adapterSchema.extend({
 // kakaotalk adapter only on dedicated agent accounts you can afford to lose.
 export const channelsSchema = z
   .object({
-    discord: adapterSchema.optional(),
+    discord: userModeAdapterSchema.optional(),
     'discord-bot': adapterSchema.optional(),
     github: githubChannelSchema.optional(),
     // LINE is a personal-account channel like KakaoTalk: plain-text only,
     // alias-only engagement (no native @-mention), credentials in
     // secrets.json#channels.line (not env). Unlike KakaoTalk it has no
     // token-renewal cron — it persists a long-lived auth token + certificate.
-    line: adapterSchema.optional(),
-    kakaotalk: adapterSchema.optional(),
-    slack: adapterSchema.optional(),
+    line: userModeAdapterSchema.optional(),
+    kakaotalk: userModeAdapterSchema.optional(),
+    slack: userModeAdapterSchema.optional(),
     'slack-bot': adapterSchema.optional(),
     'telegram-bot': adapterSchema.optional(),
-    webex: adapterSchema.optional(),
+    webex: userModeAdapterSchema.optional(),
     // Webex bots receive messages in real time over a Mercury WebSocket
     // (agent-messenger's WebexBotListener), the same persistent-socket model
     // as slack-bot (Socket Mode) and discord-bot (Gateway) — no public
@@ -287,6 +302,7 @@ export const channelsSchema = z
 
 export type EngagementConfig = z.infer<typeof engagementSchema>
 export type ChannelAdapterConfig = z.infer<typeof adapterSchema>
+export type ChannelInstanceEntry = z.infer<typeof instanceConfigSchema>
 type ParsedGithubAdapterConfig = z.infer<typeof githubChannelSchema>
 export type GithubAdapterConfig = ParsedGithubAdapterConfig
 export type ChannelsConfig = z.infer<typeof channelsSchema>

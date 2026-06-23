@@ -3,13 +3,13 @@ import { describe, expect, test } from 'bun:test'
 import type { SlackListener, SlackRTMMessageEvent } from 'agent-messenger/slack'
 
 import type { ChannelRouter } from '@/channels/router'
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
 import { createSlackAdapter, type SlackAdapterLogger } from './slack'
 
-const config = channelsSchema.parse({ slack: {} }).slack!
+const config = defaultChannelAdapterConfig()
 
 function logger(): SlackAdapterLogger & { lines: string[] } {
   const lines: string[] = []
@@ -79,6 +79,8 @@ function router(): ChannelRouter & {
       r.outbound = cb
     },
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),
+    registerConfig: (adapter: string) => registered.push(`config:${adapter}`),
+    unregisterConfig: (adapter: string) => unregistered.push(`config:${adapter}`),
     setTypingCapability: (adapter: string, _workspace: string, supported: boolean) =>
       registered.push(`typing-cap:${adapter}=${String(supported)}`),
     registerChannelNameResolver: (adapter: string) => registered.push(`names:${adapter}`),
@@ -157,6 +159,7 @@ describe('createSlackAdapter', () => {
     expect(adapter.isConnected()).toBe(true)
     expect(r.registered).toEqual([
       'outbound:slack',
+      'config:slack',
       'typing-cap:slack=false',
       'names:slack',
       'self:slack',

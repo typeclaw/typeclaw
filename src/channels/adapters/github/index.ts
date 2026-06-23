@@ -179,6 +179,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const typing = async (): Promise<void> => {}
   const registerCallbacks = (): void => {
     options.router.registerOutbound('github', ROUTE_WORKSPACE_ANY, outbound)
+    options.router.registerConfig('github', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.registerReaction('github', ROUTE_WORKSPACE_ANY, reaction)
     options.router.registerRemoveReaction('github', ROUTE_WORKSPACE_ANY, removeReaction)
     options.router.registerTyping('github', ROUTE_WORKSPACE_ANY, typing)
@@ -192,6 +193,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   }
   const unregisterCallbacks = (): void => {
     options.router.unregisterOutbound('github', ROUTE_WORKSPACE_ANY, outbound)
+    options.router.unregisterConfig('github', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.unregisterReaction('github', ROUTE_WORKSPACE_ANY, reaction)
     options.router.unregisterRemoveReaction('github', ROUTE_WORKSPACE_ANY, removeReaction)
     options.router.unregisterTyping('github', ROUTE_WORKSPACE_ANY, typing)

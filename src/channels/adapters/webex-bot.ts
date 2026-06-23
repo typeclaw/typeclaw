@@ -298,6 +298,7 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger, fetchImpl })
   const registerCallbacks = (): void => {
     options.router.registerOutbound('webex-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerConfig('webex-bot', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.registerChannelNameResolver('webex-bot', ROUTE_WORKSPACE_ANY, channelResolver)
     options.router.registerSelfIdentity('webex-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
     options.router.registerHistory('webex-bot', ROUTE_WORKSPACE_ANY, historyCallback)
@@ -307,6 +308,7 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
 
   const unregisterCallbacks = (): void => {
     options.router.unregisterOutbound('webex-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterConfig('webex-bot', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.unregisterChannelNameResolver('webex-bot', ROUTE_WORKSPACE_ANY, channelResolver)
     options.router.unregisterSelfIdentity('webex-bot', ROUTE_WORKSPACE_ANY, selfIdentityResolver)
     options.router.unregisterHistory('webex-bot', ROUTE_WORKSPACE_ANY, historyCallback)

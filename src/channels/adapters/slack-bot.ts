@@ -1250,6 +1250,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
 
       const workspace = teamId
       options.router.registerOutbound('slack-bot', workspace, outboundCallback)
+      options.router.registerConfig('slack-bot', workspace, options.configRef)
       options.router.registerReaction('slack-bot', workspace, reactionCallback)
       options.router.registerRemoveReaction('slack-bot', workspace, removeReactionCallback)
       options.router.registerTyping('slack-bot', workspace, typingCallback)
@@ -1268,6 +1269,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         // !started and would otherwise skip cleanup), mirroring the github
         // adapter's rollback path.
         options.router.unregisterOutbound('slack-bot', workspace, outboundCallback)
+        options.router.unregisterConfig('slack-bot', workspace, options.configRef)
         options.router.unregisterReaction('slack-bot', workspace, reactionCallback)
         options.router.unregisterRemoveReaction('slack-bot', workspace, removeReactionCallback)
         options.router.unregisterTyping('slack-bot', workspace, typingCallback)
@@ -1292,6 +1294,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       const workspace = teamId
       if (workspace !== null) {
         options.router.unregisterOutbound('slack-bot', workspace, outboundCallback)
+        options.router.unregisterConfig('slack-bot', workspace, options.configRef)
         options.router.unregisterReaction('slack-bot', workspace, reactionCallback)
         options.router.unregisterRemoveReaction('slack-bot', workspace, removeReactionCallback)
         options.router.unregisterTyping('slack-bot', workspace, typingCallback)

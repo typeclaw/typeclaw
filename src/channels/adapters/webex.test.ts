@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { WebexListener, WebexMessage } from 'agent-messenger/webex'
 
 import type { ChannelRouter } from '@/channels/router'
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 import type { InboundMessage, OutboundMessage } from '@/channels/types'
 import type { WebexAccountRecord } from '@/secrets/schema'
 
@@ -16,7 +16,7 @@ import {
 } from './webex'
 import type { WebexInboundMessage } from './webex-classify'
 
-const config = channelsSchema.parse({ webex: {} }).webex!
+const config = defaultChannelAdapterConfig()
 
 function logger(): WebexAdapterLogger & { lines: string[] } {
   const lines: string[] = []
@@ -95,6 +95,8 @@ function router(): ChannelRouter & { routed: InboundMessage[]; registered: strin
     },
     registerOutbound: (adapter: string) => registered.push(`outbound:${adapter}`),
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),
+    registerConfig: (adapter: string) => registered.push(`config:${adapter}`),
+    unregisterConfig: (adapter: string) => unregistered.push(`config:${adapter}`),
     registerTyping: (adapter: string) => registered.push(`typing:${adapter}`),
     unregisterTyping: (adapter: string) => unregistered.push(`typing:${adapter}`),
     setTypingCapability: (adapter: string, _workspace: string, supported: boolean) =>
@@ -263,6 +265,7 @@ describe('createWebexAdapter', () => {
     expect(adapter.isConnected()).toBe(true)
     expect(r.registered).toEqual([
       'outbound:webex',
+      'config:webex',
       'typing:webex',
       'typing-cap:webex=true',
       'names:webex',

@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 
 import { classifyInbound, type WebexInboundMessage } from './webex-classify'
 
-const config = channelsSchema.parse({ webex: {} }).webex!
+const config = defaultChannelAdapterConfig()
 
 function message(overrides: Partial<WebexInboundMessage> = {}): WebexInboundMessage {
   return {

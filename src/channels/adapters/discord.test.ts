@@ -3,13 +3,13 @@ import { describe, expect, test } from 'bun:test'
 import type { DiscordGatewayMessageCreateEvent, DiscordListener } from 'agent-messenger/discord'
 
 import type { ChannelRouter } from '@/channels/router'
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { DiscordAccountRecord } from '@/secrets/schema'
 
 import { createDiscordAdapter, type DiscordAdapterLogger } from './discord'
 
-const config = channelsSchema.parse({ discord: {} }).discord!
+const config = defaultChannelAdapterConfig()
 
 function logger(): DiscordAdapterLogger & { lines: string[] } {
   const lines: string[] = []
@@ -78,6 +78,8 @@ function router(): ChannelRouter & {
       r.outbound = cb
     },
     unregisterOutbound: (adapter: string) => unregistered.push(`outbound:${adapter}`),
+    registerConfig: (adapter: string) => registered.push(`config:${adapter}`),
+    unregisterConfig: (adapter: string) => unregistered.push(`config:${adapter}`),
     setTypingCapability: (adapter: string, _workspace: string, supported: boolean) =>
       registered.push(`typing-cap:${adapter}=${String(supported)}`),
     registerChannelNameResolver: (adapter: string) => registered.push(`names:${adapter}`),
@@ -122,6 +124,7 @@ describe('createDiscordAdapter', () => {
     expect(adapter.isConnected()).toBe(true)
     expect(r.registered).toEqual([
       'outbound:discord',
+      'config:discord',
       'typing-cap:discord=false',
       'names:discord',
       'self:discord',

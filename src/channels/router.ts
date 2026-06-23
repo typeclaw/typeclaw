@@ -563,6 +563,7 @@ export type CreateSessionForChannel = (params: {
 }>
 
 export type ConfigForAdapter = (adapter: ChannelKey['adapter']) => ChannelAdapterConfig | undefined
+export type ConfigRef = () => ChannelAdapterConfig
 
 type QueuedInbound = {
   text: string
@@ -980,6 +981,8 @@ export type ChannelRouter = {
   }) => { count: number; windowMs: number }
   registerOutbound: (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback) => void
   unregisterOutbound: (adapter: ChannelKey['adapter'], workspace: string, cb: OutboundCallback) => void
+  registerConfig: (adapter: ChannelKey['adapter'], workspace: string, configRef: ConfigRef) => void
+  unregisterConfig: (adapter: ChannelKey['adapter'], workspace: string, configRef: ConfigRef) => void
   // Reaction support is opt-in per adapter: an adapter that never calls
   // registerReaction makes `react` resolve to `code: 'unsupported'`, and
   // auto-react-on-engage becomes a silent no-op for it. Kept separate from
@@ -1223,7 +1226,7 @@ export type AliasesProvider = () => readonly string[]
 
 export type CreateChannelRouterOptions = {
   agentDir: string
-  configForAdapter: ConfigForAdapter
+  configForAdapter?: ConfigForAdapter
   configuredAliases?: AliasesProvider
   createSessionForChannel?: CreateSessionForChannel
   sessionDir?: string
@@ -1398,6 +1401,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   let liveGeneration = 0
   // Adapter registries are keyed by route key `${adapter}:${workspace}`, not bare adapter.
   const outboundCallbacks = new Map<string, Set<OutboundCallback>>()
+  const configRefs = new Map<string, ConfigRef>()
   const reactionCallbacks = new Map<string, Set<ReactionCallback>>()
   const removeReactionCallbacks = new Map<string, Set<RemoveReactionCallback>>()
   const typingCallbacks = new Map<string, Set<TypingCallback>>()
@@ -1479,6 +1483,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (lower !== '') set.add(lower)
     }
     return Array.from(set)
+  }
+
+  const resolveAdapterConfig = (
+    adapter: ChannelKey['adapter'],
+    workspace: string,
+  ): ChannelAdapterConfig | undefined => {
+    return resolveRouteEntry(configRefs, adapter, workspace)?.() ?? options.configForAdapter?.(adapter)
   }
 
   let mappings: ChannelSessionRecord[] | null = null
@@ -1986,7 +1997,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // Install before the slow prefetch so a concurrent teardown/shutdown can
         // see and dispose this session during the network fetch.
         liveSessions.set(keyId, live)
-        const adapterConfig = options.configForAdapter(key.adapter)
+        const adapterConfig = resolveAdapterConfig(key.adapter, key.workspace)
         // Overlap the disk mapping-write with the network history prefetch —
         // they are independent. allSettled lets a persist failure take priority
         // (and unwind the install) even if prefetch also rejects.
@@ -2795,7 +2806,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const route = async (event: InboundMessage): Promise<void> => {
-    const adapterConfig = options.configForAdapter(event.adapter)
+    const adapterConfig = resolveAdapterConfig(event.adapter, event.workspace)
     if (!adapterConfig) return
 
     const key: ChannelKey = {
@@ -3128,6 +3139,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       outboundCallbacks.set(rk, set)
     }
     set.add(cb)
+  }
+
+  const registerConfig = (adapter: ChannelKey['adapter'], workspace: string, configRef: ConfigRef): void => {
+    configRefs.set(routeKeyId(adapter, workspace), configRef)
+  }
+
+  const unregisterConfig = (adapter: ChannelKey['adapter'], workspace: string, configRef: ConfigRef): void => {
+    const rk = routeKeyId(adapter, workspace)
+    if (configRefs.get(rk) === configRef) {
+      configRefs.delete(rk)
+    }
   }
 
   const registerReaction = (adapter: ChannelKey['adapter'], workspace: string, cb: ReactionCallback): void => {
@@ -3632,7 +3654,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // multi-part reply must not retroactively anchor chunk 2.
     if (live && source === 'tool' && live.pendingQuoteCandidate !== null) {
       const quoteCandidate = refreshQuoteCandidate(live.pendingQuoteCandidate, live.contextBuffer)
-      const anchor = decideQuoteAnchor(quoteCandidate, now(), options.configForAdapter(msg.adapter))
+      const anchor = decideQuoteAnchor(quoteCandidate, now(), resolveAdapterConfig(msg.adapter, msg.workspace))
       if (anchor !== null) {
         msg =
           resolveReplyRenderMode(msg) === 'native'
@@ -3794,7 +3816,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // silently re-grant the credit it just cleared. Skipped only for the live
       // turn (matched by `turnSeq`); the next turn re-grants normally.
       const disengagedThisTurn = live.disengagedTurn !== null && live.disengagedTurn === live.turnSeq
-      const adapterConfig = options.configForAdapter(msg.adapter)
+      const adapterConfig = resolveAdapterConfig(msg.adapter, msg.workspace)
       if (adapterConfig && !disengagedThisTurn) {
         const targets = new Set(live.currentTurnAuthorIds.size > 0 ? live.currentTurnAuthorIds : live.lastTurnAuthorIds)
         // A user the agent addresses by @-mention is a reply target too: their
@@ -4461,7 +4483,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     const keyId = channelKeyId(key)
 
-    if (options.configForAdapter(key.adapter) === undefined) {
+    if (resolveAdapterConfig(key.adapter, key.workspace) === undefined) {
       logger.warn(`[channels] ${keyId}: restart-resume skipped — adapter not configured`)
       return null
     }
@@ -4788,6 +4810,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     getSendRate,
     registerOutbound,
     unregisterOutbound,
+    registerConfig,
+    unregisterConfig,
     registerReaction,
     unregisterReaction,
     react,

@@ -899,6 +899,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
   const removeReactionCallback = createDiscordRemoveReactionCallback({ client })
   const registerCallbacks = (): void => {
     options.router.registerOutbound('discord-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerConfig('discord-bot', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.registerReaction('discord-bot', ROUTE_WORKSPACE_ANY, reactionCallback)
     options.router.registerRemoveReaction('discord-bot', ROUTE_WORKSPACE_ANY, removeReactionCallback)
     options.router.registerTyping('discord-bot', ROUTE_WORKSPACE_ANY, typingCallback)
@@ -912,6 +913,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
 
   const unregisterCallbacks = (): void => {
     options.router.unregisterOutbound('discord-bot', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterConfig('discord-bot', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.unregisterReaction('discord-bot', ROUTE_WORKSPACE_ANY, reactionCallback)
     options.router.unregisterRemoveReaction('discord-bot', ROUTE_WORKSPACE_ANY, removeReactionCallback)
     options.router.unregisterTyping('discord-bot', ROUTE_WORKSPACE_ANY, typingCallback)

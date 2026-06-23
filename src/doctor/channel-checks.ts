@@ -457,6 +457,7 @@ function readChannelsSecrets(ctx: CheckContext): ReturnType<SecretsBackend['tryR
 function isAdapterActive(channels: ChannelsConfig, adapter: AdapterId): boolean {
   const slot = channels[adapter]
   if (slot === undefined) return false
+  if ('instances' in slot) return slot.instances.some((instance) => instance.enabled !== false)
   return slot.enabled !== false
 }
 

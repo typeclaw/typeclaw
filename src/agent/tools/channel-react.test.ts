@@ -13,6 +13,8 @@ function fakeRouter(react: (req: ReactionRequest) => Promise<ReactionResult>): C
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
     registerOutbound: () => {},
     unregisterOutbound: () => {},
+    registerConfig: () => {},
+    unregisterConfig: () => {},
     registerReaction: () => {},
     unregisterReaction: () => {},
     react,

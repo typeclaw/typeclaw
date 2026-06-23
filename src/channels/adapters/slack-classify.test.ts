@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test'
 
 import type { SlackRTMMessageEvent } from 'agent-messenger/slack'
 
-import { channelsSchema } from '@/channels/schema'
+import { defaultChannelAdapterConfig } from '@/channels/schema'
 
 import { classifyInbound } from './slack-classify'
 
-const config = channelsSchema.parse({ slack: {} }).slack!
+const config = defaultChannelAdapterConfig()
 const context = { teamId: 'T0123456789', selfUserId: 'USELF', selfAliases: ['typeclaw'] }
 
 function event(overrides: Partial<SlackRTMMessageEvent> = {}): SlackRTMMessageEvent {

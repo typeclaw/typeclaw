@@ -416,6 +416,7 @@ describe('webex lifecycle', () => {
     expect(adapter.isConnected()).toBe(true)
     expect(router.registered).toEqual([
       'outbound',
+      'config',
       'channelNameResolver',
       'selfIdentity',
       'history',
@@ -540,6 +541,8 @@ class FakeRouter {
     },
     registerOutbound: () => this.registered.push('outbound'),
     unregisterOutbound: () => this.unregistered.push('outbound'),
+    registerConfig: () => this.registered.push('config'),
+    unregisterConfig: () => this.unregistered.push('config'),
     registerChannelNameResolver: () => this.registered.push('channelNameResolver'),
     unregisterChannelNameResolver: () => this.unregistered.push('channelNameResolver'),
     registerSelfIdentity: (

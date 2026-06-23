@@ -65,6 +65,7 @@ export type WebexAdapterOptions = {
   logger?: WebexAdapterLogger
   selfAliasesRef?: () => readonly string[]
   credentialsStore?: WebexCredentialStore
+  accountId?: string
   createClient?: WebexClientFactory
   createListener?: WebexListenerFactory
   listenerOptions?: Omit<WebexListenerOptions, 'ignoreSelfMessages'>
@@ -355,6 +356,7 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
   const fetchAttachmentCallback = createFetchAttachmentCallback({ tokenRef: () => currentToken, logger, fetchImpl })
   const registerCallbacks = (): void => {
     options.router.registerOutbound('webex', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.registerConfig('webex', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.registerTyping('webex', ROUTE_WORKSPACE_ANY, typingCallback)
     options.router.setTypingCapability('webex', ROUTE_WORKSPACE_ANY, true)
     options.router.registerChannelNameResolver('webex', ROUTE_WORKSPACE_ANY, channelResolver)
@@ -366,6 +368,7 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
 
   const unregisterCallbacks = (): void => {
     options.router.unregisterOutbound('webex', ROUTE_WORKSPACE_ANY, outboundCallback)
+    options.router.unregisterConfig('webex', ROUTE_WORKSPACE_ANY, options.configRef)
     options.router.unregisterTyping('webex', ROUTE_WORKSPACE_ANY, typingCallback)
     options.router.setTypingCapability('webex', ROUTE_WORKSPACE_ANY, false)
     options.router.unregisterChannelNameResolver('webex', ROUTE_WORKSPACE_ANY, channelResolver)
@@ -419,7 +422,7 @@ export function createWebexAdapter(options: WebexAdapterOptions): WebexAdapter {
       if (started) return
       started = true
       try {
-        const account = await (options.credentialsStore ?? null)?.getAccount()
+        const account = await (options.credentialsStore ?? null)?.getAccount(options.accountId)
         if (account === null || account === undefined) {
           throw new Error('no Webex account in secrets.json#channels.webex (run typeclaw init to authenticate)')
         }

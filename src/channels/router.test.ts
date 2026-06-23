@@ -398,6 +398,34 @@ describe('ChannelRouter session lifecycle', () => {
     expect(router.liveCount()).toBe(1)
   })
 
+  test('resolves registered config by exact workspace before adapter fallback', async () => {
+    const dir = await tempDir()
+    const catchAllConfig: ChannelAdapterConfig = {
+      ...baseConfig,
+      engagement: { trigger: ['mention'], stickiness: 'off' },
+    }
+    const workspaceConfig: ChannelAdapterConfig = {
+      ...baseConfig,
+      engagement: { trigger: ['dm'], stickiness: 'off' },
+    }
+    const { router, sessions, origins } = makeRouter(dir, { config: catchAllConfig })
+    router.registerConfig('slack', ROUTE_WORKSPACE_ANY, () => catchAllConfig)
+    router.registerConfig('slack', 'WS_B', () => workspaceConfig)
+
+    await router.route(
+      inbound({
+        adapter: 'slack',
+        workspace: 'WS_B',
+        isBotMention: false,
+        isDm: true,
+      }),
+    )
+    await router.__testing!.flushDebounce({ adapter: 'slack', workspace: 'WS_B', chat: 'c1', thread: null })
+
+    expect(sessions).toHaveLength(1)
+    expect(origins[0]?.kind === 'channel' ? origins[0].workspace : undefined).toBe('WS_B')
+  })
+
   test('includes registered self-identity in the session-creation origin', async () => {
     const dir = await tempDir()
     const { router, origins } = makeRouter(dir)

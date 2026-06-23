@@ -172,9 +172,11 @@ type AdapterEntry = {
 export function createChannelManager(options: ChannelManagerOptions): ChannelManager {
   const logger = options.logger ?? consoleLogger
   const env = options.env ?? process.env
+  const normalize = options.normalizeChannelsOverride ?? normalizeChannels
   const router = createChannelRouter({
     agentDir: options.agentDir,
-    configForAdapter: (adapter) => options.channelsConfigRef()[adapter],
+    configForAdapter: (adapter) =>
+      normalize(options.channelsConfigRef()).find((instance) => instance.adapter === adapter)?.config,
     logger,
     ...(options.aliasesRef ? { configuredAliases: options.aliasesRef } : {}),
     ...(options.createSessionForChannel ? { createSessionForChannel: options.createSessionForChannel } : {}),
@@ -197,8 +199,6 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const createTelegramAdapter = options.createTelegramAdapter ?? createTelegramBotAdapter
   const createWebex = options.createWebexAdapter ?? createWebexAdapter
   const createWebexBot = options.createWebexBotAdapter ?? createWebexBotAdapter
-  const normalize = options.normalizeChannelsOverride ?? normalizeChannels
-
   const live = new Map<string, AdapterEntry>()
   const perAdapterSerial = new Map<string, Promise<unknown>>()
   const recovery = options.connectionRecovery ?? {}
@@ -245,7 +245,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     )
 
   const buildAdapter = (instance: ChannelInstanceConfig): AnyAdapter | null => {
-    const { adapter, instanceId, config: cfg } = instance
+    const { adapter, instanceId, account, config: cfg } = instance
     const configRef = () => desiredInstance(adapter, instanceId)?.config ?? cfg
     if (adapter === 'discord-bot') {
       const token = env.DISCORD_BOT_TOKEN
@@ -278,6 +278,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerLineCredentialStore(options.agentDir, env),
+        ...(account !== undefined ? { accountId: account } : {}),
       })
     }
     if (adapter === 'kakaotalk') {
@@ -287,6 +288,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerKakaoCredentialStore(options.agentDir, env),
+        ...(account !== undefined ? { accountId: account } : {}),
       })
     }
     if (adapter === 'slack') {
@@ -296,6 +298,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerSlackCredentialStore(options.agentDir, env),
+        ...(account !== undefined ? { accountId: account } : {}),
       })
     }
     if (adapter === 'discord') {
@@ -305,6 +308,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerDiscordCredentialStore(options.agentDir, env),
+        ...(account !== undefined ? { accountId: account } : {}),
       })
     }
     if (adapter === 'webex') {
@@ -314,6 +318,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerWebexCredentialStore(options.agentDir, env),
+        ...(account !== undefined ? { accountId: account } : {}),
       })
     }
     if (adapter === 'github') {
