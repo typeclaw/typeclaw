@@ -85,6 +85,7 @@ import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installCodexFetchObserver } from './codex-fetch-observer'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
+import { runStartupVectorBoot } from './startup-vector-boot'
 
 type BunServer = ReturnType<Server['start']>
 
@@ -225,17 +226,7 @@ export async function startAgent({
   // exactly once per folder; a folder already at v2 is a no-op.
   runStartupMigrations(cwd)
   if (suppressSystemMemory) {
-    await buildStartupVectorIndex(cwd, embed).catch((err) => {
-      console.warn(`[vector] startup index build failed: ${err instanceof Error ? err.message : String(err)}`)
-    })
-
-    // Warm the embedder now (even when the index needed no rebuild above, which
-    // skips embed() entirely) so the first channel turn's query embed doesn't
-    // pay the one-time ONNX init on its critical path. Non-fatal: a failure here
-    // degrades to the per-turn lazy load, same as before this step existed.
-    await warmEmbedder().catch((err) => {
-      console.warn(`[vector] embedder warm-up failed: ${err instanceof Error ? err.message : String(err)}`)
-    })
+    await runStartupVectorBoot({ buildIndex: () => buildStartupVectorIndex(cwd, embed), warmEmbedder })
   }
 
   // Channel adapters read `process.env[TOKEN_ENV]` (see channels/manager.ts).
