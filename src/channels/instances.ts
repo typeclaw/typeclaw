@@ -29,7 +29,7 @@ export function normalizeChannels(cfg: ChannelsConfig): ChannelInstanceConfig[] 
 
 const USER_MODE_ADAPTERS = new Set<AdapterId>(['discord', 'line', 'kakaotalk', 'slack', 'webex'])
 
-function isUserModeAdapter(adapter: AdapterId): boolean {
+export function isUserModeAdapter(adapter: AdapterId): boolean {
   return USER_MODE_ADAPTERS.has(adapter)
 }
 

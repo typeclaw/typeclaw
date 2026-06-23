@@ -1,9 +1,12 @@
 import { randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { cancel, confirm, intro, isCancel, log, note, password, select, spinner, text } from '@clack/prompts'
 import { defineCommand } from 'citty'
 import QRCode from 'qrcode'
 
+import { isMultiInstanceAdapter, isUserModeAdapter } from '@/channels/instances'
 import { config } from '@/config'
 import {
   listChannels,
@@ -70,6 +73,16 @@ const addSub = defineCommand({
       description: `which adapter to add (${CHANNEL_KINDS.join(' | ')}); omit to pick interactively`,
       required: false,
     },
+    id: {
+      type: 'string',
+      description: 'instance id for user-mode adapters (required when adding another instance)',
+      required: false,
+    },
+    account: {
+      type: 'string',
+      description: 'account id to bind to the new user-mode adapter instance',
+      required: false,
+    },
   },
   async run({ args }) {
     const cwd = findAgentDir(process.cwd()) ?? process.cwd()
@@ -82,6 +95,8 @@ const addSub = defineCommand({
     const configured = await readConfiguredChannels(cwd)
     const requested = args.adapter
     const channel = requested === undefined ? await pickChannel(configured) : validateAdapterArg(requested, configured)
+    const instanceId = await resolveAddInstanceId({ cwd, channel, configured, requested: args.id })
+    const accountId = resolveAddAccountId(channel, args.account)
 
     intro(`Adding channel: ${CHANNEL_LABELS[channel]}`)
 
@@ -93,6 +108,8 @@ const addSub = defineCommand({
       await runAddChannel({
         cwd,
         ...credentials,
+        ...(instanceId !== undefined ? { instanceId } : {}),
+        ...(accountId !== undefined ? { accountId } : {}),
         onProgress: reportProgress(events, lineSpinnerHolder),
       })
       if (credentials.channel === 'github' && credentials.tunnelProvider === 'none') {
@@ -245,6 +262,11 @@ const removeSub = defineCommand({
       description: 'skip the confirmation prompt',
       default: false,
     },
+    id: {
+      type: 'string',
+      description: 'remove only this user-mode adapter instance id',
+      required: false,
+    },
   },
   async run({ args }) {
     const cwd = findAgentDir(process.cwd()) ?? process.cwd()
@@ -261,10 +283,14 @@ const removeSub = defineCommand({
 
     const adapter =
       args.adapter === undefined ? await pickChannelToRemove(present) : validateRemoveAdapterArg(args.adapter, present)
+    const instanceId = validateRemoveInstanceArg(adapter, args.id)
 
     if (args.yes !== true) {
       const confirmed = await confirm({
-        message: `Remove the ${CHANNEL_LABELS[adapter]} channel? This deletes its config and credentials.`,
+        message:
+          instanceId === undefined
+            ? `Remove the ${CHANNEL_LABELS[adapter]} channel? This deletes its config and credentials.`
+            : `Remove the ${CHANNEL_LABELS[adapter]} instance "${instanceId}"? This deletes its config and credentials.`,
         initialValue: false,
       })
       if (isCancel(confirmed) || !confirmed) {
@@ -273,13 +299,19 @@ const removeSub = defineCommand({
       }
     }
 
-    const result = removeChannel(cwd, adapter)
+    const result = removeChannel(cwd, adapter, instanceId)
     if (!result.ok) {
       console.error(errorLine(result.reason))
       process.exit(1)
     }
 
-    process.stdout.write(`${successLine(`Removed ${CHANNEL_LABELS[adapter]} channel.`)}\n`)
+    process.stdout.write(
+      `${successLine(
+        instanceId === undefined
+          ? `Removed ${CHANNEL_LABELS[adapter]} channel.`
+          : `Removed ${CHANNEL_LABELS[adapter]} instance "${instanceId}".`,
+      )}\n`,
+    )
     if (result.githubCleanup !== undefined) printGithubCleanup(result.githubCleanup)
     if (result.hadRemoteWebhooks) {
       log.warn(
@@ -306,7 +338,7 @@ export const channelCommand = defineCommand({
 })
 
 function presentChannels(entries: ChannelListEntry[]): ChannelKind[] {
-  return entries.map((entry) => entry.kind)
+  return [...new Set(entries.map((entry) => entry.kind))]
 }
 
 async function pickChannelToRemove(present: ChannelKind[]): Promise<ChannelKind> {
@@ -339,10 +371,17 @@ function validateRemoveAdapterArg(adapter: string, present: ChannelKind[]): Chan
   return adapter
 }
 
+function validateRemoveInstanceArg(adapter: ChannelKind, instanceId: string | undefined): string | undefined {
+  if (instanceId === undefined) return undefined
+  if (isMultiInstanceAdapter(adapter)) return instanceId
+  console.error(errorLine(`${CHANNEL_LABELS[adapter]} ("${adapter}") does not support multiple instances; omit --id.`))
+  process.exit(1)
+}
+
 function formatChannelList(channels: ChannelListEntry[]): string {
   if (channels.length === 0) return c.dim('No channels configured.')
 
-  const kindWidth = Math.max(4, ...channels.map((ch) => ch.kind.length))
+  const kindWidth = Math.max(4, ...channels.map((ch) => displayChannelKind(ch).length))
   const statusWidth = Math.max(6, ...channels.map((ch) => channelStatusText(ch).length))
   const lines: string[] = []
   lines.push(c.dim(`${'KIND'.padEnd(kindWidth)}  ${'STATUS'.padEnd(statusWidth)}  DETAIL`))
@@ -352,9 +391,14 @@ function formatChannelList(channels: ChannelListEntry[]): string {
       ? c.green(statusText.padEnd(statusWidth))
       : c.yellow(statusText.padEnd(statusWidth))
     const detail = ch.detail ?? ''
-    lines.push(`${ch.kind.padEnd(kindWidth)}  ${status}  ${c.dim(detail)}`)
+    const kind = displayChannelKind(ch)
+    lines.push(`${kind.padEnd(kindWidth)}  ${status}  ${c.dim(detail)}`)
   }
   return lines.join('\n')
+}
+
+function displayChannelKind(ch: ChannelListEntry): string {
+  return ch.instanceId === undefined ? ch.kind : `${ch.kind}:${ch.instanceId}`
 }
 
 function channelStatusOk(ch: ChannelListEntry): boolean {
@@ -597,7 +641,7 @@ function validateAdapterArg(adapter: string, configured: Set<ChannelKind>): Chan
     console.error(errorLine(`Unknown adapter "${adapter}". Expected one of: ${CHANNEL_KINDS.join(', ')}.`))
     process.exit(1)
   }
-  if (configured.has(adapter)) {
+  if (configured.has(adapter) && !isMultiInstanceAdapter(adapter)) {
     console.error(
       errorLine(
         `${CHANNEL_LABELS[adapter]} ("${adapter}") is already configured in typeclaw.json. Edit the file directly to change its configuration.`,
@@ -613,7 +657,7 @@ function isChannelKind(value: string): value is ChannelKind {
 }
 
 async function pickChannel(configured: Set<ChannelKind>): Promise<ChannelKind> {
-  const available = CHANNEL_KINDS.filter((kind) => !configured.has(kind))
+  const available = addableChannelKinds(configured)
   if (available.length === 0) {
     console.error(errorLine('All supported channel adapters are already configured in typeclaw.json. Nothing to add.'))
     process.exit(0)
@@ -646,6 +690,99 @@ async function pickChannel(configured: Set<ChannelKind>): Promise<ChannelKind> {
   if (selected === 'slack-family') return pickSlackMode(available)
   if (selected === 'discord-family') return pickDiscordMode(available)
   return selected
+}
+
+export function addableChannelKinds(configured: ReadonlySet<ChannelKind>): ChannelKind[] {
+  return CHANNEL_KINDS.filter((kind) => isMultiInstanceAdapter(kind) || !configured.has(kind))
+}
+
+async function resolveAddInstanceId(options: {
+  cwd: string
+  channel: ChannelKind
+  configured: Set<ChannelKind>
+  requested: string | undefined
+}): Promise<string | undefined> {
+  if (!isMultiInstanceAdapter(options.channel)) {
+    const error = singleInstanceArgError(options.channel, options.requested, undefined)
+    if (error !== undefined) {
+      console.error(errorLine(error))
+      process.exit(1)
+    }
+    return undefined
+  }
+
+  const existingIds = readConfiguredInstanceIds(options.cwd, options.channel)
+  if (options.requested !== undefined) {
+    validateInstanceId(options.requested, existingIds)
+    return options.requested
+  }
+  if (!options.configured.has(options.channel)) return undefined
+
+  const entered = await text({
+    message: `Add another ${CHANNEL_LABELS[options.channel]} workspace? Enter an id for the new instance:`,
+    validate: (value) => validateInstanceIdInput(value ?? '', existingIds),
+  })
+  if (isCancel(entered)) {
+    cancel('Aborted.')
+    process.exit(0)
+  }
+  return entered
+}
+
+function resolveAddAccountId(channel: ChannelKind, account: string | undefined): string | undefined {
+  if (account === undefined) return undefined
+  if (isMultiInstanceAdapter(channel)) return account
+  console.error(errorLine(singleInstanceArgError(channel, undefined, account) ?? 'Invalid account argument'))
+  process.exit(1)
+}
+
+export function singleInstanceArgError(
+  channel: ChannelKind,
+  id: string | undefined,
+  account: string | undefined,
+): string | undefined {
+  if (isMultiInstanceAdapter(channel)) return undefined
+  if (id !== undefined) return `${CHANNEL_LABELS[channel]} ("${channel}") is single-instance; omit --id.`
+  if (account !== undefined) return `${CHANNEL_LABELS[channel]} ("${channel}") is single-instance; omit --account.`
+  return undefined
+}
+
+function validateInstanceId(id: string, existingIds: ReadonlySet<string>): void {
+  const error = validateInstanceIdInput(id, existingIds)
+  if (error !== undefined) {
+    console.error(errorLine(error))
+    process.exit(1)
+  }
+}
+
+function validateInstanceIdInput(id: string, existingIds: ReadonlySet<string>): string | undefined {
+  if (id.trim().length === 0) return 'Instance id is required'
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) return 'Instance id may contain only letters, numbers, _ and -'
+  if (existingIds.has(id)) return `Instance id "${id}" is already configured for this adapter`
+  return undefined
+}
+
+function readConfiguredInstanceIds(cwd: string, channel: ChannelKind): Set<string> {
+  const config = readTypeclawConfig(cwd)
+  const channels = isRecord(config.channels) ? config.channels : {}
+  const channelConfig = channels[channel]
+  if (!isUserModeAdapter(channel) || channelConfig === undefined) return new Set()
+  if (isRecord(channelConfig) && Array.isArray(channelConfig.instances)) {
+    return new Set(channelConfig.instances.map((entry) => (isRecord(entry) ? entry.id : undefined)).filter(isString))
+  }
+  return new Set(['default'])
+}
+
+function readTypeclawConfig(cwd: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')) as Record<string, unknown>
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string'
 }
 
 const FAMILY_OF: Partial<Record<ChannelKind, { value: FamilyValue; label: string }>> = {

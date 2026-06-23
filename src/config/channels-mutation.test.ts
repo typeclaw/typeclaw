@@ -94,6 +94,35 @@ describe('channels mutation', () => {
       expect(list).toHaveLength(1)
       expect(list[0]?.detail).toBe('1 repo')
     })
+
+    test('lists each configured user-mode instance with its account label', async () => {
+      await writeConfig({
+        channels: {
+          slack: {
+            instances: [
+              { id: 'acme', account: 'T1' },
+              { id: 'personal', account: 'T2' },
+            ],
+          },
+        },
+      })
+      await writeSecrets({
+        slack: {
+          currentAccount: 'T2',
+          accounts: {
+            T1: slackAccount('T1', 'Acme'),
+            T2: slackAccount('T2', 'Personal'),
+          },
+        },
+      })
+
+      const list = listChannels(cwd)
+
+      expect(list).toMatchObject([
+        { kind: 'slack', instanceId: 'acme', account: 'T1', detail: 'id: acme, account: T1 (Acme)' },
+        { kind: 'slack', instanceId: 'personal', account: 'T2', detail: 'id: personal, account: T2 (Personal)' },
+      ])
+    })
   })
 
   describe('removeChannel', () => {
@@ -131,6 +160,54 @@ describe('channels mutation', () => {
       if (!result.ok) return
       expect(result).toMatchObject({ configRemoved: false, secretsRemoved: true })
       expect(await readSecretsChannels()).toEqual({})
+    })
+
+    test('removes one user-mode instance and its scoped account secret', async () => {
+      await writeConfig({
+        channels: {
+          slack: {
+            instances: [
+              { id: 'acme', account: 'T1' },
+              { id: 'personal', account: 'T2' },
+            ],
+          },
+        },
+      })
+      await writeSecrets({
+        slack: {
+          currentAccount: 'T1',
+          accounts: {
+            T1: slackAccount('T1', 'Acme'),
+            T2: slackAccount('T2', 'Personal'),
+          },
+        },
+      })
+
+      const result = removeChannel(cwd, 'slack', 'acme')
+
+      expect(result.ok).toBe(true)
+      expect(await readConfig()).toEqual({
+        channels: { slack: { instances: [{ id: 'personal', account: 'T2' }] } },
+      })
+      expect(await readSecretsChannels()).toEqual({
+        slack: {
+          currentAccount: 'T2',
+          accounts: { T2: slackAccount('T2', 'Personal') },
+        },
+      })
+    })
+
+    test('removes the whole user-mode kind when removing its last instance', async () => {
+      await writeConfig({ channels: { slack: { instances: [{ id: 'personal', account: 'T2' }] } } })
+      await writeSecrets({
+        slack: { currentAccount: 'T2', accounts: { T2: slackAccount('T2', 'Personal') } },
+      })
+
+      const result = removeChannel(cwd, 'slack', 'personal')
+
+      expect(result.ok).toBe(true)
+      expect(await readConfig()).toEqual({ channels: {} })
+      expect(await readSecretsChannels()).toEqual({ slack: { currentAccount: null, accounts: {} } })
     })
 
     test('github removal strips its tunnel and repo-derived match rules but keeps cloudflared and unrelated rules', async () => {
@@ -214,3 +291,15 @@ describe('channels mutation', () => {
     })
   })
 })
+
+function slackAccount(accountId: string, workspaceName: string): Record<string, string> {
+  return {
+    account_id: accountId,
+    token: `token-${accountId}`,
+    cookie: `cookie-${accountId}`,
+    workspace_id: accountId,
+    workspace_name: workspaceName,
+    created_at: '2026-01-01T00:00:00.000Z',
+    updated_at: '2026-01-01T00:00:00.000Z',
+  }
+}

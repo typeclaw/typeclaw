@@ -2,12 +2,14 @@ import { describe, expect, test } from 'bun:test'
 import { Writable } from 'node:stream'
 
 import {
+  addableChannelKinds,
   DISCORD_MODES,
   familyModeOptions,
   holderSpinnerControl,
   printLinePincode,
   printLineQrUrl,
   SLACK_MODES,
+  singleInstanceArgError,
   WEBEX_MODES,
   type LineAuthSpinnerHolder,
 } from './channel'
@@ -100,6 +102,23 @@ describe('familyModeOptions', () => {
 
     // then
     expect(options.map((o) => o.value)).toEqual(['slack-bot'])
+  })
+})
+
+describe('addableChannelKinds', () => {
+  test('keeps a configured multi-instance kind (slack) addable but hides every single-instance kind', () => {
+    const available = addableChannelKinds(new Set(['slack', 'slack-bot', 'github', 'discord', 'webex', 'kakaotalk']))
+
+    expect(available).toContain('slack')
+    expect(available).not.toContain('slack-bot')
+    expect(available).not.toContain('github')
+    expect(available).not.toContain('discord')
+    expect(available).not.toContain('webex')
+    expect(available).not.toContain('kakaotalk')
+  })
+
+  test('rejects --id for bot-token adapters with a clear single-instance message', () => {
+    expect(singleInstanceArgError('slack-bot', 'acme', undefined)).toContain('single-instance; omit --id')
   })
 })
 

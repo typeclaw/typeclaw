@@ -2,6 +2,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
+import { isMultiInstanceAdapter, isUserModeAdapter } from '@/channels/instances'
 import {
   config,
   configSchema,
@@ -1169,6 +1170,8 @@ export type AddChannelStepEvent =
 // from prompts; tests build them inline.
 export type AddChannelOptions = {
   cwd: string
+  instanceId?: string
+  accountId?: string
   onProgress?: (event: AddChannelStepEvent) => void
 } & (
   | { channel: 'discord-bot'; discordBotToken: string }
@@ -1199,6 +1202,12 @@ export type DiscordAuthRunner = (options: { cwd: string }) => Promise<DiscordAut
 
 export async function runAddChannel(options: AddChannelOptions): Promise<void> {
   const emit = options.onProgress ?? (() => {})
+  const priorAccountIds = isUserModeAdapter(options.channel)
+    ? readChannelAccountIds(options.cwd, options.channel)
+    : new Set<string>()
+  const priorCurrentAccountId = isUserModeAdapter(options.channel)
+    ? readCurrentChannelAccountId(options.cwd, options.channel)
+    : undefined
 
   // Order: kakaotalk-auth (if applicable) -> config -> secrets.
   //
@@ -1244,8 +1253,12 @@ export async function runAddChannel(options: AddChannelOptions): Promise<void> {
     if (!result.ok) throw new Error(`Slack authentication failed: ${result.reason}`)
   }
 
+  const instanceAccountId = isUserModeAdapter(options.channel)
+    ? resolveInstanceAccountId(options.cwd, options.channel, priorAccountIds, options.accountId)
+    : undefined
+
   emit({ step: 'config', phase: 'start' })
-  await mergeChannelIntoConfig(options.cwd, options)
+  await mergeChannelIntoConfig(options.cwd, options, instanceAccountId, priorCurrentAccountId)
   emit({ step: 'config', phase: 'done' })
 
   emit({ step: 'secrets', phase: 'start' })
@@ -1379,7 +1392,12 @@ export async function readConfiguredChannels(cwd: string): Promise<Set<ChannelKi
   return present
 }
 
-async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): Promise<void> {
+async function mergeChannelIntoConfig(
+  cwd: string,
+  options: AddChannelOptions,
+  instanceAccountId: string | undefined,
+  priorCurrentAccountId: string | undefined,
+): Promise<void> {
   const path = join(cwd, CONFIG_FILE)
   let parsed: Record<string, unknown>
   try {
@@ -1399,7 +1417,7 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
       ? (parsed.channels as Record<string, unknown>)
       : {}
 
-  if (options.channel in existingChannels) {
+  if (options.channel in existingChannels && !isMultiInstanceAdapter(options.channel)) {
     // Defense in depth — the CLI already filters configured channels out of
     // the picker and rejects them as the positional arg. Hitting this branch
     // means a programmatic caller passed a duplicate; better to fail loudly
@@ -1407,7 +1425,12 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
     throw new Error(`Channel "${options.channel}" is already configured in ${CONFIG_FILE}.`)
   }
 
-  const nextChannelConfig = options.channel === 'github' ? buildGithubChannelConfig(options) : {}
+  const nextChannelConfig = buildNextChannelConfig(
+    existingChannels[options.channel],
+    options,
+    instanceAccountId,
+    priorCurrentAccountId,
+  )
 
   parsed.channels = {
     ...existingChannels,
@@ -1417,6 +1440,89 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
   if (options.channel === 'github') mergeGithubTunnelConfig(parsed, options)
 
   await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+}
+
+function buildNextChannelConfig(
+  existing: unknown,
+  options: AddChannelOptions,
+  instanceAccountId: string | undefined,
+  priorCurrentAccountId: string | undefined,
+): Record<string, unknown> {
+  if (options.channel === 'github') return buildGithubChannelConfig(options)
+  if (!isUserModeAdapter(options.channel)) return {}
+
+  if (existing === undefined) {
+    if (options.instanceId === undefined) return {}
+    return { instances: [buildInstanceEntry(options.instanceId, {}, instanceAccountId)] }
+  }
+
+  if (options.instanceId === undefined) {
+    throw new Error(`Adding another ${options.channel} instance requires an instance id.`)
+  }
+
+  if (hasInstanceEntries(existing)) {
+    if (existing.instances.some((entry) => entry.id === options.instanceId)) {
+      throw new Error(`Channel "${options.channel}" already has an instance with id "${options.instanceId}".`)
+    }
+    return {
+      ...existing,
+      instances: [...existing.instances, buildInstanceEntry(options.instanceId, {}, instanceAccountId)],
+    }
+  }
+
+  const existingConfig = isObjectRecord(existing) ? existing : {}
+  return {
+    instances: [
+      buildInstanceEntry('default', existingConfig, priorCurrentAccountId),
+      buildInstanceEntry(options.instanceId, {}, instanceAccountId),
+    ],
+  }
+}
+
+function buildInstanceEntry(
+  id: string,
+  config: Record<string, unknown>,
+  account: string | undefined,
+): Record<string, unknown> {
+  return { id, ...config, ...(account !== undefined ? { account } : {}) }
+}
+
+function hasInstanceEntries(value: unknown): value is { instances: Array<{ id: string; account?: string }> } {
+  return isObjectRecord(value) && Array.isArray(value.instances) && value.instances.every(isInstanceEntry)
+}
+
+function isInstanceEntry(value: unknown): value is { id: string; account?: string } {
+  return isObjectRecord(value) && typeof value.id === 'string'
+}
+
+function resolveInstanceAccountId(
+  cwd: string,
+  channel: ChannelKind,
+  priorAccountIds: ReadonlySet<string>,
+  requestedAccountId: string | undefined,
+): string | undefined {
+  if (requestedAccountId !== undefined) return requestedAccountId
+  const nextAccountIds = readChannelAccountIds(cwd, channel)
+  const added = [...nextAccountIds].filter((id) => !priorAccountIds.has(id))
+  if (added.length === 1) return added[0]
+  return readCurrentChannelAccountId(cwd, channel)
+}
+
+function readCurrentChannelAccountId(cwd: string, channel: ChannelKind): string | undefined {
+  const block = readChannelSecretsBlock(cwd, channel)
+  if (!isObjectRecord(block)) return undefined
+  return typeof block.currentAccount === 'string' && block.currentAccount.length > 0 ? block.currentAccount : undefined
+}
+
+function readChannelAccountIds(cwd: string, channel: ChannelKind): Set<string> {
+  const block = readChannelSecretsBlock(cwd, channel)
+  if (!isObjectRecord(block) || !isObjectRecord(block.accounts)) return new Set()
+  return new Set(Object.keys(block.accounts))
+}
+
+function readChannelSecretsBlock(cwd: string, channel: ChannelKind): unknown {
+  const channels = new SecretsBackend(join(cwd, 'secrets.json')).tryReadChannelsSync()
+  return channels?.[channel]
 }
 
 function buildGithubChannelConfig(options: Extract<AddChannelOptions, { channel: 'github' }>): Record<string, unknown> {

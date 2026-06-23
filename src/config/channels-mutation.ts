@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { isMultiInstanceAdapter, isUserModeAdapter } from '@/channels/instances'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { SecretsBackend } from '@/secrets'
 
@@ -24,6 +25,8 @@ export type ChannelKind = (typeof CHANNEL_KINDS)[number]
 
 export type ChannelListEntry = {
   kind: ChannelKind
+  instanceId?: string
+  account?: string
   configured: boolean
   hasSecrets: boolean
   enabled: boolean
@@ -55,10 +58,21 @@ export function listChannels(cwd: string): ChannelListEntry[] {
   const configuredChannels = isObjectRecord(config.channels) ? config.channels : {}
   const secrets = channelSecretsOrEmpty(readChannelSecrets(cwd))
 
-  return CHANNEL_KINDS.map((kind) => {
+  return CHANNEL_KINDS.flatMap((kind) => {
     const channelConfig = configuredChannels[kind]
     const configured = kind in configuredChannels
     const hasSecrets = kind in secrets
+    if (isUserModeAdapter(kind) && hasInstanceEntries(channelConfig)) {
+      return channelConfig.instances.map((instance) => ({
+        kind,
+        instanceId: instance.id,
+        ...(instance.account !== undefined ? { account: instance.account } : {}),
+        configured,
+        hasSecrets: hasSecrets && instanceHasSecret(secrets[kind], instance.account),
+        enabled: readEnabled(instance),
+        ...buildDetail(kind, instance, secrets[kind]),
+      }))
+    }
     return {
       kind,
       configured,
@@ -69,7 +83,7 @@ export function listChannels(cwd: string): ChannelListEntry[] {
   }).filter((entry) => entry.configured || entry.hasSecrets)
 }
 
-export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResult {
+export function removeChannel(cwd: string, kind: ChannelKind, instanceId?: string): RemoveChannelResult {
   const config = readConfigRecord(cwd)
   if (!config.ok) return config
 
@@ -97,6 +111,11 @@ export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResu
     return { ok: false, reason: `Channel "${kind}" is not configured in ${CONFIG_FILE} or ${SECRETS_FILE}.` }
   }
 
+  if (instanceId !== undefined) {
+    if (!isMultiInstanceAdapter(kind)) return { ok: false, reason: `Channel "${kind}" does not support instances.` }
+    return removeChannelInstance({ cwd, kind, instanceId, config: config.value, channels, secrets })
+  }
+
   const githubRepos = kind === 'github' ? readGithubRepos(channels.github) : []
   const hadRemoteWebhooks = githubRepos.length > 0
 
@@ -117,6 +136,55 @@ export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResu
     ...(githubCleanup !== undefined ? { githubCleanup } : {}),
     hadRemoteWebhooks,
   }
+}
+
+function removeChannelInstance(options: {
+  cwd: string
+  kind: ChannelKind
+  instanceId: string
+  config: Record<string, unknown>
+  channels: Record<string, unknown>
+  secrets: Record<string, unknown>
+}): RemoveChannelResult {
+  const existing = options.channels[options.kind]
+  if (!hasInstanceEntries(existing)) {
+    return { ok: false, reason: `Channel "${options.kind}" is not configured with instances.` }
+  }
+
+  const target = existing.instances.find((instance) => instance.id === options.instanceId)
+  if (target === undefined) {
+    return { ok: false, reason: `Channel "${options.kind}" has no instance "${options.instanceId}".` }
+  }
+
+  const remaining = existing.instances.filter((instance) => instance.id !== options.instanceId)
+  if (remaining.length === 0) delete options.channels[options.kind]
+  else options.channels[options.kind] = { ...existing, instances: remaining }
+  options.config.channels = options.channels
+
+  const write = writeConfig(options.cwd, options.config, `channel: remove ${options.kind}:${options.instanceId}`)
+  if (!write.ok) return write
+
+  const secretsRemoved = removeInstanceSecretAccount(options.cwd, options.kind, target.account)
+  return {
+    ok: true,
+    configRemoved: true,
+    secretsRemoved,
+    hadRemoteWebhooks: false,
+  }
+}
+
+function removeInstanceSecretAccount(cwd: string, kind: ChannelKind, account: string | undefined): boolean {
+  if (account === undefined) return false
+  const backend = new SecretsBackend(join(cwd, SECRETS_FILE))
+  const channels = backend.tryReadChannelsSync()
+  if (channels === null) return false
+  const block = channels[kind]
+  if (!isObjectRecord(block) || !isObjectRecord(block.accounts) || !(account in block.accounts)) return false
+  const accounts = { ...block.accounts }
+  delete accounts[account]
+  const currentAccount = block.currentAccount === account ? (Object.keys(accounts)[0] ?? null) : block.currentAccount
+  backend.writeChannelsSync({ ...channels, [kind]: { ...block, currentAccount, accounts } })
+  return true
 }
 
 // GitHub `add` writes three config artifacts beyond `channels.github`: a
@@ -189,7 +257,13 @@ function buildDetail(kind: ChannelKind, channelConfig: unknown, secretsBlock: un
     const repos = isObjectRecord(channelConfig) && Array.isArray(channelConfig.repos) ? channelConfig.repos.length : 0
     return { detail: `${repos} repo${repos === 1 ? '' : 's'}` }
   }
-  if (kind === 'line' || kind === 'kakaotalk' || kind === 'webex' || kind === 'discord') {
+  if (isUserModeAdapter(kind)) {
+    if (isObjectRecord(channelConfig) && typeof channelConfig.id === 'string') {
+      const account = typeof channelConfig.account === 'string' ? channelConfig.account : undefined
+      const parts = [`id: ${channelConfig.id}`]
+      if (account !== undefined) parts.push(`account: ${account}${accountLabelSuffix(secretsBlock, account)}`)
+      return { detail: parts.join(', ') }
+    }
     if (!isObjectRecord(secretsBlock)) return {}
     const accounts = isObjectRecord(secretsBlock.accounts) ? Object.keys(secretsBlock.accounts).length : 0
     const current = typeof secretsBlock.currentAccount === 'string' ? secretsBlock.currentAccount : undefined
@@ -197,6 +271,35 @@ function buildDetail(kind: ChannelKind, channelConfig: unknown, secretsBlock: un
     return { detail: current !== undefined ? `${accountLabel} (active: ${current})` : accountLabel }
   }
   return {}
+}
+
+function accountLabelSuffix(secretsBlock: unknown, accountId: string): string {
+  if (!isObjectRecord(secretsBlock) || !isObjectRecord(secretsBlock.accounts)) return ''
+  const account = secretsBlock.accounts[accountId]
+  if (!isObjectRecord(account)) return ''
+  const label = readAccountLabel(account)
+  return label === undefined ? '' : ` (${label})`
+}
+
+function readAccountLabel(account: Record<string, unknown>): string | undefined {
+  for (const key of ['workspace_name', 'username', 'email', 'account_id', 'user_id']) {
+    const value = account[key]
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return undefined
+}
+
+function instanceHasSecret(secretsBlock: unknown, accountId: string | undefined): boolean {
+  if (accountId === undefined) return isObjectRecord(secretsBlock)
+  return isObjectRecord(secretsBlock) && isObjectRecord(secretsBlock.accounts) && accountId in secretsBlock.accounts
+}
+
+function hasInstanceEntries(value: unknown): value is { instances: Array<{ id: string; account?: string }> } {
+  return isObjectRecord(value) && Array.isArray(value.instances) && value.instances.every(isInstanceEntry)
+}
+
+function isInstanceEntry(value: unknown): value is { id: string; account?: string } {
+  return isObjectRecord(value) && typeof value.id === 'string'
 }
 
 function readEnabled(channelConfig: unknown): boolean {

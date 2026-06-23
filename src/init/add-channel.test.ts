@@ -149,6 +149,65 @@ describe('runAddChannel', () => {
     expect((await readSecrets()).providers?.fireworks).toEqual({ type: 'api_key', key: { value: 'fw_existing' } })
   })
 
+  test('keeps first slack user add without --id in flat config for back-compat', async () => {
+    await runAddChannel({
+      cwd: root,
+      channel: 'slack',
+      slackQrDataUrl: 'data:image/png;base64,abc',
+      runSlackAuth: async ({ cwd }) => {
+        await writeSlackAccount(cwd, 'acme', 'Acme')
+        return { ok: true }
+      },
+    })
+
+    const cfg = await readConfig()
+    expect(cfg.channels?.slack).toEqual({})
+  })
+
+  test('migrates flat slack config when adding a second instance with --id', async () => {
+    const cfg = JSON.parse(await readFile(join(root, 'typeclaw.json'), 'utf8')) as Record<string, unknown>
+    cfg.channels = { slack: { enabled: false, history: { prefetch: { channel: { tail: 2 } } } } }
+    await writeFile(join(root, 'typeclaw.json'), `${JSON.stringify(cfg, null, 2)}\n`)
+    await writeSlackAccount(root, 'acme', 'Acme')
+
+    await runAddChannel({
+      cwd: root,
+      channel: 'slack',
+      instanceId: 'personal',
+      slackQrDataUrl: 'data:image/png;base64,abc',
+      runSlackAuth: async ({ cwd }) => {
+        await writeSlackAccount(cwd, 'personal', 'Personal')
+        return { ok: true }
+      },
+    })
+
+    const cfgAfter = await readConfig()
+    expect(cfgAfter.channels?.slack).toEqual({
+      instances: [
+        { id: 'default', account: 'acme', enabled: false, history: { prefetch: { channel: { tail: 2 } } } },
+        { id: 'personal', account: 'personal' },
+      ],
+    })
+    const slack = (await readSecretsChannels()).slack as { accounts: Record<string, unknown> }
+    expect(Object.keys(slack.accounts).sort()).toEqual(['acme', 'personal'])
+  })
+
+  test('adds first slack user with --id as an instances config', async () => {
+    await runAddChannel({
+      cwd: root,
+      channel: 'slack',
+      instanceId: 'acme',
+      slackQrDataUrl: 'data:image/png;base64,abc',
+      runSlackAuth: async ({ cwd }) => {
+        await writeSlackAccount(cwd, 'acme', 'Acme')
+        return { ok: true }
+      },
+    })
+
+    const cfg = await readConfig()
+    expect(cfg.channels?.slack).toEqual({ instances: [{ id: 'acme', account: 'acme' }] })
+  })
+
   test('adds telegram-bot config + secrets.json#channels.telegram-bot', async () => {
     await runAddChannel({ cwd: root, channel: 'telegram-bot', telegramBotToken: '123:tg-secret' })
 
@@ -736,6 +795,40 @@ describe('runAddChannel', () => {
     ])
   })
 })
+
+async function writeSlackAccount(cwd: string, accountId: string, workspaceName: string): Promise<void> {
+  const raw = JSON.parse(await readFile(join(cwd, 'secrets.json'), 'utf8')) as {
+    channels?: Record<string, unknown>
+    [key: string]: unknown
+  }
+  const channels = raw.channels ?? {}
+  const block = isRecord(channels.slack) ? channels.slack : {}
+  const accounts = isRecord(block.accounts) ? block.accounts : {}
+  raw.channels = {
+    ...channels,
+    slack: {
+      ...block,
+      currentAccount: accountId,
+      accounts: {
+        ...accounts,
+        [accountId]: {
+          account_id: accountId,
+          token: `token-${accountId}`,
+          cookie: `cookie-${accountId}`,
+          workspace_id: accountId,
+          workspace_name: workspaceName,
+          created_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    },
+  }
+  await writeFile(join(cwd, 'secrets.json'), `${JSON.stringify(raw, null, 2)}\n`)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
 describe('auto-commit on success', () => {
   async function runGit(cwd: string, args: string[]): Promise<string> {
