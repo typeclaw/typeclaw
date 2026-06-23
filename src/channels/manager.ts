@@ -22,6 +22,7 @@ import { createTelegramBotAdapter, type TelegramBotAdapter } from './adapters/te
 import { createWebexAdapter, type WebexAdapter } from './adapters/webex'
 import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bot'
 import type { GithubTokenBridge } from './github-token-bridge'
+import { instanceKeyId, normalizeChannels, type ChannelInstanceConfig } from './instances'
 import {
   createChannelRouter,
   type ChannelRouter,
@@ -29,13 +30,7 @@ import {
   type CreateSessionForChannel,
   type RestartCommandContext,
 } from './router'
-import {
-  ADAPTER_IDS,
-  type AdapterId,
-  type ChannelAdapterConfig,
-  type ChannelsConfig,
-  type GithubAdapterConfig,
-} from './schema'
+import { type AdapterId, type ChannelAdapterConfig, type ChannelsConfig, type GithubAdapterConfig } from './schema'
 
 export type ChannelManagerLogger = {
   info: (msg: string) => void
@@ -82,6 +77,9 @@ export type ChannelManagerOptions = {
   createTelegramAdapter?: typeof createTelegramBotAdapter
   createWebexAdapter?: typeof createWebexAdapter
   createWebexBotAdapter?: typeof createWebexBotAdapter
+  // Test seam for Phase-2 multi-instance lifecycle coverage. Production always
+  // uses normalizeChannels(), which emits one default instance per adapter.
+  normalizeChannelsOverride?: (cfg: ChannelsConfig) => ChannelInstanceConfig[]
   // Wake-up gate: forwarded to the router, which calls
   // `permissions.has(origin, 'channel.respond')` BEFORE creating a
   // session for any inbound. Optional here to keep direct manager-level
@@ -139,6 +137,7 @@ export type ChannelManager = {
   stop: () => Promise<void>
   restartAdapter: (name: AdapterId) => Promise<void>
   reload: () => Promise<{ started: string[]; stopped: string[]; restartRequired: string[] }>
+  __testing?: { liveKeys: () => string[]; liveCount: () => number }
 }
 
 type AnyAdapter =
@@ -162,6 +161,9 @@ type AnyAdapter =
 // env-var-based adapters and KakaoTalk's account credential pathway.
 type AdapterEntry = {
   adapter: AnyAdapter
+  adapterId: AdapterId
+  instanceId: string
+  workspace: string | null
   credentialSignature: string
   disconnectedSinceMs: number | null
   recoveryRestartQueued: boolean
@@ -195,9 +197,10 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const createTelegramAdapter = options.createTelegramAdapter ?? createTelegramBotAdapter
   const createWebex = options.createWebexAdapter ?? createWebexAdapter
   const createWebexBot = options.createWebexBotAdapter ?? createWebexBotAdapter
+  const normalize = options.normalizeChannelsOverride ?? normalizeChannels
 
-  const live = new Map<AdapterId, AdapterEntry>()
-  const perAdapterSerial = new Map<AdapterId, Promise<unknown>>()
+  const live = new Map<string, AdapterEntry>()
+  const perAdapterSerial = new Map<string, Promise<unknown>>()
   const recovery = options.connectionRecovery ?? {}
   const recoveryCheckIntervalMs = recovery.checkIntervalMs ?? 30_000
   const recoveryDisconnectedGraceMs = recovery.disconnectedGraceMs ?? 90_000
@@ -207,24 +210,25 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     recovery.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
   let recoveryTimer: unknown = null
 
-  const runSerially = <T>(name: AdapterId, op: () => Promise<T>): Promise<T> => {
-    const prev = perAdapterSerial.get(name) ?? Promise.resolve()
+  const runSerially = <T>(key: string, op: () => Promise<T>): Promise<T> => {
+    const prev = perAdapterSerial.get(key) ?? Promise.resolve()
     const next = prev.then(op, op)
     perAdapterSerial.set(
-      name,
+      key,
       next.catch(() => {}),
     )
     return next
   }
 
-  const buildCredentialSignature = (name: AdapterId): { signature: string; missing: string[] } => {
-    if (name === 'line') return buildLineSignature(options.agentDir)
-    if (name === 'kakaotalk') return buildKakaotalkSignature(options.agentDir)
-    if (name === 'webex') return buildWebexSignature(options.agentDir)
-    if (name === 'slack') return buildSlackSignature(options.agentDir)
-    if (name === 'discord') return buildDiscordSignature(options.agentDir)
-    if (name === 'github') return buildGithubSignature(options.agentDir)
-    const requiredEnvs = TOKEN_ENV[name]
+  const buildCredentialSignature = (instance: ChannelInstanceConfig): { signature: string; missing: string[] } => {
+    const { adapter } = instance
+    if (adapter === 'line') return buildLineSignature(options.agentDir)
+    if (adapter === 'kakaotalk') return buildKakaotalkSignature(options.agentDir)
+    if (adapter === 'webex') return buildWebexSignature(options.agentDir)
+    if (adapter === 'slack') return buildSlackSignature(options.agentDir)
+    if (adapter === 'discord') return buildDiscordSignature(options.agentDir)
+    if (adapter === 'github') return buildGithubSignature(options.agentDir)
+    const requiredEnvs = TOKEN_ENV[adapter]
     const parts: string[] = []
     const missing: string[] = []
     for (const key of requiredEnvs) {
@@ -235,82 +239,89 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     return { signature: parts.join('|'), missing }
   }
 
-  const buildAdapter = (name: AdapterId, cfg: ChannelAdapterConfig): AnyAdapter | null => {
-    if (name === 'discord-bot') {
+  const desiredInstance = (adapter: AdapterId, instanceId: string): ChannelInstanceConfig | undefined =>
+    normalize(options.channelsConfigRef()).find(
+      (instance) => instance.adapter === adapter && instance.instanceId === instanceId,
+    )
+
+  const buildAdapter = (instance: ChannelInstanceConfig): AnyAdapter | null => {
+    const { adapter, instanceId, config: cfg } = instance
+    const configRef = () => desiredInstance(adapter, instanceId)?.config ?? cfg
+    if (adapter === 'discord-bot') {
       const token = env.DISCORD_BOT_TOKEN
       if (token === undefined || token.trim() === '') return null
       return createDiscordBot({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         token,
         logger,
       })
     }
-    if (name === 'slack-bot') {
+    if (adapter === 'slack-bot') {
       const token = env.SLACK_BOT_TOKEN
       const appToken = env.SLACK_APP_TOKEN
       if (token === undefined || token.trim() === '') return null
       if (appToken === undefined || appToken.trim() === '') return null
       return createSlackBot({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         token,
         appToken,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
       })
     }
-    if (name === 'line') {
+    if (adapter === 'line') {
       return createLine({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerLineCredentialStore(options.agentDir, env),
       })
     }
-    if (name === 'kakaotalk') {
+    if (adapter === 'kakaotalk') {
       return createKakaotalk({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerKakaoCredentialStore(options.agentDir, env),
       })
     }
-    if (name === 'slack') {
+    if (adapter === 'slack') {
       return createSlackUser({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerSlackCredentialStore(options.agentDir, env),
       })
     }
-    if (name === 'discord') {
+    if (adapter === 'discord') {
       return createDiscordUser({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerDiscordCredentialStore(options.agentDir, env),
       })
     }
-    if (name === 'webex') {
+    if (adapter === 'webex') {
       return createWebex({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore: createContainerWebexCredentialStore(options.agentDir, env),
       })
     }
-    if (name === 'github') {
+    if (adapter === 'github') {
       const secrets = readGithubSecrets(options.agentDir)
       if (secrets === null) return null
       return createGithub({
         router,
-        configRef: () => (options.channelsConfigRef()[name] ?? cfg) as ChannelAdapterConfig & GithubAdapterConfig,
+        configRef: () => configRef() as ChannelAdapterConfig & GithubAdapterConfig,
         secrets,
         agentDir: options.agentDir,
         logger,
@@ -319,22 +330,22 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         ...(options.githubTokenBridge !== undefined ? { githubTokenBridge: options.githubTokenBridge } : {}),
       })
     }
-    if (name === 'telegram-bot') {
+    if (adapter === 'telegram-bot') {
       const token = env.TELEGRAM_BOT_TOKEN
       if (token === undefined || token.trim() === '') return null
       return createTelegramAdapter({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         token,
         logger,
       })
     }
-    if (name === 'webex-bot') {
+    if (adapter === 'webex-bot') {
       const token = env.WEBEX_BOT_TOKEN
       if (token === undefined || token.trim() === '') return null
       return createWebexBot({
         router,
-        configRef: () => options.channelsConfigRef()[name] ?? cfg,
+        configRef,
         token,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
@@ -343,52 +354,60 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     return null
   }
 
-  const startAdapter = async (name: AdapterId, cfg: ChannelAdapterConfig): Promise<boolean> => {
-    if (cfg.enabled === false) {
-      logger.info(`[channels] adapter "${name}" is disabled; skipping`)
+  const startAdapter = async (instance: ChannelInstanceConfig): Promise<boolean> => {
+    const { adapter, instanceId, config } = instance
+    const key = instanceKeyId(adapter, instanceId)
+    if (config.enabled === false) {
+      logger.info(`[channels] adapter "${displayInstance(instance)}" is disabled; skipping`)
       return false
     }
-    const { signature, missing } = buildCredentialSignature(name)
+    const { signature, missing } = buildCredentialSignature(instance)
     if (missing.length > 0) {
-      logger.error(`[channels] adapter "${name}" missing credentials: ${missing.join(', ')}; skipping`)
+      logger.error(
+        `[channels] adapter "${displayInstance(instance)}" missing credentials: ${missing.join(', ')}; skipping`,
+      )
       return false
     }
-    const adapter = buildAdapter(name, cfg)
-    if (adapter === null) {
-      logger.error(`[channels] adapter "${name}" could not be constructed; skipping`)
+    const built = buildAdapter(instance)
+    if (built === null) {
+      logger.error(`[channels] adapter "${displayInstance(instance)}" could not be constructed; skipping`)
       return false
     }
     try {
-      await adapter.start()
-      live.set(name, {
-        adapter,
+      await built.start()
+      live.set(key, {
+        adapter: built,
+        adapterId: adapter,
+        instanceId,
+        // TODO(Phase 3): populate this if/when adapters expose their connected workspace.
+        workspace: null,
         credentialSignature: signature,
-        disconnectedSinceMs: adapter.isConnected() ? null : recoveryNow(),
+        disconnectedSinceMs: built.isConnected() ? null : recoveryNow(),
         recoveryRestartQueued: false,
       })
-      logger.info(`[channels] adapter "${name}" started`)
+      logger.info(`[channels] adapter "${displayInstance(instance)}" started`)
       return true
     } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to start: ${describe(err)}`)
+      logger.error(`[channels] adapter "${displayInstance(instance)}" failed to start: ${describe(err)}`)
       return false
     }
   }
 
-  const stopAdapter = async (name: AdapterId): Promise<void> => {
-    const entry = live.get(name)
+  const stopAdapter = async (key: string): Promise<void> => {
+    const entry = live.get(key)
     if (!entry) return
     try {
       await entry.adapter.stop()
-      live.delete(name)
-      logger.info(`[channels] adapter "${name}" stopped`)
+      live.delete(key)
+      logger.info(`[channels] adapter "${displayEntry(entry)}" stopped`)
     } catch (err) {
-      logger.error(`[channels] adapter "${name}" failed to stop: ${describe(err)}`)
+      logger.error(`[channels] adapter "${displayEntry(entry)}" failed to stop: ${describe(err)}`)
     }
   }
 
   const checkConnectionRecovery = (): void => {
     const now = recoveryNow()
-    for (const [name, entry] of live) {
+    for (const [key, entry] of live) {
       if (entry.adapter.isConnected()) {
         entry.disconnectedSinceMs = null
         entry.recoveryRestartQueued = false
@@ -396,28 +415,28 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       }
       if (entry.disconnectedSinceMs === null) {
         entry.disconnectedSinceMs = now
-        logger.warn(`[channels] adapter "${name}" is disconnected; waiting for SDK recovery`)
+        logger.warn(`[channels] adapter "${displayEntry(entry)}" is disconnected; waiting for SDK recovery`)
         continue
       }
       const disconnectedForMs = now - entry.disconnectedSinceMs
       if (disconnectedForMs < recoveryDisconnectedGraceMs || entry.recoveryRestartQueued) continue
       entry.recoveryRestartQueued = true
       logger.warn(
-        `[channels] adapter "${name}" disconnected for ${Math.round(disconnectedForMs)}ms; restarting adapter`,
+        `[channels] adapter "${displayEntry(entry)}" disconnected for ${Math.round(disconnectedForMs)}ms; restarting adapter`,
       )
-      void runSerially(name, async () => {
+      void runSerially(key, async () => {
         try {
-          const current = live.get(name)
+          const current = live.get(key)
           if (current !== entry) return
-          const currentCfg = options.channelsConfigRef()[name]
-          if (currentCfg === undefined || currentCfg.enabled === false) {
-            logger.info(`[channels] recovery restart for "${name}" skipped; adapter no longer enabled`)
+          const currentInstance = desiredInstance(entry.adapterId, entry.instanceId)
+          if (currentInstance === undefined || currentInstance.config.enabled === false) {
+            logger.info(`[channels] recovery restart for "${displayEntry(entry)}" skipped; adapter no longer enabled`)
             return
           }
-          await stopAdapter(name)
-          await startAdapter(name, currentCfg)
+          await stopAdapter(key)
+          await startAdapter(currentInstance)
         } finally {
-          if (live.get(name) === entry) entry.recoveryRestartQueued = false
+          if (live.get(key) === entry) entry.recoveryRestartQueued = false
         }
       })
     }
@@ -438,13 +457,14 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     router,
 
     async start(): Promise<void> {
-      const cfg = options.channelsConfigRef()
-      // Safe to fan out: router registries are keyed by route key
-      // (adapter:workspace), so different instances do not collide. Serial start
-      // would otherwise pay the sum of each adapter's connect latency.
-      const starts = ADAPTER_IDS.flatMap((name) => {
-        const adapterCfg = cfg[name]
-        return adapterCfg === undefined ? [] : [runSerially(name, () => startAdapter(name, adapterCfg))]
+      const instances = normalize(options.channelsConfigRef())
+      // Safe to fan out: manager lifecycle work is serialized by lifecycle
+      // instance key (adapter:instanceId), while router registries are keyed by
+      // route key (adapter:workspace). Serial start would otherwise pay the sum
+      // of each adapter instance's connect latency.
+      const starts = instances.map((instance) => {
+        const key = instanceKeyId(instance.adapter, instance.instanceId)
+        return runSerially(key, () => startAdapter(instance))
       })
       // Await every launched start to settle BEFORE surfacing a failure.
       // `startAdapter` converts expected per-adapter failures to `false`, so a
@@ -460,45 +480,55 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
 
     async stop(): Promise<void> {
       stopRecoveryTimer()
-      for (const name of Array.from(live.keys())) await runSerially(name, () => stopAdapter(name))
+      for (const key of Array.from(live.keys())) await runSerially(key, () => stopAdapter(key))
       await router.stop()
     },
 
     async restartAdapter(name: AdapterId): Promise<void> {
-      await runSerially(name, async () => {
-        if (!live.has(name)) {
+      const instanceId = 'default'
+      const key = instanceKeyId(name, instanceId)
+      await runSerially(key, async () => {
+        if (!live.has(key)) {
           logger.info(`[channels] restartAdapter('${name}'): adapter not live, skipping`)
           return
         }
-        const currentCfg = options.channelsConfigRef()[name]
-        if (currentCfg === undefined) {
+        const currentInstance = desiredInstance(name, instanceId)
+        if (currentInstance === undefined) {
           logger.info(`[channels] restartAdapter('${name}'): adapter config missing, skipping`)
           return
         }
-        await stopAdapter(name)
-        await startAdapter(name, currentCfg)
+        await stopAdapter(key)
+        await startAdapter(currentInstance)
       })
     },
 
     async reload(): Promise<{ started: string[]; stopped: string[]; restartRequired: string[] }> {
-      const cfg = options.channelsConfigRef()
+      const desired = new Map(
+        normalize(options.channelsConfigRef()).map((instance) => [
+          instanceKeyId(instance.adapter, instance.instanceId),
+          instance,
+        ]),
+      )
       const started: string[] = []
       const stopped: string[] = []
       const restartRequired: string[] = []
 
-      for (const name of ADAPTER_IDS) {
-        const desired = cfg[name]
-        const current = live.get(name)
-        if (desired === undefined || desired.enabled === false) {
-          if (current) {
-            await runSerially(name, () => stopAdapter(name))
-            stopped.push(name)
-          }
-        } else if (!current) {
-          const ok = await runSerially(name, () => startAdapter(name, desired))
-          if (ok) started.push(name)
+      for (const [key, entry] of Array.from(live)) {
+        const instance = desired.get(key)
+        if (instance === undefined || instance.config.enabled === false) {
+          await runSerially(key, () => stopAdapter(key))
+          stopped.push(displayEntry(entry))
+        }
+      }
+
+      for (const [key, instance] of desired) {
+        if (instance.config.enabled === false) continue
+        const current = live.get(key)
+        if (!current) {
+          const ok = await runSerially(key, () => startAdapter(instance))
+          if (ok) started.push(displayInstance(instance))
         } else {
-          const { signature, missing } = buildCredentialSignature(name)
+          const { signature, missing } = buildCredentialSignature(instance)
           if (missing.length > 0) {
             // Required credentials disappeared (env vars removed from .env, or
             // KakaoTalk credentials removed from secrets.json). Continuing to use the
@@ -506,23 +536,40 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             // operator explicitly removed, so stop the adapter instead of
             // waiting for a manual restart.
             logger.warn(
-              `[channels] adapter "${name}" missing credentials after reload (${missing.join(', ')}); stopping`,
+              `[channels] adapter "${displayInstance(instance)}" missing credentials after reload (${missing.join(', ')}); stopping`,
             )
-            await runSerially(name, () => stopAdapter(name))
-            stopped.push(name)
+            await runSerially(key, () => stopAdapter(key))
+            stopped.push(displayInstance(instance))
           } else if (signature !== current.credentialSignature) {
             const reason =
-              name === 'kakaotalk' || name === 'line' || name === 'webex' || name === 'slack' || name === 'discord'
+              instance.adapter === 'kakaotalk' ||
+              instance.adapter === 'line' ||
+              instance.adapter === 'webex' ||
+              instance.adapter === 'slack' ||
+              instance.adapter === 'discord'
                 ? 'credential rotation'
                 : 'token rotation'
-            restartRequired.push(`${name} (${reason})`)
+            restartRequired.push(`${displayInstance(instance)} (${reason})`)
           }
         }
       }
 
       return { started, stopped, restartRequired }
     },
+
+    __testing: {
+      liveKeys: () => Array.from(live.keys()),
+      liveCount: () => live.size,
+    },
   }
+}
+
+function displayInstance(instance: ChannelInstanceConfig): string {
+  return instance.instanceId === 'default' ? instance.adapter : instanceKeyId(instance.adapter, instance.instanceId)
+}
+
+function displayEntry(entry: Pick<AdapterEntry, 'adapterId' | 'instanceId'>): string {
+  return entry.instanceId === 'default' ? entry.adapterId : instanceKeyId(entry.adapterId, entry.instanceId)
 }
 
 // Token-based adapters only. Personal-account credentials live in

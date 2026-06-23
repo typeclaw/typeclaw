@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import type { AgentSession } from '@/agent'
 
+import { instanceKeyId, type ChannelInstanceConfig } from './instances'
 import { createChannelManager } from './manager'
 import { defaultHistoryConfig, type ChannelAdapterConfig, type ChannelsConfig } from './schema'
 import type { ChannelKey, InboundMessage } from './types'
@@ -411,6 +412,73 @@ describe('channel manager — restartAdapter serialization', () => {
 
     slackStopGate.resolve()
     await slackRestart
+    await mgr.stop()
+  })
+
+  test('tracks two same-adapter instances with distinct lifecycle keys and independent stop', async () => {
+    const slackCfg = enabledAdapterCfg()
+    cfg['slack-bot'] = slackCfg
+    const a = makeFakeAdapter()
+    const b = makeFakeAdapter()
+    const adapters = [a, b]
+    let instances: ChannelInstanceConfig[] = [
+      { adapter: 'slack-bot', instanceId: 'a', config: slackCfg },
+      { adapter: 'slack-bot', instanceId: 'b', config: slackCfg },
+    ]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { SLACK_BOT_TOKEN: 'xoxb-a', SLACK_APP_TOKEN: 'xapp-b' },
+      createSlackAdapter: () => adapters.shift()!,
+      normalizeChannelsOverride: () => instances,
+    })
+
+    await mgr.start()
+
+    expect(mgr.__testing?.liveKeys()).toEqual([instanceKeyId('slack-bot', 'a'), instanceKeyId('slack-bot', 'b')])
+    expect(mgr.__testing?.liveCount()).toBe(2)
+    expect(a.startCalls).toBe(1)
+    expect(b.startCalls).toBe(1)
+
+    instances = [{ adapter: 'slack-bot', instanceId: 'a', config: slackCfg }]
+    const result = await mgr.reload()
+
+    expect(result.stopped).toEqual([instanceKeyId('slack-bot', 'b')])
+    expect(mgr.__testing?.liveKeys()).toEqual([instanceKeyId('slack-bot', 'a')])
+    expect(a.stopCalls).toBe(0)
+    expect(b.stopCalls).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('reload starts only a newly added same-adapter instance', async () => {
+    const slackCfg = enabledAdapterCfg()
+    cfg['slack-bot'] = slackCfg
+    const a = makeFakeAdapter()
+    const b = makeFakeAdapter()
+    const adapters = [a, b]
+    let instances: ChannelInstanceConfig[] = [{ adapter: 'slack-bot', instanceId: 'a', config: slackCfg }]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { SLACK_BOT_TOKEN: 'xoxb-a', SLACK_APP_TOKEN: 'xapp-b' },
+      createSlackAdapter: () => adapters.shift()!,
+      normalizeChannelsOverride: () => instances,
+    })
+
+    await mgr.start()
+    instances = [
+      { adapter: 'slack-bot', instanceId: 'a', config: slackCfg },
+      { adapter: 'slack-bot', instanceId: 'b', config: slackCfg },
+    ]
+
+    const result = await mgr.reload()
+
+    expect(result.started).toEqual([instanceKeyId('slack-bot', 'b')])
+    expect(mgr.__testing?.liveKeys()).toEqual([instanceKeyId('slack-bot', 'a'), instanceKeyId('slack-bot', 'b')])
+    expect(a.startCalls).toBe(1)
+    expect(b.startCalls).toBe(1)
+
     await mgr.stop()
   })
 
