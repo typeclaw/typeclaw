@@ -84,6 +84,7 @@ import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } fr
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installCodexFetchObserver } from './codex-fetch-observer'
+import { connectMcpAndLoadPlugins } from './connect-mcp-and-load-plugins'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
 
 type BunServer = ReturnType<Server['start']>
@@ -170,22 +171,22 @@ export async function startAgent({
   const githubTokenBridge = createGithubTokenBridge()
   const mcpManager =
     cwdConfig.mcpServers.length > 0 ? createMcpManager(cwdConfig.mcpServers, { env: process.env }) : null
-  if (mcpManager !== null) {
-    const results = await mcpManager.connectAll()
-    for (const result of results) {
-      if (!result.ok) console.warn(`[mcp] ${result.name} failed to connect: ${result.error.message}`)
-    }
-  }
   const mcpManagerOpt = mcpManager !== null ? { mcpManager } : {}
-  const pluginsLoaded = await loadPlugins({
-    entries: withDefaultPlugins(cwdConfig.plugins),
-    agentDir: cwd,
-    configsByName: pluginConfigsByName,
-    bundled: BUNDLED_PLUGINS,
-    resolveGithubTokenForRepo: githubTokenBridge.resolveTokenForRepo,
-    hasGithubAppTokenResolver: githubTokenBridge.hasAppTokenResolver,
-    ...(cwdConfig.roles !== undefined ? { roles: cwdConfig.roles } : {}),
-  })
+  // MCP connection and plugin loading share no data, so run them concurrently
+  // instead of paying both serially. The helper joins with allSettled and closes
+  // any established MCP connection if the plugin load fails fatally, so a
+  // rejecting plugin load can't leak the background MCP servers.
+  const pluginsLoaded = await connectMcpAndLoadPlugins(mcpManager, () =>
+    loadPlugins({
+      entries: withDefaultPlugins(cwdConfig.plugins),
+      agentDir: cwd,
+      configsByName: pluginConfigsByName,
+      bundled: BUNDLED_PLUGINS,
+      resolveGithubTokenForRepo: githubTokenBridge.resolveTokenForRepo,
+      hasGithubAppTokenResolver: githubTokenBridge.hasAppTokenResolver,
+      ...(cwdConfig.roles !== undefined ? { roles: cwdConfig.roles } : {}),
+    }),
+  )
 
   reloadRegistry.register(
     createConfigReloadable({
