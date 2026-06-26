@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,6 +12,7 @@ import { noopPermissionService } from '@/permissions'
 import type { PluginContext, PluginExports, PluginLogger, SessionEndEvent, SessionIdleEvent } from '@/plugin'
 import { createPluginContext, createPluginLogger } from '@/plugin/context'
 import { formatLocalDate } from '@/shared'
+import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
 import memoryPlugin, { createMemoryPluginForTests, type MemoryPluginDeps } from './index'
 import { streamFilePath } from './paths'
@@ -165,7 +166,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(disposers.map((dispose) => dispose()))
-  await rm(agentDir, { recursive: true, force: true })
+  await rmTempDir(agentDir)
 })
 
 describe('memory plugin shape', () => {

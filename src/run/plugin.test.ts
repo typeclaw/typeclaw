@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import type { LoadCronResult } from '@/cron'
+import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
 import { startAgent, type LoadCronFn } from './index'
 
@@ -13,6 +14,13 @@ const noCron: LoadCronFn = async () => ({ ok: true, file: null }) as LoadCronRes
 let running: Awaited<ReturnType<typeof startAgent>> | null = null
 let agentDir: string | null = null
 let savedBrokerToken: string | undefined
+
+async function stopRunningAgent(): Promise<void> {
+  if (!running) return
+  running.tuiPromise?.catch(() => {})
+  await running.stop()
+  running = null
+}
 
 beforeEach(() => {
   // startAgent boots the agent-browser plugin. Keep the broker token absent so
@@ -23,13 +31,9 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  if (running) {
-    running.stop()
-    running.tuiPromise?.catch(() => {})
-    running = null
-  }
+  await stopRunningAgent()
   if (agentDir) {
-    await rm(agentDir, { recursive: true, force: true })
+    await rmTempDir(agentDir)
     agentDir = null
   }
   resetDashboardForwardRequest()

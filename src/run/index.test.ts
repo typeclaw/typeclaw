@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -9,6 +9,7 @@ import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } 
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
 import type { SessionFactory } from '@/sessions'
+import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TuiOptions } from '@/tui'
 import type { TunnelManager, TunnelManagerOptions } from '@/tunnels'
 
@@ -27,6 +28,13 @@ function stubScheduler(): Scheduler {
 let running: Awaited<ReturnType<typeof startAgent>> | null = null
 let savedBrokerToken: string | undefined
 
+async function stopRunningAgent(): Promise<void> {
+  if (!running) return
+  running.tuiPromise?.catch(() => {})
+  await running.stop()
+  running = null
+}
+
 beforeEach(() => {
   // startAgent boots the agent-browser plugin. Keep the broker token absent so
   // these run-loop tests do not publish a reserved dashboard forward request
@@ -39,10 +47,7 @@ afterEach(async () => {
   resetDashboardForwardRequest()
   if (savedBrokerToken === undefined) delete process.env['TYPECLAW_HOSTD_BROKER_TOKEN']
   else process.env['TYPECLAW_HOSTD_BROKER_TOKEN'] = savedBrokerToken
-  if (!running) return
-  running.tuiPromise?.catch(() => {})
-  await running.stop()
-  running = null
+  await stopRunningAgent()
 })
 
 describe('startAgent', () => {
@@ -54,7 +59,8 @@ describe('startAgent', () => {
     testCwd = await mkdtemp(join(tmpdir(), 'typeclaw-run-cwd-'))
   })
   afterEach(async () => {
-    await rm(testCwd, { recursive: true, force: true })
+    await stopRunningAgent()
+    await rmTempDir(testCwd)
   })
 
   test('starts a ws server on an ephemeral port in headless mode', async () => {
@@ -450,10 +456,9 @@ describe('startAgent', () => {
 
       expect(restarts).toEqual(['github'])
     } finally {
-      await running?.stop()
-      running = null
+      await stopRunningAgent()
       __resetConfigForTesting()
-      await rm(agentDir, { recursive: true, force: true })
+      await rmTempDir(agentDir)
     }
   })
 
@@ -513,10 +518,9 @@ describe('startAgent', () => {
       expect(tunnelOptions.resolveChannelUpstreamPort?.('slack')).toBeNull()
       expect(channelOptions.tunnelUrlForChannel?.('github')).toBe('https://x.trycloudflare.com')
     } finally {
-      await running?.stop()
-      running = null
+      await stopRunningAgent()
       __resetConfigForTesting()
-      await rm(agentDir, { recursive: true, force: true })
+      await rmTempDir(agentDir)
     }
   })
 })
@@ -546,7 +550,8 @@ describe('startAgent bundled memory plugin (dreaming cron)', () => {
       expect(factoryCalls).toHaveLength(1)
       expect(running.scheduler).not.toBeNull()
     } finally {
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 
@@ -577,7 +582,8 @@ describe('startAgent bundled memory plugin (dreaming cron)', () => {
       expect(factoryCalls).toHaveLength(1)
       expect(running.scheduler).not.toBeNull()
     } finally {
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 
@@ -616,7 +622,8 @@ describe('startAgent bundled memory plugin (dreaming cron)', () => {
       expect(ids).toContain('__plugin_memory_dreaming')
       expect(ids).toContain('user-job')
     } finally {
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 
@@ -668,7 +675,8 @@ describe('startAgent bundled memory plugin (dreaming cron)', () => {
         expect(dreamingMsg.payload).toEqual({ agentDir })
       }
     } finally {
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 })
@@ -703,7 +711,8 @@ describe('startAgent config reload wiring', () => {
     } finally {
       if (originalContainerName === undefined) delete process.env.TYPECLAW_CONTAINER_NAME
       else process.env.TYPECLAW_CONTAINER_NAME = originalContainerName
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 
@@ -735,7 +744,8 @@ describe('startAgent config reload wiring', () => {
       }
     } finally {
       if (originalContainerName !== undefined) process.env.TYPECLAW_CONTAINER_NAME = originalContainerName
-      await rm(agentDir, { recursive: true, force: true })
+      await stopRunningAgent()
+      await rmTempDir(agentDir)
     }
   })
 })
@@ -744,7 +754,8 @@ describe('startAgent session persistence wiring', () => {
   let agentDir: string
 
   afterEach(async () => {
-    if (agentDir) await rm(agentDir, { recursive: true, force: true })
+    await stopRunningAgent()
+    if (agentDir) await rmTempDir(agentDir)
   })
 
   test('creates <cwd>/sessions/ on disk when no sessionFactory is injected', async () => {

@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
 import { formatStatus, parseStatusResult, type StatusReport } from './status'
 
@@ -188,7 +190,7 @@ describe('typeclaw status survives broken typeclaw.json', () => {
   })
 
   afterEach(async () => {
-    await rm(cwd, { recursive: true, force: true })
+    await rmTempDir(cwd)
   })
 
   async function runStatus(): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -213,7 +215,9 @@ describe('typeclaw status survives broken typeclaw.json', () => {
     expect(stdout).toContain('Port forwarding')
     expect(stderr).toMatch(/not valid JSON/)
     expect(stderr).toMatch(/diagnostic commands still work/)
-  })
+    // Spawns `bun CLI status` (compiles + loads the full CLI); slow on a loaded
+    // Windows runner, so override the 30s default (require-parallel.ts).
+  }, 120_000)
 
   test('exits 0 and renders sections when typeclaw.json is schema-invalid', async () => {
     await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'not-a-known-model' } }))
@@ -222,12 +226,12 @@ describe('typeclaw status survives broken typeclaw.json', () => {
     expect(stdout).toContain('Container')
     expect(stdout).toContain('Host daemon')
     expect(stderr).toMatch(/typeclaw\.json is invalid/)
-  })
+  }, 120_000)
 
   test('exits 0 and prints no warning when typeclaw.json is missing (fresh dir)', async () => {
     const { exitCode, stdout, stderr } = await runStatus()
     expect(exitCode).toBe(0)
     expect(stdout).toContain('Container')
     expect(stderr).not.toMatch(/warning:/)
-  })
+  }, 120_000)
 })
