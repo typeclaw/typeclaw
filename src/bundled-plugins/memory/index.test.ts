@@ -150,7 +150,12 @@ function createMemoryPluginWithStoreCapture(overrides: Partial<MemoryPluginDeps>
     ...overrides,
     openAppendVectorStore: (dir) => {
       const store = VectorStore.open(join(dir, 'memory', '.vectors', 'index.db'))
-      disposers.push(() => store.close())
+      let closed = false
+      disposers.push(() => {
+        if (closed) return
+        closed = true
+        store.close()
+      })
       return store
     },
   })
@@ -213,6 +218,39 @@ describe('memory plugin shape', () => {
     expect(withDream.cronJobs?.dreaming?.schedule).toBe('*/30 * * * *')
   })
 
+  test('onDispose closes the append vector store', async () => {
+    let closed = false
+    const plugin = createMemoryPluginForTests({
+      openAppendVectorStore: (dir) => {
+        const store = VectorStore.open(join(dir, 'memory', '.vectors', 'index.db'))
+        const close = store.close.bind(store)
+        store.close = () => {
+          closed = true
+          close()
+        }
+        return store
+      },
+    })
+    const parsed = plugin.configSchema!.safeParse({})
+    if (!parsed.success) throw new Error(`config invalid: ${parsed.error.message}`)
+    const exports = await plugin.plugin(
+      createPluginContext({
+        name: 'memory',
+        version: undefined,
+        agentDir,
+        config: parsed.data,
+        logger: createPluginLogger('memory'),
+        permissions: noopPermissionService,
+        spawnSubagent: async () => {},
+        isBooted: () => true,
+      }),
+    )
+
+    exports.onDispose?.()
+
+    expect(closed).toBe(true)
+  })
+
   test('rejects invalid cron expression in dreaming.schedule', async () => {
     await expect(bootMemoryPlugin(agentDir, { dreaming: { schedule: 'not a cron' } })).rejects.toThrow(/cron/i)
   })
@@ -234,6 +272,18 @@ describe('session.idle hook (debouncer)', () => {
     const { exports, spawned } = await bootMemoryPlugin(agentDir, { idleMs: 1000 })
     const event: SessionIdleEvent = { sessionId: 'ses_a', parentTranscriptPath: '/tmp/t.jsonl', idleMs: 0 }
     await exports.hooks!['session.idle']!(event, { agentDir, pluginName: 'memory', logger: createPluginLogger('m') })
+    expect(spawned).toHaveLength(0)
+  })
+
+  test('onDispose cancels pending idle timers', async () => {
+    const { exports, spawned } = await bootMemoryPlugin(agentDir, { idleMs: 1000 })
+    const ctx = { agentDir, pluginName: 'memory', logger: createPluginLogger('m') }
+
+    await exports.hooks!['session.idle']!({ sessionId: 'ses_a', parentTranscriptPath: '/tmp/a.jsonl', idleMs: 0 }, ctx)
+    await exports.hooks!['session.idle']!({ sessionId: 'ses_b', parentTranscriptPath: '/tmp/b.jsonl', idleMs: 0 }, ctx)
+    exports.onDispose?.()
+    await tickMs(1100)
+
     expect(spawned).toHaveLength(0)
   })
 

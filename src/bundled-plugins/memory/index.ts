@@ -402,14 +402,18 @@ export function createMemoryPlugin(deps: MemoryPluginDeps = defaultDeps) {
         error: (m: string) => ctx.logger.error(m),
       }
 
-      // Long-lived, process-lifetime SQLite handle for append-time indexing
-      // (the on-write fragment/reference hooks below). Intentionally not closed
-      // by the plugin: it lives as long as the agent runtime and is released on
-      // process teardown. The per-turn query stores opened in renderVectorTurnMemory
-      // are the ones that get closed each turn.
+      // Long-lived SQLite handle for append-time indexing (the on-write
+      // fragment/reference hooks below). Closed in onDispose on agent stop so it
+      // does not pin the agent dir on Windows across restarts; the per-turn query
+      // stores opened in renderVectorTurnMemory are closed each turn.
       const appendVectorStore = deps.openAppendVectorStore(ctx.agentDir)
 
       return {
+        onDispose: () => {
+          for (const timer of idleTimers.values()) clearTimeout(timer)
+          idleTimers.clear()
+          appendVectorStore.close()
+        },
         subagents: {
           'memory-logger': createMemoryLoggerSubagent({
             logger: subagentLogger,
