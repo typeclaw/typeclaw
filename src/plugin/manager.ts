@@ -51,6 +51,7 @@ export type LoadPluginsResult = {
   failedPlugins: FailedPlugin[]
   markBooted: () => void
   setSpawnSubagent: (fn: SpawnSubagentFn) => void
+  disposePlugins: () => Promise<void>
 }
 
 export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPluginsResult> {
@@ -181,7 +182,20 @@ export async function loadPlugins(opts: LoadPluginsOptions): Promise<LoadPlugins
     setSpawnSubagent: (fn) => {
       spawnSubagentImpl = fn
     },
+    disposePlugins: () => disposePlugins(registry),
   }
+}
+
+async function disposePlugins(registry: PluginRegistry): Promise<void> {
+  await Promise.all(
+    registry.disposers.map(async (disposer) => {
+      try {
+        await disposer.dispose()
+      } catch (err) {
+        disposer.logger.warn(`onDispose failed: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }),
+  )
 }
 
 // Tags WHICH sub-phase failed (for the failedPlugins report) while preserving

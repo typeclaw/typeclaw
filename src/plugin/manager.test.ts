@@ -553,6 +553,44 @@ describe('loadPlugins — markBooted gates spawnSubagent', () => {
   })
 })
 
+describe('loadPlugins — plugin disposal', () => {
+  test('disposePlugins awaits all onDispose callbacks and isolates failures', async () => {
+    const calls: string[] = []
+    const loadEntry: LoadPluginEntryFn = async (entry) => ({
+      name: entry,
+      version: undefined,
+      source: entry,
+      defined: {
+        plugin: async () => ({
+          onDispose: async () => {
+            calls.push(`${entry}:start`)
+            await Promise.resolve()
+            if (entry === 'bad') throw new Error('dispose boom')
+            calls.push(`${entry}:done`)
+          },
+        }),
+      },
+    })
+
+    const cap = captureWarnings()
+    try {
+      const result = await loadPlugins({
+        entries: ['good', 'bad', 'later'],
+        agentDir: '/tmp',
+        configsByName: {},
+        loadEntry,
+      })
+
+      await result.disposePlugins()
+    } finally {
+      cap.restore()
+    }
+
+    expect(calls).toEqual(expect.arrayContaining(['good:start', 'good:done', 'bad:start', 'later:start', 'later:done']))
+    expect(cap.warnings.some((w) => w.includes('[plugin:bad] onDispose failed: dispose boom'))).toBe(true)
+  })
+})
+
 describe('loadPlugins — registry shape', () => {
   test('pluginCronJobs returns CronJob[] with __plugin_<name>_<key> ids', async () => {
     const loadEntry: LoadPluginEntryFn = async () => ({

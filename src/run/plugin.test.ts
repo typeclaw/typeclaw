@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import type { LoadCronResult } from '@/cron'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
+import type { TunnelManager } from '@/tunnels'
 
 import { startAgent, type LoadCronFn } from './index'
 
@@ -152,6 +153,86 @@ export default {
     }
     ws.close()
     throw new Error(`session.start hook never fired within ${TIMEOUT_MS}ms (sentinel ${sentinelFile} missing)`)
+  })
+
+  test('stop awaits plugin onDispose', async () => {
+    agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-plugin-e2e-'))
+    const sentinelFile = join(agentDir, 'disposed.log')
+    await writeFile(
+      join(agentDir, 'typeclaw.json'),
+      JSON.stringify({
+        models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' },
+        plugins: ['./plugin.ts'],
+      }),
+    )
+    await writePlugin(
+      agentDir,
+      `import { writeFile } from 'node:fs/promises'
+export default {
+  plugin: async () => ({
+    onDispose: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      await writeFile(${JSON.stringify(sentinelFile)}, 'disposed')
+    },
+  }),
+}`,
+    )
+
+    running = await startAgent({ port: 0, attachTui: false, cwd: agentDir, loadCron: noCron })
+
+    await running.stop()
+    running = null
+
+    expect(await Bun.file(sentinelFile).text()).toBe('disposed')
+  })
+
+  test('boot failure after plugins load (late tunnel start) still runs plugin onDispose', async () => {
+    agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-plugin-e2e-'))
+    const sentinelFile = join(agentDir, 'disposed.log')
+    await writeFile(
+      join(agentDir, 'typeclaw.json'),
+      JSON.stringify({
+        models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' },
+        plugins: ['./plugin.ts'],
+      }),
+    )
+    await writePlugin(
+      agentDir,
+      `import { writeFile } from 'node:fs/promises'
+export default {
+  plugin: async () => ({
+    onDispose: async () => {
+      await writeFile(${JSON.stringify(sentinelFile)}, 'disposed')
+    },
+  }),
+}`,
+    )
+
+    const failingTunnelManager = (): TunnelManager => ({
+      start: async () => {
+        throw new Error('boot failure: tunnel start')
+      },
+      stop: async () => {},
+      snapshot: () => [],
+      urlFor: () => null,
+      tail: () => [],
+      subscribeToLogs: () => () => {},
+    })
+
+    // tunnelManager.start() runs AFTER channelManager.start(), so a throw here
+    // proves the boot-cleanup stack disposes plugins on a LATE boot failure —
+    // the caller never gets a stop() on this path.
+    await expect(
+      startAgent({
+        port: 0,
+        attachTui: false,
+        cwd: agentDir,
+        loadCron: noCron,
+        createTunnelManager: failingTunnelManager,
+      }),
+    ).rejects.toThrow('boot failure: tunnel start')
+
+    expect(await Bun.file(sentinelFile).text()).toBe('disposed')
   })
 
   test('plugin skill is materialized and present in the resource loader for new sessions', async () => {

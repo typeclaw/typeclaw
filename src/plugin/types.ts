@@ -314,6 +314,10 @@ export type PluginExports = {
   skillsDirs?: string[]
   hooks?: Hooks
   doctorChecks?: Record<string, PluginDoctorCheck>
+  // Released once when the agent stops, for plugin-lifetime resources a GC can't
+  // reclaim deterministically (open DB handles, timers). Disposers are isolated:
+  // one throwing never blocks the others.
+  onDispose?: () => void | Promise<void>
 }
 
 export type PluginMcpServer = {

@@ -125,24 +125,32 @@ export type StartAgentResult = {
   stop: () => void | Promise<void>
 }
 
-// Thin wrapper that owns ONLY the boot-failure cleanup of process-global
-// installs. `installCodexFetchObserver` and `installFatalGuard` attach
-// process-wide listeners before the fallible boot work; if any boot step throws
-// before `startAgentRuntime` returns, the caller never receives a
-// `StartAgentResult` and can never call `stop()`, so those listeners would
-// strand and double-fire into the next `startAgent`. The runtime hands its
-// disposer back via `onProcessGlobalsInstalled`; on a boot throw we dispose and
+// Owns boot-failure cleanup for everything installed before `startAgentRuntime`
+// returns a `StartAgentResult`. `installCodexFetchObserver`/`installFatalGuard`
+// attach process-wide listeners, and `loadPlugins` opens plugin-lifetime
+// resources (the memory plugin's sqlite handle); if any boot step throws before
+// the result exists, the caller never receives `stop()`, so each of those would
+// strand. The runtime registers each cleanup via `registerBootCleanup` as boot
+// progresses; on a throw we run them all (newest first, best-effort) and
 // rethrow, on success ownership transfers to the returned `stop()`. `return
 // await` is load-bearing — without it an async boot rejection would escape this
-// try. Dispose is idempotent, so the success path's `stop()` never double-fires.
+// try. Cleanups are idempotent, so the success path's `stop()` never double-fires.
 export async function startAgent(options: StartAgentOptions): Promise<StartAgentResult> {
-  const captured: { dispose: (() => void) | null } = { dispose: null }
+  const bootCleanups: Array<() => void | Promise<void>> = []
   try {
-    return await startAgentRuntime(options, (dispose) => {
-      captured.dispose = dispose
+    return await startAgentRuntime(options, (cleanup) => {
+      bootCleanups.push(cleanup)
     })
   } catch (err) {
-    captured.dispose?.()
+    for (const cleanup of bootCleanups.reverse()) {
+      try {
+        await cleanup()
+      } catch (cleanupErr) {
+        console.warn(
+          `[run] boot-failure cleanup error: ${cleanupErr instanceof Error ? cleanupErr.message : cleanupErr}`,
+        )
+      }
+    }
     throw err
   }
 }
@@ -161,7 +169,7 @@ async function startAgentRuntime(
     createChannelManager: createChannelManagerFor = createChannelManager,
     createTunnelManager: createTunnelManagerFor = createTunnelManager,
   }: StartAgentOptions,
-  onProcessGlobalsInstalled: (dispose: () => void) => void,
+  registerBootCleanup: (cleanup: () => void | Promise<void>) => void,
 ): Promise<StartAgentResult> {
   const reloadRegistry = new ReloadRegistry()
 
@@ -218,7 +226,7 @@ async function startAgentRuntime(
     if (sigtermHandler !== null) process.removeListener('SIGTERM', sigtermHandler)
   }
   let sigtermHandler: (() => void) | null = null
-  onProcessGlobalsInstalled(disposeProcessGlobals)
+  registerBootCleanup(disposeProcessGlobals)
 
   const { config: cwdConfig, pluginConfigs: pluginConfigsByName } = loadConfigBundleSync(cwd)
   const githubTokenBridge = createGithubTokenBridge()
@@ -238,6 +246,10 @@ async function startAgentRuntime(
   })
   const vectorStartupPromise = runVectorStartup(cwd)
   const [pluginsLoaded] = await Promise.all([pluginsLoadedPromise, vectorStartupPromise])
+  // Plugins are loaded (sqlite handles open); from here any boot failure must
+  // release them — the caller gets no stop() on the failure path. (mcpManager is
+  // created below and cleaned up via bootMcpManager in disposeProcessGlobals.)
+  registerBootCleanup(() => pluginsLoaded.disposePlugins())
 
   reloadRegistry.register(
     createConfigReloadable({
@@ -936,10 +948,9 @@ async function startAgentRuntime(
   const stop = async () => {
     if (stopped) return
     stopped = true
-    // The crash-guard and codex-observer disposers run in `finally` so an
-    // earlier async teardown rejection (tunnel/channel/mcp stop) cannot strand
-    // the process-global listeners they removed — a stranded fatal-guard
-    // listener would survive into the next `startAgent` and double-fire.
+    // The final disposers run in `finally` so an earlier async teardown
+    // rejection cannot strand process-global listeners or plugin-owned handles
+    // into the next `startAgent`.
     try {
       scheduler?.stop()
       cronConsumer.stop()
@@ -954,6 +965,7 @@ async function startAgentRuntime(
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
+      await pluginsLoaded.disposePlugins()
       disposeProcessGlobals()
     }
   }

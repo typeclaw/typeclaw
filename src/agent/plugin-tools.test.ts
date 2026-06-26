@@ -1305,6 +1305,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
       skillsDirs: [],
       doctorChecks: [],
       commands: [],
+      disposers: [],
     }
 
     const session = await createSession({
@@ -1355,6 +1356,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
       skillsDirs: [],
       doctorChecks: [],
       commands: [],
+      disposers: [],
     }
 
     const session = await createSession({
@@ -1382,6 +1384,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
       skillsDirs: [],
       doctorChecks: [],
       commands: [],
+      disposers: [],
     }
 
     const session = await createSession({
@@ -1423,6 +1426,7 @@ describe('setupSession integration: builtin pi tools route through customTools w
       skillsDirs: [],
       doctorChecks: [],
       commands: [],
+      disposers: [],
     }
 
     const session = await createSession({

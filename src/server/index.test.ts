@@ -44,6 +44,7 @@ const EMPTY_REGISTRY: PluginRegistry = {
   skillsDirs: [],
   doctorChecks: [],
   commands: [],
+  disposers: [],
 }
 
 function makeRuntimeWith(opts: { subagents: SubagentRegistry }): PluginRuntime {

@@ -72,6 +72,14 @@ describe('registerContributions', () => {
     expect(() => registerContributions(opts)).toThrow(/doctor check "dir-writable" already registered/)
   })
 
+  test('records plugin disposers', () => {
+    const onDispose = () => {}
+    const opts = makeOptions('p1', { onDispose })
+    registerContributions(opts)
+
+    expect(opts.registry.disposers).toEqual([{ pluginName: 'p1', logger: noopLogger, dispose: onDispose }])
+  })
+
   test('rejects duplicate tool name across plugins', () => {
     const tool = defineTool({
       description: 'echo',
@@ -318,6 +326,7 @@ describe('discardRegistrationsBy', () => {
         skills: { sk1: { description: '', content: '' } },
         skillsDirs: ['/p1/skills'],
         hooks: { 'session.start': () => {} },
+        onDispose: () => {},
         doctorChecks: {
           ping: {
             description: 'always ok',
@@ -355,6 +364,7 @@ describe('discardRegistrationsBy', () => {
     expect(registry.skills).toEqual([])
     expect(registry.skillsDirs).toEqual([])
     expect(registry.doctorChecks).toEqual([])
+    expect(registry.disposers).toEqual([])
     expect(hooks.count('session.start')).toBe(0)
     expect(hooks.count('session.end')).toBe(1)
   })

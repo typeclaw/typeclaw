@@ -36,6 +36,11 @@ export type RegisteredCommand = {
   logger: PluginLogger
 }
 export type RegisteredMcpServer = { pluginName: string; name: string; server: PluginMcpServer; logger: PluginLogger }
+export type RegisteredPluginDisposer = {
+  pluginName: string
+  logger: PluginLogger
+  dispose: () => void | Promise<void>
+}
 
 export type PluginRegistry = {
   tools: RegisteredTool[]
@@ -46,6 +51,7 @@ export type PluginRegistry = {
   skillsDirs: RegisteredSkillDir[]
   doctorChecks: RegisteredDoctorCheck[]
   commands: RegisteredCommand[]
+  disposers: RegisteredPluginDisposer[]
 }
 
 export type RegisterContributionsOptions = {
@@ -178,6 +184,10 @@ export function registerContributions(opts: RegisterContributionsOptions): void 
       registry.commands.push({ pluginName, commandName, command, logger })
     }
   }
+
+  if (ex.onDispose) {
+    registry.disposers.push({ pluginName, logger, dispose: ex.onDispose })
+  }
 }
 
 export function discardRegistrationsBy(pluginName: string, registry: PluginRegistry, hooks: HookBus): void {
@@ -189,6 +199,7 @@ export function discardRegistrationsBy(pluginName: string, registry: PluginRegis
   registry.skillsDirs = registry.skillsDirs.filter((d) => d.pluginName !== pluginName)
   registry.doctorChecks = registry.doctorChecks.filter((d) => d.pluginName !== pluginName)
   registry.commands = registry.commands.filter((c) => c.pluginName !== pluginName)
+  registry.disposers = registry.disposers.filter((d) => d.pluginName !== pluginName)
   hooks.unregisterAll(pluginName)
 }
 
@@ -202,6 +213,7 @@ export function emptyRegistry(): PluginRegistry {
     skillsDirs: [],
     doctorChecks: [],
     commands: [],
+    disposers: [],
   }
 }
 
