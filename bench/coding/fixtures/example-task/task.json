@@ -1,0 +1,4 @@
+{
+  "verify": ["bash", "verify.sh"],
+  "timeoutMs": 30000
+}
