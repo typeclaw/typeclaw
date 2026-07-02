@@ -1,0 +1,10 @@
+services:
+  runner:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./datasets:/bench/datasets
+      - ./suites:/bench/suites
+      - ./results:/bench/results
+    network_mode: host
