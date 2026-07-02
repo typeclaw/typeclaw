@@ -3,6 +3,7 @@ import { resolveHostPort, resolveTuiToken } from './docker-discovery'
 import { buildReport, writeReport } from './report'
 import { scoreTask } from './score'
 import { loadTaskSuite } from './task'
+import { makeContainerVerifier } from './verify'
 import { makeContainerWorkspaceProvider } from './workspace'
 
 export type CodingRunArgs = {
@@ -48,10 +49,11 @@ async function runSinglePrompt(prompt: string, url: string): Promise<number> {
 async function runSuite(args: CodingRunArgs, url: string): Promise<number> {
   const runs = args.runs ?? 3
   const tasks = await loadTaskSuite(args.suite!)
+  const verify = makeContainerVerifier(args.container)
   const scores = []
   for (const task of tasks) {
     const workspaceProvider = makeContainerWorkspaceProvider(args.container, task.dir)
-    scores.push(await scoreTask({ task, url, runs, workspaceProvider }))
+    scores.push(await scoreTask({ task, url, runs, verify, workspaceProvider }))
   }
 
   const report = buildReport({ suite: args.suite!, container: args.container, runsPerTask: runs, scores })

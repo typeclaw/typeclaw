@@ -9,14 +9,23 @@ export type VerifyResult = {
 
 export type VerifyRunner = (command: string[], cwd: string, timeoutMs: number) => Promise<VerifyResult>
 
-export const runVerifier: VerifyRunner = (command, cwd, timeoutMs) =>
-  new Promise((resolve) => {
-    const [bin, ...args] = command
-    if (bin === undefined) {
-      resolve({ passed: false, exitCode: 1, stdout: '', stderr: 'empty verify command' })
-      return
-    }
+// Verifies in the ALREADY-PREPARED workspace via `docker exec -w <cwd>`. It does
+// NOT copy the task in — seeding is the workspace provider's job, done before the
+// agent turn. Copying here would overwrite the agent's output with the seed.
+export function makeContainerVerifier(container: string): VerifyRunner {
+  return (command, cwd, timeoutMs) => runProcess('docker', ['exec', '-w', cwd, container, ...command], timeoutMs)
+}
 
+export const runVerifier: VerifyRunner = (command, cwd, timeoutMs) => {
+  const [bin, ...args] = command
+  if (bin === undefined) {
+    return Promise.resolve({ passed: false, exitCode: 1, stdout: '', stderr: 'empty verify command' })
+  }
+  return runProcess(bin, args, timeoutMs, cwd)
+}
+
+function runProcess(bin: string, args: string[], timeoutMs: number, cwd?: string): Promise<VerifyResult> {
+  return new Promise((resolve) => {
     const child = spawn(bin, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
@@ -34,3 +43,4 @@ export const runVerifier: VerifyRunner = (command, cwd, timeoutMs) =>
       resolve({ passed: exitCode === 0, exitCode, stdout, stderr })
     })
   })
+}
