@@ -1,0 +1,20 @@
+{
+  "name": "@typeclaw/bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "lint": "oxlint",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "test": "bun test",
+    "coding": "bun run coding/run.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@typescript/native-preview": "^7.0.0-dev.20260416.1",
+    "oxfmt": "^0.45.0",
+    "oxlint": "^1.60.0"
+  }
+}
