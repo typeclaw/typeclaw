@@ -58,11 +58,13 @@ auth.json
 /channels/
 /todo/
 
-# Bench: downloaded suites/datasets and per-project deps stay out of git.
-# /bench/results/ is intentionally tracked — the scores are the point.
+# Bench: downloaded suites/datasets, per-project deps, and per-run outputs stay
+# out of git. The results/ dir is kept (via .gitkeep) but run outputs are local.
 /bench/datasets/
 /bench/suites/
 /bench/node_modules/
 /bench/**/.venv/
 /bench/**/__pycache__/
+/bench/results/*
+!/bench/results/.gitkeep
 

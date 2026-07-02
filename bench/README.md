@@ -8,7 +8,7 @@ Design + rationale: [issue #1128](https://github.com/typeclaw/typeclaw/issues/11
 
 Docker + Bun only — both already required by typeclaw. All Python lives inside the bench container; datasets and cloned suites stay in gitignored dirs, never `$HOME`. Teardown: `docker compose down` + `rm -rf datasets suites`.
 
-## `coding/` — Seam A: drive the running agent over its TUI websocket
+## `coding/` — drive the running agent over its TUI websocket
 
 Benchmarks the **whole real agent** by connecting to `typeclaw tui`'s websocket exactly as the TUI does — send a task prompt, read the event stream to `{ type: 'done' }`. No server changes, no harness reconstruction. Comparable to Hermes / opencode / Goose / Claude Code on the same tasks.
 
@@ -18,10 +18,19 @@ Start a typeclaw agent (so its container is up), then:
 
 ```sh
 bun install
-bun run coding/run.ts --container <container-name> --prompt "Fix the failing test in foo.ts"
+
+# ad-hoc single turn — prints text, tool calls, token/cost usage as JSON
+bun run coding/run.ts --container <name> --prompt "Fix the failing test in foo.ts"
+
+# score a task suite (N runs each, pass@1 + pass^k), writes JSON to results/
+bun run coding/run.ts --container <name> --suite ./suites/mytasks --runs 3
 ```
 
-The runner discovers the host port (`docker port <c> 8973/tcp`) and TUI token (`docker inspect` label) itself, connects, and prints the agent's text, tool calls, and token/cost usage as JSON.
+The runner discovers the host port (`docker port <c> 8973/tcp`) and TUI token (`docker inspect` label) itself.
+
+A **task** is a directory: `instruction.md` (the prompt), an optional `task.json` (verify command + timeout), and a verifier script. The agent works inside its own container at `/agent`, so the verifier runs **there** (`docker cp` the task in, then `docker exec` the verify command) — not on the host. Each task runs `k` times; the scorer reports **pass@1** (first run) and **pass^k** (all runs passed — the reliability metric).
+
+> Isolation caveat: a single reused container is fine for validating the harness, but a _meaningful_ multi-task number needs a fresh agent per task (cross-task memory/workspace bleed otherwise). Per-task provisioning is the next slice.
 
 ### Test
 
@@ -51,6 +60,6 @@ bench/
 
 ## Roadmap
 
-- **`coding/`** _(this slice)_ — websocket adapter, done. Next: wire Terminal-Bench-2 tasks + programmatic verifier via Harbor.
+- **`coding/`** _(this slice)_ — websocket adapter + scoring loop (task → run → container verifier → pass^k → report), done. Next: per-task agent provisioning + vendor Terminal-Bench-2 tasks via Harbor for comparable numbers.
 - **`memory/`** — LongMemEval / LoCoMo with dreaming ON vs OFF. Answerer = Fireworks; judge = OpenAI (separate family).
 - **`ablation/`** _(optional)_ — bare pi + one typeclaw component toggled, for per-component deltas.
