@@ -1,0 +1,31 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install Bun (typeclaw's runtime) and the typeclaw package into a fresh task
+# container, then materialize the agent dir from base64-encoded config/secrets
+# passed via _env. The agent dir is kept SEPARATE from the task dir so config +
+# codex auth resolve from cwd there while the agent's tools operate on the task
+# filesystem (see bench-runner.ts).
+apt-get update -qq
+apt-get install -y -qq curl unzip ca-certificates >/dev/null
+
+curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1
+export BUN_INSTALL="${HOME}/.bun"
+export PATH="${BUN_INSTALL}/bin:${PATH}"
+
+AGENT_DIR=/opt/tc-agent
+mkdir -p "${AGENT_DIR}"
+cd "${AGENT_DIR}"
+
+bun add "typeclaw@{{ version }}" >/dev/null 2>&1
+
+# Materialize the agent folder: model config + codex credentials, decoded from
+# the base64 env vars the adapter set (avoids shipping secrets as plaintext args).
+printf '%s' "${TC_CONFIG_B64}" | base64 -d > "${AGENT_DIR}/typeclaw.json"
+printf '%s' "${TC_SECRETS_B64}" | base64 -d > "${AGENT_DIR}/secrets.json"
+
+# The runner imports typeclaw internals via the @/ alias, which only resolves
+# from inside the package dir (its tsconfig owns the alias). Place it there.
+printf '%s' "${TC_RUNNER_B64}" | base64 -d > "${AGENT_DIR}/node_modules/typeclaw/bench-runner.ts"
+
+echo "TYPECLAW_SETUP_OK"

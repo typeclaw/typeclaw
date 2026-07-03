@@ -17,5 +17,6 @@
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true
   },
-  "include": ["."]
+  "include": ["."],
+  "exclude": ["node_modules", "suites", "datasets", "coding/tb_adapter"]
 }
