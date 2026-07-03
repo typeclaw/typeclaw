@@ -2424,13 +2424,14 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     expect(removed[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', reactionRef: INSTANCE_REF })
   })
 
-  test('removes every engage reaction when multiple inbounds coalesce into one turn', async () => {
-    // given two inbounds debounced into a single turn, each with its own :eyes:
+  test('rolls the eager eyes onto only the last inbound when several coalesce into one turn', async () => {
+    // given three inbounds debounced into a single turn, each eagerly acked
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     const instanceFor: Record<string, ReactionRef> = {
       'msg-a': { adapter: 'discord-bot', value: 'instance-a' },
       'msg-b': { adapter: 'discord-bot', value: 'instance-b' },
+      'msg-c': { adapter: 'discord-bot', value: 'instance-c' },
     }
     const removed: RemoveReactionRequest[] = []
     router.registerReaction('discord-bot', async (req) => ({
@@ -2443,17 +2444,77 @@ describe('ChannelRouter drop-eyes-after-reply', () => {
     })
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
-    // when both arrive before the debounce flush, then the agent replies once
+    // when all three arrive before the debounce flush, each newer one supersedes
+    // the previous ack, so the earlier eyes are removed before the turn even runs
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-a' } }))
     await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-b' } }))
+    await router.route(inbound({ reactionRef: { adapter: 'discord-bot', value: 'msg-c' } }))
+
+    // then only the last message's eyes survives into the turn; the first two are
+    // already rolled off before any reply is produced
+    await waitFor(
+      () =>
+        removed
+          .map((r) => r.reactionRef.value)
+          .sort()
+          .join(',') === 'instance-a,instance-b',
+    )
+
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'reply' })
     }
     await router.__testing!.flushDebounce(KEY)
 
-    // then both engage reactions are removed, not just the last inbound's
-    await waitFor(() => removed.length === 2)
-    expect(removed.map((r) => r.reactionRef.value).sort()).toEqual(['instance-a', 'instance-b'])
+    // and the surviving last-message eyes is removed after the reply lands
+    await waitFor(() => removed.length === 3)
+    expect(removed.map((r) => r.reactionRef.value).sort()).toEqual(['instance-a', 'instance-b', 'instance-c'])
+  })
+
+  test('a later reactionRef-less inbound still rolls off the previous eager eyes', async () => {
+    // given an engaging inbound that gets an eager :eyes:
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const removed: RemoveReactionRequest[] = []
+    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req)
+      return { ok: true }
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // when a newer engaging inbound with NO reactionRef coalesces in
+    await router.route(inbound({ reactionRef: TARGET_REF }))
+    await router.route(inbound({ externalMessageId: 'm2' }))
+
+    // then the previous eyes is stripped even though the new inbound is unreactable
+    await waitFor(() => removed.length === 1)
+    expect(removed[0]).toMatchObject({ reactionRef: INSTANCE_REF })
+
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'reply' })
+    }
+    await router.__testing!.flushDebounce(KEY)
+  })
+
+  test('drops a still-unanswered engage reaction when the session is torn down', async () => {
+    // given an engaged inbound whose turn never replies before teardown
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const removed: RemoveReactionRequest[] = []
+    router.registerReaction('discord-bot', async () => ({ ok: true, reactionRef: INSTANCE_REF }))
+    router.registerRemoveReaction('discord-bot', async (req) => {
+      removed.push(req)
+      return { ok: true }
+    })
+
+    await router.route(inbound({ reactionRef: TARGET_REF }))
+
+    // when the session is destroyed before the queued turn drains
+    await router.tearDownAllLive()
+
+    // then the stranded eager :eyes: is removed rather than left on the message
+    await waitFor(() => removed.length === 1)
+    expect(removed[0]).toMatchObject({ reactionRef: INSTANCE_REF })
   })
 
   test('keeps the engage reaction when the turn sends no reply', async () => {
