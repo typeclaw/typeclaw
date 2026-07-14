@@ -15,6 +15,7 @@ export function kakaoWorkspaceForType(kind: KakaoChatKind): KakaoWorkspace {
 export type KakaoChatLookupValue = {
   workspace: KakaoWorkspace
   isDm: boolean
+  provisional: boolean
 }
 
 export type KakaoChannelResolver = {
@@ -41,6 +42,7 @@ export type KakaoChannelResolverOptions = {
 type Entry = {
   workspace: KakaoWorkspace
   isDm: boolean
+  provisional: boolean
   chatName: string | null
   expiresAt: number
 }
@@ -79,6 +81,7 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
     cache.set(chat.chat_id, {
       workspace,
       isDm: kind === 'dm',
+      provisional: false,
       chatName: chat.title ?? chat.display_name,
       expiresAt,
     })
@@ -102,7 +105,7 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
   const lookupChat = (chatId: string): KakaoChatLookupValue | null => {
     const entry = cache.get(chatId)
     if (entry === undefined || entry.expiresAt <= now()) return null
-    return { workspace: entry.workspace, isDm: entry.isDm }
+    return { workspace: entry.workspace, isDm: entry.isDm, provisional: entry.provisional }
   }
 
   const ingestProvisional = (chatId: string): void => {
@@ -111,6 +114,7 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
     cache.set(chatId, {
       workspace: '@kakao-group',
       isDm: false,
+      provisional: true,
       chatName: null,
       expiresAt: now() + ttlMs,
     })

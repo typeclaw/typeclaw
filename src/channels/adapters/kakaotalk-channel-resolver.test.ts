@@ -46,8 +46,8 @@ describe('createKakaoChannelResolver', () => {
       client: fakeClient([dmChat('111', 'Alice'), groupChat('222', 'Team')]),
     })
     await resolver.refresh()
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true })
-    expect(resolver.lookupChat('222')).toEqual({ workspace: '@kakao-group', isDm: false })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
+    expect(resolver.lookupChat('222')).toEqual({ workspace: '@kakao-group', isDm: false, provisional: false })
   })
 
   test('lookupChat returns null for stale entries (TTL expired)', async () => {
@@ -58,7 +58,7 @@ describe('createKakaoChannelResolver', () => {
       ttlMs: 100,
     })
     await resolver.refresh()
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
 
     // Advance past the TTL. lookupChat must NOT keep returning the stale
     // entry — callers depend on null to trigger a refresh.
@@ -106,12 +106,12 @@ describe('createKakaoChannelResolver', () => {
       ttlMs: 100,
     })
     await resolver.refresh()
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
 
     chats = [groupChat('111', 'Alice, Bob')]
     now += 200
     await resolver.refresh()
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-group', isDm: false })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-group', isDm: false, provisional: false })
   })
 })
 
@@ -122,7 +122,11 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
 
     resolver.ingestProvisional('468625891988320')
 
-    expect(resolver.lookupChat('468625891988320')).toEqual({ workspace: '@kakao-group', isDm: false })
+    expect(resolver.lookupChat('468625891988320')).toEqual({
+      workspace: '@kakao-group',
+      isDm: false,
+      provisional: true,
+    })
   })
 
   test('is a no-op when a real cache entry already exists', async () => {
@@ -130,7 +134,7 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
       client: fakeClient([dmChat('111', 'Alice')]),
     })
     await resolver.refresh()
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
 
     // ingestProvisional must NOT overwrite the authoritative DM classification
     // with the provisional @kakao-group fallback — otherwise a flap in
@@ -138,7 +142,7 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
     // silently change allow-rule semantics.
     resolver.ingestProvisional('111')
 
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
   })
 
   test('subsequent refresh upgrades a provisional entry to its real kind', async () => {
@@ -150,13 +154,21 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
     // Simulates the production failure mode: getChats({all:true}) initially
     // does not return chat 468625891988320, but a push event from it arrives.
     resolver.ingestProvisional('468625891988320')
-    expect(resolver.lookupChat('468625891988320')).toEqual({ workspace: '@kakao-group', isDm: false })
+    expect(resolver.lookupChat('468625891988320')).toEqual({
+      workspace: '@kakao-group',
+      isDm: false,
+      provisional: true,
+    })
 
     // Later, getChats catches up and starts returning it as a DM.
     chats = [dmChat('468625891988320', 'Alice')]
     await resolver.refresh()
 
-    expect(resolver.lookupChat('468625891988320')).toEqual({ workspace: '@kakao-dm', isDm: true })
+    expect(resolver.lookupChat('468625891988320')).toEqual({
+      workspace: '@kakao-dm',
+      isDm: true,
+      provisional: false,
+    })
   })
 
   test('respects TTL so provisional entries do not live forever', async () => {
@@ -167,7 +179,7 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
       ttlMs: 100,
     })
     resolver.ingestProvisional('111')
-    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-group', isDm: false })
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-group', isDm: false, provisional: true })
 
     now += 200
     expect(resolver.lookupChat('111')).toBeNull()
