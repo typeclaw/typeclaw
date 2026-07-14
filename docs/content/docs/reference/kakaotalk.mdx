@@ -73,7 +73,7 @@ CLI: `typeclaw channel add kakaotalk` (interactive). **Do not use `channel set`*
 | ----------------------- | --------- | -------------------------------------------------------------- |
 | Outbound messages       | yes       |                                                                |
 | Reactions               | no        |                                                                |
-| Typing indicator        | no        |                                                                |
+| Typing indicator        | yes       | DMs and group chats; OpenChat is not yet supported             |
 | Channel-name resolution | yes       |                                                                |
 | Self identity           | no        |                                                                |
 | History                 | yes       | Limit 200 messages                                             |
@@ -92,6 +92,7 @@ typeclaw channel reauth kakaotalk
 
 - **KICKOUT recovery**: if the same `device_uuid` logs in elsewhere, the adapter detects the KICKOUT event and retries with bounded backoff (2s / 10s / 60s, 5-minute budget total).
 - **Mark-read**: fires on every inbound message, clearing the unread "1" (노란숫자), except in open chats.
+- **Typing indicator**: sends auto-expiring typing pulses in DMs and group chats. OpenChat is skipped because the SDK does not yet expose the room `linkId` required by KakaoTalk's `ACTION` packet.
 - **Provisional registration**: chats not surfaced by `getChats` are registered provisionally on first message.
 - **No combined send**: files are sent first, then text, as separate API calls.
 
