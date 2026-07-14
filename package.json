@@ -50,7 +50,7 @@
     "@mariozechner/pi-tui": "^0.73.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
-    "agent-messenger": "^2.30.0",
+    "agent-messenger": "^2.31.0",
     "cheerio": "^1.2.0",
     "citty": "^0.2.2",
     "cron-parser": "^5.5.0",
