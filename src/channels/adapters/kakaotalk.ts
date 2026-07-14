@@ -15,6 +15,7 @@ import {
   type KakaoTalkListenerEventMap,
   type KakaoTalkPushEmoticonEvent,
   type KakaoTalkPushMessageEvent,
+  type KakaoTypingResult,
 } from 'agent-messenger/kakaotalk'
 import type { KakaoAccountCredentials, KakaoConfig, PendingLoginState } from 'agent-messenger/kakaotalk'
 
@@ -30,6 +31,8 @@ import type {
   ResolvedChannelNames,
   SendResult,
   InboundAttachment,
+  TypingCallback,
+  TypingTarget,
 } from '@/channels/types'
 
 import { describeError } from './describe-error'
@@ -68,6 +71,7 @@ export interface KakaoTalkClient {
   ): Promise<KakaoSendResult>
   sendAttachment(chatId: string, attachments: ReadonlyArray<AttachmentInput>): Promise<KakaoSendResult>
   markRead(chatId: string, logId: string, opts?: { linkId?: string }): Promise<KakaoMarkReadResult>
+  sendTyping(chatId: string, opts?: { linkId?: string }): Promise<KakaoTypingResult>
   getProfile(): Promise<KakaoProfile>
   getMembers(chatId: string): Promise<KakaoMember[]>
   lookupAuthorName(chatId: string, authorId: number): string | null
@@ -277,6 +281,31 @@ export function createOutboundCallback(deps: {
   }
 }
 
+export function createTypingCallback(deps: {
+  client: Pick<KakaoTalkClient, 'sendTyping'>
+  channelResolver: Pick<KakaoChannelResolver, 'lookupChat'>
+  logger: KakaotalkAdapterLogger
+}): TypingCallback {
+  return async (target: TypingTarget): Promise<void> => {
+    if (target.adapter !== 'kakaotalk') return
+    const chat = deps.channelResolver.lookupChat(target.chat)
+    // OpenChat ACTION packets require the room linkId, but agent-messenger's
+    // public KakaoChat shape does not expose it yet. Skip instead of sending a
+    // malformed pulse. Provisional @kakao-group entries may also be OpenChat,
+    // so fail closed until getChats() supplies an authoritative classification.
+    if (target.workspace === '@kakao-open' || chat === null || chat.provisional || chat.workspace === '@kakao-open')
+      return
+    // KakaoTalk exposes a ~5s pulse with no explicit clear operation. Router
+    // ticks re-fire it while work is active; stop is intentionally a no-op.
+    if (target.phase === 'stop') return
+    try {
+      await deps.client.sendTyping(target.chat)
+    } catch (err) {
+      deps.logger.warn(`[kakaotalk] typing chat=${target.chat} failed: ${describeError(err)}`)
+    }
+  }
+}
+
 // KakaoTalk replies need the full source message, not just its log_id. Resolve
 // it from the chat's recent history (matching the upstream CLI's approach).
 // Returns undefined when the target isn't in the fetched window or the fetch
@@ -402,6 +431,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     logger,
     formatChannelTag,
   })
+  const typingCallback = createTypingCallback({ client, channelResolver, logger })
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ logger })
 
@@ -669,6 +699,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // but outboundCallback would still send via a dead client). Stop()
       // unregisters in the inverse order.
       options.router.registerOutbound('kakaotalk', outboundCallback)
+      options.router.registerTyping('kakaotalk', typingCallback)
+      options.router.setTypingCapability('kakaotalk', true)
       options.router.registerChannelNameResolver('kakaotalk', channelResolver.resolve)
       options.router.registerHistory('kakaotalk', historyCallback)
       options.router.registerFetchAttachment('kakaotalk', fetchAttachmentCallback)
@@ -679,6 +711,8 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       if (!started) return
       started = false
       options.router.unregisterOutbound('kakaotalk', outboundCallback)
+      options.router.unregisterTyping('kakaotalk', typingCallback)
+      options.router.setTypingCapability('kakaotalk', false)
       options.router.unregisterChannelNameResolver('kakaotalk', channelResolver.resolve)
       options.router.unregisterHistory('kakaotalk', historyCallback)
       options.router.unregisterFetchAttachment('kakaotalk', fetchAttachmentCallback)

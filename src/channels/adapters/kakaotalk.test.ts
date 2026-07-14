@@ -14,6 +14,7 @@ import type {
   KakaoSendResult,
   KakaoTalkListenerEventMap,
   KakaoTalkPushMessageEvent,
+  KakaoTypingResult,
 } from 'agent-messenger/kakaotalk'
 
 import { createChannelRouter, type ChannelRouter } from '@/channels/router'
@@ -22,6 +23,7 @@ import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/sche
 import {
   createKakaotalkAdapter,
   createOutboundCallback,
+  createTypingCallback,
   type KakaoTalkClient,
   type KakaoTalkListener,
 } from './kakaotalk'
@@ -95,6 +97,8 @@ class FakeClient implements KakaoTalkClient {
   markReadCalls: Array<{ chatId: string; logId: string; opts?: { linkId?: string } }> = []
   markReadResult: KakaoMarkReadResult = { success: true, status_code: 0, chat_id: '111', watermark: 'L1' }
   markReadError: Error | null = null
+  sendTypingCalls: Array<{ chatId: string; opts?: { linkId?: string } }> = []
+  sendTypingError: Error | null = null
 
   async login(): Promise<this> {
     this.loginCalls++
@@ -159,6 +163,12 @@ class FakeClient implements KakaoTalkClient {
     return this.markReadResult
   }
 
+  async sendTyping(chatId: string, opts?: { linkId?: string }): Promise<KakaoTypingResult> {
+    this.sendTypingCalls.push({ chatId, ...(opts !== undefined ? { opts } : {}) })
+    if (this.sendTypingError !== null) throw this.sendTypingError
+    return { success: true, status_code: 0, chat_id: chatId }
+  }
+
   profileError: Error | null = null
   async getProfile(): Promise<KakaoProfile> {
     if (this.profileError !== null) throw this.profileError
@@ -200,6 +210,57 @@ afterEach(async () => {
 })
 
 describe('createKakaotalkAdapter — start/stop lifecycle', () => {
+  test('registers typing while started and disables it before shutdown', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const events: string[] = []
+    const startListener = listener.start.bind(listener)
+    const stopListener = listener.stop.bind(listener)
+    listener.start = async () => {
+      events.push('listener:start')
+      await startListener()
+    }
+    listener.stop = () => {
+      events.push('listener:stop')
+      stopListener()
+    }
+    const registerTyping = router.registerTyping.bind(router)
+    const unregisterTyping = router.unregisterTyping.bind(router)
+    const setTypingCapability = router.setTypingCapability.bind(router)
+    router.registerTyping = (adapter, callback) => {
+      events.push(`typing:${adapter}`)
+      registerTyping(adapter, callback)
+    }
+    router.unregisterTyping = (adapter, callback) => {
+      events.push(`untyping:${adapter}`)
+      unregisterTyping(adapter, callback)
+    }
+    router.setTypingCapability = (adapter, supported) => {
+      events.push(`typing-cap:${adapter}=${String(supported)}`)
+      setTypingCapability(adapter, supported)
+    }
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+
+    await adapter.start()
+    await adapter.stop()
+
+    expect(events).toEqual([
+      'listener:start',
+      'typing:kakaotalk',
+      'typing-cap:kakaotalk=true',
+      'untyping:kakaotalk',
+      'typing-cap:kakaotalk=false',
+      'listener:stop',
+    ])
+    await router.stop()
+  })
+
   test('login + getProfile + listener.start are called in order', async () => {
     const client = new FakeClient()
     const listener = new FakeListener()
@@ -313,6 +374,95 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
     await expect(adapter.start()).rejects.not.toThrow(/sub-device session is stale/)
 
     await router.stop()
+  })
+})
+
+describe('createTypingCallback', () => {
+  const authoritativeChat = {
+    lookupChat: () => ({ workspace: '@kakao-dm' as const, isDm: true, provisional: false }),
+  }
+
+  test('sends a KakaoTalk typing pulse for a router tick', async () => {
+    const client = new FakeClient()
+    const callback = createTypingCallback({
+      client,
+      channelResolver: authoritativeChat,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await callback({ adapter: 'kakaotalk', workspace: '@kakao-dm', chat: '111', thread: null, phase: 'tick' })
+
+    expect(client.sendTypingCalls).toEqual([{ chatId: '111' }])
+  })
+
+  test('does not send a pulse for the stop phase because KakaoTalk auto-expires it', async () => {
+    const client = new FakeClient()
+    const callback = createTypingCallback({
+      client,
+      channelResolver: authoritativeChat,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await callback({ adapter: 'kakaotalk', workspace: '@kakao-dm', chat: '111', thread: null, phase: 'stop' })
+
+    expect(client.sendTypingCalls).toHaveLength(0)
+  })
+
+  test('ignores typing targets for another adapter', async () => {
+    const client = new FakeClient()
+    const callback = createTypingCallback({
+      client,
+      channelResolver: authoritativeChat,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await callback({ adapter: 'line', workspace: 'line', chat: '111', thread: null, phase: 'tick' })
+
+    expect(client.sendTypingCalls).toHaveLength(0)
+  })
+
+  test('skips OpenChat because agent-messenger does not expose the required room linkId', async () => {
+    const client = new FakeClient()
+    const callback = createTypingCallback({
+      client,
+      channelResolver: authoritativeChat,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await callback({ adapter: 'kakaotalk', workspace: '@kakao-open', chat: '555', thread: null, phase: 'tick' })
+
+    expect(client.sendTypingCalls).toHaveLength(0)
+  })
+
+  test('skips provisionally classified chats because they may be OpenChat', async () => {
+    const client = new FakeClient()
+    const callback = createTypingCallback({
+      client,
+      channelResolver: {
+        lookupChat: () => ({ workspace: '@kakao-group', isDm: false, provisional: true }),
+      },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await callback({ adapter: 'kakaotalk', workspace: '@kakao-group', chat: '555', thread: null, phase: 'tick' })
+
+    expect(client.sendTypingCalls).toHaveLength(0)
+  })
+
+  test('logs and swallows typing failures because the signal is best-effort', async () => {
+    const client = new FakeClient()
+    client.sendTypingError = new Error('LOCO packet timeout')
+    const warnings: string[] = []
+    const callback = createTypingCallback({
+      client,
+      channelResolver: authoritativeChat,
+      logger: { info: () => {}, warn: (message) => warnings.push(message), error: () => {} },
+    })
+
+    await expect(
+      callback({ adapter: 'kakaotalk', workspace: '@kakao-dm', chat: '111', thread: null, phase: 'tick' }),
+    ).resolves.toBeUndefined()
+    expect(warnings).toEqual(['[kakaotalk] typing chat=111 failed: LOCO packet timeout'])
   })
 })
 
