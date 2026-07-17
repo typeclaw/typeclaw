@@ -411,9 +411,9 @@ describe('configSchema', () => {
 })
 
 describe('sandboxSchema', () => {
-  test('defaults realProc to false and writablePaths/symlinks to [] when omitted', () => {
+  test('defaults realProc to false and writablePaths/symlinks/env.allow to [] when omitted', () => {
     const parsed = configSchema.parse({ models: { default: VALID_MODEL } })
-    expect(parsed.sandbox).toEqual({ realProc: false, writablePaths: [], symlinks: [] })
+    expect(parsed.sandbox).toEqual({ realProc: false, writablePaths: [], symlinks: [], env: { allow: [] } })
   })
 
   test('accepts agent-relative writablePaths', () => {

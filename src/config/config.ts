@@ -469,13 +469,27 @@ export const symlinkSchema = z.object({
 
 export type SandboxSymlink = z.infer<typeof symlinkSchema>
 
+// `sandbox.env.allow` adds operator-chosen `.env` names to the built-in
+// safe-config-pointer allowlist that model-driven bash may read. Allowlist, not
+// denylist: `.env` is a documented credential store, so nothing is exposed to
+// bash unless it is a recognized safe pointer or explicitly allowed here. Names
+// listed here are still subject to the unconditional secret/hijack deny rules
+// (an operator cannot `allow` a name that matches a secret pattern), and a
+// credential-dir pointer is exposed only when its target is masked.
+export const sandboxEnvSchema = z
+  .object({
+    allow: z.array(z.string().min(1)).default([]),
+  })
+  .default({ allow: [] })
+
 export const sandboxSchema = z
   .object({
     realProc: z.boolean().default(false),
     writablePaths: z.array(relativeAgentPathSchema).default([]),
     symlinks: z.array(symlinkSchema).default([]),
+    env: sandboxEnvSchema,
   })
-  .default({ realProc: false, writablePaths: [], symlinks: [] })
+  .default({ realProc: false, writablePaths: [], symlinks: [], env: { allow: [] } })
 
 export type SandboxConfig = z.infer<typeof sandboxSchema>
 
