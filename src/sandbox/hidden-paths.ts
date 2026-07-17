@@ -1,5 +1,5 @@
 import { lstat, mkdir, opendir, writeFile } from 'node:fs/promises'
-import { join, sep } from 'node:path'
+import { join, resolve, sep } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
@@ -11,6 +11,15 @@ import { SandboxMaskTargetError } from './errors'
 export type HiddenPaths = {
   dirs: string[]
   files: string[]
+  // Subset of `dirs` whose contents are reusable credentials. These get the
+  // recursive hardlink-alias scan and ancestor-symlink rejection at mask time,
+  // regardless of whether the operator configured an absolute or relative path.
+  credentialDirs?: string[]
+  // Agent-root boundary for the ancestor-symlink walk. Only path components
+  // STRICTLY BELOW this are attacker-relevant; the agent root and anything above
+  // it (`/`, `/private/var` on macOS, the tmpfs bind) are system-owned, so
+  // walking from `/` would false-positive on platform symlinks like `/var`.
+  agentRoot?: string
 }
 
 const PRIVATE_DIRS = ['workspace', 'memory', 'sessions'] as const
@@ -34,12 +43,30 @@ export function resolveHiddenPaths(
   agentDir: string,
 ): HiddenPaths {
   const seesPrivate = canSeePrivateSurface(permissions, origin)
-  const dirs = [
-    ...CANONICAL_AGENT_SECRET_DIRS.map((dir) => join(agentDir, dir)),
-    ...(seesPrivate ? [] : PRIVATE_DIRS.map((dir) => join(agentDir, dir))),
-  ]
+  const canonicalDirs = CANONICAL_AGENT_SECRET_DIRS.map((dir) => join(agentDir, dir))
+  const messengerDir = resolvedMessengerCredentialDir(agentDir)
+  const credentialDirs = [...canonicalDirs, ...(messengerDir === undefined ? [] : [messengerDir])]
+  const dirs = [...credentialDirs, ...(seesPrivate ? [] : PRIVATE_DIRS.map((dir) => join(agentDir, dir)))]
   const files = CANONICAL_AGENT_SECRET_FILES.map((f) => join(agentDir, f))
-  return { dirs, files }
+  return { dirs, files, credentialDirs, agentRoot: agentDir }
+}
+
+// An operator may relocate agent-messenger's credential dir via
+// AGENT_MESSENGER_CONFIG_DIR (e.g. a noncanonical workspace/.config/agent-messenger).
+// Its reusable tokens must be masked from sandboxed bash exactly like the
+// canonical workspace/.agent-messenger — otherwise a workspace-visible role's
+// bash reads the profile. Return the resolved path only when it stays STRICTLY
+// inside agentDir: equality (AGENT_MESSENGER_CONFIG_DIR=.) would --tmpfs the whole
+// agent root, and a value outside agentDir is not ours to mask. `resolve`
+// collapses `..`, so the strict-prefix check is a real lexical containment gate;
+// ancestor-symlink escape is caught at mask time by rejectSymlinkAncestors.
+function resolvedMessengerCredentialDir(agentDir: string): string | undefined {
+  const configured = process.env.AGENT_MESSENGER_CONFIG_DIR
+  if (configured === undefined || configured.length === 0) return undefined
+  const resolved = resolve(agentDir, configured)
+  const canonical = CANONICAL_AGENT_SECRET_DIRS.map((dir) => join(agentDir, dir))
+  if (canonical.includes(resolved)) return undefined
+  return resolved.startsWith(`${agentDir}${sep}`) ? resolved : undefined
 }
 
 // Before canonical secret masking became unconditional, roles carrying both
@@ -80,29 +107,50 @@ function canSeePrivateSurface(permissions: PermissionService, origin: SessionOri
 // fail-closed: symlinks, wrong entry kinds, hardlinked files, materialization
 // failures, or a late identity change abort bash.
 export async function ensureHiddenMaskTargets(hidden: HiddenPaths): Promise<HiddenPaths> {
-  const dirs = await Promise.all(hidden.dirs.map((target) => ensureRequiredDirMaskTarget(target)))
+  const credentialDirs = new Set(hidden.credentialDirs ?? [])
+  const agentRoot = hidden.agentRoot
+  const dirs = await Promise.all(
+    hidden.dirs.map((target) => ensureRequiredDirMaskTarget(target, credentialDirs, agentRoot)),
+  )
   const files = await Promise.all(hidden.files.map((target) => ensureRequiredFileMaskTarget(target)))
-  return { dirs, files }
+  return {
+    dirs,
+    files,
+    ...(hidden.credentialDirs === undefined ? {} : { credentialDirs: hidden.credentialDirs }),
+    ...(agentRoot === undefined ? {} : { agentRoot }),
+  }
 }
 
 export async function verifyHiddenMaskTargets(hidden: HiddenPaths): Promise<void> {
-  await Promise.all(hidden.dirs.map((target) => verifyRequiredMaskTarget(target, 'dir')))
-  await Promise.all(hidden.files.map((target) => verifyRequiredMaskTarget(target, 'file')))
+  const credentialDirs = new Set(hidden.credentialDirs ?? [])
+  const agentRoot = hidden.agentRoot
+  await Promise.all(hidden.dirs.map((target) => verifyRequiredMaskTarget(target, 'dir', credentialDirs, agentRoot)))
+  await Promise.all(hidden.files.map((target) => verifyRequiredMaskTarget(target, 'file', new Set(), undefined)))
 }
 
-async function ensureRequiredDirMaskTarget(target: string): Promise<string> {
+async function ensureRequiredDirMaskTarget(
+  target: string,
+  credentialDirs: ReadonlySet<string>,
+  agentRoot: string | undefined,
+): Promise<string> {
+  if (credentialDirs.has(target)) await rejectSymlinkAncestors(target, agentRoot)
   await mkdir(target, { recursive: true }).catch(() => {})
-  await verifyRequiredMaskTarget(target, 'dir')
+  await verifyRequiredMaskTarget(target, 'dir', credentialDirs, agentRoot)
   return target
 }
 
 async function ensureRequiredFileMaskTarget(target: string): Promise<string> {
   await ensureEmptyFile(target)
-  await verifyRequiredMaskTarget(target, 'file')
+  await verifyRequiredMaskTarget(target, 'file', new Set(), undefined)
   return target
 }
 
-async function verifyRequiredMaskTarget(target: string, kind: 'dir' | 'file'): Promise<void> {
+async function verifyRequiredMaskTarget(
+  target: string,
+  kind: 'dir' | 'file',
+  credentialDirs: ReadonlySet<string>,
+  agentRoot: string | undefined,
+): Promise<void> {
   const stats = await lstat(target).catch(() => {
     throw new SandboxMaskTargetError(target, `could not materialize or inspect a ${kind}`)
   })
@@ -110,11 +158,37 @@ async function verifyRequiredMaskTarget(target: string, kind: 'dir' | 'file'): P
   if (kind === 'dir' && !stats.isDirectory()) throw new SandboxMaskTargetError(target, 'target is not a directory')
   if (kind === 'file' && !stats.isFile()) throw new SandboxMaskTargetError(target, 'target is not a regular file')
   if (kind === 'file' && stats.nlink !== 1) throw new SandboxMaskTargetError(target, 'target has hardlink aliases')
-  if (kind === 'dir' && isCanonicalSecretDir(target)) await rejectHardlinksUnderCanonicalDir(target)
+  if (kind === 'dir' && credentialDirs.has(target)) {
+    await rejectSymlinkAncestors(target, agentRoot)
+    await rejectHardlinksUnderCanonicalDir(target)
+  }
 }
 
-function isCanonicalSecretDir(target: string): boolean {
-  return CANONICAL_AGENT_SECRET_DIRS.some((dir) => target.endsWith(`${sep}${dir.split('/').join(sep)}`))
+// A masked credential dir must have NO symlink in any path component BELOW the
+// agent root. mkdir(recursive)/lstat/opendir all FOLLOW an ancestor symlink, so
+// a planted `workspace/link -> /tmp/outside` would let the mask materialize and
+// scan run under an attacker-chosen tree outside the agent — defeating
+// containment. Walk each component strictly below `agentRoot` (the root and
+// above are system-owned: `/`, `/private/var`, the tmpfs bind — checking those
+// would false-positive on platform symlinks like macOS `/var`). Nonexistent
+// trailing components are fine (the mask ensures them next); only EXISTING
+// components are checked, and any that IS a symlink fails closed. Without a known
+// agentRoot the walk is skipped (the direct-target symlink check still applies).
+async function rejectSymlinkAncestors(target: string, agentRoot: string | undefined): Promise<void> {
+  if (agentRoot === undefined || !target.startsWith(`${agentRoot}${sep}`)) return
+  const rest = target
+    .slice(agentRoot.length + 1)
+    .split(sep)
+    .filter((s) => s.length > 0)
+  let current = agentRoot
+  for (const segment of rest) {
+    current = `${current}${sep}${segment}`
+    const stats = await lstat(current).catch(() => undefined)
+    if (stats === undefined) return
+    if (stats.isSymbolicLink()) {
+      throw new SandboxMaskTargetError(target, `credential mask path has a symlinked ancestor: ${current}`)
+    }
+  }
 }
 
 async function rejectHardlinksUnderCanonicalDir(root: string): Promise<void> {
@@ -133,10 +207,15 @@ async function rejectHardlinksUnderCanonicalDir(root: string): Promise<void> {
         }
         const child = join(current, entry.name)
         const stats = await lstat(child)
-        if (stats.isSymbolicLink()) continue
+        // A symlink inside a credential dir is an escape: masking the dir with
+        // --tmpfs hides the LINK, but the SDK writes/reads the token through it to
+        // a visible target outside the mask. Reject rather than skip.
+        if (stats.isSymbolicLink()) {
+          throw new SandboxMaskTargetError(root, `symlink under credential directory escapes the mask: ${child}`)
+        }
         if (stats.isDirectory()) pending.push(child)
         if (stats.isFile() && stats.nlink !== 1) {
-          throw new SandboxMaskTargetError(root, `file under canonical secret directory has hardlink aliases: ${child}`)
+          throw new SandboxMaskTargetError(root, `file under credential directory has hardlink aliases: ${child}`)
         }
       }
     } finally {

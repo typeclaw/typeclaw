@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 import { createPermissionService } from '@/permissions/permissions'
@@ -100,6 +100,65 @@ describe('resolveHiddenPaths — builtin tiers', () => {
     const svc = createPermissionService()
     const { dirs } = resolveHiddenPaths(svc, spawnedBy('guest'), AGENT)
     expect(dirs).not.toContain(join(AGENT, 'public'))
+  })
+})
+
+describe('resolveHiddenPaths — resolved AGENT_MESSENGER_CONFIG_DIR mask', () => {
+  const CONFIG_DIR_ENV = 'AGENT_MESSENGER_CONFIG_DIR'
+  // Use a fully-resolved, platform-native agent root so the production
+  // `resolve()`/`startsWith(agentDir + sep)` containment check and the test's
+  // expectations agree on Windows (where `/agent` resolves to `C:\agent`).
+  const ROOT = resolve(AGENT)
+  let saved: string | undefined
+
+  beforeEach(() => {
+    saved = process.env[CONFIG_DIR_ENV]
+  })
+  afterEach(() => {
+    if (saved === undefined) delete process.env[CONFIG_DIR_ENV]
+    else process.env[CONFIG_DIR_ENV] = saved
+  })
+
+  test('masks a noncanonical cred dir for every role, including tui/owner', () => {
+    const expected = join(ROOT, 'workspace', '.config', 'agent-messenger')
+    process.env[CONFIG_DIR_ENV] = expected
+    const svc = createPermissionService()
+    for (const origin of [tui, spawnedBy('trusted'), spawnedBy('member'), spawnedBy('guest')]) {
+      const { dirs } = resolveHiddenPaths(svc, origin, ROOT)
+      expect(dirs).toContain(expected)
+    }
+  })
+
+  test('does not double-add when the value is already the canonical path', () => {
+    const canonical = join(ROOT, 'workspace', '.agent-messenger')
+    process.env[CONFIG_DIR_ENV] = canonical
+    const { dirs } = resolveHiddenPaths(createPermissionService(), tui, ROOT)
+    expect(dirs.filter((d) => d === canonical)).toHaveLength(1)
+  })
+
+  test('ignores a value pointing outside the agent root', () => {
+    const outside = resolve(ROOT, '..', 'outside-agent-messenger')
+    process.env[CONFIG_DIR_ENV] = outside
+    const { dirs } = resolveHiddenPaths(createPermissionService(), tui, ROOT)
+    expect(dirs).not.toContain(outside)
+  })
+
+  test('ignores a value resolving to the agent root itself (never masks the whole root)', () => {
+    process.env[CONFIG_DIR_ENV] = '.'
+    const { dirs } = resolveHiddenPaths(createPermissionService(), tui, ROOT)
+    expect(dirs).not.toContain(ROOT)
+  })
+
+  test('ignores a traversal escape even when it lands back near the root', () => {
+    process.env[CONFIG_DIR_ENV] = join('workspace', '..', '..', 'etc', 'x')
+    const { dirs } = resolveHiddenPaths(createPermissionService(), tui, ROOT)
+    expect(dirs).not.toContain(resolve(ROOT, '..', 'etc', 'x'))
+  })
+
+  test('resolves a relative value against the agent root before masking', () => {
+    process.env[CONFIG_DIR_ENV] = join('workspace', '.config', 'agent-messenger')
+    const { dirs } = resolveHiddenPaths(createPermissionService(), tui, ROOT)
+    expect(dirs).toContain(join(ROOT, 'workspace', '.config', 'agent-messenger'))
   })
 })
 
@@ -278,11 +337,60 @@ describe('ensureHiddenMaskTargets', () => {
     await mkdir(join(gws, 'accounts'))
     await writeFile(credential, 'secret')
     await link(credential, join(dir, 'public-alias'))
-    await expect(ensureHiddenMaskTargets({ dirs: [gws], files: [] })).rejects.toThrow(/hardlink|mask target/i)
+    await expect(ensureHiddenMaskTargets({ dirs: [gws], files: [], credentialDirs: [gws] })).rejects.toThrow(
+      /hardlink|mask target/i,
+    )
   })
 
   test('fails closed when an absent canonical mask target cannot be materialized', async () => {
     const env = join(dir, 'missing-parent', '.env')
     await expect(ensureHiddenMaskTargets({ dirs: [], files: [env] })).rejects.toThrow(/mask target/i)
+  })
+
+  test('rejects a credential dir reached through a symlinked ancestor', async () => {
+    const outside = await mkdtemp(join(tmpdir(), 'tc-outside-'))
+    try {
+      await symlink(outside, join(dir, 'workspace'))
+      const credDir = join(dir, 'workspace', '.config', 'agent-messenger')
+      await expect(
+        ensureHiddenMaskTargets({ dirs: [credDir], files: [], credentialDirs: [credDir], agentRoot: dir }),
+      ).rejects.toThrow(/symlinked ancestor|mask target/i)
+    } finally {
+      await rm(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('runs the hardlink scan on a relative-configured (declared) credential dir', async () => {
+    const credDir = join(dir, 'workspace', '.config', 'agent-messenger')
+    await mkdir(credDir, { recursive: true })
+    const token = join(credDir, 'webex-credentials.json')
+    await writeFile(token, 'secret')
+    await link(token, join(dir, 'public-alias'))
+    await expect(
+      ensureHiddenMaskTargets({ dirs: [credDir], files: [], credentialDirs: [credDir], agentRoot: dir }),
+    ).rejects.toThrow(/hardlink|mask target/i)
+  })
+
+  test('rejects a symlinked token file inside a credential dir (escape via link target)', async () => {
+    const credDir = join(dir, 'workspace', '.agent-messenger')
+    await mkdir(credDir, { recursive: true })
+    const visibleTarget = join(dir, 'public', 'leaked-token.json')
+    await mkdir(join(dir, 'public'), { recursive: true })
+    await writeFile(visibleTarget, 'secret')
+    await symlink(visibleTarget, join(credDir, 'webex-credentials.json'))
+    await expect(
+      ensureHiddenMaskTargets({ dirs: [credDir], files: [], credentialDirs: [credDir], agentRoot: dir }),
+    ).rejects.toThrow(/symlink under credential|mask target/i)
+  })
+
+  test('rejects a symlinked SUBDIRECTORY inside a credential dir', async () => {
+    const credDir = join(dir, 'workspace', '.agent-messenger')
+    await mkdir(credDir, { recursive: true })
+    const visibleDir = join(dir, 'public', 'accounts')
+    await mkdir(visibleDir, { recursive: true })
+    await symlink(visibleDir, join(credDir, 'accounts'))
+    await expect(
+      ensureHiddenMaskTargets({ dirs: [credDir], files: [], credentialDirs: [credDir], agentRoot: dir }),
+    ).rejects.toThrow(/symlink under credential|mask target/i)
   })
 })
