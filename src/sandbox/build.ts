@@ -15,6 +15,13 @@ const { dirname } = posix
 export type SandboxedCommand = {
   argv: string[]
   commandString: string
+  // Exact environment the bwrap PARENT process must run with. bwrap only drops
+  // --clearenv when there are inherited names and then --unsetenv's the keys
+  // present in process.env AT BUILD TIME — a secret added to the live env between
+  // build and spawn would otherwise be inherited. The spawn must therefore start
+  // from THIS snapshot (defaults + resolved set + snapshotted inherited values),
+  // never the live process.env, so late-added keys can't reach the sandbox.
+  spawnEnv: Record<string, string>
 }
 
 // Fixed fd the rendered commandString opens to /dev/null for --ro-bind-data
@@ -35,7 +42,7 @@ export function buildSandboxedCommand(command: string, policy: SandboxPolicy = {
   const argv = buildArgv(command, policy)
   const needsMaskFd = (policy.masks?.files?.length ?? 0) > 0
   const commandString = needsMaskFd ? `${formatCommand(argv)} ${MASK_DATA_FD}</dev/null` : formatCommand(argv)
-  return { argv, commandString }
+  return { argv, commandString, spawnEnv: resolveSpawnEnv(policy.env) }
 }
 
 function buildArgv(command: string, policy: SandboxPolicy): string[] {
@@ -264,6 +271,20 @@ function resolveEnv(env: SandboxEnvPolicy | undefined): Record<string, string> {
   for (const key of env?.passthrough ?? []) {
     const value = process.env[key]
     if (value !== undefined) resolved[key] = value
+  }
+  return resolved
+}
+
+// The exact env for the bwrap parent process: the --setenv/passthrough values
+// PLUS a one-shot snapshot of each inherited name's current value. Because the
+// parent starts from exactly this map (and nothing else), a key added to the
+// live process.env after this point cannot be inherited — closing the
+// build-to-spawn TOCTOU on the --unsetenv enumeration.
+function resolveSpawnEnv(env: SandboxEnvPolicy | undefined): Record<string, string> {
+  const resolved = resolveEnv(env)
+  for (const name of env?.inherit ?? []) {
+    const value = process.env[name]
+    if (value !== undefined) resolved[name] = value
   }
   return resolved
 }

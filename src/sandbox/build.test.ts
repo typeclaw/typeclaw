@@ -187,6 +187,32 @@ describe('buildSandboxedCommand env policy', () => {
   })
 })
 
+describe('buildSandboxedCommand spawnEnv (bwrap parent env snapshot)', () => {
+  test('snapshots inherited values so a late-added secret cannot be inherited', () => {
+    const name = 'TYPECLAW_SANDBOX_SPAWN_INHERIT'
+    const late = 'GH_TOKEN'
+    process.env[name] = 'inherited-value'
+    delete process.env[late]
+    try {
+      const { spawnEnv } = buildSandboxedCommand('true', { env: { inherit: [name] } })
+      // late secret added AFTER the build must not appear in the frozen snapshot
+      process.env[late] = 'late-secret'
+      expect(spawnEnv[name]).toBe('inherited-value')
+      expect(spawnEnv[late]).toBeUndefined()
+      expect(Object.keys(spawnEnv)).not.toContain(late)
+    } finally {
+      delete process.env[name]
+      delete process.env[late]
+    }
+  })
+
+  test('spawnEnv contains only defaults + set + inherited names', () => {
+    const { spawnEnv } = buildSandboxedCommand('true', { env: { set: { GIT_PAGER: 'cat' } } })
+    expect(spawnEnv.PATH).toBe('/usr/local/bin:/usr/bin:/bin')
+    expect(spawnEnv.GIT_PAGER).toBe('cat')
+  })
+})
+
 describe('buildSandboxedCommand mounts', () => {
   test('renders ro-bind, bind, tmpfs and dev mounts', () => {
     const argv = argvOf('true', {
