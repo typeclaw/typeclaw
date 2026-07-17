@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import {
   createBashToolDefinition as piCreateBashToolDefinition,
@@ -25,6 +25,7 @@ import {
 } from '@/bundled-plugins/guard/policy'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
 import { assertNoCanonicalSecretsInGit } from '@/git/secret-history'
+import { readEnvFile } from '@/init/env-file'
 import type { PermissionService } from '@/permissions/permissions'
 import type {
   BuiltinToolRef,
@@ -63,6 +64,8 @@ import {
   verifyHiddenMaskTargets,
   verifyPrivilegedSandboxRuntime,
 } from '@/sandbox'
+import { isSecretEnvName, resolveExposableEnvNames } from '@/sandbox/env-exposure'
+import { collectSecretEnvRefs } from '@/secrets/env-refs'
 
 import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-guard'
 import { checkImageReadRedirect } from './multimodal/read-redirect'
@@ -94,10 +97,16 @@ export const TYPECLAW_INTERNAL_BASH_ENV = '__typeclawBashEnv'
 type BashEnvOverlay = Record<string, string>
 const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
 
-const SECRET_ENV_NAME_PATTERN =
-  /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PWD|API_KEY|ACCESS_KEY(?:_ID)?|SECRET_KEY|PRIVATE_KEY|AUTH)$/
+type BashSpawnEnvContext = {
+  overlay?: BashEnvOverlay
+  // Exact env for the outer bwrap process on a sandboxed call. When present, the
+  // spawn hook uses it verbatim rather than the live inherited env, so a secret
+  // that appears in process.env between policy build and spawn stays out of the
+  // sandbox (closes the inherit TOCTOU).
+  sandboxSpawnEnv?: Record<string, string>
+}
 
-const bashEnvStore = new AsyncLocalStorage<BashEnvOverlay | undefined>()
+const bashEnvStore = new AsyncLocalStorage<BashSpawnEnvContext | undefined>()
 
 function readBashEnvOverlay(args: Record<string, unknown>): BashEnvOverlay | undefined {
   const raw = args[TYPECLAW_INTERNAL_BASH_ENV]
@@ -110,8 +119,9 @@ function readBashEnvOverlay(args: Record<string, unknown>): BashEnvOverlay | und
 }
 
 function bashSpawnHookWithOverlay(context: BashSpawnContext): BashSpawnContext {
-  const overlay = bashEnvStore.getStore()
-  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, overlay) }
+  const store = bashEnvStore.getStore()
+  if (store?.sandboxSpawnEnv !== undefined) return { ...context, env: { ...store.sandboxSpawnEnv } }
+  return { ...context, env: sanitizeBashSpawnEnvironment(context.env, store?.overlay) }
 }
 
 export function sanitizeBashSpawnEnvironment(
@@ -585,7 +595,16 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           signal,
         })
         await preparedSandboxRuntime?.verify()
-        rawResult = await bashEnvStore.run(bashEnvOverlay, () =>
+        const spawnEnvContext: BashSpawnEnvContext | undefined =
+          bashEnvOverlay !== undefined || preparedSandboxRuntime?.spawnEnv !== undefined
+            ? {
+                ...(bashEnvOverlay !== undefined ? { overlay: bashEnvOverlay } : {}),
+                ...(preparedSandboxRuntime?.spawnEnv !== undefined
+                  ? { sandboxSpawnEnv: preparedSandboxRuntime.spawnEnv }
+                  : {}),
+              }
+            : undefined
+        rawResult = await bashEnvStore.run(spawnEnvContext, () =>
           tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate, ctx),
         )
       } catch (error) {
@@ -666,6 +685,7 @@ type BashFilesystemPolicyOptions = {
 type PreparedBashSandbox = {
   verify: () => Promise<void>
   cleanup: () => Promise<void>
+  spawnEnv?: Record<string, string>
 }
 
 export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) {
@@ -695,9 +715,9 @@ async function applyBashSandbox(
 
   await assertNoCanonicalSecretsInGit(agentDir)
 
-  const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
+  const { dirs, files, credentialDirs, agentRoot } = resolveHiddenPaths(permissions, origin, agentDir)
   const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, envOverlay)
-  const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
+  const maskTargets = await ensureHiddenMaskTargets({ dirs, files, credentialDirs, agentRoot })
   await boundary.ensureAvailable()
   const sessionTmp = await ensureSessionTmpDir(sessionId)
   const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
@@ -727,7 +747,7 @@ async function applyBashSandbox(
     (boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime)
   try {
     await verifyHiddenMaskTargets(maskTargets)
-    const { commandString } = boundary.buildCommand(command, {
+    const { commandString, spawnEnv } = boundary.buildCommand(command, {
       mounts: [
         { type: 'ro-bind', source: agentDir, dest: agentDir },
         { type: 'bind', source: sessionTmp, dest: '/tmp' },
@@ -741,14 +761,25 @@ async function applyBashSandbox(
       cwd: agentDir,
       proc,
       procSelfExe: resolveProcSelfExe(),
-      ...(sandboxEnvOverlay !== undefined || privilegedRuntime !== undefined
-        ? { env: buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env) }
-        : {}),
+      ...spreadSandboxEnv(
+        buildSandboxEnvPolicy(
+          sandboxEnvOverlay,
+          privilegedRuntime?.env,
+          resolveExposableBashEnvNames(agentDir, maskTargets.credentialDirs ?? []),
+        ),
+      ),
     })
     mutableArgs.command = commandString
+    // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
+    // that live in neither process.env nor argv; resolveSpawnEnv snapshots
+    // inherited names from process.env only, so merge the overlay values in here
+    // to complete the exact bwrap-parent env.
+    const mergedSpawnEnv =
+      spawnEnv !== undefined && sandboxEnvOverlay !== undefined ? { ...spawnEnv, ...sandboxEnvOverlay } : spawnEnv
     return {
       verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(privilegedRuntime),
       cleanup,
+      spawnEnv: mergedSpawnEnv,
     }
   } catch (error) {
     await cleanup()
@@ -756,21 +787,79 @@ async function applyBashSandbox(
   }
 }
 
-function buildSandboxEnvPolicy(
+export function buildSandboxEnvPolicy(
   overlay: BashEnvOverlay | undefined,
   runtimeEnv: Record<string, string> | undefined,
+  exposableEnvNames: readonly string[] = [],
 ): { inherit?: string[]; set?: Record<string, string> } {
   const set = { ...runtimeEnv }
   const inherit: string[] = []
+  const inheritSeen = new Set<string>()
+  const pushInherit = (key: string): void => {
+    if (Object.hasOwn(set, key) || inheritSeen.has(key)) return
+    inheritSeen.add(key)
+    inherit.push(key)
+  }
   for (const [key, value] of Object.entries(overlay ?? {})) {
     if (Object.hasOwn(set, key)) continue
-    if (SECRET_ENV_NAME_PATTERN.test(key)) inherit.push(key)
+    if (isSecretEnvName(key)) pushInherit(key)
     else set[key] = value
   }
+  // Operator-declared .env vars pass through by NAME (inherit), keeping values
+  // out of the rendered bwrap argv. Withholding of secret/hijack names already
+  // happened in resolveExposableEnvNames — these are the vetted survivors.
+  for (const key of exposableEnvNames) pushInherit(key)
   return {
     ...(inherit.length > 0 ? { inherit } : {}),
     ...(Object.keys(set).length > 0 ? { set } : {}),
   }
+}
+
+function spreadSandboxEnv(policy: ReturnType<typeof buildSandboxEnvPolicy>): {
+  env?: ReturnType<typeof buildSandboxEnvPolicy>
+} {
+  return Object.keys(policy).length > 0 ? { env: policy } : {}
+}
+
+// Env var NAMES an operator wired as configured secret sources (MCP server env
+// bindings + their Secret `env` overrides, tunnel tokenEnv). These carry
+// credential values by intent, so they are withheld from bash even when their
+// name looks innocuous and is declared in .env.
+function configuredSecretEnvNames(agentDir: string): string[] {
+  const names: string[] = [...collectSecretEnvRefs(agentDir)]
+  for (const server of config.mcpServers) {
+    for (const [key, secret] of Object.entries(server.env)) {
+      names.push(key)
+      const envRef = (secret as { env?: unknown }).env
+      if (typeof envRef === 'string' && envRef.length > 0) names.push(envRef)
+    }
+  }
+  for (const tunnel of config.tunnels) {
+    const tokenEnv = (tunnel as { tokenEnv?: unknown }).tokenEnv
+    if (typeof tokenEnv === 'string' && tokenEnv.length > 0) names.push(tokenEnv)
+  }
+  return names
+}
+
+// Couple AGENT_MESSENGER_CONFIG_DIR exposure to masking: the pointer may reach
+// bash ONLY when its resolved target is one of the credential dirs we actually
+// masked. If it resolves outside the agent root or to the root itself, no mask
+// is applied (resolvedMessengerCredentialDir returns nothing), yet /etc and the
+// agent root are mounted into the sandbox — so exposing the pointer would let the
+// model read credentials at the unmasked target. Withhold it in that case.
+function withheldUnmaskedPointers(agentDir: string, maskedCredentialDirs: readonly string[]): string[] {
+  const configured = process.env.AGENT_MESSENGER_CONFIG_DIR
+  if (configured === undefined || configured.length === 0) return []
+  const resolved = resolve(agentDir, configured)
+  return maskedCredentialDirs.includes(resolved) ? [] : ['AGENT_MESSENGER_CONFIG_DIR']
+}
+
+function resolveExposableBashEnvNames(agentDir: string, maskedCredentialDirs: readonly string[]): string[] {
+  const declared = readEnvFile(agentDir).keys()
+  return resolveExposableEnvNames(declared, process.env, config.sandbox.env?.allow ?? [], [
+    ...configuredSecretEnvNames(agentDir),
+    ...withheldUnmaskedPointers(agentDir, maskedCredentialDirs),
+  ])
 }
 
 function buildRoleScopedConfigEnv(
