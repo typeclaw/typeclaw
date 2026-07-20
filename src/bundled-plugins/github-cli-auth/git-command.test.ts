@@ -101,8 +101,10 @@ describe('analyzeGitCommand — inject (remote resolution)', () => {
   test('fetch origin', async () => {
     expect(await analyze('git fetch origin', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
   })
-  test('pull origin main', async () => {
-    expect(await analyze('git pull origin main', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+  test('pull origin main blocks because pull can execute repo-local merge drivers and filters', async () => {
+    const result = await analyze('git pull origin main', ghRemote)
+    expect(result.kind).toBe('block')
+    expect((result as { reason: string }).reason).toContain('fetch')
   })
   test('push origin main', async () => {
     expect(await analyze('git push origin main', ghRemote)).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
@@ -164,6 +166,14 @@ describe('analyzeGitCommand — cd rewrite', () => {
       kind: 'inject',
       repoSlug: 'acme/widgets',
       rewrittenCommand: "git -C '/agent/workspace/repo' push origin main",
+    })
+  })
+  test('cd repo && git fetch is rewritten to git -C', async () => {
+    const result = await analyze('cd workspace/repo && git fetch origin', ghRemote)
+    expect(result).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      rewrittenCommand: "git -C '/agent/workspace/repo' fetch origin",
     })
   })
   test('cd with absolute path', async () => {
@@ -247,11 +257,23 @@ describe('analyzeGitCommand — multi-remote resolution', () => {
     expect((await analyze('git fetch --multiple origin upstream', r)).kind).toBe('block')
   })
 
-  test('fetch --multiple across one owner injects', async () => {
+  test('fetch --multiple with two distinct explicit GitHub slugs blocks', async () => {
+    const result = await analyze(
+      'git fetch --multiple https://github.com/acme/widgets.git https://github.com/acme/tools.git',
+    )
+    expect(result.kind).toBe('block')
+  })
+
+  test('fetch --multiple across two repos under one owner blocks', async () => {
     const r = resolvers({
       resolveRemoteUrl: async (_cwd, remote) =>
         remote === 'origin' ? 'https://github.com/acme/widgets.git' : 'https://github.com/acme/tools.git',
     })
+    expect((await analyze('git fetch --multiple origin upstream', r)).kind).toBe('block')
+  })
+
+  test('fetch --multiple permits one repeated repo slug', async () => {
+    const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
     expect(await analyze('git fetch --multiple origin upstream', r)).toEqual({
       kind: 'inject',
       repoSlug: 'acme/widgets',
@@ -304,15 +326,45 @@ describe('analyzeGitCommand — token-exfil hardening', () => {
     expect((await analyze('git --namespace=ns push origin main', ghRemote)).kind).toBe('block')
     expect((await analyze('git --exec-path=/tmp/x push origin main', ghRemote)).kind).toBe('block')
   })
+  test('push signing flags block for every non-negative value, while explicit negatives remain allowed', async () => {
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed')).kind).toBe('block')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=true')).kind).toBe('block')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=if-asked')).kind).toBe('block')
+    // Git parses yes/on/1 as true — the gate must not be limited to true/if-asked.
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=yes')).kind).toBe('block')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=on')).kind).toBe('block')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=1')).kind).toBe('block')
+    expect((await analyze('git push https://github.com/acme/widgets.git --no-signed')).kind).toBe('inject')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=false')).kind).toBe('inject')
+    expect((await analyze('git push https://github.com/acme/widgets.git --signed=no')).kind).toBe('inject')
+  })
+  test('clone --config / --template block (inject a filter/hook command before checkout)', async () => {
+    expect(
+      (await analyze('git clone --config=filter.leak.smudge=/tmp/leak https://github.com/acme/widgets.git')).kind,
+    ).toBe('block')
+    expect(
+      (await analyze('git clone --config filter.leak.smudge=/tmp/leak https://github.com/acme/widgets.git')).kind,
+    ).toBe('block')
+    expect((await analyze('git clone --template=/tmp/t https://github.com/acme/widgets.git')).kind).toBe('block')
+    expect((await analyze('git clone https://github.com/acme/widgets.git')).kind).toBe('inject')
+  })
+  test('positive recurse-submodules flags block, while negative forms remain allowed', async () => {
+    expect((await analyze('git fetch https://github.com/acme/widgets.git --recurse-submodules')).kind).toBe('block')
+    expect((await analyze('git clone https://github.com/acme/widgets.git --recurse-submodules=yes')).kind).toBe('block')
+    expect((await analyze('git fetch https://github.com/acme/widgets.git --no-recurse-submodules')).kind).toBe('inject')
+    expect((await analyze('git fetch https://github.com/acme/widgets.git --recurse-submodules=no')).kind).toBe('inject')
+  })
+  test('remote helper execution flags block', async () => {
+    expect((await analyze('git fetch --upload-pack=/x https://github.com/acme/widgets.git')).kind).toBe('block')
+    expect((await analyze('git push --receive-pack /x https://github.com/acme/widgets.git')).kind).toBe('block')
+    expect((await analyze('git clone --exec=/x https://github.com/acme/widgets.git')).kind).toBe('block')
+  })
 })
 
-describe('analyzeGitCommand — fetch/pull --all', () => {
+describe('analyzeGitCommand — fetch --all', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
   test('fetch --all blocks (cannot enumerate every remote safely)', async () => {
     expect((await analyze('git fetch --all', ghRemote)).kind).toBe('block')
-  })
-  test('pull --all blocks', async () => {
-    expect((await analyze('git pull --all', ghRemote)).kind).toBe('block')
   })
 })
 
@@ -346,19 +398,23 @@ describe('analyzeGitCommand — resolver errors fail safe', () => {
 describe('analyzeGitCommand — &&-joined git chains', () => {
   const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
 
-  test('REGRESSION: clone && fetch (same owner) injects instead of passing through tokenless', async () => {
-    // given: a compound clone+fetch that previously ran in the sandbox with no
-    // credential because the multi-git chain silently passed through.
+  test('clone && fetch blocks because the later git inherits the token environment', async () => {
     const result = await analyze(
       'git clone --depth 1 https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch origin main',
       ghRemote,
     )
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
+    expect((result as { reason: string }).reason).toContain('single bare `git`')
   })
 
-  test('clone && checkout (only first targets a remote) injects for the remote owner', async () => {
+  test('fetch && a later git segment blocks', async () => {
+    const result = await analyze('git fetch https://github.com/acme/widgets.git && git leak')
+    expect(result.kind).toBe('block')
+  })
+
+  test('clone && checkout blocks even when only the first git targets a remote', async () => {
     const result = await analyze('git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x checkout main')
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
   })
 
   test('non-remote chain (status && log) passes through (nothing to authenticate)', async () => {
@@ -411,13 +467,13 @@ describe('analyzeGitCommand — &&-joined git chains', () => {
     ).toBe('block')
   })
 
-  test('two single-owner remotes across the chain inject', async () => {
+  test('two single-owner remotes across the chain block', async () => {
     const r = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/tools.git' })
     const result = await analyze(
       'git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch upstream',
       r,
     )
-    expect(result).toEqual({ kind: 'inject', repoSlug: 'acme/widgets' })
+    expect(result.kind).toBe('block')
   })
 
   test('non-github chain passes through (no token to mint)', async () => {

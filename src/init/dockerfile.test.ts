@@ -4,6 +4,7 @@ import { mkdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { ASKPASS_SCRIPT, TYPECLAW_GIT_ASKPASS_PATH } from '@/bundled-plugins/github-cli-auth/git-askpass'
 import { dockerfileSchema } from '@/config/config'
 import { isWindows } from '@/shared'
 
@@ -32,6 +33,21 @@ import {
 // asserts the toggle-driven content of the rendered Dockerfile string.
 
 const onWindows = isWindows()
+
+describe('git askpass helper layer', () => {
+  const encoded = Buffer.from(ASKPASS_SCRIPT, 'utf8').toString('base64')
+
+  for (const [label, render] of [
+    ['inline', () => buildDockerfile()],
+    ['base', () => buildBaseDockerfile()],
+  ] as const) {
+    test(`${label} image installs the exact secret-free helper as root-owned executable`, () => {
+      const out = render()
+      expect(out).toContain(`echo "${encoded}" | base64 -d > ${TYPECLAW_GIT_ASKPASS_PATH}`)
+      expect(out).toContain(`chmod 755 ${TYPECLAW_GIT_ASKPASS_PATH}`)
+    })
+  }
+})
 
 // Pulls the package list passed to the main `apt-get install` line so
 // assertions are scoped to what actually gets installed and not to

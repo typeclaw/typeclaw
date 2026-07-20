@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { isWindows } from '@/shared'
 
-import { ensureGitAskPassHelper, resetGitAskPassHelperForTests } from './git-askpass'
+import { ensureGitAskPassHelper, resetGitAskPassHelperForTests, TYPECLAW_GIT_ASKPASS_PATH } from './git-askpass'
 
 const onWindows = isWindows()
 
@@ -24,6 +24,20 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper', () => {
     const path = await tmpHelperPath()
     expect(await ensureGitAskPassHelper(path)).toBe(path)
     expect((await stat(path)).isFile()).toBe(true)
+  })
+
+  test('honors the path override when no explicit path is passed', async () => {
+    const path = await tmpHelperPath()
+    process.env.TYPECLAW_GIT_ASKPASS_PATH = path
+    try {
+      expect(await ensureGitAskPassHelper()).toBe(path)
+    } finally {
+      delete process.env.TYPECLAW_GIT_ASKPASS_PATH
+    }
+  })
+
+  test('exports the image-baked production path', () => {
+    expect(TYPECLAW_GIT_ASKPASS_PATH).toBe('/usr/local/bin/typeclaw-git-askpass')
   })
 
   test('helper content contains no token, only the env var name', async () => {

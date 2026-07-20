@@ -4,6 +4,7 @@ import path from 'node:path'
 
 import { SESSION_TMP_ROOT } from '@/sandbox'
 
+import { TYPECLAW_GIT_ASKPASS_PATH } from './git-askpass'
 import { prepareReviewerCheckout } from './review-checkout'
 
 const SHA = '0123456789abcdef0123456789abcdef01234567'
@@ -57,6 +58,21 @@ describe('prepareReviewerCheckout', () => {
       }),
     ).rejects.toThrow(/full 40-character/i)
     expect(resolved).toBe(false)
+  })
+
+  test('uses the image-baked askpass path without a runtime write', async () => {
+    const calls: Array<{ env: NodeJS.ProcessEnv }> = []
+    await prepareReviewerCheckout({
+      repoSlug: 'acme/widgets',
+      headSha: SHA,
+      sessionId,
+      resolveTokenForRepo: async () => ({ kind: 'token', token: 'ghs_secret' }),
+      fetchImpl: async () => new Response(JSON.stringify({ sha: SHA })),
+      runProcess: async (_file, _args, options) => {
+        calls.push({ env: options.env })
+      },
+    })
+    expect(calls[1]?.env.GIT_ASKPASS).toBe(TYPECLAW_GIT_ASKPASS_PATH)
   })
 
   test('rejects a commit verification response for a different SHA', async () => {

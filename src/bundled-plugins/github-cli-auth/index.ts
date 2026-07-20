@@ -15,6 +15,7 @@ import {
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
+import { TYPECLAW_GIT_ASKPASS_PATH } from './git-askpass'
 import { analyzeGitCommand, defaultGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
@@ -346,18 +347,90 @@ export default definePlugin({
       return
     }
 
-    const handleGitCommand = async (params: { command: string; agentDir: string }): Promise<HookResult> => {
-      const { command, agentDir } = params
+    const handleGitCommand = async (params: {
+      event: { args: Record<string, unknown>; origin?: SessionOrigin }
+      command: string
+      agentDir: string
+    }): Promise<HookResult> => {
+      const { event, command, agentDir } = params
       const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
       if (decision.kind === 'pass-through') return
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
-      const token = effectiveProcessToken()
-      if (token === undefined && !hasAppTokenResolver()) return
-      return {
-        block: true,
-        reason:
-          'Authenticated git is unavailable to model-driven bash because git can invoke repository hooks and credential helpers that inherit reusable credentials. Local git commands still work; use a first-class GitHub action or run network git host-side.',
+
+      // Prefer a least-privilege per-repo GitHub App installation token. A PAT is
+      // NOT re-minted per repo and NOT brokered to git here: git — unlike gh — can
+      // execute repo-local hooks/filters/helpers, so we only ever hand it a
+      // short-lived, server-confined single-repo App token, never a broad PAT.
+      // With no live App minter, leave the command untouched so git fails honestly
+      // (a possibly-declared `.env` PAT is inherited by the sandbox for `gh`, but
+      // is deliberately not wired into authenticated git).
+      if (!hasAppTokenResolver()) return
+      const result = await resolveTokenForRepo(decision.repoSlug)
+      if (result.kind === 'unavailable') return { block: true, reason: result.reason }
+
+      // The analyzer guarantees a SINGLE bare `git` (no composition, no dangerous
+      // global flags, single owner), so the token env reaches only this git and no
+      // sibling process. Even so, git reads the target repo's LOCAL `.git/config`,
+      // which the argv analyzer cannot see and which could run code with the token
+      // in env (core.hooksPath, core.fsmonitor, credential.helper, clean/smudge
+      // filters, url.insteadOf, submodule/protocol tricks). We neutralize those at
+      // the process edge via GIT_CONFIG_* env — highest-precedence, applied
+      // regardless of the model-controlled command string — plus GIT_ALLOW_PROTOCOL
+      // to fence transport. GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL drop system+
+      // global config; local config is overridden key-by-key below.
+      const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
+      const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
+      // Forced git config, in GIT_CONFIG_KEY_n/VALUE_n pairs. hooksPath/fsmonitor
+      // kill hook + monitor command execution; credential.helper= empties the
+      // helper chain so no helper can capture the token; the two insteadOf rewrites
+      // fold SSH/scp remotes to https so the askpass credential applies uniformly;
+      // protocol.allow=never + protocol.https.allow=always confine transport to
+      // https (belt-and-suspenders with GIT_ALLOW_PROTOCOL).
+      const forcedConfig: Array<[string, string]> = [
+        ['core.hooksPath', '/dev/null'],
+        ['core.fsmonitor', 'false'],
+        ['core.alternateRefsCommand', '/bin/true'],
+        ['core.askPass', TYPECLAW_GIT_ASKPASS_PATH],
+        ['credential.helper', ''],
+        ['maintenance.auto', 'false'],
+        ['push.gpgSign', 'false'],
+        ['commit.gpgSign', 'false'],
+        ['tag.gpgSign', 'false'],
+        ['gpg.program', '/bin/false'],
+        ['gpg.openpgp.program', '/bin/false'],
+        ['gpg.x509.program', '/bin/false'],
+        ['gpg.ssh.program', '/bin/false'],
+        ['gpg.ssh.defaultKeyCommand', '/bin/false'],
+        ['submodule.recurse', 'false'],
+        ['fetch.recurseSubmodules', 'false'],
+        ['push.recurseSubmodules', 'no'],
+        ['pager.fetch', 'false'],
+        ['pager.push', 'false'],
+        ['pager.ls-remote', 'false'],
+        ['protocol.allow', 'never'],
+        ['protocol.https.allow', 'always'],
+        ['url.https://github.com/.insteadOf', 'git@github.com:'],
+        ['url.https://github.com/.insteadOf', 'ssh://git@github.com/'],
+      ]
+      const configEnv: Record<string, string> = { GIT_CONFIG_COUNT: String(forcedConfig.length) }
+      forcedConfig.forEach(([key, value], i) => {
+        configEnv[`GIT_CONFIG_KEY_${i}`] = key
+        configEnv[`GIT_CONFIG_VALUE_${i}`] = value
+      })
+      event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
+        ...overlay,
+        GIT_ASKPASS: TYPECLAW_GIT_ASKPASS_PATH,
+        TYPECLAW_GIT_TOKEN: result.token,
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_ALLOW_PROTOCOL: 'https',
+        GIT_PROTOCOL_FROM_USER: '0',
+        GIT_PAGER: '/bin/cat',
+        ...configEnv,
       }
+      if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
+      return
     }
 
     return {
@@ -373,7 +446,7 @@ export default definePlugin({
           }
 
           if (command.includes('git')) {
-            return await handleGitCommand({ command, agentDir: ctx.agentDir })
+            return await handleGitCommand({ event, command, agentDir: ctx.agentDir })
           }
           return
         },

@@ -1,3 +1,4 @@
+import { ASKPASS_SCRIPT, TYPECLAW_GIT_ASKPASS_PATH } from '@/bundled-plugins/github-cli-auth/git-askpass'
 import { validateDockerfileAppendLine } from '@/config/config'
 import type { DockerfileConfig, DockerfileFeatureToggle } from '@/config/config'
 import {
@@ -671,6 +672,12 @@ function renderEntrypointShimLayer(): string {
 # The shim is a no-op unless \`network.blockInternal\` is true at runtime.
 RUN echo "${encoded}" | base64 -d > ${TYPECLAW_ENTRYPOINT_PATH} \\
  && chmod +x ${TYPECLAW_ENTRYPOINT_PATH}`
+}
+
+function renderGitAskPassLayer(): string {
+  const encoded = Buffer.from(ASKPASS_SCRIPT, 'utf8').toString('base64')
+  return `RUN echo "${encoded}" | base64 -d > ${TYPECLAW_GIT_ASKPASS_PATH} \\
+ && chmod 755 ${TYPECLAW_GIT_ASKPASS_PATH}`
 }
 
 // Layer 7: install @huggingface/transformers with its linux-native binaries.
@@ -1417,7 +1424,9 @@ WORKDIR /agent
 
 ARG TARGETARCH
 
-${ghKeyringLayer}${toggleAptLayer}${cloudflaredBlock}${claudeCodeBlock}${codexCliBlock}${renderEntrypointShimLayer()}
+${ghKeyringLayer}${toggleAptLayer}${cloudflaredBlock}${claudeCodeBlock}${codexCliBlock}${renderGitAskPassLayer()}
+
+${renderEntrypointShimLayer()}
 
 ${LAYER_TRANSFORMERS_INSTALL}
 
@@ -1480,7 +1489,9 @@ ${LAYER_4_5_AGENT_BROWSER_HEADED_WRAPPER}
 
 ${renderChromeForTestingLayer(buildKit)}
 
-${cloudflaredBlock}${claudeCodeBlock}${codexCliBlock}${renderEntrypointShimLayer()}
+${cloudflaredBlock}${claudeCodeBlock}${codexCliBlock}${renderGitAskPassLayer()}
+
+${renderEntrypointShimLayer()}
 
 ${LAYER_TRANSFORMERS_INSTALL}
 
@@ -1556,6 +1567,8 @@ ${renderAgentBrowserInstallLayer(true)}
 ${LAYER_4_5_AGENT_BROWSER_HEADED_WRAPPER}
 
 ${renderChromeForTestingLayer(true)}
+
+${renderGitAskPassLayer()}
 
 ${renderEntrypointShimLayer()}
 

@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path'
 // \`github.com.evil/\`, or \`x@github.com.evil/\`. Without the userinfo arm the
 // password prompt falls through to \`exit 1\` and every HTTPS clone/fetch fails
 // with "unable to read askpass response".
-const ASKPASS_SCRIPT = `#!/bin/sh
+export const ASKPASS_SCRIPT = `#!/bin/sh
 case "$1" in
   *//github.com/*|*//github.com\\'*|*//*@github.com/*|*//*@github.com\\'*) : ;;
   *) exit 1 ;;
@@ -40,11 +40,11 @@ esac
 // so a helper here is readable by sandboxed bash; the per-session /tmp bind is not
 // a stable path. TYPECLAW_GIT_ASKPASS_PATH overrides it for tests/CI, which
 // cannot write under /usr.
-const DEFAULT_ASKPASS_PATH = '/usr/local/bin/typeclaw-git-askpass'
+export const TYPECLAW_GIT_ASKPASS_PATH = '/usr/local/bin/typeclaw-git-askpass'
 
 function defaultPath(): string {
   const override = process.env.TYPECLAW_GIT_ASKPASS_PATH
-  return override !== undefined && override !== '' ? override : DEFAULT_ASKPASS_PATH
+  return override !== undefined && override !== '' ? override : TYPECLAW_GIT_ASKPASS_PATH
 }
 
 let ensurePromise: Promise<string> | null = null

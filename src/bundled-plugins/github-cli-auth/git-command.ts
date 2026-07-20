@@ -54,19 +54,28 @@ export const defaultGitResolvers: GitResolvers = {
   resolveCurrentBranch: (cwd) => runGit(cwd, ['symbolic-ref', '--short', 'HEAD']),
 }
 
-const REMOTE_SUBCOMMANDS = new Set(['push', 'fetch', 'pull', 'clone', 'ls-remote'])
+const REMOTE_SUBCOMMANDS = new Set(['fetch', 'clone', 'push', 'ls-remote'])
+const TOKEN_TARGETING_SUBCOMMANDS = new Set([...REMOTE_SUBCOMMANDS, 'pull'])
 
 const MULTI_OWNER_REASON =
   'This git command targets repos under more than one owner; a single minted ' +
   'GitHub App token cannot authenticate all of them. Split it into separate ' +
   'commands, one owner each.'
 
+const MULTI_REPO_REASON =
+  'This git command targets more than one repository; a minted GitHub App token ' +
+  'is scoped to exactly one owner/repo. Split it into separate commands, one repository each.'
+
+const PULL_REASON =
+  '`git pull` can execute repo-local merge drivers and filters while the minted ' +
+  'token is in its environment. Run `git fetch` first, then merge or reset in a separate tokenless command.'
+
 const COMPOSITION_REASON =
   'A repo-targeting `git` command receives a minted GitHub App token via ' +
   'GIT_ASKPASS in its process environment, so it must run as a single bare ' +
   '`git` command — no `;`, `&&`, `||`, `&`, newlines, pipes, redirections, ' +
-  'command/parameter substitution, or subshells (any sibling process would ' +
-  'inherit the token). The one accepted prefix is `cd <simple-path> && git …`, ' +
+  'command/parameter substitution, or subshells. A later git segment, including ' +
+  'a `!` alias, would inherit TYPECLAW_GIT_TOKEN. The one accepted prefix is `cd <simple-path> && git …`, ' +
   'which is rewritten to `git -C <path> …`.'
 
 const DANGEROUS_CONFIG_REASON =
@@ -78,9 +87,13 @@ const DANGEROUS_CONFIG_REASON =
   'the token. Remove them and re-run, or run without the minted token.'
 
 const FETCH_ALL_REASON =
-  '`git fetch --all` / `git pull --all` contacts every configured remote, which ' +
+  '`git fetch --all` contacts every configured remote, which ' +
   'cannot be enumerated safely here — a minted token scoped to one remote could ' +
   'be sent to another. Fetch a specific remote instead.'
+
+const DANGEROUS_REMOTE_OPTION_REASON =
+  'This token-bearing git command enables an option that can execute a configured ' +
+  'program with TYPECLAW_GIT_TOKEN in its environment. Remove signing, submodule recursion, or remote helper overrides.'
 
 // OUTSIDE single quotes these spawn a sibling process (which would inherit the
 // askpass token) or expand shell state. `$`/backtick stay active inside double
@@ -99,41 +112,22 @@ export async function analyzeGitCommand(
   if (stripped.unsafe) return { kind: 'pass-through' }
   if (stripped.cdDir !== null) return analyzeSingleCdGit(stripped, options)
 
-  // Split the command into `&&`-joined git segments. null = not a pure
-  // git-only `&&` chain (a non-git segment, a forbidden shell operator, a
-  // leading env assignment, or no git at all).
   const chain = extractGitInvocationChain(command)
-  if (chain === null) {
-    // Distinguish "no git here at all" (pass-through) from "git is present but
-    // the composition is unsafe" (block). A bare `ls`/`echo` is not our concern;
-    // a `git push … | tee` or `git … && curl evil` must be blocked, never run
-    // tokenless (which is what silently passing through used to do — the bug).
-    return containsGitInvocation(command) ? { kind: 'block', reason: COMPOSITION_REASON } : { kind: 'pass-through' }
-  }
-
-  const remoteSegments = chain.filter((s) => {
+  const invocations = chain ?? extractGitInvocations(command)
+  const remoteSegments = invocations.filter((s) => {
     const sub = findSubcommand(s.args)
-    return sub !== undefined && REMOTE_SUBCOMMANDS.has(sub)
+    return sub !== undefined && TOKEN_TARGETING_SUBCOMMANDS.has(sub)
   })
   // No segment talks to a remote (e.g. `git status && git log`): nothing to
   // authenticate, so pass through and let git run with no token.
   if (remoteSegments.length === 0) return { kind: 'pass-through' }
-
-  // Every segment — even non-remote ones like `git status` that ride along in
-  // the chain — must pass the redirect screen: a token lives in the shared env
-  // the whole chain inherits, so a `-c`/env-assignment on ANY git could steer
-  // auth or destination.
-  for (const seg of chain) {
-    if (seg.hasLeadingEnvAssignment || hasDangerousGitConfig(seg.args)) {
-      return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
-    }
-    const sub = findSubcommand(seg.args)
-    if ((sub === 'fetch' || sub === 'pull') && seg.args.includes('--all')) {
-      return { kind: 'block', reason: FETCH_ALL_REASON }
-    }
+  if (remoteSegments.some((seg) => findSubcommand(seg.args) === 'fetch' && seg.args.includes('--all'))) {
+    return { kind: 'block', reason: FETCH_ALL_REASON }
   }
 
   const owners = new Set<string>()
+  const repos = new Set<string>()
+  const targetedSegments: GitInvocation[] = []
   let representativeSlug: string | null = null
   for (const seg of remoteSegments) {
     const sub = findSubcommand(seg.args) as string
@@ -146,8 +140,10 @@ export async function analyzeGitCommand(
     } catch {
       return { kind: 'pass-through' }
     }
+    if (slugs.length > 0) targetedSegments.push(seg)
     for (const slug of slugs) {
       owners.add(slug.split('/')[0] as string)
+      repos.add(slug)
       representativeSlug ??= slug
     }
   }
@@ -156,7 +152,24 @@ export async function analyzeGitCommand(
   // not mint a possibly-wrong-owner token, and silently passing through would
   // reproduce the credential-less failure. Block with an actionable reason.
   if (representativeSlug === null) return { kind: 'pass-through' }
+  if (targetedSegments.some((seg) => findSubcommand(seg.args) === 'pull')) {
+    return { kind: 'block', reason: PULL_REASON }
+  }
+  if (chain === null || chain.length !== 1) return { kind: 'block', reason: COMPOSITION_REASON }
+
+  const segment = chain[0] as GitInvocation
+  if (segment.hasLeadingEnvAssignment || hasDangerousGitConfig(segment.args)) {
+    return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
+  }
+  const subcommand = findSubcommand(segment.args) as string
+  if (subcommand === 'fetch' && segment.args.includes('--all')) {
+    return { kind: 'block', reason: FETCH_ALL_REASON }
+  }
+  if (hasDangerousRemoteOption(subcommand, segment.args)) {
+    return { kind: 'block', reason: DANGEROUS_REMOTE_OPTION_REASON }
+  }
   if (owners.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+  if (repos.size > 1) return { kind: 'block', reason: MULTI_REPO_REASON }
 
   return { kind: 'inject', repoSlug: representativeSlug }
 }
@@ -173,13 +186,8 @@ async function analyzeSingleCdGit(
   if (segment === null) return { kind: 'pass-through' }
   const args = segment.args
   const subcommand = findSubcommand(args)
-  if (subcommand === undefined || !REMOTE_SUBCOMMANDS.has(subcommand)) return { kind: 'pass-through' }
-  if (segment.hasLeadingEnvAssignment || hasDangerousGitConfig(args)) {
-    return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
-  }
-  if ((subcommand === 'fetch' || subcommand === 'pull') && args.includes('--all')) {
-    return { kind: 'block', reason: FETCH_ALL_REASON }
-  }
+  if (subcommand === undefined || !TOKEN_TARGETING_SUBCOMMANDS.has(subcommand)) return { kind: 'pass-through' }
+  if (subcommand === 'fetch' && args.includes('--all')) return { kind: 'block', reason: FETCH_ALL_REASON }
   const dashCDir = extractDashCDir(args)
   const effectiveCwd = resolveCwd(resolveCwd(options.cwd, stripped.cdDir), dashCDir)
   let slugs: string[]
@@ -189,8 +197,18 @@ async function analyzeSingleCdGit(
     return { kind: 'pass-through' }
   }
   if (slugs.length === 0) return { kind: 'pass-through' }
+  if (subcommand === 'pull') return { kind: 'block', reason: PULL_REASON }
+  if (segment.hasLeadingEnvAssignment || hasDangerousGitConfig(args)) {
+    return { kind: 'block', reason: DANGEROUS_CONFIG_REASON }
+  }
+  if (subcommand === 'fetch' && args.includes('--all')) return { kind: 'block', reason: FETCH_ALL_REASON }
+  if (hasDangerousRemoteOption(subcommand, args)) {
+    return { kind: 'block', reason: DANGEROUS_REMOTE_OPTION_REASON }
+  }
   const owners = new Set(slugs.map((s) => s.split('/')[0]))
+  const repos = new Set(slugs)
   if (owners.size > 1) return { kind: 'block', reason: MULTI_OWNER_REASON }
+  if (repos.size > 1) return { kind: 'block', reason: MULTI_REPO_REASON }
   const repoSlug = slugs[0] as string
   // The rewrite cannot stack two `-C` (the git part must not already carry one)
   // and the rest must be a single bare git (no further composition).
@@ -219,16 +237,63 @@ function hasDangerousGitConfig(args: readonly string[]): boolean {
   return false
 }
 
+function hasDangerousRemoteOption(subcommand: string, args: readonly string[]): boolean {
+  for (const arg of args) {
+    // `--signed` selects a signing program (`gpg.program` / `gpg.ssh.program` /
+    // `gpg.ssh.defaultKeyCommand`) that would run with the token. Git parses any
+    // non-negative boolean (`true`/`yes`/`on`/`1`) — plus `if-asked` — as "sign",
+    // so reject the bare flag and every `--signed=<value>` unless explicitly
+    // negative; `--no-signed` is git's own negation and stays allowed.
+    if (
+      subcommand === 'push' &&
+      (arg === '--signed' || (arg.startsWith('--signed=') && !isNegativeBoolean(arg.slice('--signed='.length))))
+    )
+      return true
+    // `clone --config <k>=<v>` (and `--template <dir>`) inject repo-local config
+    // BEFORE checkout, so a tracked `.gitattributes` can select an attacker-named
+    // `filter.<x>.smudge` the forced GIT_CONFIG_* list can't enumerate — the token
+    // then rides that filter. `-c` is already caught by hasDangerousGitConfig.
+    if (
+      subcommand === 'clone' &&
+      (arg === '--config' || arg.startsWith('--config=') || arg === '--template' || arg.startsWith('--template='))
+    )
+      return true
+    if (
+      (subcommand === 'fetch' || subcommand === 'push' || subcommand === 'clone') &&
+      (arg === '--recurse-submodules' ||
+        (arg.startsWith('--recurse-submodules=') && !isNegativeBoolean(arg.slice('--recurse-submodules='.length))))
+    )
+      return true
+    if (
+      arg === '--upload-pack' ||
+      arg.startsWith('--upload-pack=') ||
+      arg === '--receive-pack' ||
+      arg.startsWith('--receive-pack=') ||
+      arg === '--exec' ||
+      arg.startsWith('--exec=')
+    )
+      return true
+  }
+  return false
+}
+
+function isNegativeBoolean(value: string): boolean {
+  return ['false', 'no', 'off', '0'].includes(value.toLocaleLowerCase())
+}
+
 async function resolveRepoSlugs(
   subcommand: string,
   args: readonly string[],
   cwd: string,
   resolvers: GitResolvers,
 ): Promise<string[]> {
-  const explicitUrl = extractExplicitUrl(subcommand, args)
-  if (explicitUrl !== null) {
-    const slug = parseGithubRepoFromGitUrl(explicitUrl)
-    return slug === null ? [] : [slug]
+  const explicitUrls = extractExplicitUrls(subcommand, args)
+  if (explicitUrls.length > 0) {
+    const candidates = args.includes('--multiple') ? explicitUrls : [explicitUrls[0] as string]
+    return candidates.flatMap((url) => {
+      const slug = parseGithubRepoFromGitUrl(url)
+      return slug === null ? [] : [slug]
+    })
   }
 
   // clone needs an explicit URL; it has no configured-remote fallback.
@@ -325,24 +390,23 @@ const GIT_VALUE_FLAGS = new Set([
   '-b',
   '--branch',
   '-u',
+  '--upload-pack',
+  '--receive-pack',
+  '--exec',
 ])
 
-function extractExplicitUrl(subcommand: string, args: readonly string[]): string | null {
+function extractExplicitUrls(subcommand: string, args: readonly string[]): string[] {
   // `git push --repo <url>` / `--repo=<url>`
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string
     if (arg === '--repo' || arg === '--repository') {
       const v = args[i + 1]
-      if (v !== undefined && looksLikeUrl(v)) return v
+      if (v !== undefined && looksLikeUrl(v)) return [v]
     }
-    if (arg.startsWith('--repo=')) return arg.slice('--repo='.length)
-    if (arg.startsWith('--repository=')) return arg.slice('--repository='.length)
+    if (arg.startsWith('--repo=')) return [arg.slice('--repo='.length)]
+    if (arg.startsWith('--repository=')) return [arg.slice('--repository='.length)]
   }
-  // First positional after the subcommand that looks like a URL.
-  for (const pos of positionalsAfterSubcommand(subcommand, args)) {
-    if (looksLikeUrl(pos)) return pos
-  }
-  return null
+  return positionalsAfterSubcommand(subcommand, args).filter(looksLikeUrl)
 }
 
 // The git subcommand is the first positional that is NOT consumed by a global
@@ -424,16 +488,18 @@ function extractSingleGitInvocation(command: string): GitInvocation | null {
   return { args, hasLeadingEnvAssignment }
 }
 
-// True if `git` appears at any command boundary. Used to decide block-vs-pass:
-// a command with no git at all is none of our business (pass-through), but one
-// that DOES contain git yet is not a clean git-only `&&` chain must be blocked,
-// not run tokenless.
-function containsGitInvocation(command: string): boolean {
+function extractGitInvocations(command: string): GitInvocation[] {
   const tokens = tokenize(command)
+  const invocations: GitInvocation[] = []
   for (let i = 0; i < tokens.length; i++) {
-    if (tokens[i] === 'git' && (i === 0 || isCommandBoundaryBefore(tokens, i))) return true
+    if (tokens[i] !== 'git' || (i !== 0 && !isCommandBoundaryBefore(tokens, i))) continue
+    const hasLeadingEnvAssignment = i > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i - 1] ?? '')
+    let end = i + 1
+    while (end < tokens.length && !['&&', '||', '|', ';', '&', '\n'].includes(tokens[end] as string)) end += 1
+    invocations.push({ args: tokens.slice(i + 1, end), hasLeadingEnvAssignment })
+    i = end - 1
   }
-  return false
+  return invocations
 }
 
 // Splits a command into `&&`-joined segments and accepts it ONLY when EVERY

@@ -15,6 +15,7 @@ import { noopPermissionService, type PermissionService } from '@/permissions'
 import { createHookBus, type PluginContext, type PluginLogger, type ToolBeforeEvent } from '@/plugin'
 import { buildSandboxedCommand } from '@/sandbox'
 
+import { TYPECLAW_GIT_ASKPASS_PATH } from './git-askpass'
 import githubCliAuthPlugin from './index'
 
 const noopLogger = { info: () => {}, warn: () => {}, error: () => {} }
@@ -1146,40 +1147,96 @@ describe('github-cli-auth plugin — .env PAT role gating (gh path)', () => {
 })
 
 describe('github-cli-auth plugin — git path', () => {
-  test('App auth: blocks explicit-URL git clone without exposing a token', async () => {
-    process.env.GH_TOKEN = 'ghs_seeded'
-    const hook = await hookFor(tokenResolver('ghs_minted'))
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+  const gitEnv = (event: ToolBeforeEvent): Record<string, string> =>
+    (event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {}) as Record<string, string>
 
-    const result = await hook(event, hookCtx)
+  const forcedConfigPairs = (env: Record<string, string>): Array<[string, string]> => {
+    const count = Number(env.GIT_CONFIG_COUNT ?? '0')
+    const pairs: Array<[string, string]> = []
+    for (let i = 0; i < count; i++)
+      pairs.push([env[`GIT_CONFIG_KEY_${i}`] as string, env[`GIT_CONFIG_VALUE_${i}`] as string])
+    return pairs
+  }
 
-    expect(result).toMatchObject({ block: true })
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(event.args.command).toBe('git clone https://github.com/acme/widgets.git')
-    expect(JSON.stringify(event.args.command)).not.toContain('ghs_minted')
-  })
-
-  test('authenticated git is blocked without minting a repo token', async () => {
+  test('App auth: mints a per-repo token into git via the askpass overlay, never the command', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const seen: string[] = []
     const hook = await hookFor(async (slug) => {
       seen.push(slug)
       return { kind: 'token', token: 'ghs_minted' }
     })
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
 
-    const result = await hook(bashEvent('git clone https://github.com/acme/widgets.git'), hookCtx)
+    const result = await hook(event, hookCtx)
 
-    expect(result).toMatchObject({ block: true })
-    expect(seen).toEqual([])
+    expect(result).toBeUndefined()
+    expect(seen).toEqual(['acme/widgets'])
+    const env = gitEnv(event)
+    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+    expect(env.GIT_ASKPASS).toBe(TYPECLAW_GIT_ASKPASS_PATH)
+    // The secret rides ONLY in the env overlay, never in the command string.
+    expect(JSON.stringify(event.args.command)).not.toContain('ghs_minted')
   })
 
-  test('multi-owner App auth blocks git push rather than minting into git', async () => {
-    // given: the reported #733 failure — a push under a multi-owner App where
-    // GH_TOKEN is never seeded, so the old `classifyGhToken(GH_TOKEN) === app`
-    // gate dropped the credential and git died with "could not read Username".
+  test('minted git carries the forced hardening config that neutralizes repo-local execution vectors', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('git fetch https://github.com/acme/widgets.git main')
+
+    await hook(event, hookCtx)
+
+    const env = gitEnv(event)
+    expect(env.GIT_CONFIG_NOSYSTEM).toBe('1')
+    expect(env.GIT_CONFIG_GLOBAL).toBe('/dev/null')
+    expect(env.GIT_ALLOW_PROTOCOL).toBe('https')
+    expect(env.GIT_TERMINAL_PROMPT).toBe('0')
+    expect(env.GIT_PAGER).toBe('/bin/cat')
+    const pairs = forcedConfigPairs(env)
+    expect(pairs).toEqual([
+      ['core.hooksPath', '/dev/null'],
+      ['core.fsmonitor', 'false'],
+      ['core.alternateRefsCommand', '/bin/true'],
+      ['core.askPass', TYPECLAW_GIT_ASKPASS_PATH],
+      ['credential.helper', ''],
+      ['maintenance.auto', 'false'],
+      ['push.gpgSign', 'false'],
+      ['commit.gpgSign', 'false'],
+      ['tag.gpgSign', 'false'],
+      ['gpg.program', '/bin/false'],
+      ['gpg.openpgp.program', '/bin/false'],
+      ['gpg.x509.program', '/bin/false'],
+      ['gpg.ssh.program', '/bin/false'],
+      ['gpg.ssh.defaultKeyCommand', '/bin/false'],
+      ['submodule.recurse', 'false'],
+      ['fetch.recurseSubmodules', 'false'],
+      ['push.recurseSubmodules', 'no'],
+      ['pager.fetch', 'false'],
+      ['pager.push', 'false'],
+      ['pager.ls-remote', 'false'],
+      ['protocol.allow', 'never'],
+      ['protocol.https.allow', 'always'],
+      ['url.https://github.com/.insteadOf', 'git@github.com:'],
+      ['url.https://github.com/.insteadOf', 'ssh://git@github.com/'],
+    ])
+  })
+
+  test('single-owner App auth mints for git push', async () => {
     delete process.env.GH_TOKEN
     const hook = await hookFor(tokenResolver('ghs_minted'), true)
     const event = bashEvent('git push https://github.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(gitEnv(event).TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+  })
+
+  test('multi-owner git blocks rather than minting a single-repo token for foreign owners', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent(
+      'git fetch https://github.com/acme/widgets.git && git fetch https://github.com/other/thing.git',
+    )
 
     const result = await hook(event, hookCtx)
 
@@ -1187,7 +1244,7 @@ describe('github-cli-auth plugin — git path', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('no App auth (GH_TOKEN unseeded, no minter): git push passes through without minting', async () => {
+  test('no App auth (no minter): authenticated git passes through so git fails honestly', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false
     const hook = await hookFor(async () => {
@@ -1203,26 +1260,31 @@ describe('github-cli-auth plugin — git path', () => {
     expect(resolverCalled).toBe(false)
   })
 
-  test('App auth: blocks before consulting an unavailable bridge', async () => {
+  test('App auth: blocks when the bridge is unavailable (repo not in repos[])', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(unavailableResolver)
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
 
-    const result = await hook(bashEvent('git clone https://github.com/acme/widgets.git'), hookCtx)
+    const result = await hook(event, hookCtx)
 
     expect(result).toMatchObject({ block: true })
-    expect((result as { reason: string }).reason).toContain('Authenticated git')
+    expect((result as { reason: string }).reason).toContain('adapter down')
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
-  test('App auth: blocks a compound (token-leaking) git command', async () => {
+  test('blocks a compound (token-leaking) git command before minting', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('git clone https://github.com/acme/widgets.git && cat .env')
 
-    const result = await hook(bashEvent('git clone https://github.com/acme/widgets.git && cat .env'), hookCtx)
+    const result = await hook(event, hookCtx)
 
     expect(result).toMatchObject({ block: true })
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(JSON.stringify(event.args.command)).not.toContain('ghs_minted')
   })
 
-  test('App auth: blocks an all-git chain because hooks/helpers inherit credentials', async () => {
+  test('a same-owner git-only && chain blocks before minting', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(tokenResolver('ghs_minted'))
     const event = bashEvent('git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch origin main')
@@ -1231,95 +1293,47 @@ describe('github-cli-auth plugin — git path', () => {
 
     expect(result).toMatchObject({ block: true })
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(event.args.command).toBe(
-      'git clone https://github.com/acme/widgets.git /tmp/x && git -C /tmp/x fetch origin main',
-    )
     expect(JSON.stringify(event.args.command)).not.toContain('ghs_minted')
   })
 
-  test('classic PAT is never injected into git, even for a credential-entitled role', async () => {
+  test('pull blocks before minting because it can execute repo-local merge programs', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('git pull https://github.com/acme/widgets.git main')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('classic PAT is never brokered to git; an App token is minted instead', async () => {
+    process.env.GH_TOKEN = 'ghp_classic'
+    const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })
+    const event = bashEvent('git clone https://github.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    const env = gitEnv(event)
+    expect(env.TYPECLAW_GIT_TOKEN).toBe('ghs_minted')
+    expect(JSON.stringify(env)).not.toContain('ghp_classic')
+  })
+
+  test('PAT with no App minter: authenticated git passes through, PAT never reaches git', async () => {
     process.env.GH_TOKEN = 'ghp_classic'
     let resolverCalled = false
-    const hook = await hookFor(
-      async () => {
-        resolverCalled = true
-        return { kind: 'token', token: 'ghs_minted' }
-      },
-      true,
-      { permissions: privilegedPermissions },
-    )
+    const hook = await hookFor(async () => {
+      resolverCalled = true
+      return { kind: 'token', token: 'ghs_minted' }
+    }, false)
     const event = bashEvent('git clone https://github.com/acme/widgets.git')
 
     const result = await hook(event, hookCtx)
 
-    expect(result).toMatchObject({ block: true })
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(JSON.stringify(event.args.command)).not.toContain('ghp_classic')
-    expect(resolverCalled).toBe(false)
-  })
-
-  test('fine-grained PAT is never injected into git, even for a credential-entitled role', async () => {
-    process.env.GH_TOKEN = 'github_pat_xyz'
-    let resolverCalled = false
-    const hook = await hookFor(
-      async () => {
-        resolverCalled = true
-        return { kind: 'token', token: 'ghs_minted' }
-      },
-      true,
-      { permissions: privilegedPermissions },
-    )
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
-
-    const result = await hook(event, hookCtx)
-
-    expect(result).toMatchObject({ block: true })
+    expect(result).toBeUndefined()
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
     expect(resolverCalled).toBe(false)
-  })
-
-  test('git does not receive GITHUB_TOKEN when GH_TOKEN is absent', async () => {
-    delete process.env.GH_TOKEN
-    process.env.GITHUB_TOKEN = 'github_pat_fallback'
-    let resolverCalled = false
-    const hook = await hookFor(
-      async () => {
-        resolverCalled = true
-        return { kind: 'token', token: 'ghs_minted' }
-      },
-      true,
-      { permissions: privilegedPermissions },
-    )
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
-
-    const result = await hook(event, hookCtx)
-
-    expect(result).toMatchObject({ block: true })
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-    expect(resolverCalled).toBe(false)
-  })
-
-  test('PAT plus App minter still does not place a reusable token in git', async () => {
-    process.env.GH_TOKEN = 'ghp_classic'
-    const hook = await hookFor(tokenResolver('ghs_minted'), true)
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
-
-    const result = await hook(event, hookCtx)
-
-    expect(result).toMatchObject({ block: true })
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
-  })
-
-  test('PAT without App minter blocks git with confused-deputy guidance', async () => {
-    process.env.GH_TOKEN = 'ghp_classic'
-    const hook = await hookFor(tokenResolver('ghs_minted'), false)
-    const event = bashEvent('git clone https://github.com/acme/widgets.git')
-
-    const result = await hook(event, hookCtx)
-
-    expect(result).toMatchObject({ block: true })
-    expect((result as { reason: string }).reason).toContain('credential helpers')
-    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
   test('non-github explicit-URL git command passes through without minting', async () => {
@@ -1330,6 +1344,22 @@ describe('github-cli-auth plugin — git path', () => {
       return { kind: 'token', token: 'ghs_minted' }
     })
     const event = bashEvent('git clone https://gitlab.com/acme/widgets.git')
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(resolverCalled).toBe(false)
+  })
+
+  test('local (non-network) git passes through without minting', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    let resolverCalled = false
+    const hook = await hookFor(async () => {
+      resolverCalled = true
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+    const event = bashEvent('git status')
 
     const result = await hook(event, hookCtx)
 

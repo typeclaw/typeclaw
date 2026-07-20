@@ -10,7 +10,7 @@ import type { ResolveGithubTokenForRepo } from '@/channels/github-token-bridge'
 import { defineTool } from '@/plugin'
 import { ensureSessionTmpDir } from '@/sandbox'
 
-import { ensureGitAskPassHelper } from './git-askpass'
+import { TYPECLAW_GIT_ASKPASS_PATH } from './git-askpass'
 
 const execFileAsync = promisify(execFile)
 const FULL_SHA = /^[0-9a-f]{40}$/i
@@ -47,7 +47,7 @@ export async function prepareReviewerCheckout(options: {
       GIT_TERMINAL_PROMPT: '0',
     }
     await run('git', ['init', '--quiet', checkout], { env: baseEnv })
-    const askPass = await (options.ensureAskPass ?? ensureGitAskPassHelper)()
+    const askPass = options.ensureAskPass === undefined ? TYPECLAW_GIT_ASKPASS_PATH : await options.ensureAskPass()
     await run(
       'git',
       [
