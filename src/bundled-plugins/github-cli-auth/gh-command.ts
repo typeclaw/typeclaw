@@ -244,6 +244,10 @@ export function analyzeGhCommand(command: string, fallbackRepo?: string): GhComm
   return { kind: 'block', code: 'composition', reason: COMPOSITION_REASON }
 }
 
+export function containsGhCommandInvocation(command: string): boolean {
+  return findGhInvocations(tokenize(command)).length > 0
+}
+
 function isCredentialDisplayOrManagement(args: readonly string[]): boolean {
   if (args[0] !== 'auth') return false
   const subcommand = args[1]

@@ -697,6 +697,31 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
+  test('privileged PAT commands that only contain gh text pass through untouched', async () => {
+    process.env.GH_TOKEN = 'ghp_primary'
+    let mintCalls = 0
+    const hook = await hookFor(
+      async () => {
+        mintCalls++
+        return { kind: 'token', token: 'ghs_minted' }
+      },
+      false,
+      { permissions: privilegedPermissions },
+    )
+
+    for (const command of [
+      'git clone https://github.com/acme/widgets.git workspace/gh',
+      'echo gh',
+      'git status # gh',
+    ]) {
+      const event = bashEvent(command)
+      expect(await hook(event, hookCtx)).toBeUndefined()
+      expect(event.args.command).toBe(command)
+      expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    }
+    expect(mintCalls).toBe(0)
+  })
+
   test('never injects a PAT into backslash-escaped sensitive gh arguments', async () => {
     process.env.GH_TOKEN = 'ghp_primary'
     const hook = await hookFor(tokenResolver('ghs_minted'), true, { permissions: privilegedPermissions })

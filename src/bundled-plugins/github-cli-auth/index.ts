@@ -12,6 +12,7 @@ import { createGithubEffectiveApprovalResolver, createGithubHeadShaResolver } fr
 import {
   analyzeGhCommand,
   canInjectPatIntoPassThroughGh,
+  containsGhCommandInvocation,
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
@@ -353,7 +354,7 @@ export default definePlugin({
           const command = event.args.command
           if (typeof command !== 'string') return
 
-          if (command.includes('gh')) {
+          if (containsGhCommandInvocation(command)) {
             const ghResult = await handleGhCommand({ event, command })
             if (ghResult !== 'fall-through') return ghResult
           }
