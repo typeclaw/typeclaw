@@ -14,13 +14,11 @@ export type BackupPushAuthDeps = {
   ensureAskPassHelper: () => Promise<string>
 }
 
-// The backup runner spawns git directly (not via the bash tool), so the
-// `github-cli-auth` plugin's `tool.before` credential injection never fires for
-// its push. Without this, App-auth agents push with no credentials and fail.
-// A live App resolver is authoritative even when the process also carries an
-// operator PAT: runtime backup always uses the repo-scoped App credential.
-// Without a resolver, PAT/SSH/credential-helper setups keep using the runner's
-// inherited process env.
+// The backup runner owns an independent per-repo App-auth path for its direct
+// git process. A live App resolver is authoritative even when the process also
+// carries an operator PAT, and the minted token is scoped to the github.com
+// origin's repo slug. Without a resolver, PAT/SSH/credential-helper setups keep
+// using the runner's inherited process env.
 export async function resolveBackupPushAuthEnv(
   cwd: string,
   deps: BackupPushAuthDeps,
@@ -42,7 +40,7 @@ export async function resolveBackupPushAuthEnv(
   // Token rides in TYPECLAW_GIT_TOKEN (read by the askpass helper), never in
   // argv/config. The insteadOf rewrites map ssh/scp github remotes to https so
   // the askpass credential applies; GIT_TERMINAL_PROMPT=0 fails fast instead of
-  // hanging on a prompt. Mirrors github-cli-auth/index.ts.
+  // hanging on a prompt.
   return {
     GIT_ASKPASS: askpass,
     TYPECLAW_GIT_TOKEN: token.token,

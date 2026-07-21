@@ -170,17 +170,16 @@ export type CreateSessionForSubagentOptions = {
   spawnedByOrigin?: SessionOrigin
   // Plugin hook wiring for the subagent's tools. When present, the subagent's
   // builtin bash/read/edit/write run through the plugin `tool.before`/`tool.after`
-  // hooks (security guards AND github-cli-auth GitHub-token injection) exactly
+  // hooks (security guards AND github-cli-auth token injection for validated gh) exactly
   // like the main and plugin-subagent sessions. Without it, the builtin tools run
   // raw (the prior behavior) — so standalone/test callers stay unaffected. The
-  // production runtime always supplies it (src/run/index.ts) so a generic
-  // task-spawned subagent's `git push`/`gh` gets a minted token instead of
-  // failing with "could not read Username".
+  // production runtime always supplies it (src/run/index.ts), so generic
+  // task-spawned subagents get the same guarded gh behavior as main sessions.
   plugins?: PluginSessionWiring
   // The role/permission service that drives builtin-bash sandboxing. It MUST be
   // forwarded alongside `plugins`: buildBuiltinPiToolOverrides only applies
   // applyBashSandbox / applyTmpPathRedirect when `permissions` is present, so
-  // wiring hooks without permissions would inject the GitHub token yet leave the
+  // wiring hooks without permissions would inject a gh-scoped GitHub token yet leave the
   // sandbox OFF — strictly weaker than the plugin-subagent branch this matches.
   permissions?: PermissionService
   // Per-spawn model-profile override, resolved by `invokeSubagent` from the

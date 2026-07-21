@@ -7,7 +7,7 @@ const baseDeps = (overrides: Partial<BackupPushAuthDeps> = {}): BackupPushAuthDe
   ghToken: undefined,
   resolveTokenForRepo: async () => ({ kind: 'token', token: 'ghs_minted' }),
   resolveOriginPushUrl: async () => 'https://github.com/acme/widgets.git',
-  ensureAskPassHelper: async () => '/usr/local/bin/typeclaw-git-askpass',
+  ensureAskPassHelper: async () => '/tmp/typeclaw-git-askpass',
   ...overrides,
 })
 
@@ -16,7 +16,7 @@ describe('resolveBackupPushAuthEnv', () => {
     const env = await resolveBackupPushAuthEnv('/agent', baseDeps())
     expect(env).not.toBeNull()
     expect(env).toMatchObject({
-      GIT_ASKPASS: '/usr/local/bin/typeclaw-git-askpass',
+      GIT_ASKPASS: '/tmp/typeclaw-git-askpass',
       TYPECLAW_GIT_TOKEN: 'ghs_minted',
       GIT_TERMINAL_PROMPT: '0',
     })
@@ -29,7 +29,7 @@ describe('resolveBackupPushAuthEnv', () => {
     })
 
     expect(env).toMatchObject({
-      GIT_ASKPASS: '/usr/local/bin/typeclaw-git-askpass',
+      GIT_ASKPASS: '/tmp/typeclaw-git-askpass',
       TYPECLAW_GIT_TOKEN: 'ghs_minted',
       GIT_TERMINAL_PROMPT: '0',
     })
