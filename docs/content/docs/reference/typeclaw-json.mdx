@@ -19,6 +19,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 | `portForward`           | `{ allow, deny? }`                              | restart-required                             | auto port-forward allow/deny lists; default `{ allow: '*' }`                             |
 | `network`               | `NetworkPolicy`                                 | restart-required                             | egress filtering                                                                         |
 | `sandbox`               | `SandboxPolicy`                                 | restart-required                             | per-tool bwrap sandbox options                                                           |
+| `modelTools`            | `{ limits }`                                    | restart-required                             | bounded file, image, web-fetch, and channel-attachment budgets                           |
 | `tunnels`               | `Tunnel[]`                                      | restart-required                             | public URLs (see [/concepts/architecture](/docs/concepts/architecture))                  |
 | `roles`                 | `Record<name, Role>`                            | `match` live, `permissions` restart-required | permission roles (see [/concepts/permissions-model](/docs/concepts/permissions-model))   |
 | `docker.file`           | `DockerFileOptions`                             | rebuild via `start`                          | Dockerfile feature toggles + append lines                                                |
@@ -116,6 +117,38 @@ Set it from the CLI with `typeclaw model set <profile> <ref> --thinking <level>`
 
 Model-driven bash starts from a cleared environment and re-introduces a fixed allowlist (`PATH`, `HOME`, `LANG`, `BUN_TMPDIR`, `BUN_INSTALL`) plus **every var an operator declared in `.env`** — `.env` is the deliberate expose-to-the-agent surface, so anything you put there reaches bash. This includes `GH_TOKEN`/`GITHUB_TOKEN` — a GitHub token in `.env` reaches bash like any other operator var (so plain `gh`/`git`/`curl` work in agents with no GitHub channel), while the `github-cli-auth` broker separately injects a narrower per-repo token for validated `gh` calls. A few classes are withheld, none by credential name — they protect the sandbox mechanism and the host-injected runtime tokens: the sandbox-owned names (`PATH`/`HOME`/`BUN_*`/`LANG`); process- and outer-shell-hijack vars (`LD_PRELOAD`, `NODE_OPTIONS`, `BASH_ENV`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `BASH_XTRACEFD`, the `BASH_FUNC_` prefix, `GIT_CONFIG_*`, `SSH_AUTH_SOCK`, `KUBECONFIG`, …); and the host/container-injected runtime tokens `TYPECLAW_TUI_TOKEN`/`TYPECLAW_HOSTD_TOKEN`/`TYPECLAW_HOSTD_BROKER_TOKEN` (never something an operator writes in `.env`). Credentials you do **not** want the agent to read must live in `secrets.json`, which is never inherited into bash. Eligibility is decided from the parsed `.env` file value (a non-empty declaration), never `process.env`, so an empty line like `DISCORD_BOT_TOKEN=` is not an expose-choice even if `secrets.json` later fills that name. `trusted`/`owner` retain normal agent-root writes, while `.env`, `secrets.json`, historical root `auth.json`, and the runtime-owned GWS / agent-messenger / persisted CLI-auth directories stay masked. Reusable GWS, agent-messenger, Codex, and Claude profiles are never mounted into model-driven children; standalone local Git may receive only a generated name/email config. See [Environment variables](/docs/reference/env-vars#model-driven-bash-environment) and [/internals/sandbox](/docs/internals/sandbox).
 
+## `modelTools.limits`
+
+```json
+{
+  "modelTools": {
+    "limits": {
+      "readSnapshotMaxBytes": 67108864,
+      "lookAtImageMaxBytes": 20971520,
+      "lookAtTotalMaxBytes": 20971520,
+      "lookAtMaxImages": 16,
+      "webFetchTransportMaxBytes": 5242880,
+      "channelAttachmentMaxBytes": 104857600
+    }
+  }
+}
+```
+
+All values are positive integers. Byte values are literal bytes. Defaults preserve TypeClaw's built-in budgets; operators can lower or raise them only up to immutable safety ceilings:
+
+| Field                       | Default | Hard maximum | Applies to                                                                       |
+| --------------------------- | ------- | ------------ | -------------------------------------------------------------------------------- |
+| `readSnapshotMaxBytes`      | 64 MiB  | 256 MiB      | immutable file/directory snapshot made before a file-reading model tool executes |
+| `lookAtImageMaxBytes`       | 20 MiB  | 64 MiB       | each local, base64, URL, or channel image passed to `look_at`                    |
+| `lookAtTotalMaxBytes`       | 20 MiB  | 64 MiB       | all images in one `look_at` invocation; must be at least `lookAtImageMaxBytes`   |
+| `lookAtMaxImages`           | 16      | 64           | image count in one `look_at` invocation                                          |
+| `webFetchTransportMaxBytes` | 5 MiB   | 5 MiB        | HTTP response bytes buffered before `web_fetch` compaction                       |
+| `channelAttachmentMaxBytes` | 100 MiB | 100 MiB      | channel attachment download and local channel-upload snapshot                    |
+
+Unknown-length HTTP bodies are still consumed as streams and cancelled as soon as the effective limit is crossed. The web-fetch and channel-attachment hard maxima remain at their historical defaults because downstream HTML parsing and third-party adapter allocation cannot be bounded precisely enough to raise them safely; operators can still lower them. The existing per-strategy web output caps remain independent: oversized text is compacted and explicitly marked as truncated rather than buffered into an unbounded model result. These transport/input limits are separate from the bundled `tool-result-cap` plugin's post-result controls.
+
+One boot-time, process-wide weighted admission budget covers buffered web responses, image raw/base64/provider-payload amplification, channel attachment buffers, and pinned snapshots. It reserves known sizes before allocation, grows unknown streams chunk by chunk, rejects growth over its immutable 256 MiB memory ceiling, and keeps a finite 32-waiter queue. Pinned-snapshot byte/count dimensions are derived from the largest configured invocation allowance; with defaults they remain 100 MiB and 32 files, preserving existing snapshot concurrency. Changes are restart-required because the shared pool and tool schemas are created at container boot.
+
 ## `mounts`
 
 ```json
@@ -166,7 +199,7 @@ Boolean toggles can also take a version string (`"gh": "2.40.0"`) to pin via `ap
 typeclaw reload
 ```
 
-Re-reads `typeclaw.json` and applies hot-reloadable fields. Boot-only fields (`port`, `mounts`, `plugins`, `portForward`, `network`, `tunnels`) are captured once at container start; reload reports which changes require a restart.
+Re-reads `typeclaw.json` and applies hot-reloadable fields. Boot-only fields (`port`, `mounts`, `plugins`, `portForward`, `network`, `modelTools`, `tunnels`) are captured once at container start; reload reports which changes require a restart.
 
 ## Auto-migration
 
