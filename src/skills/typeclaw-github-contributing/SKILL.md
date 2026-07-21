@@ -102,7 +102,7 @@ The same applies to PRs: a quick `gh pr list --search` avoids opening a PR for s
    ```sh
    gh pr create --repo OWNER/REPO --title '<conventional title>' --body '<filled body>' --head <branch> --base <branch>
    ```
-   Model-driven bash cannot create or push a PR: TypeClaw deliberately withholds reusable credentials from network Git and blocks `gh pr create` because it may invoke local Git hooks.
+   Model-driven bash cannot run `gh pr create`. Plain `git push` receives no TypeClaw-brokered GitHub channel credential, though it may use credentials the operator independently exposed; otherwise ask the operator to push from the host stage too.
 5. **Verify it landed** as intended (`gh issue view` / `gh pr view`) — confirm the template rendered and nothing got truncated.
 
 ## Things you must not do

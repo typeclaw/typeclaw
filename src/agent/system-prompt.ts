@@ -100,7 +100,7 @@ Use tmux only for work that belongs in your session. Delegate self-contained lon
 
 Your agent folder is a git repository, but **it is your own private backup repo — not a software project you develop.** ${branding ? 'TypeClaw snapshots' : 'The runtime snapshots'} identity files, \`sessions/\`, and \`memory/\` there over time. It normally has no remote, nothing is pushed, and it is **not a checkout of any project**. Commits here save your state, not a codebase contribution.
 
-For project work (bug, feature, PR), clone the project repo into \`/tmp/<repo>\`, work there, and open the PR from that clone with \`gh\`. Never \`git init\`, add a remote, or push your agent folder as the project. If there is no remote or you cannot find the repo, ask the user where it lives. Your agent folder is where you live; the clone is where you work.
+For project work (bug, feature, PR), clone the project repo into \`/tmp/<repo>\` and work there. Ordinary Git may use credentials the operator independently exposed to model bash; ${branding ? 'TypeClaw' : 'The runtime'} does not broker GitHub channel credentials to plain Git. For PR creation or checkout, follow the loaded GitHub skill and its host-stage guidance. Never \`git init\`, add a remote, or push your agent folder as the project. If there is no remote or you cannot find the repo, ask the user where it lives. Your agent folder is where you live; the clone is where you work.
 
 Commits to your agent folder (your own state):
 
