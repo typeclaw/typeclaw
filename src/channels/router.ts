@@ -10,6 +10,7 @@ import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
 import { detectHardProviderError, isFailoverWorthy, subscribeProviderErrors } from '@/agent/provider-error'
+import { processResourceBudget, type ResourceLease, type WeightedResourceBudget } from '@/agent/resource-budget'
 import {
   acquireRestartHandoffLock,
   peekRestartHandoff,
@@ -31,7 +32,7 @@ import {
 import { SUBAGENT_OUTPUT_TOOL_NAME } from '@/agent/tools/subagent-output'
 import { promptPersistentTurnWithFallback } from '@/agent/turn-runner'
 import { type Command, type CommandPermission, type CommandResult, createCommandRegistry } from '@/commands'
-import { getConfig, resolveModel } from '@/config'
+import { config, getConfig, resolveModel } from '@/config'
 import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 import type { HookBus } from '@/plugin'
 import { extractClaimCode } from '@/role-claim'
@@ -86,9 +87,11 @@ import type {
   EditMessageCallback,
   EditMessageRequest,
   EditMessageResult,
-  FetchAttachmentArgs,
   FetchAttachmentCallback,
+  FetchAttachmentRequest,
   FetchAttachmentResult,
+  FetchAttachmentBudget,
+  RoutedFetchAttachmentResult,
   FetchHistoryArgs,
   FetchHistoryResult,
   GetMessageArgs,
@@ -1295,7 +1298,10 @@ export type ChannelRouter = {
   editMessage: (req: EditMessageRequest) => Promise<EditMessageResult>
   registerFetchAttachment: (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback) => void
   unregisterFetchAttachment: (adapter: ChannelKey['adapter'], cb: FetchAttachmentCallback) => void
-  fetchAttachment: (adapter: ChannelKey['adapter'], args: FetchAttachmentArgs) => Promise<FetchAttachmentResult>
+  fetchAttachment: (
+    adapter: ChannelKey['adapter'],
+    args: FetchAttachmentRequest,
+  ) => Promise<RoutedFetchAttachmentResult>
   // Review-thread resolution is opt-in per adapter and last-write-wins (one
   // bot account per adapter, like self-identity). An adapter that never calls
   // registerReviewThreadResolver makes `resolveReviewThread` answer
@@ -1487,6 +1493,7 @@ export type CreateChannelRouterOptions = {
   createSessionForChannel?: CreateSessionForChannel
   sessionDir?: string
   logger?: RouterLogger
+  resourceBudget?: WeightedResourceBudget
   // Test seam: clock for sticky/debounce/participants. Defaults to Date.now.
   now?: () => number
   // Test seams for synchronizing strict post-tool retry backoff without global
@@ -1612,7 +1619,21 @@ const GRANT_ALL_PERMISSIONS: PermissionService = {
   replaceRoles: () => {},
 }
 
+function createAttachmentBudget(lease: ResourceLease): FetchAttachmentBudget {
+  return {
+    tryResize: (memoryBytes) => lease.tryResize({ memoryBytes }),
+    release: () => lease.release(),
+  }
+}
+
+function throwIfAttachmentAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted !== true) return
+  const reason = signal.reason
+  throw new Error(`attachment request aborted${reason === undefined ? '' : `: ${String(reason)}`}`)
+}
+
 export function createChannelRouter(options: CreateChannelRouterOptions): ChannelRouter {
+  const resourceBudget = options.resourceBudget ?? processResourceBudget
   const logger = options.logger ?? consoleLogger
   const now = options.now ?? Date.now
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
@@ -4085,13 +4106,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const fetchAttachment = async (
     adapter: ChannelKey['adapter'],
-    args: FetchAttachmentArgs,
-  ): Promise<FetchAttachmentResult> => {
+    args: FetchAttachmentRequest,
+  ): Promise<RoutedFetchAttachmentResult> => {
+    if (!Number.isSafeInteger(args.maxBytes) || args.maxBytes < 1) {
+      return { ok: false, error: 'fetchAttachment maxBytes must be a positive safe integer' }
+    }
+    if (args.memoryMaxBytes !== undefined && (!Number.isSafeInteger(args.memoryMaxBytes) || args.memoryMaxBytes < 1)) {
+      return { ok: false, error: 'fetchAttachment memoryMaxBytes must be a positive safe integer' }
+    }
     const callbacks = fetchAttachmentCallbacks.get(adapter)
     if (!callbacks || callbacks.size === 0) {
       return { ok: false, error: `no fetchAttachment callback registered for "${adapter}"` }
     }
     const snapshot = Array.from(callbacks)
+    const boundedArgs = {
+      ...args,
+      maxBytes: Math.min(args.maxBytes, config.modelTools.limits.channelAttachmentMaxBytes),
+    }
+    const reservedMemoryBytes = Math.max(boundedArgs.maxBytes * 2, args.memoryMaxBytes ?? 0)
+    const memoryLease = await resourceBudget.acquire({ memoryBytes: reservedMemoryBytes }, args.signal)
     // Initialized only so TypeScript can prove the variable is assigned
     // before return. The loop body always overwrites it on the failure
     // path (we just returned on the success path), so this string is
@@ -4102,12 +4135,37 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ok: false,
       error: `fetchAttachment for "${adapter}" returned no result (router bug)`,
     }
-    for (const cb of snapshot) {
-      const result = await cb(args)
-      if (result.ok) return result
-      lastError = result
+    try {
+      for (const cb of snapshot) {
+        throwIfAttachmentAborted(args.signal)
+        const result = await cb(boundedArgs)
+        throwIfAttachmentAborted(args.signal)
+        if (result.ok) {
+          if (result.buffer.byteLength > boundedArgs.maxBytes) {
+            lastError = {
+              ok: false,
+              error: `attachment callback returned an oversized buffer (${result.buffer.byteLength} bytes > ${boundedArgs.maxBytes} byte limit)`,
+            }
+            continue
+          }
+          const retainedMemoryBytes = Math.max(result.buffer.byteLength, args.memoryMaxBytes ?? 0)
+          if (!memoryLease.tryResize({ memoryBytes: retainedMemoryBytes })) {
+            lastError = {
+              ok: false,
+              error: `attachment callback result exceeds the process-wide memory budget (${retainedMemoryBytes} weighted bytes requested)`,
+            }
+            continue
+          }
+          return { ...result, budget: createAttachmentBudget(memoryLease) }
+        }
+        lastError = result
+      }
+      memoryLease.release()
+      return lastError
+    } catch (error) {
+      memoryLease.release()
+      throw error
     }
-    return lastError
   }
 
   const registerReviewThreadResolver = (adapter: ChannelKey['adapter'], resolver: ReviewThreadResolver): void => {

@@ -457,11 +457,26 @@ export type FetchAttachmentArgs = {
   ref: string
   filename?: string
   maxBytes?: number
+  signal?: AbortSignal
 }
 
-export type FetchAttachmentResult =
-  | { ok: true; buffer: Buffer; filename: string; mimetype?: string; size: number }
-  | { ok: false; error: string }
+export type FetchAttachmentRequest = FetchAttachmentArgs & {
+  maxBytes: number
+  memoryMaxBytes?: number
+}
+
+export type FetchAttachmentSuccess = { ok: true; buffer: Buffer; filename: string; mimetype?: string; size: number }
+export type FetchAttachmentFailure = { ok: false; error: string }
+export type FetchAttachmentResult = FetchAttachmentSuccess | FetchAttachmentFailure
+
+export type FetchAttachmentBudget = {
+  tryResize(memoryBytes: number): boolean
+  release(): void
+}
+
+export type RoutedFetchAttachmentResult =
+  | (FetchAttachmentSuccess & { budget: FetchAttachmentBudget })
+  | FetchAttachmentFailure
 
 export type FetchAttachmentCallback = (args: FetchAttachmentArgs) => Promise<FetchAttachmentResult>
 

@@ -8,6 +8,8 @@ import type { AssistantMessage } from '@mariozechner/pi-ai'
 import type { SessionEntry } from '@mariozechner/pi-coding-agent'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
+import { withBudgetedAttachmentBase64 } from '@/agent/multimodal/look-at'
+import { WeightedResourceBudget } from '@/agent/resource-budget'
 import {
   consumeRestartHandoff,
   peekRestartHandoff,
@@ -22,6 +24,7 @@ import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
 
+import { createFetchAttachmentCallback as createTelegramFetchAttachmentCallback } from './adapters/telegram-bot'
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
 import {
@@ -9801,6 +9804,257 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     const idleWarn = logs.find((l) => l.includes('warn:[channels]') && l.includes('session.idle hook threw'))
     expect(idleWarn).toBeDefined()
     expect(idleWarn).toMatch(/session\.idle timed out after 30ms/)
+  })
+})
+
+describe('ChannelRouter attachment memory boundary', () => {
+  test('rejects an oversized callback buffer even when the adapter ignores maxBytes', async () => {
+    const agentDir = await tempDir()
+    const router = createChannelRouter({
+      agentDir,
+      configForAdapter: () => baseConfig,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_budget',
+        dispose: async () => {},
+      }),
+    })
+    router.registerFetchAttachment('slack-bot', async () => ({
+      ok: true,
+      buffer: Buffer.alloc(6),
+      filename: 'oversized.bin',
+      size: 6,
+    }))
+
+    const result = await router.fetchAttachment('slack-bot', { ref: 'F1', maxBytes: 5 })
+
+    expect(result.ok).toBeFalse()
+    if (!result.ok) expect(result.error).toMatch(/6 bytes > 5 byte limit/)
+  })
+
+  test('serializes concurrent maximum attachment buffers until the first result is released', async () => {
+    const resourceBudget = new WeightedResourceBudget({
+      maxMemoryBytes: 10,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 2,
+    })
+    const router = createChannelRouter({
+      agentDir: await tempDir(),
+      configForAdapter: () => baseConfig,
+      resourceBudget,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_concurrency',
+        dispose: async () => {},
+      }),
+    })
+    let callbackCalls = 0
+    router.registerFetchAttachment('slack-bot', async () => {
+      callbackCalls++
+      return { ok: true, buffer: Buffer.alloc(5), filename: 'file.bin', size: 5 }
+    })
+
+    const first = await router.fetchAttachment('slack-bot', { ref: 'F1', maxBytes: 5 })
+    const secondPromise = router.fetchAttachment('slack-bot', { ref: 'F2', maxBytes: 5 })
+    await Bun.sleep(5)
+    expect(callbackCalls).toBe(1)
+    if (!first.ok) throw new Error(first.error)
+    first.budget.release()
+
+    const second = await secondPromise
+    expect(callbackCalls).toBe(2)
+    if (second.ok) second.budget.release()
+  })
+
+  test('owns leases per result when concurrent callbacks return the same Buffer instance', async () => {
+    const resourceBudget = new WeightedResourceBudget({
+      maxMemoryBytes: 20,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 2,
+    })
+    const router = createChannelRouter({
+      agentDir: await tempDir(),
+      configForAdapter: () => baseConfig,
+      resourceBudget,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_shared_buffer',
+        dispose: async () => {},
+      }),
+    })
+    const shared = Buffer.alloc(5)
+    router.registerFetchAttachment('slack-bot', async () => ({
+      ok: true,
+      buffer: shared,
+      filename: 'cached.bin',
+      size: shared.byteLength,
+    }))
+
+    const first = await router.fetchAttachment('slack-bot', { ref: 'F1', maxBytes: 5 })
+    const second = await router.fetchAttachment('slack-bot', { ref: 'F2', maxBytes: 5 })
+    if (!first.ok) throw new Error(first.error)
+    if (!second.ok) throw new Error(second.error)
+    expect(first.buffer).toBe(second.buffer)
+    expect(first.budget).not.toBe(second.budget)
+    expect(resourceBudget.usage().memoryBytes).toBe(10)
+
+    expect(first.budget.tryResize(7)).toBeTrue()
+    expect(second.budget.tryResize(9)).toBeTrue()
+    expect(resourceBudget.usage().memoryBytes).toBe(16)
+    first.budget.release()
+    expect(resourceBudget.usage().memoryBytes).toBe(9)
+    second.budget.release()
+    expect(resourceBudget.usage().memoryBytes).toBe(0)
+  })
+
+  test('removes an aborted queued attachment request before its callback can execute', async () => {
+    const resourceBudget = new WeightedResourceBudget({
+      maxMemoryBytes: 10,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 2,
+    })
+    const router = createChannelRouter({
+      agentDir: await tempDir(),
+      configForAdapter: () => baseConfig,
+      resourceBudget,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_abort',
+        dispose: async () => {},
+      }),
+    })
+    let callbackCalls = 0
+    router.registerFetchAttachment('slack-bot', async () => {
+      callbackCalls++
+      return { ok: true, buffer: Buffer.alloc(5), filename: 'file.bin', size: 5 }
+    })
+    const first = await router.fetchAttachment('slack-bot', { ref: 'F1', maxBytes: 5 })
+    const controller = new AbortController()
+    const queued = router.fetchAttachment('slack-bot', {
+      ref: 'F2',
+      maxBytes: 5,
+      signal: controller.signal,
+    })
+    await Bun.sleep(5)
+    expect(resourceBudget.usage().waiters).toBe(1)
+
+    controller.abort('cancel queued attachment')
+    await expect(queued).rejects.toThrow(/abort|cancel/i)
+    if (!first.ok) throw new Error(first.error)
+    first.budget.release()
+    await Bun.sleep(5)
+
+    expect(callbackCalls).toBe(1)
+    expect(resourceBudget.usage()).toMatchObject({ memoryBytes: 0, waiters: 0 })
+  })
+
+  test('cancels an in-flight adapter download and releases its resource lease', async () => {
+    const resourceBudget = new WeightedResourceBudget({
+      maxMemoryBytes: 10,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 1,
+    })
+    const router = createChannelRouter({
+      agentDir: await tempDir(),
+      configForAdapter: () => baseConfig,
+      resourceBudget,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_inflight_abort',
+        dispose: async () => {},
+      }),
+    })
+    let downloadStarted = false
+    let underlyingRequestCancelled = false
+    const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.includes('/getFile')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ ok: true, result: { file_path: 'documents/in-flight.bin' } })),
+        )
+      }
+      downloadStarted = true
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        const cancel = () => {
+          underlyingRequestCancelled = true
+          reject(new DOMException(String(signal?.reason ?? 'aborted'), 'AbortError'))
+        }
+        if (signal?.aborted === true) cancel()
+        else signal?.addEventListener('abort', cancel, { once: true })
+      })
+    }) as typeof fetch
+    router.registerFetchAttachment(
+      'telegram-bot',
+      createTelegramFetchAttachmentCallback({
+        token: 'test-token',
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        fetchImpl,
+      }),
+    )
+    const controller = new AbortController()
+    const pending = router.fetchAttachment('telegram-bot', {
+      ref: 'file-id',
+      maxBytes: 5,
+      signal: controller.signal,
+    })
+
+    await waitFor(() => downloadStarted)
+    expect(downloadStarted).toBeTrue()
+    expect(resourceBudget.usage().memoryBytes).toBe(10)
+    controller.abort('cancel in-flight attachment')
+
+    await expect(pending).rejects.toThrow(/abort|cancel/i)
+    expect(underlyingRequestCancelled).toBeTrue()
+    expect(resourceBudget.usage()).toMatchObject({ memoryBytes: 0, waiters: 0 })
+
+    const reused = await resourceBudget.acquire({ memoryBytes: 10 })
+    expect(resourceBudget.usage().memoryBytes).toBe(10)
+    reused.release()
+  })
+
+  test('retains raw channel image and base64/provider accounting through its consumer', async () => {
+    const resourceBudget = new WeightedResourceBudget({
+      maxMemoryBytes: 11,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 1,
+    })
+    const router = createChannelRouter({
+      agentDir: await tempDir(),
+      configForAdapter: () => baseConfig,
+      resourceBudget,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createSessionForChannel: async () => ({
+        session: new FakeSession() as unknown as AgentSession,
+        sessionId: 'ses_attachment_image',
+        dispose: async () => {},
+      }),
+    })
+    router.registerFetchAttachment('slack-bot', async () => ({
+      ok: true,
+      buffer: Buffer.from([1, 2, 3]),
+      filename: 'image.png',
+      size: 3,
+    }))
+    const result = await router.fetchAttachment('slack-bot', { ref: 'F1', maxBytes: 3, memoryMaxBytes: 11 })
+    if (!result.ok) throw new Error(result.error)
+
+    await withBudgetedAttachmentBase64(result.buffer, result.budget, async (data) => {
+      expect(data).toBe('AQID')
+      expect(resourceBudget.usage().memoryBytes).toBe(11)
+    })
+
+    expect(resourceBudget.usage().memoryBytes).toBe(0)
   })
 })
 
