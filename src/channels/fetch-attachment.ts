@@ -1,6 +1,7 @@
 import { readResponseBodyBounded } from '@/agent/network/response-body'
+import { DEFAULT_MODEL_TOOL_LIMITS } from '@/config'
 
-export const DEFAULT_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024
+export const DEFAULT_ATTACHMENT_MAX_BYTES = DEFAULT_MODEL_TOOL_LIMITS.channelAttachmentMaxBytes
 
 export async function readAttachmentResponse(response: Response, maxBytes: number): Promise<Buffer> {
   try {

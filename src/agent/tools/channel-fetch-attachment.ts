@@ -4,9 +4,10 @@ import { Type } from '@mariozechner/pi-ai'
 import { defineTool } from '@mariozechner/pi-coding-agent'
 
 import type { SessionOrigin } from '@/agent/session-origin'
-import { TOOL_INPUT_MAX_BYTES, writeFileAnchored } from '@/agent/tool-file-safety'
+import { writeFileAnchored } from '@/agent/tool-file-safety'
 import type { ChannelRouter } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'
+import { config } from '@/config'
 import type { PermissionService } from '@/permissions'
 import { resolveHiddenPaths } from '@/sandbox'
 
@@ -78,7 +79,7 @@ export function createChannelFetchAttachmentTool({
       ),
     }),
 
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const found = router.lookupInboundAttachment({
         adapter,
         workspace: origin.workspace,
@@ -110,7 +111,8 @@ export function createChannelFetchAttachmentTool({
       const filename = params.filename ?? found.filename
       const result = await router.fetchAttachment(adapter, {
         ref,
-        maxBytes: TOOL_INPUT_MAX_BYTES.channel_upload,
+        maxBytes: config.modelTools.limits.channelAttachmentMaxBytes,
+        signal,
         ...(filename !== undefined ? { filename } : {}),
       })
       if (!result.ok) {
@@ -120,35 +122,39 @@ export function createChannelFetchAttachmentTool({
         return { content: [{ type: 'text' as const, text }], details }
       }
 
-      const safeFilename = sanitizeFilename(result.filename)
-      const refSlug = sanitizeRefSlug(ref)
-      const baseDir = resolveBaseDir?.() ?? fallbackBaseDir
-      const targetDir = join(baseDir, adapter, refSlug)
-      const targetPath = join(targetDir, safeFilename)
       try {
-        await writeFileAnchored({
-          targetPath,
-          data: result.buffer,
-          agentDir,
-          tool: 'channel_fetch_attachment',
-        })
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        logger.warn(formatChannelToolFailure('channel_fetch_attachment', `${adapter}: write failed: ${message}`))
-        const text = `channel_fetch_attachment error: write failed: ${message}`
-        const details: FetchAttachmentDetails = { ok: false, error: `write failed: ${message}` }
-        return { content: [{ type: 'text' as const, text }], details }
-      }
+        const safeFilename = sanitizeFilename(result.filename)
+        const refSlug = sanitizeRefSlug(ref)
+        const baseDir = resolveBaseDir?.() ?? fallbackBaseDir
+        const targetDir = join(baseDir, adapter, refSlug)
+        const targetPath = join(targetDir, safeFilename)
+        try {
+          await writeFileAnchored({
+            targetPath,
+            data: result.buffer,
+            agentDir,
+            tool: 'channel_fetch_attachment',
+          })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          logger.warn(formatChannelToolFailure('channel_fetch_attachment', `${adapter}: write failed: ${message}`))
+          const text = `channel_fetch_attachment error: write failed: ${message}`
+          const details: FetchAttachmentDetails = { ok: false, error: `write failed: ${message}` }
+          return { content: [{ type: 'text' as const, text }], details }
+        }
 
-      const mimetypePart = result.mimetype !== undefined ? ` (${result.mimetype})` : ''
-      const text = `saved ${result.size} bytes to ${targetPath}${mimetypePart}`
-      const details: FetchAttachmentDetails = {
-        ok: true,
-        path: targetPath,
-        ...(result.mimetype !== undefined ? { mimetype: result.mimetype } : {}),
-        size: result.size,
+        const mimetypePart = result.mimetype !== undefined ? ` (${result.mimetype})` : ''
+        const text = `saved ${result.size} bytes to ${targetPath}${mimetypePart}`
+        const details: FetchAttachmentDetails = {
+          ok: true,
+          path: targetPath,
+          ...(result.mimetype !== undefined ? { mimetype: result.mimetype } : {}),
+          size: result.size,
+        }
+        return { content: [{ type: 'text' as const, text }], details }
+      } finally {
+        result.budget.release()
       }
-      return { content: [{ type: 'text' as const, text }], details }
     },
   })
 }

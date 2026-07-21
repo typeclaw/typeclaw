@@ -38,6 +38,10 @@ type RouterOverrides = {
 }
 
 function fakeRouter(overrides: RouterOverrides = {}): ChannelRouter {
+  const fetchAttachment: ChannelRouter['fetchAttachment'] = async () => {
+    const result = await (overrides.fetchAttachment ?? (async () => ({ ok: false as const, error: 'no callback' })))()
+    return result.ok ? { ...result, budget: { tryResize: () => true, release: () => {} } } : result
+  }
   return {
     route: async () => {},
     send: overrides.send ?? (async () => ({ ok: true })),
@@ -77,7 +81,7 @@ function fakeRouter(overrides: RouterOverrides = {}): ChannelRouter {
     editMessage: async () => ({ ok: false, error: 'message-edit-not-supported', code: 'not-supported' }),
     registerFetchAttachment: () => {},
     unregisterFetchAttachment: () => {},
-    fetchAttachment: overrides.fetchAttachment ?? (async () => ({ ok: false, error: 'no callback' })),
+    fetchAttachment,
     registerReviewThreadResolver: () => {},
     unregisterReviewThreadResolver: () => {},
     resolveReviewThread: async () => ({ ok: true }),

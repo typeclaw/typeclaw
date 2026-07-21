@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
-import { TOOL_INPUT_MAX_BYTES } from '@/agent/tool-file-safety'
+import { DEFAULT_TOOL_INPUT_MAX_BYTES } from '@/agent/tool-file-safety'
 import type { ChannelRouter } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'
 import type { FetchAttachmentArgs, FetchAttachmentResult, InboundAttachment } from '@/channels/types'
@@ -28,6 +28,13 @@ type FakeRouterOptions = {
 
 function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
   const attachments = options.attachments ?? []
+  const fetchAttachment: ChannelRouter['fetchAttachment'] = async (adapter, args) => {
+    const result = await (options.fetch ?? (async () => ({ ok: false as const, error: 'not implemented' })))(
+      adapter,
+      args,
+    )
+    return result.ok ? { ...result, budget: testAttachmentBudget() } : result
+  }
   return {
     route: async () => {},
     send: async () => ({ ok: true }),
@@ -67,7 +74,7 @@ function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
     editMessage: async () => ({ ok: false, error: 'message-edit-not-supported', code: 'not-supported' }),
     registerFetchAttachment: () => {},
     unregisterFetchAttachment: () => {},
-    fetchAttachment: options.fetch ?? (async () => ({ ok: false, error: 'not implemented' })),
+    fetchAttachment,
     registerReviewThreadResolver: () => {},
     unregisterReviewThreadResolver: () => {},
     resolveReviewThread: async () => ({ ok: true }),
@@ -95,6 +102,10 @@ function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
     writeInterruptedSubagentHandoff: async () => false,
     liveCount: () => 0,
   }
+}
+
+function testAttachmentBudget() {
+  return { tryResize: () => true, release: () => {} }
 }
 
 async function runTool(
@@ -140,7 +151,7 @@ describe('channel_fetch_attachment', () => {
       expect(calls).toEqual([
         {
           adapter: 'slack-bot',
-          args: { ref: 'F12345', filename: 'diagram.png', maxBytes: TOOL_INPUT_MAX_BYTES.channel_upload },
+          args: { ref: 'F12345', filename: 'diagram.png', maxBytes: DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload },
         },
       ])
       expect(result.details).toMatchObject({ ok: true, mimetype: 'image/png', size: 11 })
@@ -163,7 +174,9 @@ describe('channel_fetch_attachment', () => {
     const tool = createChannelFetchAttachmentTool({ router, origin, inboxDir })
     const result = await runTool(tool, { attachment_id: 1, filename: 'renamed.bin' })
 
-    expect(calls).toEqual([{ ref: 'F1', filename: 'renamed.bin', maxBytes: TOOL_INPUT_MAX_BYTES.channel_upload }])
+    expect(calls).toEqual([
+      { ref: 'F1', filename: 'renamed.bin', maxBytes: DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload },
+    ])
     expect(result.details?.path).toMatch(/[/\\]renamed\.bin$/)
   })
 
