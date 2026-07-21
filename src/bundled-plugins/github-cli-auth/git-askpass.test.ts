@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -91,19 +91,6 @@ describe.skipIf(onWindows)('ensureGitAskPassHelper', () => {
     expect(await ensureGitAskPassHelper(pathB)).toBe(pathB)
     expect((await stat(pathA)).isFile()).toBe(true)
     expect((await stat(pathB)).isFile()).toBe(true)
-  })
-
-  test('a pre-existing executable helper in a read-only dir is returned without a write (no EACCES)', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-askpass-baked-'))
-    const path = join(dir, 'typeclaw-git-askpass')
-    await writeFile(path, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
-    await chmod(dir, 0o555) // read-only dir: any temp-write+rename would EACCES
-    try {
-      resetGitAskPassHelperForTests()
-      expect(await ensureGitAskPassHelper(path)).toBe(path)
-    } finally {
-      await chmod(dir, 0o755)
-    }
   })
 })
 

@@ -4,15 +4,15 @@ import { access, chmod, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promis
 import { dirname, join } from 'node:path'
 
 // A GIT_ASKPASS helper git invokes for username/password prompts. The token
-// rides in TYPECLAW_GIT_TOKEN (env, via the bash env overlay), NEVER in argv or
+// rides in TYPECLAW_GIT_TOKEN (a runtime-owned git env), NEVER in argv or
 // git config — so it cannot leak through process listings, logs, or .git/config.
 // The script contents are constant and secret-free; only the env value is secret.
 //
 // Host-scoped: git's prompt is `Username for 'https://github.com': ` etc. We
 // answer ONLY when the prompt names github.com; for any other host (e.g. one an
 // `insteadOf`/`pushurl` rewrite redirected to) we exit non-zero WITHOUT printing
-// the token, so a redirect can never exfiltrate it. The analyzer already blocks
-// the known redirect vectors; this is defense-in-depth at the credential edge.
+// the token, so a redirect can never exfiltrate it. Runtime-owned callers also
+// constrain git config; this is defense-in-depth at the credential edge.
 //
 // Two prompt shapes must match, because git rewrites the host between the two
 // prompts of a single clone/fetch: it first asks `Username for
@@ -37,17 +37,9 @@ case "$1" in
 esac
 `
 
-// The sandboxed-bash consumer (the github-cli-auth broker's authenticated git)
-// runs INSIDE the per-tool bwrap sandbox, which `--ro-bind`s /usr but masks /tmp
-// with a tmpfs (src/sandbox/build.ts). So its helper must live under /usr, baked
-// into the image at build time (dockerfile.ts) — the read-only /usr is why
-// ensureGitAskPassHelper early-returns when the file already exists rather than
-// rewriting it. TYPECLAW_GIT_ASKPASS_PATH overrides it for tests/CI.
-export const TYPECLAW_GIT_ASKPASS_PATH = '/usr/local/bin/typeclaw-git-askpass'
-
 // The base is the FIXED real `/tmp`, NOT `os.tmpdir()`: os.tmpdir() honors
 // TMPDIR/TMP/TEMP, so an env pointing it at a model-writable location would let a
-// sandboxed tool replace the cached helper before a later UNSANDBOXED reviewer
+// model-driven tool replace the cached helper before a later runtime-owned reviewer
 // checkout / backup push executes it with TYPECLAW_GIT_TOKEN in env. A random
 // `mkdtemp` subdir (mode 0700) keeps the name unpredictable.
 const ASKPASS_DIR_BASE = '/tmp/typeclaw-git-askpass-'
@@ -67,14 +59,7 @@ function resolveDefaultDir(): Promise<string> {
   })
 }
 
-// The path the SANDBOXED-bash consumer must use: the baked, sandbox-visible /usr
-// helper (or the test/CI override). Unlike the unsandboxed default, this never
-// falls back to /tmp, which the sandbox's tmpfs would hide from model bash.
-export function resolveSandboxGitAskPassPath(): string {
-  return configuredPath() ?? TYPECLAW_GIT_ASKPASS_PATH
-}
-
-// The path UNSANDBOXED execFile consumers (reviewer checkout, backup push) use:
+// The path runtime-owned execFile consumers (reviewer checkout, backup push) use:
 // a runtime-writable, unpredictable real-/tmp path. They don't run under bwrap, so
 // /tmp masking doesn't apply, and a non-root runtime can write here.
 async function defaultPath(): Promise<string> {
@@ -82,8 +67,7 @@ async function defaultPath(): Promise<string> {
 }
 
 // Keyed by resolved path: a single shared promise would let the first caller's
-// path win even when a later caller explicitly asks for a different one (the
-// sandbox /usr path and the unsandboxed /tmp path are legitimately distinct).
+// path win even when a later caller explicitly asks for a different one.
 const ensurePromises = new Map<string, Promise<string>>()
 
 export function resetGitAskPassHelperForTests(): void {
@@ -92,9 +76,8 @@ export function resetGitAskPassHelperForTests(): void {
 }
 
 // Returns the helper's absolute path, creating it once per path if needed. When
-// an executable file already exists at the resolved path (the baked /usr helper),
-// we return it WITHOUT writing — the read-only /usr would EACCES a rewrite. Only
-// creates when absent: dev, the unsandboxed /tmp path, or a writable test
+// an executable file already exists at the resolved path, we return it without
+// rewriting. Creates when absent at the runtime /tmp path or a writable test
 // override. Idempotent + race-safe via the per-path promise; the create uses an
 // unpredictable temp opened `wx` (fails on an existing file/symlink) then renamed.
 export async function ensureGitAskPassHelper(path?: string): Promise<string> {

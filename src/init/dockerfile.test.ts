@@ -1061,18 +1061,6 @@ describe('transformers native-deps layer (sharp + onnxruntime linux binaries)', 
     })
   }
 
-  for (const [label, render] of [
-    ['inline (dev)', () => buildDockerfile()],
-    ['versioned (base-image)', () => buildDockerfile(dockerfileSchema.parse({}), { baseImageVersion: '0.1.1' })],
-    ['base', () => buildBaseDockerfile()],
-  ] as const) {
-    test(`${label} form bakes the git-askpass helper at /usr/local/bin/typeclaw-git-askpass, chmod 755 (non-root runtime cannot write it at runtime)`, () => {
-      const out = render()
-      expect(out).toContain('> /usr/local/bin/typeclaw-git-askpass')
-      expect(out).toContain('chmod 755 /usr/local/bin/typeclaw-git-askpass')
-    })
-  }
-
   test('TRANSFORMERS_VERSION matches the @huggingface/transformers pin in package.json — host download (models.ts) and container install (Layer 7) must resolve the same library, and the package.json pin is exact (no caret) so the repo install agrees', () => {
     const pkg = JSON.parse(readFileSync(join(import.meta.dir, '..', '..', 'package.json'), 'utf8')) as {
       dependencies: Record<string, string>
