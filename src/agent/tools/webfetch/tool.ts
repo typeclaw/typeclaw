@@ -91,82 +91,88 @@ export const webFetchTool = defineTool({
 
     let response
     try {
-      response = await fetchWithLimits(normalizedUrl, timeout, signal, params.antibotWarmup ?? 'auto')
+      response = await fetchWithLimits(normalizedUrl, timeout, signal, params.antibotWarmup ?? 'auto', undefined, {
+        retainResultBudget: true,
+      })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       return errorResult(normalizedUrl, message, { startedAt, finalUrl: normalizedUrl })
     }
 
-    const mime = parseMimeType(response.contentType)
-    const resolved = resolveStrategy(params.strategy, mime)
-    if (resolved.kind === 'error') {
-      return errorResult(normalizedUrl, resolved.message, {
-        startedAt,
-        finalUrl: response.finalUrl,
-        contentType: response.contentType,
-        httpStatus: response.httpStatus,
-        bytesIn: response.bytesIn,
-      })
-    }
-    const strategy = resolved.strategy
-    const autoDetected = resolved.autoDetected
-
-    const validation = validateStrategyArgs(strategy, params)
-    if (validation) {
-      return errorResult(normalizedUrl, validation, {
-        startedAt,
-        finalUrl: response.finalUrl,
-        contentType: response.contentType,
-        httpStatus: response.httpStatus,
-        bytesIn: response.bytesIn,
-        strategy,
-        autoDetected,
-      })
-    }
-
-    let output: string
     try {
-      output = await runStrategy(strategy, response.body, response.finalUrl, params)
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      return errorResult(normalizedUrl, message, {
-        startedAt,
+      const mime = parseMimeType(response.contentType)
+      const resolved = resolveStrategy(params.strategy, mime)
+      if (resolved.kind === 'error') {
+        return errorResult(normalizedUrl, resolved.message, {
+          startedAt,
+          finalUrl: response.finalUrl,
+          contentType: response.contentType,
+          httpStatus: response.httpStatus,
+          bytesIn: response.bytesIn,
+        })
+      }
+      const strategy = resolved.strategy
+      const autoDetected = resolved.autoDetected
+
+      const validation = validateStrategyArgs(strategy, params)
+      if (validation) {
+        return errorResult(normalizedUrl, validation, {
+          startedAt,
+          finalUrl: response.finalUrl,
+          contentType: response.contentType,
+          httpStatus: response.httpStatus,
+          bytesIn: response.bytesIn,
+          strategy,
+          autoDetected,
+        })
+      }
+
+      let output: string
+      try {
+        output = await runStrategy(strategy, response.body, response.finalUrl, params)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return errorResult(normalizedUrl, message, {
+          startedAt,
+          finalUrl: response.finalUrl,
+          contentType: response.contentType,
+          httpStatus: response.httpStatus,
+          bytesIn: response.bytesIn,
+          strategy,
+          autoDetected,
+        })
+      }
+
+      const capped = capOutput(output, strategy)
+      const details: WebFetchDetails = {
+        url: normalizedUrl,
         finalUrl: response.finalUrl,
+        strategy,
+        autoDetected,
         contentType: response.contentType,
         httpStatus: response.httpStatus,
         bytesIn: response.bytesIn,
-        strategy,
-        autoDetected,
-      })
-    }
+        bytesOut: byteLength(capped.text),
+        truncated: capped.truncated,
+        durationMs: Date.now() - startedAt,
+        ...(response.antibotWarmup?.triggered
+          ? {
+              antibotWarmup: {
+                triggered: true,
+                initialStatus: response.antibotWarmup.initialStatus,
+                initialSetCookieNames: response.antibotWarmup.initialSetCookieNames,
+                replayStatus: response.antibotWarmup.replayStatus,
+              },
+            }
+          : {}),
+      }
 
-    const capped = capOutput(output, strategy)
-    const details: WebFetchDetails = {
-      url: normalizedUrl,
-      finalUrl: response.finalUrl,
-      strategy,
-      autoDetected,
-      contentType: response.contentType,
-      httpStatus: response.httpStatus,
-      bytesIn: response.bytesIn,
-      bytesOut: byteLength(capped.text),
-      truncated: capped.truncated,
-      durationMs: Date.now() - startedAt,
-      ...(response.antibotWarmup?.triggered
-        ? {
-            antibotWarmup: {
-              triggered: true,
-              initialStatus: response.antibotWarmup.initialStatus,
-              initialSetCookieNames: response.antibotWarmup.initialSetCookieNames,
-              replayStatus: response.antibotWarmup.replayStatus,
-            },
-          }
-        : {}),
-    }
-
-    return {
-      content: [{ type: 'text' as const, text: capped.text }],
-      details,
+      return {
+        content: [{ type: 'text' as const, text: capped.text }],
+        details,
+      }
+    } finally {
+      response.release()
     }
   },
 })

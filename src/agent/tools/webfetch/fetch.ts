@@ -7,8 +7,8 @@ import {
   type PublicHttpDependencies,
   type PublicHttpResponse,
 } from '@/agent/network/safe-http'
-
-import { MAX_RESPONSE_BYTES } from './types'
+import { processResourceBudget, type ResourceLease, type WeightedResourceBudget } from '@/agent/resource-budget'
+import { config } from '@/config'
 
 export type AntibotWarmup = 'auto' | 'off'
 
@@ -27,6 +27,13 @@ export type FetchResult = {
   httpStatus: number
   bytesIn: number
   antibotWarmup?: AntibotWarmupInfo
+  release(): void
+}
+
+export type WebFetchResourceOptions = {
+  maxResponseBytes?: number
+  resourceBudget?: WeightedResourceBudget
+  retainResultBudget?: boolean
 }
 
 export type WebFetchNetworkDependencies = PublicHttpDependencies
@@ -69,7 +76,10 @@ export async function fetchWithLimits(
   parentSignal?: AbortSignal,
   antibotWarmup: AntibotWarmup = 'auto',
   network: WebFetchNetworkDependencies = forceFallbackForTest ? testFetchDependencies : defaultPublicHttpDependencies,
+  resourceOptions: WebFetchResourceOptions = {},
 ): Promise<FetchResult> {
+  const maxResponseBytes = resourceOptions.maxResponseBytes ?? config.modelTools.limits.webFetchTransportMaxBytes
+  const resourceBudget = resourceOptions.resourceBudget ?? processResourceBudget
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(new Error('timeout')), timeoutSeconds * 1000)
   const onAbort = () => controller.abort(parentSignal?.reason)
@@ -78,27 +88,48 @@ export async function fetchWithLimits(
   try {
     const cookieJar = new WarmupCookieJar()
     const visitedUrls = new Set<string>()
-    const first = await fetchOnce(url, controller.signal, network, REQUEST_HEADERS, cookieJar, visitedUrls)
+    const first = await fetchOnce(
+      url,
+      controller.signal,
+      network,
+      REQUEST_HEADERS,
+      maxResponseBytes,
+      resourceBudget,
+      cookieJar,
+      visitedUrls,
+    )
     const cookieNames = cookieJar.names()
     const warmup =
       antibotWarmup === 'auto' &&
       first.statusCode === 403 &&
       [...visitedUrls].some((visitedUrl) => cookieJar.hasMatching(visitedUrl, AKAMAI_BOTMANAGER_COOKIE))
     if (!warmup) {
-      return toFetchResult(first, { attempted: antibotWarmup === 'auto', triggered: false })
+      return toFetchResult(first, resourceOptions.retainResultBudget === true, {
+        attempted: antibotWarmup === 'auto',
+        triggered: false,
+      })
     }
 
     const remainingMs = timeoutSeconds * 1000 - (Date.now() - startedAt)
     if (remainingMs < 1_000) {
-      return toFetchResult(first, {
+      return toFetchResult(first, resourceOptions.retainResultBudget === true, {
         attempted: true,
         triggered: false,
         initialStatus: first.statusCode,
         initialSetCookieNames: cookieNames,
       })
     }
-    const replay = await fetchOnce(url, controller.signal, network, REQUEST_HEADERS, cookieJar)
-    return toFetchResult(replay, {
+    first.lease.release()
+    const replay = await fetchOnce(
+      url,
+      controller.signal,
+      network,
+      REQUEST_HEADERS,
+      maxResponseBytes,
+      resourceBudget,
+      cookieJar,
+    )
+    return toFetchResult(replay, resourceOptions.retainResultBudget === true, {
       attempted: true,
       triggered: true,
       initialStatus: first.statusCode,
@@ -143,6 +174,7 @@ type BufferedResponse = {
   headers: PublicHttpResponse['headers']
   statusCode: number
   finalUrl: string
+  lease: ResourceLease
 }
 
 async function fetchOnce(
@@ -150,10 +182,12 @@ async function fetchOnce(
   signal: AbortSignal,
   network: WebFetchNetworkDependencies,
   headers: Record<string, string>,
+  maxResponseBytes: number,
+  resourceBudget: WeightedResourceBudget,
   cookieJar?: WarmupCookieJar,
   visitedUrls?: Set<string>,
 ): Promise<BufferedResponse> {
-  const { response, finalUrl } = await requestPublicHttpUrl(url, {
+  const requested = await requestPublicHttpUrl(url, {
     signal,
     headers,
     dependencies: network,
@@ -167,36 +201,76 @@ async function fetchOnce(
       cookieJar?.store(response.headers, responseUrl)
     },
   })
+  const { response, finalUrl } = requested
+  const declared = Number(headerValue(response.headers, 'content-length') ?? '')
+  if (Number.isFinite(declared) && declared > maxResponseBytes) {
+    response.cancel()
+    throw tooLarge(declared, maxResponseBytes)
+  }
+  const reservedRaw = Number.isFinite(declared) && declared > 0 ? declared : 0
+  const lease = await resourceBudget.acquire({ memoryBytes: reservedRaw }, signal).catch((error) => {
+    response.cancel()
+    throw error
+  })
   try {
-    const declared = Number(headerValue(response.headers, 'content-length') ?? '')
-    if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
-      throw tooLarge(declared)
-    }
     const chunks: Uint8Array[] = []
     let total = 0
     for await (const chunk of response.body) {
       total += chunk.byteLength
-      if (total > MAX_RESPONSE_BYTES) throw tooLarge(total)
+      if (total > maxResponseBytes) throw tooLarge(total, maxResponseBytes)
+      const retainedRaw = Math.max(total, reservedRaw)
+      if (!lease.tryResize({ memoryBytes: retainedRaw })) throw memoryBudgetExceeded(retainedRaw)
       chunks.push(chunk)
     }
-    return { body: Buffer.concat(chunks), headers: response.headers, statusCode: response.statusCode, finalUrl }
+    if (!lease.tryResize({ memoryBytes: total * 2 })) throw memoryBudgetExceeded(total * 2)
+    const body = Buffer.concat(chunks)
+    chunks.length = 0
+    if (!lease.tryResize({ memoryBytes: total })) throw memoryBudgetExceeded(total)
+    return { body, headers: response.headers, statusCode: response.statusCode, finalUrl, lease }
+  } catch (error) {
+    lease.release()
+    throw error
   } finally {
     response.cancel()
   }
 }
 
-function toFetchResult(response: BufferedResponse, antibotWarmup?: AntibotWarmupInfo): FetchResult {
+function toFetchResult(
+  response: BufferedResponse,
+  retainResultBudget: boolean,
+  antibotWarmup?: AntibotWarmupInfo,
+): FetchResult {
   if (response.statusCode < 200 || response.statusCode >= 300) {
+    response.lease.release()
     throw new WebFetchError(`Fetch failed: HTTP ${response.statusCode}`)
   }
-  return {
-    body: new TextDecoder('utf-8', { fatal: false }).decode(response.body),
-    contentType: headerValue(response.headers, 'content-type') ?? '',
-    finalUrl: response.finalUrl,
-    httpStatus: response.statusCode,
-    bytesIn: response.body.byteLength,
-    ...(antibotWarmup !== undefined ? { antibotWarmup } : {}),
+  const bytesIn = response.body.byteLength
+  if (!response.lease.tryResize({ memoryBytes: bytesIn * 3 })) {
+    response.lease.release()
+    throw memoryBudgetExceeded(bytesIn * 3)
   }
+  const lease = response.lease
+  try {
+    const body = new TextDecoder('utf-8', { fatal: false }).decode(response.body)
+    const result: FetchResult = {
+      body,
+      contentType: headerValue(response.headers, 'content-type') ?? '',
+      finalUrl: response.finalUrl,
+      httpStatus: response.statusCode,
+      bytesIn,
+      release: createLeaseRelease(lease),
+      ...(antibotWarmup !== undefined ? { antibotWarmup } : {}),
+    }
+    if (!retainResultBudget) lease.release()
+    return result
+  } catch (error) {
+    lease.release()
+    throw error
+  }
+}
+
+function createLeaseRelease(lease: ResourceLease): () => void {
+  return () => lease.release()
 }
 
 function setCookieValues(headers: PublicHttpResponse['headers']): string[] {
@@ -230,10 +304,12 @@ class WarmupCookieJar {
   }
 }
 
-function tooLarge(bytes: number): WebFetchError {
-  return new WebFetchError(
-    `Response too large (${formatBytes(bytes)} exceeds ${formatBytes(MAX_RESPONSE_BYTES)} limit)`,
-  )
+function tooLarge(bytes: number, maxResponseBytes: number): WebFetchError {
+  return new WebFetchError(`Response too large (${formatBytes(bytes)} exceeds ${formatBytes(maxResponseBytes)} limit)`)
+}
+
+function memoryBudgetExceeded(bytes: number): WebFetchError {
+  return new WebFetchError(`Response exceeds the process-wide memory budget (${bytes} weighted bytes requested)`)
 }
 
 export function parseMimeType(contentType: string): string {

@@ -1,3 +1,5 @@
+import { DEFAULT_MODEL_TOOL_LIMITS } from '@/config'
+
 export type CompactionStrategy = 'readability' | 'jq' | 'selector' | 'grep' | 'snapshot' | 'raw'
 
 export type AntibotWarmupDetails = {
@@ -35,7 +37,7 @@ export const OUTPUT_CAPS: Record<CompactionStrategy, number> = {
   snapshot: 50_000,
 }
 
-export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+export const DEFAULT_WEB_FETCH_TRANSPORT_MAX_BYTES = DEFAULT_MODEL_TOOL_LIMITS.webFetchTransportMaxBytes
 
 export const DEFAULT_TIMEOUT_SECONDS = 30
 export const MAX_TIMEOUT_SECONDS = 120

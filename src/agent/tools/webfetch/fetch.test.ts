@@ -2,9 +2,10 @@ import { describe, expect, test } from 'bun:test'
 import type { LookupAddress } from 'node:dns'
 
 import type { PublicHttpRequestOptions, PublicHttpResponse } from '@/agent/network/safe-http'
+import { WeightedResourceBudget } from '@/agent/resource-budget'
 
 import { fetchWithLimits, normalizeUrl, parseMimeType, type WebFetchNetworkDependencies, WebFetchError } from './fetch'
-import { MAX_RESPONSE_BYTES } from './types'
+import { DEFAULT_WEB_FETCH_TRANSPORT_MAX_BYTES } from './types'
 
 describe('normalizeUrl', () => {
   test('normalizes HTTP(S) and rejects other schemes', () => {
@@ -96,8 +97,8 @@ describe('fetchWithLimits safe transport', () => {
   test('cancels non-2xx, declared-oversize, streaming-oversize, iteration-error, and successful responses', async () => {
     for (const candidate of [
       response({ statusCode: 404 }),
-      response({ headers: { 'content-length': String(MAX_RESPONSE_BYTES + 1) } }),
-      response({ chunks: [new Uint8Array(MAX_RESPONSE_BYTES + 1)] }),
+      response({ headers: { 'content-length': String(DEFAULT_WEB_FETCH_TRANSPORT_MAX_BYTES + 1) } }),
+      response({ chunks: [new Uint8Array(DEFAULT_WEB_FETCH_TRANSPORT_MAX_BYTES + 1)] }),
       response({ iterationError: new Error('body broke') }),
       response({ chunks: [new Uint8Array([1])] }),
     ]) {
@@ -105,6 +106,57 @@ describe('fetchWithLimits safe transport', () => {
       await fetchWithLimits('https://example.com', 30, undefined, 'off', network).catch(() => undefined)
       expect(candidate.cancelled()).toBeTrue()
     }
+  })
+
+  test('streams an unknown-length body and aborts at a configured lower transport ceiling', async () => {
+    const candidate = response({ chunks: [new Uint8Array(6), new Uint8Array(5)] })
+    const network = fixture({ request: async (options) => (await socketAddress(options), candidate) })
+
+    await expect(
+      fetchWithLimits('https://example.com', 30, undefined, 'off', network, { maxResponseBytes: 10 }),
+    ).rejects.toThrow(/10B limit/)
+    expect(candidate.cancelled()).toBeTrue()
+  })
+
+  test('accounts for chunk retention plus Buffer.concat before allocating the concat buffer', async () => {
+    const candidate = response({ chunks: [new Uint8Array(4), new Uint8Array(4)] })
+    const network = fixture({ request: async (options) => (await socketAddress(options), candidate) })
+    const budget = new WeightedResourceBudget({
+      maxMemoryBytes: 15,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 1,
+    })
+
+    await expect(
+      fetchWithLimits('https://example.com', 30, undefined, 'off', network, {
+        maxResponseBytes: 10,
+        resourceBudget: budget,
+      }),
+    ).rejects.toThrow(/memory budget/i)
+    expect(candidate.cancelled()).toBeTrue()
+    expect(budget.usage().memoryBytes).toBe(0)
+  })
+
+  test('retains raw plus decoded-body accounting without a hidden BufferedResponse capture', async () => {
+    const candidate = response({ chunks: [new TextEncoder().encode('test')] })
+    const network = fixture({ request: async (options) => (await socketAddress(options), candidate) })
+    const budget = new WeightedResourceBudget({
+      maxMemoryBytes: 12,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 1,
+    })
+
+    const result = await fetchWithLimits('https://example.com', 30, undefined, 'off', network, {
+      resourceBudget: budget,
+      retainResultBudget: true,
+    })
+    expect(result.body).toBe('test')
+    expect(budget.usage().memoryBytes).toBe(12)
+
+    result.release()
+    expect(budget.usage().memoryBytes).toBe(0)
   })
 
   test('safely replays Akamai cookie warmup through the same pinned transport', async () => {
