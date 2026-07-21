@@ -530,6 +530,62 @@ describe('runBackup', () => {
     await runBackup({ cwd, pushToOrigin: true }, baseDeps(spawn, '   '))
     expect(captured).toBe('Backup')
   })
+
+  test('runs git gc after a successful commit when packs meet the threshold', async () => {
+    // given: a repo whose pack count is at/above the threshold
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' M foo\n')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'commit') return okResult()
+      if (args[0] === 'count-objects') return okResult('count: 3\npacks: 25\n')
+      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
+      return okResult()
+    })
+
+    // when
+    const result = await runBackup({ cwd, pushToOrigin: false, gcPackThreshold: 20 }, baseDeps(spawn))
+
+    // then: committed, and gc ran AFTER the commit
+    expect(result).toEqual({ ok: true, kind: 'committed' })
+    const commitIdx = calls.findIndex((c) => c.args[0] === 'commit')
+    const gcIdx = calls.findIndex((c) => c.args[0] === 'gc')
+    expect(gcIdx).toBeGreaterThan(commitIdx)
+  })
+
+  test('never runs git gc when gcPackThreshold is 0', async () => {
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' M foo\n')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'commit') return okResult()
+      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
+      return okResult()
+    })
+
+    const result = await runBackup({ cwd, pushToOrigin: false, gcPackThreshold: 0 }, baseDeps(spawn))
+
+    expect(result).toEqual({ ok: true, kind: 'committed' })
+    expect(calls.some((c) => c.args[0] === 'count-objects')).toBe(false)
+    expect(calls.some((c) => c.args[0] === 'gc')).toBe(false)
+  })
+
+  test('a git gc failure does not fail the backup', async () => {
+    const cwd = await makeRepo()
+    const { spawn } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' M foo\n')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'commit') return okResult()
+      if (args[0] === 'count-objects') return okResult('packs: 99\n')
+      if (args[0] === 'gc') return failResult('gc exploded', 1)
+      if (args[0] === 'rev-parse') return failResult('no upstream', 128)
+      return okResult()
+    })
+
+    const result = await runBackup({ cwd, pushToOrigin: false, gcPackThreshold: 20 }, baseDeps(spawn))
+
+    expect(result).toEqual({ ok: true, kind: 'committed' })
+  })
 })
 
 describe('parsePorcelain', () => {

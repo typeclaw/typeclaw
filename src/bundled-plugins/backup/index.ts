@@ -6,6 +6,7 @@ import { resolveAgentGit } from '@/git/resolve-agent-git'
 import { definePlugin, type PluginContext, type SpawnSubagentOptions, type Subagent } from '@/plugin'
 
 import { type BackupPushAuthDeps, makeDefaultAskPassEnsurer, resolveBackupPushAuthEnv } from './git-auth'
+import { DEFAULT_GC_PACK_THRESHOLD } from './maintenance'
 import { COMMIT_TIMEOUT_MS, makeDefaultGitSpawn, NETWORK_TIMEOUT_MS, runBackup, type BackupResult } from './runner'
 import {
   cleanupMessageFile,
@@ -38,6 +39,7 @@ const backupConfigSchema = z
     pushToOrigin: z.boolean().default(true),
     commitTimeoutMs: z.number().int().min(1).default(COMMIT_TIMEOUT_MS),
     networkTimeoutMs: z.number().int().min(1).default(NETWORK_TIMEOUT_MS),
+    gcPackThreshold: z.number().int().min(0).default(DEFAULT_GC_PACK_THRESHOLD),
   })
   .default({
     enabled: true,
@@ -45,11 +47,13 @@ const backupConfigSchema = z
     pushToOrigin: true,
     commitTimeoutMs: COMMIT_TIMEOUT_MS,
     networkTimeoutMs: NETWORK_TIMEOUT_MS,
+    gcPackThreshold: DEFAULT_GC_PACK_THRESHOLD,
   })
 
 const runnerPayloadSchema = z.object({
   agentDir: z.string(),
   pushToOrigin: z.boolean(),
+  gcPackThreshold: z.number().int().min(0),
 })
 
 type RunnerPayload = z.infer<typeof runnerPayloadSchema>
@@ -60,6 +64,7 @@ export default definePlugin({
     const enabled = ctx.config.enabled
     const idleMs = ctx.config.idleMs
     const pushToOrigin = ctx.config.pushToOrigin
+    const gcPackThreshold = ctx.config.gcPackThreshold
 
     const activeTurns = new Set<string>()
     let idleTimer: ReturnType<typeof setTimeout> | null = null
@@ -87,6 +92,7 @@ export default definePlugin({
           {
             agentDir: ctx.agentDir,
             pushToOrigin,
+            gcPackThreshold,
           } satisfies RunnerPayload,
           // The backup runner is a system-level operation that commits +
           // pushes on the operator's behalf. It runs after every idle
@@ -190,10 +196,11 @@ async function runBackupOnce(
 
   const result = await withGitLock(payload.agentDir, () =>
     runBackup(
-      { cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin },
+      { cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin, gcPackThreshold: payload.gcPackThreshold },
       {
         gitSpawn: makeDefaultGitSpawn(),
         pushEnv,
+        logger: ctx.logger,
         pickCommitMessage: async ({ status, diffstat }) => {
           await cleanupMessageFile(messagePath)
           const messagePayload: CommitMessagePayload = {

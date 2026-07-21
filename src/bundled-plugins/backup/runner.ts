@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { hooklessGitArgs } from '@/git/hookless'
 import { type AgentGit, resolveAgentGit } from '@/git/resolve-agent-git'
 
+import { DEFAULT_GC_PACK_THRESHOLD, maybeRunGitGc } from './maintenance'
+
 export const COMMIT_TIMEOUT_MS = 30_000
 export const NETWORK_TIMEOUT_MS = 60_000
 
@@ -38,12 +40,15 @@ export type BackupRunnerDeps = {
   // commands — `git commit` can run repo-controlled hooks, which must never see
   // the minted token.
   pushEnv?: Record<string, string>
+  logger?: { info: (m: string) => void; warn: (m: string) => void }
   now?: () => number
 }
 
 export type BackupRunnerOptions = {
   cwd: string
   pushToOrigin: boolean
+  // Pack-count threshold for the post-commit `git gc`. 0 disables maintenance.
+  gcPackThreshold?: number
 }
 
 export type BackupFailureInput = {
@@ -66,6 +71,7 @@ type PushPlan = ActivePushPlan | { kind: 'skip' }
 
 export async function runBackup(options: BackupRunnerOptions, deps: BackupRunnerDeps): Promise<BackupResult> {
   const { cwd, pushToOrigin } = options
+  const gcPackThreshold = options.gcPackThreshold ?? DEFAULT_GC_PACK_THRESHOLD
 
   const repo = resolveAgentGit(cwd)
   if (!repo) return { ok: true, kind: 'no-repo' }
@@ -143,6 +149,11 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
   })
   if (commit.exitCode !== 0)
     return { ok: false, kind: 'commit-failed', reason: `git commit failed: ${shortErr(commit)}` }
+
+  // Repack/prune before pushing so the object count the next per-bash secret
+  // fsck must walk stays bounded. Best-effort: maybeRunGitGc never throws, so a
+  // gc failure leaves the already-made commit intact and falls through to push.
+  await maybeRunGitGc({ cwd, repo, gitSpawn: deps.gitSpawn, packThreshold: gcPackThreshold, logger: deps.logger })
 
   if (!pushToOrigin) return { ok: true, kind: 'committed' }
 

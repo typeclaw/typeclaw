@@ -114,6 +114,7 @@ describe('backup plugin', () => {
       pushToOrigin: true,
       commitTimeoutMs: 30_000,
       networkTimeoutMs: 60_000,
+      gcPackThreshold: 20,
     })
   })
 
