@@ -7,10 +7,12 @@ import { pipeline } from 'node:stream/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
+import { config, DEFAULT_MODEL_TOOL_LIMITS } from '@/config'
 import type { ToolFileOperands, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
 
+import { processResourceBudget, type ResourceLease } from './resource-budget'
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from './tools-without-local-file-operands'
 
 export { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS }
@@ -27,25 +29,30 @@ type VerifiedInput = {
   kind: 'file' | 'directory'
 }
 
-export const TOOL_INPUT_MAX_BYTES = {
+export type ToolInputByteLimits = {
+  read: number
+  look_at: number
+  channel_upload: number
+}
+
+export const DEFAULT_TOOL_INPUT_MAX_BYTES = {
   // read supports offset/limit browsing, so permit large source files while
   // bounding the immutable whole-object snapshot.
-  read: 64 * 1024 * 1024,
+  read: DEFAULT_MODEL_TOOL_LIMITS.readSnapshotMaxBytes,
   // Keep local images on the same budget as look_at's bounded URL fetch.
-  look_at: 20 * 1024 * 1024,
+  look_at: DEFAULT_MODEL_TOOL_LIMITS.lookAtImageMaxBytes,
   // Preserve common channel upload sizes without allowing unbounded copies.
-  channel_upload: 100 * 1024 * 1024,
-} as const
+  channel_upload: DEFAULT_MODEL_TOOL_LIMITS.channelAttachmentMaxBytes,
+} as const satisfies ToolInputByteLimits
 
-export const TOOL_INPUT_MAX_COUNT = {
+export const DEFAULT_TOOL_INPUT_MAX_COUNT = {
   read: 1,
-  look_at: 16,
+  look_at: DEFAULT_MODEL_TOOL_LIMITS.lookAtMaxImages,
   channel_upload: 32,
 } as const
 
-export const PINNED_SNAPSHOT_GLOBAL_MAX_BYTES = TOOL_INPUT_MAX_BYTES.channel_upload
-export const PINNED_SNAPSHOT_GLOBAL_MAX_COUNT = TOOL_INPUT_MAX_COUNT.channel_upload
-export const PINNED_SNAPSHOT_MAX_WAITERS = 32
+export const DEFAULT_PINNED_SNAPSHOT_MAX_BYTES = DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload
+export const DEFAULT_PINNED_SNAPSHOT_MAX_COUNT = DEFAULT_TOOL_INPUT_MAX_COUNT.channel_upload
 const TREE_SNAPSHOT_MAX_ENTRIES = 4096
 const AGENT_ROOT_SNAPSHOT_EXCLUDED_DIRS = new Set(['.git', '.gitstore', 'node_modules'])
 
@@ -73,11 +80,13 @@ export async function enforceAndPinToolFiles(
     fileOperands?: ToolFileOperands
     hidden?: HiddenPaths
     signal?: AbortSignal
+    limits?: ToolInputByteLimits
   },
   hooks: EnforceAndPinToolFilesHooks = {},
 ): Promise<PinnedToolFiles> {
   if (options.signal?.aborted === true) throw abortError(options.signal)
-  const maxCount = maxInputCount(options.tool)
+  const inputLimits = resolveInputLimits(options.tool, options.limits)
+  const maxCount = inputLimits.maxCount
   const targets = fileTargets(
     options.tool,
     options.args,
@@ -94,8 +103,9 @@ export async function enforceAndPinToolFiles(
   let dir: string | undefined
   const rewrites: Rewrite[] = []
   const verified: VerifiedInput[] = []
-  const maxBytes = maxInputBytes(options.tool)
-  let lease: BudgetLease | undefined
+  const maxBytes = inputLimits.maxBytes
+  const maxTotalBytes = inputLimits.maxTotalBytes
+  let lease: ResourceLease | undefined
   try {
     let declaredBytes = 0
     for (const target of targets) {
@@ -116,11 +126,14 @@ export async function enforceAndPinToolFiles(
       if (kind === 'file') assertSingleLinkRegularFile(inspected, original)
       if (kind === 'file' && inspected.size > maxBytes) throw inputTooLarge(original, inspected.size, maxBytes)
       declaredBytes += kind === 'file' ? inspected.size : 0
-      if (declaredBytes > maxBytes) throw aggregateInputTooLarge(declaredBytes, maxBytes)
+      if (declaredBytes > maxTotalBytes) throw aggregateInputTooLarge(declaredBytes, maxTotalBytes)
       verified.push({ target, original, resolved, dev: inspected.dev, ino: inspected.ino, size: inspected.size, kind })
     }
 
-    lease = await pinnedSnapshotBudget.acquire(declaredBytes, verified.length, options.signal)
+    lease = await processResourceBudget.acquire(
+      { pinnedBytes: declaredBytes, pinnedCount: verified.length },
+      options.signal,
+    )
     await hooks.afterBudgetAcquire?.()
 
     dir = await mkdtemp(path.join(options.tempRoot ?? tmpdir(), TOOL_INPUT_TEMP_PREFIX))
@@ -141,6 +154,7 @@ export async function enforceAndPinToolFiles(
             pinned,
             input.original,
             maxBytes,
+            maxTotalBytes,
             copiedBytes,
             lease,
             verified.length,
@@ -157,6 +171,7 @@ export async function enforceAndPinToolFiles(
           agentDir: options.agentDir,
           tool: options.tool,
           maxBytes,
+          maxTotalBytes,
           previouslyCopied: copiedBytes,
           lease,
           operandCount: verified.length,
@@ -168,7 +183,9 @@ export async function enforceAndPinToolFiles(
       input.target.set(executionValue)
       rewrites.push({ original: input.target.original, pinned: executionValue })
     }
-    if (!lease.resize(copiedBytes, verified.length)) throw processBudgetGrowthExceeded(copiedBytes)
+    if (!lease.tryResize({ pinnedBytes: copiedBytes, pinnedCount: verified.length })) {
+      throw processBudgetGrowthExceeded(copiedBytes)
+    }
   } catch (error) {
     try {
       if (dir !== undefined) await removePinnedSnapshot(dir)
@@ -666,8 +683,9 @@ async function streamSnapshot(
   destination: string,
   original: string,
   maxBytes: number,
+  maxTotalBytes: number,
   previouslyCopied: number,
-  lease: BudgetLease,
+  lease: ResourceLease,
   operandCount: number,
   signal?: AbortSignal,
 ): Promise<number> {
@@ -679,11 +697,11 @@ async function streamSnapshot(
         callback(inputTooLarge(original, copied, maxBytes))
         return
       }
-      if (previouslyCopied + copied > maxBytes) {
-        callback(aggregateInputTooLarge(previouslyCopied + copied, maxBytes))
+      if (previouslyCopied + copied > maxTotalBytes) {
+        callback(aggregateInputTooLarge(previouslyCopied + copied, maxTotalBytes))
         return
       }
-      if (!lease.resize(previouslyCopied + copied, operandCount)) {
+      if (!lease.tryResize({ pinnedBytes: previouslyCopied + copied, pinnedCount: operandCount })) {
         callback(processBudgetGrowthExceeded(previouslyCopied + copied))
         return
       }
@@ -708,8 +726,9 @@ async function snapshotDirectoryTree(options: {
   agentDir: string
   tool: string
   maxBytes: number
+  maxTotalBytes: number
   previouslyCopied: number
-  lease: BudgetLease
+  lease: ResourceLease
   operandCount: number
   hidden?: HiddenPaths
   signal?: AbortSignal
@@ -788,6 +807,7 @@ async function snapshotOpenedDirectory(
         target,
         resolved,
         options.maxBytes,
+        options.maxTotalBytes,
         options.previouslyCopied + state.copied,
         options.lease,
         options.operandCount,
@@ -809,16 +829,24 @@ function assertSingleLinkRegularFile(stats: Stats, original: string): void {
   }
 }
 
-function maxInputBytes(tool: string): number {
-  if (tool === 'look_at') return TOOL_INPUT_MAX_BYTES.look_at
-  if (tool === 'channel_send' || tool === 'channel_reply') return TOOL_INPUT_MAX_BYTES.channel_upload
-  return TOOL_INPUT_MAX_BYTES.read
-}
-
-function maxInputCount(tool: string): number {
-  if (tool === 'look_at') return TOOL_INPUT_MAX_COUNT.look_at
-  if (tool === 'channel_send' || tool === 'channel_reply') return TOOL_INPUT_MAX_COUNT.channel_upload
-  return TOOL_INPUT_MAX_COUNT.read
+function resolveInputLimits(
+  tool: string,
+  override?: ToolInputByteLimits,
+): { maxBytes: number; maxTotalBytes: number; maxCount: number } {
+  if (tool === 'look_at') {
+    const maxBytes = override?.look_at ?? config.modelTools.limits.lookAtImageMaxBytes
+    return {
+      maxBytes,
+      maxTotalBytes: override?.look_at ?? config.modelTools.limits.lookAtTotalMaxBytes,
+      maxCount: config.modelTools.limits.lookAtMaxImages,
+    }
+  }
+  if (tool === 'channel_send' || tool === 'channel_reply') {
+    const maxBytes = override?.channel_upload ?? config.modelTools.limits.channelAttachmentMaxBytes
+    return { maxBytes, maxTotalBytes: maxBytes, maxCount: DEFAULT_TOOL_INPUT_MAX_COUNT.channel_upload }
+  }
+  const maxBytes = override?.read ?? config.modelTools.limits.readSnapshotMaxBytes
+  return { maxBytes, maxTotalBytes: maxBytes, maxCount: DEFAULT_TOOL_INPUT_MAX_COUNT.read }
 }
 
 function isOutputTool(tool: string): boolean {
@@ -962,98 +990,6 @@ function replaceDeep(value: unknown, rewrite: Rewrite): unknown {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object'
 }
-
-type BudgetRequest = {
-  bytes: number
-  count: number
-  signal?: AbortSignal
-  resolve(lease: BudgetLease): void
-  reject(error: Error): void
-  onAbort?: () => void
-}
-
-type BudgetLease = {
-  resize(bytes: number, count: number): boolean
-  release(): void
-}
-
-class PinnedSnapshotBudget {
-  private bytes = 0
-  private count = 0
-  private readonly queue: BudgetRequest[] = []
-
-  async acquire(bytes: number, count: number, signal?: AbortSignal): Promise<BudgetLease> {
-    if (bytes > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES || count > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT) {
-      throw new Error('tool inputs exceed the process-wide pinned snapshot budget')
-    }
-    if (signal?.aborted === true) throw abortError(signal)
-    if (this.queue.length >= PINNED_SNAPSHOT_MAX_WAITERS) {
-      throw new Error(`pinned snapshot waiter queue is full (${PINNED_SNAPSHOT_MAX_WAITERS} waiters)`)
-    }
-    return await new Promise<BudgetLease>((resolve, reject) => {
-      const request: BudgetRequest = { bytes, count, signal, resolve, reject }
-      if (signal !== undefined) {
-        request.onAbort = () => {
-          const index = this.queue.indexOf(request)
-          if (index === -1) return
-          this.queue.splice(index, 1)
-          reject(abortError(signal))
-          this.drain()
-        }
-        signal.addEventListener('abort', request.onAbort, { once: true })
-      }
-      this.queue.push(request)
-      this.drain()
-    })
-  }
-
-  private drain(): void {
-    while (this.queue.length > 0) {
-      const next = this.queue[0] as BudgetRequest
-      if (
-        this.bytes + next.bytes > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES ||
-        this.count + next.count > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT
-      ) {
-        return
-      }
-      this.queue.shift()
-      if (next.onAbort !== undefined) next.signal?.removeEventListener('abort', next.onAbort)
-      this.bytes += next.bytes
-      this.count += next.count
-      let released = false
-      let leasedBytes = next.bytes
-      let leasedCount = next.count
-      next.resolve({
-        resize: (bytes, count) => {
-          if (released) return false
-          const byteDelta = bytes - leasedBytes
-          const countDelta = count - leasedCount
-          if (
-            this.bytes + byteDelta > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES ||
-            this.count + countDelta > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT
-          ) {
-            return false
-          }
-          this.bytes += byteDelta
-          this.count += countDelta
-          leasedBytes = bytes
-          leasedCount = count
-          this.drain()
-          return true
-        },
-        release: () => {
-          if (released) return
-          released = true
-          this.bytes -= leasedBytes
-          this.count -= leasedCount
-          this.drain()
-        },
-      })
-    }
-  }
-}
-
-const pinnedSnapshotBudget = new PinnedSnapshotBudget()
 
 function abortError(signal: AbortSignal): Error {
   const reason = signal.reason

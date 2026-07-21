@@ -25,6 +25,7 @@ import { z } from 'zod'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
+import { PROCESS_RESOURCE_MAX_WAITERS } from '@/config'
 import { hooklessGitArgs } from '@/git/hookless'
 import { createPermissionService } from '@/permissions/permissions'
 import { createHookBus, defineTool, type PluginRegistry, type ToolResult } from '@/plugin'
@@ -38,7 +39,7 @@ import {
   resolvePrivilegedSandboxRuntime,
 } from '@/sandbox'
 
-import { URL_FETCH_MAX_BYTES } from './multimodal/looker'
+import { DEFAULT_LOOK_AT_IMAGE_MAX_BYTES } from './multimodal/looker'
 import {
   __resetSharedLoopGuardForTests,
   buildBashFilesystemPolicy,
@@ -55,10 +56,9 @@ import {
 import type { SessionOrigin } from './session-origin'
 import {
   enforceAndPinToolFiles,
-  PINNED_SNAPSHOT_GLOBAL_MAX_COUNT,
-  PINNED_SNAPSHOT_MAX_WAITERS,
-  TOOL_INPUT_MAX_BYTES,
-  TOOL_INPUT_MAX_COUNT,
+  DEFAULT_PINNED_SNAPSHOT_MAX_COUNT,
+  DEFAULT_TOOL_INPUT_MAX_BYTES,
+  DEFAULT_TOOL_INPUT_MAX_COUNT,
   writeToolOutputNoFollow,
 } from './tool-file-safety'
 
@@ -753,7 +753,7 @@ describe('wrapPluginTool', () => {
 
 describe('wrapSystemTool', () => {
   test('local look_at snapshots share the remote-image byte ceiling', () => {
-    expect(TOOL_INPUT_MAX_BYTES.look_at).toBe(URL_FETCH_MAX_BYTES)
+    expect(DEFAULT_TOOL_INPUT_MAX_BYTES.look_at).toBe(DEFAULT_LOOK_AT_IMAGE_MAX_BYTES)
   })
 
   test('session-level system-tool wrapping stays active with an empty hook bus', async () => {
@@ -1633,11 +1633,15 @@ describe('wrapSystemTool', () => {
   test('rejects oversized read, look_at, and channel-upload inputs before tool execution', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-oversized-input-'))
     const cases = [
-      { name: 'read', limit: TOOL_INPUT_MAX_BYTES.read, args: (file: string) => ({ path: file }) },
-      { name: 'look_at', limit: TOOL_INPUT_MAX_BYTES.look_at, args: (file: string) => ({ images: [{ path: file }] }) },
+      { name: 'read', limit: DEFAULT_TOOL_INPUT_MAX_BYTES.read, args: (file: string) => ({ path: file }) },
+      {
+        name: 'look_at',
+        limit: DEFAULT_TOOL_INPUT_MAX_BYTES.look_at,
+        args: (file: string) => ({ images: [{ path: file }] }),
+      },
       {
         name: 'channel_send',
-        limit: TOOL_INPUT_MAX_BYTES.channel_upload,
+        limit: DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload,
         args: (file: string) => ({ attachments: [{ path: file }] }),
       },
     ]
@@ -1672,6 +1676,24 @@ describe('wrapSystemTool', () => {
     }
   })
 
+  test('honors a configured lower read snapshot ceiling', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-configured-read-input-'))
+    const input = path.join(agentDir, 'input.bin')
+    await writeFile(input, '12345')
+    try {
+      await expect(
+        enforceAndPinToolFiles({
+          tool: 'read',
+          args: { path: input },
+          agentDir,
+          limits: { ...DEFAULT_TOOL_INPUT_MAX_BYTES, read: 4 },
+        }),
+      ).rejects.toThrow(/5 bytes > 4 byte limit/)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('rejects repeated near-limit look_at and channel attachments over the aggregate byte ceiling', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-aggregate-input-'))
     const snapshotRoot = path.join(agentDir, 'snapshots')
@@ -1679,12 +1701,12 @@ describe('wrapSystemTool', () => {
     const cases = [
       {
         tool: 'look_at',
-        limit: TOOL_INPUT_MAX_BYTES.look_at,
+        limit: DEFAULT_TOOL_INPUT_MAX_BYTES.look_at,
         args: (files: string[]) => ({ images: files.map((file) => ({ path: file })) }),
       },
       {
         tool: 'channel_send',
-        limit: TOOL_INPUT_MAX_BYTES.channel_upload,
+        limit: DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload,
         args: (files: string[]) => ({ attachments: files.map((file) => ({ path: file })) }),
       },
     ]
@@ -1726,11 +1748,11 @@ describe('wrapSystemTool', () => {
       await expect(
         enforceAndPinToolFiles({
           tool: 'look_at',
-          args: { images: Array.from({ length: TOOL_INPUT_MAX_COUNT.look_at + 1 }, () => ({ path: file })) },
+          args: { images: Array.from({ length: DEFAULT_TOOL_INPUT_MAX_COUNT.look_at + 1 }, () => ({ path: file })) },
           agentDir,
           tempRoot: snapshotRoot,
         }),
-      ).rejects.toThrow(new RegExp(`count.*> ${TOOL_INPUT_MAX_COUNT.look_at}`, 'i'))
+      ).rejects.toThrow(new RegExp(`count.*> ${DEFAULT_TOOL_INPUT_MAX_COUNT.look_at}`, 'i'))
       expect(await readdir(snapshotRoot)).toEqual([])
     } finally {
       await rm(agentDir, { recursive: true, force: true })
@@ -1745,7 +1767,7 @@ describe('wrapSystemTool', () => {
     const oversized = path.join(agentDir, 'oversized.bin')
     await writeFile(small, 'small')
     await writeFile(oversized, '')
-    await truncate(oversized, TOOL_INPUT_MAX_BYTES.channel_upload + 1)
+    await truncate(oversized, DEFAULT_TOOL_INPUT_MAX_BYTES.channel_upload + 1)
     try {
       await expect(
         enforceAndPinToolFiles({
@@ -1781,7 +1803,7 @@ describe('wrapSystemTool', () => {
 
   test('direct snapshots reject a file hardlinked to .env after initial authorization but before open', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-direct-hardlink-race-'))
-    const holderFiles = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT }, (_, i) =>
+    const holderFiles = Array.from({ length: DEFAULT_PINNED_SNAPSHOT_MAX_COUNT }, (_, i) =>
       path.join(agentDir, `holder-${i}.txt`),
     )
     const input = path.join(agentDir, 'input.txt')
@@ -1842,7 +1864,7 @@ describe('wrapSystemTool', () => {
 
   test('holds the process-wide pinned-count reservation through cleanup', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-global-snapshot-budget-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
+    const files = Array.from({ length: DEFAULT_PINNED_SNAPSHOT_MAX_COUNT + 1 }, (_, i) =>
       path.join(agentDir, `${i}.png`),
     )
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
@@ -1856,10 +1878,10 @@ describe('wrapSystemTool', () => {
     let second: Awaited<ReturnType<typeof make>> | undefined
     let third: Awaited<ReturnType<typeof make>> | undefined
     try {
-      first = await make(files.slice(0, TOOL_INPUT_MAX_COUNT.look_at))
-      second = await make(files.slice(TOOL_INPUT_MAX_COUNT.look_at, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT))
+      first = await make(files.slice(0, DEFAULT_TOOL_INPUT_MAX_COUNT.look_at))
+      second = await make(files.slice(DEFAULT_TOOL_INPUT_MAX_COUNT.look_at, DEFAULT_PINNED_SNAPSHOT_MAX_COUNT))
       let settled = false
-      const waiting = make([files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string]).then((value) => {
+      const waiting = make([files[DEFAULT_PINNED_SNAPSHOT_MAX_COUNT] as string]).then((value) => {
         settled = true
         return value
       })
@@ -1879,7 +1901,7 @@ describe('wrapSystemTool', () => {
 
   test('aborting a queued snapshot waiter removes it without consuming capacity', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-aborted-snapshot-waiter-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
+    const files = Array.from({ length: DEFAULT_PINNED_SNAPSHOT_MAX_COUNT + 1 }, (_, i) =>
       path.join(agentDir, `${i}.bin`),
     )
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
@@ -1887,13 +1909,13 @@ describe('wrapSystemTool', () => {
     try {
       holder = await enforceAndPinToolFiles({
         tool: 'channel_send',
-        args: { attachments: files.slice(0, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT).map((file) => ({ path: file })) },
+        args: { attachments: files.slice(0, DEFAULT_PINNED_SNAPSHOT_MAX_COUNT).map((file) => ({ path: file })) },
         agentDir,
       })
       const controller = new AbortController()
       const waiting = enforceAndPinToolFiles({
         tool: 'read',
-        args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
+        args: { path: files[DEFAULT_PINNED_SNAPSHOT_MAX_COUNT] as string },
         agentDir,
         signal: controller.signal,
       })
@@ -1903,7 +1925,7 @@ describe('wrapSystemTool', () => {
       holder = undefined
       const next = await enforceAndPinToolFiles({
         tool: 'read',
-        args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
+        args: { path: files[DEFAULT_PINNED_SNAPSHOT_MAX_COUNT] as string },
         agentDir,
       })
       await next.cleanup()
@@ -1915,7 +1937,7 @@ describe('wrapSystemTool', () => {
 
   test('rejects excess queued snapshot waiters with a deterministic bound', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-bounded-snapshot-waiters-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
+    const files = Array.from({ length: DEFAULT_PINNED_SNAPSHOT_MAX_COUNT + 1 }, (_, i) =>
       path.join(agentDir, `${i}.bin`),
     )
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
@@ -1926,15 +1948,15 @@ describe('wrapSystemTool', () => {
     try {
       holder = await enforceAndPinToolFiles({
         tool: 'channel_send',
-        args: { attachments: files.slice(0, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT).map((file) => ({ path: file })) },
+        args: { attachments: files.slice(0, DEFAULT_PINNED_SNAPSHOT_MAX_COUNT).map((file) => ({ path: file })) },
         agentDir,
       })
-      waiters = Array.from({ length: PINNED_SNAPSHOT_MAX_WAITERS + 1 }, () => {
+      waiters = Array.from({ length: PROCESS_RESOURCE_MAX_WAITERS + 1 }, () => {
         const controller = new AbortController()
         controllers.push(controller)
         return enforceAndPinToolFiles({
           tool: 'read',
-          args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
+          args: { path: files[DEFAULT_PINNED_SNAPSHOT_MAX_COUNT] as string },
           agentDir,
           signal: controller.signal,
         }).then<WaiterOutcome, WaiterOutcome>(
