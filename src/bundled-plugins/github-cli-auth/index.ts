@@ -15,8 +15,7 @@ import {
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
-import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
-import { analyzeGitCommand, defaultGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
+import { defaultGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
@@ -72,20 +71,20 @@ export default definePlugin({
       return undefined
     }
 
-    // A process-only PAT (runtime/App-seeded process.env, NOT declared in `.env`)
+    // A process-only PAT (runtime-seeded process.env, NOT declared in `.env`)
     // is stripped by --clearenv for this role, and a PAT is not re-mintable per
     // repo, so there is no token to inject. Tell the AGENT (model-visible block)
-    // instead of letting git/gh fail ambiguously — the silent variant of this is
+    // instead of letting gh fail ambiguously — the silent variant of this is
     // exactly what caused a multi-day debugging hunt. This does NOT fire for a PAT
     // the operator declared in `.env`: that one is inherited into the sandbox and
     // handled by the allow-path above.
     const sandboxedPatWithheldReason =
       'A classic/fine-grained GitHub PAT is present in the runtime environment but was NOT declared ' +
       'in `.env`, and this command runs in a sandboxed (low-trust) role whose environment is cleared ' +
-      'before bash — so the PAT is withheld here and is NOT available to git/gh. This is a deliberate ' +
+      'before bash — so the PAT is withheld here and is NOT available to gh. This is a deliberate ' +
       'guard, not missing auth: a broad, long-lived runtime PAT must not be reachable from a low-trust ' +
       'sandbox. Configure GitHub App auth (channels.github) for per-repo, short-lived tokens that work ' +
-      'for sandboxed roles, or declare the PAT in `.env` to deliberately expose it to model bash.'
+      'with validated gh calls in sandboxed roles, or declare the PAT in `.env` to deliberately expose it to model bash.'
 
     let warnedSandboxedPatWithheld = false
     const warnSandboxedPatWithheldOnce = (): void => {
@@ -93,8 +92,8 @@ export default definePlugin({
       warnedSandboxedPatWithheld = true
       ctx.logger.warn(
         'GH_TOKEN (classic/fine-grained PAT) withheld from a sandboxed role: the env is cleared for ' +
-          'low-trust bash, so git/gh have no credential. Configure GitHub App auth (channels.github) ' +
-          'for per-repo tokens that work in sandboxed roles.',
+          'low-trust bash, so gh has no credential. Configure GitHub App auth (channels.github) ' +
+          'for per-repo tokens that work with validated gh calls in sandboxed roles.',
       )
     }
     // `/user` resolves the caller's USER identity. An App installation token is not
@@ -158,8 +157,8 @@ export default definePlugin({
       return ` For example: \`gh <cmd> -R ${slug}\` as a single bare command.`
     }
 
-    // 'fall-through' means "not a repo-targeting gh command" so the caller can
-    // try the git path on the same command (e.g. `git ... # gh` substrings).
+    // 'fall-through' means "not a repo-targeting gh command" so the caller leaves
+    // the bash command untouched (including commands that merely contain `gh`).
     const handleGhCommand = async (params: {
       event: { callId: string; args: Record<string, unknown>; origin?: SessionOrigin }
       command: string
@@ -291,7 +290,7 @@ export default definePlugin({
       }
 
       // PAT classes (classic = cross-owner, fine-grained) are not re-minted per
-      // repo; the seeded GH_TOKEN is the only token we have. App minting, when
+      // repo; the process GH_TOKEN is the only token we have. App minting, when
       // available, is preferred for ALL roles (least-privilege per-repo token over
       // a broad PAT), so a PAT must not suppress minting. An entitled role with NO
       // minter receives the PAT through the narrow overlay; raw process.env and
@@ -347,56 +346,6 @@ export default definePlugin({
       return
     }
 
-    const handleGitCommand = async (params: {
-      event: { args: Record<string, unknown> }
-      command: string
-      agentDir: string
-    }): Promise<HookResult> => {
-      const { event, command, agentDir } = params
-      const decision = await analyzeGitCommand(command, { cwd: agentDir, resolvers: defaultGitResolvers })
-      if (decision.kind === 'pass-through') return
-      if (decision.kind === 'block') return { block: true, reason: decision.reason }
-
-      // Only a per-repo GitHub App token is brokered to git — never a PAT (git,
-      // unlike gh, runs repo-local hooks/helpers, and a PAT is not repo-confined).
-      // With no App minter, pass through so git fails honestly.
-      if (!hasAppTokenResolver()) return
-      const result = await resolveTokenForRepo(decision.repoSlug)
-      if (result.kind === 'unavailable') return { block: true, reason: result.reason }
-
-      // Deliver the token via GIT_ASKPASS (env, never argv/config). The analyzer
-      // already constrained this to a single bare github git command, so the token
-      // env reaches only this git. hooksPath=/dev/null + credential.helper= stop the
-      // two highest-value ways a repo could capture the token; insteadOf folds
-      // ssh/scp remotes to https so the credential applies. This is defense-in-depth
-      // WITHIN one trust domain, not a wall against a hostile repo — untrusted repos
-      // belong in a separate agent (see docs/internals/sandbox.mdx).
-      // Sandboxed bash: the helper must be on a sandbox-visible path (baked /usr),
-      // not the unsandboxed /tmp default the tmpfs would hide.
-      const askpass = await ensureGitAskPassHelper(resolveSandboxGitAskPassPath())
-      const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
-      const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
-      event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
-        ...overlay,
-        GIT_ASKPASS: askpass,
-        TYPECLAW_GIT_TOKEN: result.token,
-        GIT_TERMINAL_PROMPT: '0',
-        GIT_CONFIG_COUNT: '4',
-        GIT_CONFIG_KEY_0: 'core.hooksPath',
-        GIT_CONFIG_VALUE_0: '/dev/null',
-        GIT_CONFIG_KEY_1: 'credential.helper',
-        GIT_CONFIG_VALUE_1: '',
-        // Both ssh remote spellings fold to https so the askpass credential applies:
-        // the scp short form (git@github.com:owner/repo) and the ssh:// URL form.
-        GIT_CONFIG_KEY_2: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_2: 'git@github.com:',
-        GIT_CONFIG_KEY_3: 'url.https://github.com/.insteadOf',
-        GIT_CONFIG_VALUE_3: 'ssh://git@github.com/',
-      }
-      if (decision.rewrittenCommand !== undefined) event.args.command = decision.rewrittenCommand
-      return
-    }
-
     return {
       hooks: {
         'tool.before': async (event) => {
@@ -409,9 +358,6 @@ export default definePlugin({
             if (ghResult !== 'fall-through') return ghResult
           }
 
-          if (command.includes('git')) {
-            return await handleGitCommand({ event, command, agentDir: ctx.agentDir })
-          }
           return
         },
         'tool.after': async (event) => {
