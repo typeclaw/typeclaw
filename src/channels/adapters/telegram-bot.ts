@@ -319,13 +319,15 @@ export function createFetchAttachmentCallback(deps: {
 }): FetchAttachmentCallback {
   const { token, logger } = deps
   const fetchImpl = deps.fetchImpl ?? fetch
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     if (ref === '' || ref.includes('://')) {
       return { ok: false, error: `invalid Telegram file_id: ${ref}` }
     }
     let metaResponse: Response
     try {
-      metaResponse = await fetchImpl(`${TELEGRAM_API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(ref)}`)
+      metaResponse = await fetchImpl(`${TELEGRAM_API_BASE}/bot${token}/getFile?file_id=${encodeURIComponent(ref)}`, {
+        signal,
+      })
     } catch (err) {
       const message = describeError(err)
       logger.error(`[telegram-bot] getFile failed for ${ref}: ${message}`)
@@ -352,7 +354,7 @@ export function createFetchAttachmentCallback(deps: {
     const downloadUrl = `${TELEGRAM_API_BASE}/file/bot${token}/${filePath}`
     let response: Response
     try {
-      response = await fetchImpl(downloadUrl)
+      response = await fetchImpl(downloadUrl, { signal })
     } catch (err) {
       const message = describeError(err)
       logger.error(`[telegram-bot] download failed for ${ref}: ${message}`)

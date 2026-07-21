@@ -290,7 +290,7 @@ export function createFetchAttachmentCallback(deps: {
   fetchImpl?: typeof fetch
 }): FetchAttachmentCallback {
   const fetchImpl = deps.fetchImpl ?? fetch
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     const token = deps.tokenRef()
     if (token === null) return { ok: false, error: 'webex account token is not available' }
     let url: URL
@@ -309,7 +309,7 @@ export function createFetchAttachmentCallback(deps: {
       return { ok: false, error: `not a Webex file URL: ${url.hostname}` }
     }
     try {
-      const res = await fetchImpl(url.toString(), { headers: { Authorization: `Bearer ${token}` } })
+      const res = await fetchImpl(url.toString(), { headers: { Authorization: `Bearer ${token}` }, signal })
       if (!res.ok) {
         const body = await readAttachmentErrorSnippet(res)
         const message = `webex file fetch ${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`

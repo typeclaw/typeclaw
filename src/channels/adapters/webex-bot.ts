@@ -241,7 +241,7 @@ export function createFetchAttachmentCallback(deps: {
   fetchImpl?: typeof fetch
 }): FetchAttachmentCallback {
   const fetchImpl = deps.fetchImpl ?? fetch
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     let url: URL
     try {
       url = new URL(ref)
@@ -258,7 +258,10 @@ export function createFetchAttachmentCallback(deps: {
       return { ok: false, error: `not a Webex file URL: ${url.hostname}` }
     }
     try {
-      const res = await fetchImpl(url.toString(), { headers: { Authorization: `Bearer ${deps.token}` } })
+      const res = await fetchImpl(url.toString(), {
+        headers: { Authorization: `Bearer ${deps.token}` },
+        signal,
+      })
       if (!res.ok) {
         const body = await readAttachmentErrorSnippet(res)
         const message = `webex file fetch ${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`
