@@ -906,7 +906,7 @@ export function createFetchAttachmentCallback(deps: {
 }): FetchAttachmentCallback {
   const { token, logger } = deps
   const fetchImpl = deps.fetchImpl ?? fetch
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     let url: URL
     try {
       url = new URL(ref)
@@ -917,7 +917,7 @@ export function createFetchAttachmentCallback(deps: {
       return { ok: false, error: `not a Discord CDN URL: ${url.hostname}` }
     }
     try {
-      const res = await fetchImpl(url.toString(), { headers: { Authorization: `Bot ${token}` } })
+      const res = await fetchImpl(url.toString(), { headers: { Authorization: `Bot ${token}` }, signal })
       if (!res.ok) {
         const body = await readAttachmentErrorSnippet(res)
         const message = `discord cdn fetch ${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ''}`

@@ -26,7 +26,7 @@ export function createFetchAttachmentCallback(deps: {
 }): FetchAttachmentCallback {
   const { logger } = deps
   const fetchImpl = deps.fetchImpl ?? fetch
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     let url: URL
     try {
       url = new URL(ref)
@@ -40,7 +40,7 @@ export function createFetchAttachmentCallback(deps: {
       return { ok: false, error: `not a KakaoTalk CDN URL: ${url.hostname}` }
     }
     try {
-      const res = await fetchImpl(url.toString())
+      const res = await fetchImpl(url.toString(), { signal })
       if (!res.ok) {
         const body = await readAttachmentErrorSnippet(res)
         // 403 from kakaocdn almost always means the pre-signed URL expired
