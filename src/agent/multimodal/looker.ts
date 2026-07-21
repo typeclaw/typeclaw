@@ -13,6 +13,8 @@ import {
   type PublicHttpRequestOptions,
   type PublicHttpResponse,
 } from '@/agent/network/safe-http'
+import { processResourceBudget, type ResourceLease, type WeightedResourceBudget } from '@/agent/resource-budget'
+import { config, DEFAULT_MODEL_TOOL_LIMITS } from '@/config'
 
 const SUPPORTED_MIME_TYPES = {
   '.png': 'image/png',
@@ -28,9 +30,9 @@ const SUPPORTED_MIME_TYPES = {
 // reasonable screenshot/photo and well below container memory budgets;
 // 30 s is generous for a single HTTP image fetch over a slow link.
 export const URL_FETCH_TIMEOUT_MS = 30_000
-export const URL_FETCH_MAX_BYTES = 20 * 1024 * 1024
-export const LOOK_AT_MAX_IMAGES = 16
-export const LOOK_AT_MAX_BYTES = URL_FETCH_MAX_BYTES
+export const DEFAULT_LOOK_AT_IMAGE_MAX_BYTES = DEFAULT_MODEL_TOOL_LIMITS.lookAtImageMaxBytes
+export const DEFAULT_LOOK_AT_MAX_IMAGES = DEFAULT_MODEL_TOOL_LIMITS.lookAtMaxImages
+export const DEFAULT_LOOK_AT_TOTAL_MAX_BYTES = DEFAULT_MODEL_TOOL_LIMITS.lookAtTotalMaxBytes
 export const LOOK_AT_MAX_CONCURRENCY = 4
 export const LOOK_AT_MAX_REDIRECTS = 5
 
@@ -95,20 +97,41 @@ type ImageByteBudget = {
   consume(bytes: number): void
 }
 
+export type LookAtResourceLimits = {
+  maxImageBytes: number
+  maxAggregateBytes: number
+  maxImages: number
+}
+
+export type LookAtResolutionOptions = {
+  resourceBudget?: WeightedResourceBudget
+  retainResultBudget?: boolean
+}
+
+const resolvedImageLeases = new WeakMap<ResolvedImage[], ResourceLease[]>()
+
+const configuredLookAtLimits: LookAtResourceLimits = {
+  maxImageBytes: config.modelTools.limits.lookAtImageMaxBytes,
+  maxAggregateBytes: config.modelTools.limits.lookAtTotalMaxBytes,
+  maxImages: config.modelTools.limits.lookAtMaxImages,
+}
+
 export async function resolveImagesBounded(
   inputs: ImageInput[],
   signal?: AbortSignal,
   network: LookAtNetworkDependencies = defaultLookAtNetwork,
+  limits: LookAtResourceLimits = configuredLookAtLimits,
+  options: LookAtResolutionOptions = {},
 ): Promise<ResolvedImage[]> {
-  if (inputs.length > LOOK_AT_MAX_IMAGES) {
-    throw new Error(`look_at: image count exceeds limit (${inputs.length} > ${LOOK_AT_MAX_IMAGES})`)
+  if (inputs.length > limits.maxImages) {
+    throw new Error(`look_at: image count exceeds limit (${inputs.length} > ${limits.maxImages})`)
   }
   let consumed = 0
   const budget: ImageByteBudget = {
     consume(bytes) {
       consumed += bytes
-      if (consumed > LOOK_AT_MAX_BYTES) {
-        throw new Error(`look_at: images exceed aggregate byte limit (${consumed} > ${LOOK_AT_MAX_BYTES})`)
+      if (consumed > limits.maxAggregateBytes) {
+        throw new Error(`look_at: images exceed aggregate byte limit (${consumed} > ${limits.maxAggregateBytes})`)
       }
     },
   }
@@ -119,11 +142,21 @@ export async function resolveImagesBounded(
   let next = 0
   let firstError: unknown
   let failed = false
+  const leases: ResourceLease[] = []
   const worker = async (): Promise<void> => {
     try {
       while (next < inputs.length) {
         const index = next++
-        results[index] = await resolveImage(inputs[index] as ImageInput, workerSignal, budget, network)
+        const resolved = await resolveImageBudgeted(
+          inputs[index] as ImageInput,
+          workerSignal,
+          budget,
+          network,
+          limits.maxImageBytes,
+          options.resourceBudget ?? processResourceBudget,
+        )
+        results[index] = resolved.image
+        leases.push(resolved.lease)
       }
     } catch (error) {
       if (!failed) firstError = error
@@ -133,8 +166,20 @@ export async function resolveImagesBounded(
     }
   }
   await Promise.allSettled(Array.from({ length: Math.min(inputs.length, LOOK_AT_MAX_CONCURRENCY) }, worker))
-  if (failed) throw firstError
+  if (failed) {
+    for (const lease of leases) lease.release()
+    throw firstError
+  }
+  if (options.retainResultBudget === true) resolvedImageLeases.set(results, leases)
+  else for (const lease of leases) lease.release()
   return results
+}
+
+export function releaseResolvedImages(images: ResolvedImage[]): void {
+  const leases = resolvedImageLeases.get(images)
+  if (leases === undefined) return
+  resolvedImageLeases.delete(images)
+  for (const lease of leases) lease.release()
 }
 
 // Materializes an ImageInput into the base64-encoded form pi-ai expects.
@@ -149,17 +194,39 @@ export async function resolveImage(
   signal?: AbortSignal,
   aggregateBudget?: ImageByteBudget,
   network: LookAtNetworkDependencies = defaultLookAtNetwork,
+  maxImageBytes: number = configuredLookAtLimits.maxImageBytes,
 ): Promise<ResolvedImage> {
+  const resolved = await resolveImageBudgeted(
+    input,
+    signal,
+    aggregateBudget,
+    network,
+    maxImageBytes,
+    processResourceBudget,
+  )
+  resolved.lease.release()
+  return resolved.image
+}
+
+async function resolveImageBudgeted(
+  input: ImageInput,
+  signal: AbortSignal | undefined,
+  aggregateBudget: ImageByteBudget | undefined,
+  network: LookAtNetworkDependencies,
+  maxImageBytes: number,
+  resourceBudget: WeightedResourceBudget,
+): Promise<{ image: ResolvedImage; lease: ResourceLease }> {
   if (input.kind === 'base64') {
     if (!input.mimeType.startsWith('image/')) {
       throw new Error(`look_at: base64 mimeType must be image/* (got "${input.mimeType}")`)
     }
-    const decodedBytes = decodedBase64Size(input.data)
-    if (decodedBytes > URL_FETCH_MAX_BYTES) {
-      throw new Error(`look_at: base64 image too large (${decodedBytes} bytes > ${URL_FETCH_MAX_BYTES} cap)`)
+    const decodedBytes = decodedBase64Size(input.data, maxImageBytes)
+    if (decodedBytes > maxImageBytes) {
+      throw new Error(`look_at: base64 image too large (${decodedBytes} bytes > ${maxImageBytes} cap)`)
     }
     aggregateBudget?.consume(decodedBytes)
-    return { data: input.data, mimeType: input.mimeType }
+    const lease = await resourceBudget.acquire({ memoryBytes: input.data.length * 2 }, signal)
+    return { image: { data: input.data, mimeType: input.mimeType }, lease }
   }
   if (input.kind === 'file') {
     if (!isAbsolute(input.path)) {
@@ -177,22 +244,33 @@ export async function resolveImage(
     })
     try {
       const size = (await handle.stat()).size
-      if (size > URL_FETCH_MAX_BYTES) {
-        throw new Error(`look_at: file too large (${size} bytes > ${URL_FETCH_MAX_BYTES} cap)`)
+      if (size > maxImageBytes) {
+        throw new Error(`look_at: file too large (${size} bytes > ${maxImageBytes} cap)`)
       }
       aggregateBudget?.consume(size)
+      const encodedBytes = encodedBase64Length(size)
+      const lease = await resourceBudget.acquire({ memoryBytes: size + 1 + encodedBytes * 2 }, signal)
       const bytes = Buffer.alloc(size + 1)
-      let offset = 0
-      while (offset < bytes.byteLength) {
-        const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, null)
-        if (bytesRead === 0) break
-        offset += bytesRead
+      try {
+        let offset = 0
+        while (offset < bytes.byteLength) {
+          const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, null)
+          if (bytesRead === 0) break
+          offset += bytesRead
+        }
+        const finalSize = (await handle.stat()).size
+        if (offset !== size || finalSize !== size) {
+          throw new Error(`look_at: file changed while being read: ${input.path}`)
+        }
+        const data = bytes.subarray(0, offset).toString('base64')
+        if (!lease.tryResize({ memoryBytes: data.length * 2 })) {
+          throw lookAtMemoryBudgetExceeded(data.length * 2)
+        }
+        return { image: { data, mimeType }, lease }
+      } catch (error) {
+        lease.release()
+        throw error
       }
-      const finalSize = (await handle.stat()).size
-      if (offset !== size || finalSize !== size) {
-        throw new Error(`look_at: file changed while being read: ${input.path}`)
-      }
-      return { data: bytes.subarray(0, offset).toString('base64'), mimeType }
     } finally {
       await handle.close()
     }
@@ -202,11 +280,22 @@ export async function resolveImage(
   // over our timeout AND vice versa.
   const timeoutSignal = AbortSignal.timeout(URL_FETCH_TIMEOUT_MS)
   const mergedSignal = signal !== undefined ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
-  const { response: res, finalUrl } = await requestPublicHttpUrl(input.url, {
+  const requested = await requestPublicHttpUrl(input.url, {
     signal: mergedSignal,
     headers: { Accept: 'image/*' },
     maxRedirects: LOOK_AT_MAX_REDIRECTS,
     dependencies: network,
+  })
+  const { response: res, finalUrl } = requested
+  const declared = Number(headerValue(res.headers, 'content-length') ?? '')
+  if (Number.isFinite(declared) && declared > maxImageBytes) {
+    res.cancel()
+    throw new Error(`look_at: ${input.url} response too large (${declared} bytes > ${maxImageBytes} cap)`)
+  }
+  const reservedRaw = Number.isFinite(declared) && declared > 0 ? declared : 0
+  const lease = await resourceBudget.acquire({ memoryBytes: reservedRaw }, mergedSignal).catch((error) => {
+    res.cancel()
+    throw error
   })
   try {
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -220,34 +309,53 @@ export async function resolveImage(
     // could enforce a cap. Read chunk-by-chunk and abort once we cross the
     // limit. Content-Length is checked first when present, but absent or lying
     // headers fall through to the streaming check.
-    const declared = Number(headerValue(res.headers, 'content-length') ?? '')
-    if (Number.isFinite(declared) && declared > URL_FETCH_MAX_BYTES) {
-      throw new Error(`look_at: ${input.url} response too large (${declared} bytes > ${URL_FETCH_MAX_BYTES} cap)`)
-    }
     const chunks: Uint8Array[] = []
     let total = 0
     for await (const value of res.body) {
       total += value.byteLength
-      if (total > URL_FETCH_MAX_BYTES) {
-        throw new Error(`look_at: ${input.url} response exceeded ${URL_FETCH_MAX_BYTES}-byte cap`)
+      if (total > maxImageBytes) {
+        throw new Error(`look_at: ${input.url} response exceeded ${maxImageBytes}-byte cap`)
       }
+      const retainedRaw = Math.max(total, reservedRaw)
+      if (!lease.tryResize({ memoryBytes: retainedRaw })) throw lookAtMemoryBudgetExceeded(retainedRaw)
       aggregateBudget?.consume(value.byteLength)
       chunks.push(value)
     }
+    if (!lease.tryResize({ memoryBytes: total * 2 })) throw lookAtMemoryBudgetExceeded(total * 2)
     const buf = Buffer.concat(chunks)
-    return { data: buf.toString('base64'), mimeType }
+    chunks.length = 0
+    const encodedBytes = encodedBase64Length(total)
+    if (!lease.tryResize({ memoryBytes: total + encodedBytes * 2 })) {
+      throw lookAtMemoryBudgetExceeded(total + encodedBytes * 2)
+    }
+    const data = buf.toString('base64')
+    if (!lease.tryResize({ memoryBytes: data.length * 2 })) {
+      throw lookAtMemoryBudgetExceeded(data.length * 2)
+    }
+    return { image: { data, mimeType }, lease }
+  } catch (error) {
+    lease.release()
+    throw error
   } finally {
     res.cancel()
   }
+}
+
+function encodedBase64Length(bytes: number): number {
+  return Math.ceil(bytes / 3) * 4
+}
+
+function lookAtMemoryBudgetExceeded(bytes: number): Error {
+  return new Error(`look_at: images exceed the process-wide memory budget (${bytes} weighted bytes requested)`)
 }
 
 const defaultLookAtNetwork = defaultPublicHttpDependencies
 
 export { createPublicSocketLookup }
 
-function decodedBase64Size(data: string): number {
-  if (data.length > Math.ceil(URL_FETCH_MAX_BYTES / 3) * 4) {
-    throw new Error(`look_at: base64 image too large (encoded length exceeds ${URL_FETCH_MAX_BYTES}-byte cap)`)
+function decodedBase64Size(data: string, maxImageBytes: number): number {
+  if (data.length > Math.ceil(maxImageBytes / 3) * 4) {
+    throw new Error(`look_at: base64 image too large (encoded length exceeds ${maxImageBytes}-byte cap)`)
   }
   if (data.length % 4 !== 0 || !/^[A-Za-z\d+/]*={0,2}$/.test(data)) {
     throw new Error('look_at: invalid base64 image data')

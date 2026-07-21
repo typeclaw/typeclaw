@@ -4,7 +4,7 @@ export {
   imageInputSchema,
   multimodalLookerPayloadSchema,
   resolveImage,
-  URL_FETCH_MAX_BYTES,
+  DEFAULT_LOOK_AT_IMAGE_MAX_BYTES,
   URL_FETCH_TIMEOUT_MS,
   type ImageInput,
   type MultimodalLookerPayload,

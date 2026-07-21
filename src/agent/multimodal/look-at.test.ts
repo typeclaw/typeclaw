@@ -4,6 +4,8 @@ import { mkdtemp, rm, truncate } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { WeightedResourceBudget } from '@/agent/resource-budget'
+
 import {
   buildGlmVisionMessages,
   extractGlmVisionText,
@@ -17,7 +19,12 @@ import {
   type LookAtNetworkDependencies,
   type LookAtRequestOptions,
 } from './looker'
-import { LOOK_AT_MAX_BYTES, LOOK_AT_MAX_CONCURRENCY, LOOK_AT_MAX_IMAGES, resolveImagesBounded } from './looker'
+import {
+  DEFAULT_LOOK_AT_TOTAL_MAX_BYTES,
+  LOOK_AT_MAX_CONCURRENCY,
+  DEFAULT_LOOK_AT_MAX_IMAGES,
+  resolveImagesBounded,
+} from './looker'
 
 type ImageParam = { url?: string; path?: string; data?: string; mimeType?: string } | Record<string, never>
 
@@ -97,10 +104,58 @@ describe('lookAtTool — image source validation (no LLM call)', () => {
 })
 
 describe('resolveImagesBounded — aggregate resource boundary', () => {
+  test('honors configured lower per-image, aggregate, and count limits', async () => {
+    const limits = { maxImageBytes: 4, maxAggregateBytes: 6, maxImages: 2 }
+    await expect(
+      resolveImagesBounded(
+        [
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+        ],
+        undefined,
+        undefined,
+        limits,
+      ),
+    ).rejects.toThrow(/image count exceeds limit/)
+
+    await expect(
+      resolveImagesBounded(
+        [
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+          { kind: 'base64' as const, data: 'AAAA', mimeType: 'image/png' },
+        ].slice(0, 2),
+        undefined,
+        undefined,
+        { ...limits, maxAggregateBytes: 5 },
+      ),
+    ).rejects.toThrow(/aggregate byte limit/)
+  })
+
+  test('accounts for retained base64 plus provider-payload amplification', async () => {
+    const budget = new WeightedResourceBudget({
+      maxMemoryBytes: 7,
+      maxPinnedBytes: 1,
+      maxPinnedCount: 1,
+      maxWaiters: 1,
+    })
+    await expect(
+      resolveImagesBounded(
+        [{ kind: 'base64', data: 'AAAA', mimeType: 'image/png' }],
+        undefined,
+        undefined,
+        { maxImageBytes: 4, maxAggregateBytes: 4, maxImages: 1 },
+        { resourceBudget: budget },
+      ),
+    ).rejects.toThrow(/memory budget/i)
+    expect(budget.usage().memoryBytes).toBe(0)
+  })
+
   test('rejects image arrays above the global count limit before resolving any source', async () => {
     await expect(
       resolveImagesBounded(
-        Array.from({ length: LOOK_AT_MAX_IMAGES + 1 }, () => ({
+        Array.from({ length: DEFAULT_LOOK_AT_MAX_IMAGES + 1 }, () => ({
           kind: 'url' as const,
           url: 'https://example.com/image.png',
         })),
@@ -109,7 +164,7 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
   })
 
   test('bounds decoded base64 size before constructing a decoded Buffer', async () => {
-    const encoded = 'A'.repeat(Math.ceil((LOOK_AT_MAX_BYTES + 1) / 3) * 4)
+    const encoded = 'A'.repeat(Math.ceil((DEFAULT_LOOK_AT_TOTAL_MAX_BYTES + 1) / 3) * 4)
     await expect(resolveImagesBounded([{ kind: 'base64', data: encoded, mimeType: 'image/png' }])).rejects.toThrow(
       /base64 image too large/,
     )
@@ -119,8 +174,8 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
     const root = await mkdtemp(path.join(tmpdir(), 'typeclaw-look-at-mixed-'))
     const file = path.join(root, 'image.png')
     await Bun.write(file, '')
-    await truncate(file, Math.floor(LOOK_AT_MAX_BYTES * 0.6))
-    const encoded = 'A'.repeat(Math.ceil((LOOK_AT_MAX_BYTES * 0.6) / 3) * 4)
+    await truncate(file, Math.floor(DEFAULT_LOOK_AT_TOTAL_MAX_BYTES * 0.6))
+    const encoded = 'A'.repeat(Math.ceil((DEFAULT_LOOK_AT_TOTAL_MAX_BYTES * 0.6) / 3) * 4)
     try {
       await expect(
         resolveImagesBounded([
@@ -147,7 +202,7 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
       },
     })
     await resolveImagesBounded(
-      Array.from({ length: LOOK_AT_MAX_IMAGES }, (_, i) => ({
+      Array.from({ length: DEFAULT_LOOK_AT_MAX_IMAGES }, (_, i) => ({
         kind: 'url' as const,
         url: `https://example.com/${i}.png`,
       })),
@@ -371,7 +426,7 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
     const oversized = networkFixture({
       request: async (options) => {
         await resolveSocketAddress(options)
-        return imageResponse({ chunks: [new Uint8Array(LOOK_AT_MAX_BYTES + 1)] })
+        return imageResponse({ chunks: [new Uint8Array(DEFAULT_LOOK_AT_TOTAL_MAX_BYTES + 1)] })
       },
     })
     await expect(
@@ -383,8 +438,8 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
     const cases = [
       imageResponse({ statusCode: 404 }),
       imageResponse({ headers: { 'content-type': 'text/html' } }),
-      imageResponse({ headers: { 'content-length': String(LOOK_AT_MAX_BYTES + 1) } }),
-      imageResponse({ chunks: [new Uint8Array(LOOK_AT_MAX_BYTES + 1)] }),
+      imageResponse({ headers: { 'content-length': String(DEFAULT_LOOK_AT_TOTAL_MAX_BYTES + 1) } }),
+      imageResponse({ chunks: [new Uint8Array(DEFAULT_LOOK_AT_TOTAL_MAX_BYTES + 1)] }),
       imageResponse({ chunks: [new Uint8Array([1])], iterationError: new Error('body failed') }),
       imageResponse({ chunks: [new Uint8Array([1])] }),
     ]
@@ -403,9 +458,9 @@ describe('resolveImagesBounded — aggregate resource boundary', () => {
   })
 
   test('cancels the response when the aggregate budget rejects a URL chunk', async () => {
-    const candidate = imageResponse({ chunks: [new Uint8Array(Math.ceil(LOOK_AT_MAX_BYTES * 0.6))] })
+    const candidate = imageResponse({ chunks: [new Uint8Array(Math.ceil(DEFAULT_LOOK_AT_TOTAL_MAX_BYTES * 0.6))] })
     const network = networkFixture({ request: async (options) => (await resolveSocketAddress(options), candidate) })
-    const encoded = 'A'.repeat(Math.ceil((LOOK_AT_MAX_BYTES * 0.6) / 3) * 4)
+    const encoded = 'A'.repeat(Math.ceil((DEFAULT_LOOK_AT_TOTAL_MAX_BYTES * 0.6) / 3) * 4)
     await expect(
       resolveImagesBounded(
         [

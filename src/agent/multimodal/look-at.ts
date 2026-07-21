@@ -8,7 +8,8 @@ import { createSessionWithDispose, type SessionOrigin } from '@/agent'
 import { readResponseBodyBounded } from '@/agent/network/response-body'
 import type { ChannelRouter } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'
-import { getConfig, resolveModel, resolveProfile } from '@/config'
+import type { FetchAttachmentBudget } from '@/channels/types'
+import { config, getConfig, resolveModel, resolveProfile } from '@/config'
 import { providerForModelRef } from '@/config/providers'
 import type { PermissionService } from '@/permissions'
 import { LLM_FETCH_OBSERVER_TIMEOUTS, type LlmFetchObservedRequestInit } from '@/run/llm-fetch-observer'
@@ -17,8 +18,7 @@ import { SecretsBackend } from '@/secrets'
 import { promptWithSameRefRetryOnly } from '../retry-same-ref'
 import {
   buildMultimodalLookerSystemPrompt,
-  LOOK_AT_MAX_BYTES,
-  LOOK_AT_MAX_IMAGES,
+  releaseResolvedImages,
   resolveImagesBounded,
   type ImageInput,
 } from './looker'
@@ -42,6 +42,28 @@ export type ChannelLookAtOrigin = {
   workspace: string
   chat: string
   thread: string | null
+}
+
+export async function withBudgetedAttachmentBase64<T>(
+  buffer: Buffer,
+  budget: FetchAttachmentBudget,
+  consume: (data: string) => Promise<T>,
+): Promise<T> {
+  try {
+    const encodedBytes = Math.ceil(buffer.byteLength / 3) * 4
+    const estimatedRetainedBytes = buffer.byteLength + encodedBytes * 2
+    if (!budget.tryResize(estimatedRetainedBytes)) {
+      throw new Error('channel image exceeds the process-wide memory budget')
+    }
+    const data = buffer.toString('base64')
+    const retainedBytes = buffer.byteLength + data.length * 2
+    if (!budget.tryResize(retainedBytes)) {
+      throw new Error('channel image exceeds the process-wide memory budget')
+    }
+    return await consume(data)
+  } finally {
+    budget.release()
+  }
 }
 
 // Routes an image-bearing turn to a vision-capable subagent so the main
@@ -74,7 +96,11 @@ export function createLookAtTool(permissions?: PermissionService) {
           data: Type.Optional(Type.String({ description: 'Base64-encoded image bytes (pair with mimeType).' })),
           mimeType: Type.Optional(Type.String({ description: 'MIME type when using `data` (e.g. "image/png").' })),
         }),
-        { minItems: 1, maxItems: LOOK_AT_MAX_IMAGES, description: 'One or more images to look at.' },
+        {
+          minItems: 1,
+          maxItems: config.modelTools.limits.lookAtMaxImages,
+          description: 'One or more images to look at.',
+        },
       ),
       prompt: Type.Optional(
         Type.String({
@@ -88,9 +114,15 @@ export function createLookAtTool(permissions?: PermissionService) {
       const args = params as LookAtArgs
       try {
         const imageInputs = args.images.map(toImageInput)
-        const resolved = await resolveImagesBounded(imageInputs, signal)
-        const imageContents: ImageContent[] = resolved.map((r) => toImageContent(r.data, r.mimeType))
-        return await runLookAtImages(imageContents, args.prompt, permissions)
+        const resolved = await resolveImagesBounded(imageInputs, signal, undefined, undefined, {
+          retainResultBudget: true,
+        })
+        try {
+          const imageContents: ImageContent[] = resolved.map((r) => toImageContent(r.data, r.mimeType))
+          return await runLookAtImages(imageContents, args.prompt, permissions)
+        } finally {
+          releaseResolvedImages(resolved)
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return errorResult(message, { count: args.images.length, prompt: args.prompt })
@@ -127,7 +159,7 @@ export function createChannelLookAtTool(
         Type.String({ description: 'Optional question to ask about the image; omitted means describe it.' }),
       ),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
       const found = router.lookupInboundAttachment({ ...origin, id: params.attachment_id })
       if (found === null) {
         const validIds = router.listInboundAttachmentIds(origin)
@@ -146,17 +178,29 @@ export function createChannelLookAtTool(
           { count: 0, prompt: params.prompt },
         )
       }
+      const maxBytes = Math.min(
+        config.modelTools.limits.lookAtImageMaxBytes,
+        config.modelTools.limits.channelAttachmentMaxBytes,
+      )
       const result = await router.fetchAttachment(origin.adapter, {
         ref: found.ref,
-        maxBytes: LOOK_AT_MAX_BYTES,
+        maxBytes,
+        memoryMaxBytes: maxBytes + Math.ceil(maxBytes / 3) * 4 * 2,
+        signal,
         ...(found.filename !== undefined ? { filename: found.filename } : {}),
       })
       if (!result.ok) return errorResult(result.error, { count: 0, prompt: params.prompt })
-      return await runLookAtImages(
-        [toImageContent(result.buffer.toString('base64'), result.mimetype ?? 'image/jpeg')],
-        params.prompt,
-        permissions,
-      )
+      try {
+        return await withBudgetedAttachmentBase64(
+          result.buffer,
+          result.budget,
+          async (data) =>
+            await runLookAtImages([toImageContent(data, result.mimetype ?? 'image/jpeg')], params.prompt, permissions),
+        )
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return errorResult(message, { count: 0, prompt: params.prompt })
+      }
     },
   })
 }
