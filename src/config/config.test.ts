@@ -786,11 +786,12 @@ describe('configSchema preserves unknown top-level keys (plugin config blocks)',
     expect(configs).toEqual({ agentBrowser: { dashboardProxy: false }, customPlugin: { enabled: true } })
   })
 
-  test('treats mcpServers and tunnels as known top-level keys, not plugin blocks', () => {
+  test('treats mcpServers, tunnels, and modelTools as known top-level keys, not plugin blocks', () => {
     const configs = extractPluginConfigs({
       models: { default: VALID_MODEL },
       mcpServers: [{ name: 'fs', command: 'server' }],
       tunnels: [{ provider: 'cloudflare-quick' }],
+      modelTools: { limits: { readSnapshotMaxBytes: 1024 } },
       customPlugin: { enabled: true },
     })
 

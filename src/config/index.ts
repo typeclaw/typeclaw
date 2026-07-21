@@ -51,5 +51,16 @@ export {
   type ThinkingLevel,
   type ValidateConfigResult,
 } from './config'
+export {
+  deriveProcessResourceBudgetLimits,
+  MODEL_TOOL_LIMIT_HARD_MAX,
+  DEFAULT_MODEL_TOOL_LIMITS,
+  modelToolLimitsSchema,
+  modelToolsSchema,
+  PROCESS_RESOURCE_MAX_WAITERS,
+  type ModelToolLimits,
+  type ModelToolsConfig,
+  type ProcessResourceBudgetLimits,
+} from './model-tool-limits'
 export { type KnownModelRef, type KnownProviderId, type ModelRef } from './providers'
 export { createConfigReloadable, type CreateConfigReloadableOptions } from './reloadable'

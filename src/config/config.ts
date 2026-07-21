@@ -10,6 +10,7 @@ import { commitSystemFileSync } from '@/git/system-commit'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
+import { modelToolsSchema } from './model-tool-limits'
 import {
   DEFAULT_MODEL_REF,
   KNOWN_PROVIDERS,
@@ -782,6 +783,7 @@ export const configSchema = z
     portForward: portForwardSchema,
     network: networkSchema,
     sandbox: sandboxSchema,
+    modelTools: modelToolsSchema,
     docker: dockerSchema,
     git: gitSchema,
     roles: rolesConfigSchema.optional(),
@@ -1007,6 +1009,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   portForward: 'restart-required',
   network: 'restart-required',
   sandbox: 'restart-required',
+  modelTools: 'restart-required',
   tunnels: 'restart-required',
   'docker.file': 'restart-required',
   'git.ignore': 'restart-required',
@@ -1108,6 +1111,7 @@ export function extractPluginConfigs(raw: unknown): Record<string, unknown> {
     'permissions',
     'tunnels',
     'mcpServers',
+    'modelTools',
   ])
   const result: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
