@@ -174,9 +174,10 @@ export function createSlackFetchAttachmentCallback(deps: {
   fetchImpl?: SlackAttachmentFetch
   logger: SlackAdapterLogger
 }): FetchAttachmentCallback {
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     try {
       const metadata = await deps.client.getFileInfo(ref)
+      if (signal?.aborted === true) throw new Error('Slack attachment request aborted')
       enforceAttachmentMetadataSize(metadata.size, maxBytes)
       const token = deps.tokenRef()
       if (token === null) throw new Error('Slack attachment credential is unavailable')
@@ -186,6 +187,7 @@ export function createSlackFetchAttachmentCallback(deps: {
         token,
         ...(cookie === undefined ? {} : { cookie }),
         maxBytes,
+        signal,
         fetchImpl: deps.fetchImpl,
       })
       return {

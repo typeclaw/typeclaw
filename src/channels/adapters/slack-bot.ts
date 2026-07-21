@@ -1062,18 +1062,20 @@ export function createFetchAttachmentCallback(deps: {
   logger: SlackBotAdapterLogger
 }): FetchAttachmentCallback {
   const { client, logger } = deps
-  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES }) => {
+  return async ({ ref, filename, maxBytes = DEFAULT_ATTACHMENT_MAX_BYTES, signal }) => {
     const fileId = ref.trim()
     if (!/^F[A-Z0-9]+$/.test(fileId)) {
       return { ok: false, error: `invalid Slack file id: ${ref}` }
     }
     try {
       const metadata = await client.getFileInfo(fileId)
+      if (signal?.aborted === true) throw new Error('Slack attachment request aborted')
       enforceAttachmentMetadataSize(metadata.size, maxBytes)
       const { buffer } = await downloadSlackAttachment({
         metadata,
         token: deps.token,
         maxBytes,
+        signal,
         fetchImpl: deps.fetchImpl,
       })
       logger.info(`[slack-bot] downloaded id=${fileId} name=${metadata.name} size=${buffer.length}`)

@@ -23,6 +23,7 @@ export async function downloadSlackAttachment(options: {
   token: string
   cookie?: string
   maxBytes: number
+  signal?: AbortSignal
   fetchImpl?: SlackAttachmentFetch
 }): Promise<{ buffer: Buffer; url: URL }> {
   const rawUrl = options.metadata.url_private_download ?? options.metadata.url_private
@@ -37,6 +38,7 @@ export async function downloadSlackAttachment(options: {
         ...(options.cookie === undefined ? {} : { Cookie: `d=${options.cookie}` }),
       },
       redirect: 'manual',
+      signal: options.signal,
     })
     if (REDIRECT_STATUSES.has(response.status)) {
       await discardAttachmentResponse(response)
