@@ -11,9 +11,12 @@ import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
 import {
   buildStaticChecks,
   detectWindowsBindMountIssues,
+  macosMaxFiles,
+  parseLaunchctlMaxFilesSoft,
   windowsBindMount,
   windowsSecretPerms,
   wslDriveMount,
+  type MacosMaxFilesDeps,
   type WindowsBindMountDeps,
   type WindowsSecretPermsDeps,
   type WslDriveMountDeps,
@@ -102,6 +105,84 @@ describe('windowsSecretPerms', () => {
 
   test('is registered in the static check set', () => {
     expect(buildStaticChecks().some((c) => c.name === 'hostd.windows-secret-perms')).toBe(true)
+  })
+})
+
+describe('macosMaxFiles', () => {
+  const hostCtx: CheckContext = { cwd: '/tmp/agent', hasAgentFolder: true }
+
+  function macDeps(overrides: Partial<MacosMaxFilesDeps> = {}): MacosMaxFilesDeps {
+    return {
+      isMacOS: () => true,
+      readLaunchctlMaxFiles: async () => '\tmaxfiles    256            unlimited      \n',
+      ...overrides,
+    }
+  }
+
+  test('passes when not running on macOS', async () => {
+    const check = macosMaxFiles(macDeps({ isMacOS: () => false }))
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('ok')
+    expect(result.message).toContain('not running on macOS')
+  })
+
+  test('warns on the macOS default 256 soft limit', async () => {
+    const check = macosMaxFiles(macDeps())
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('warning')
+    expect(result.message).toContain('256')
+    expect(result.details?.some((d) => d.includes('too many open files'))).toBe(true)
+    expect(result.fix?.description).toContain('relaunch')
+  })
+
+  test('passes when the soft limit is comfortably high', async () => {
+    const check = macosMaxFiles(macDeps({ readLaunchctlMaxFiles: async () => '\tmaxfiles    10240    unlimited\n' }))
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('ok')
+    expect(result.message).toContain('10240')
+  })
+
+  test('passes when the soft limit is unlimited', async () => {
+    const check = macosMaxFiles(
+      macDeps({ readLaunchctlMaxFiles: async () => '\tmaxfiles    unlimited    unlimited\n' }),
+    )
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('ok')
+  })
+
+  test('degrades to info when the limit cannot be read', async () => {
+    const check = macosMaxFiles(macDeps({ readLaunchctlMaxFiles: async () => null }))
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('info')
+    expect(result.status).not.toBe('error')
+  })
+
+  test('degrades to info on unparseable output', async () => {
+    const check = macosMaxFiles(macDeps({ readLaunchctlMaxFiles: async () => 'garbage output\n' }))
+    const result = await check.run(hostCtx)
+    expect(result.status).toBe('info')
+  })
+
+  test('is registered in the static check set', () => {
+    expect(buildStaticChecks().some((c) => c.name === 'hostd.macos-maxfiles')).toBe(true)
+  })
+})
+
+describe('parseLaunchctlMaxFilesSoft', () => {
+  test('parses the real launchctl output shape', () => {
+    expect(parseLaunchctlMaxFilesSoft('\tmaxfiles    256            unlimited      \n')).toBe(256)
+  })
+
+  test('parses unlimited as Infinity', () => {
+    expect(parseLaunchctlMaxFilesSoft('\tmaxfiles    unlimited    unlimited\n')).toBe(Number.POSITIVE_INFINITY)
+  })
+
+  test('returns null when there is no maxfiles line', () => {
+    expect(parseLaunchctlMaxFilesSoft('\tcpu    unlimited    unlimited\n')).toBeNull()
+  })
+
+  test('returns null on a non-numeric soft field', () => {
+    expect(parseLaunchctlMaxFilesSoft('\tmaxfiles    notanumber    unlimited\n')).toBeNull()
   })
 })
 

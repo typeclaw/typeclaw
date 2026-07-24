@@ -20,7 +20,7 @@ import { resolveBaseImageVersion } from '@/init/cli-version'
 import { buildDockerfile, DOCKERFILE } from '@/init/dockerfile'
 import { detectMissingDeps } from '@/init/ensure-deps'
 import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
-import { detectWsl, isWindows, isWindowsDriveMount, type WslInfo } from '@/shared'
+import { detectWsl, isMacOS, isWindows, isWindowsDriveMount, type WslInfo } from '@/shared'
 
 import { buildChannelChecks } from './channel-checks'
 import { agentFileOwnership, type FileOwnershipDeps } from './file-ownership'
@@ -40,6 +40,7 @@ export function buildStaticChecks(opts: { dockerExec?: DockerExec } & FileOwners
     agentFileOwnership(opts),
     configValid(),
     hostdHomeWritable(),
+    macosMaxFiles(),
     wslDriveMount(),
     windowsSecretPerms(),
     hostdReachable(),
@@ -255,6 +256,98 @@ function hostdHomeWritable(): DoctorCheck {
         }
       }
     },
+  }
+}
+
+export type MacosMaxFilesDeps = {
+  isMacOS: () => boolean
+  // Returns the raw `launchctl limit maxfiles` stdout, or null when the command
+  // is unavailable / errors. Injected so tests never shell out.
+  readLaunchctlMaxFiles: () => Promise<string | null>
+}
+
+// macOS ships a per-process RLIMIT_NOFILE *soft* limit of 256 by default (the
+// legacy OPEN_MAX), and GUI apps launched by launchd — including OrbStack —
+// inherit it unless something raises it (a /Library/LaunchDaemons plist, or the
+// app calling setrlimit itself). Under load, OrbStack's host-side vmgr can
+// accumulate enough FDs to cross 256 and start failing `accept()` on its
+// control socket with "too many open files", which manifests to the user as
+// OrbStack crashing (SIGKILL). This is a RISK INDICATOR, not proof the live
+// runtime inherited exactly this limit: the kernel ceiling (kern.maxfiles*) and
+// per-container limits are separate, and a well-behaved runtime raises its own
+// soft limit. We only surface the measured value and non-privileged
+// remediation; we never edit launchd files or run privileged commands.
+const MACOS_MAXFILES_RISK_THRESHOLD = 1024
+
+export function macosMaxFiles(deps: Partial<MacosMaxFilesDeps> = {}): DoctorCheck {
+  const onMacOS = deps.isMacOS ?? isMacOS
+  const readLimit = deps.readLaunchctlMaxFiles ?? readLaunchctlMaxFiles
+
+  return {
+    name: 'hostd.macos-maxfiles',
+    category: 'hostd',
+    description: 'macOS open-files soft limit is high enough for the container runtime',
+    async run() {
+      if (!onMacOS()) return { status: 'ok', message: 'not running on macOS' }
+
+      const raw = await readLimit()
+      const soft = raw === null ? null : parseLaunchctlMaxFilesSoft(raw)
+      if (soft === null) {
+        return {
+          status: 'info',
+          message: 'could not read the macOS open-files limit (launchctl limit maxfiles)',
+          details: ['Skipping the open-files check; this does not affect the agent.'],
+        }
+      }
+
+      if (soft >= MACOS_MAXFILES_RISK_THRESHOLD) {
+        return { status: 'ok', message: `open-files soft limit is ${soft}` }
+      }
+
+      return {
+        status: 'warning',
+        message: `macOS open-files soft limit is low (${soft})`,
+        details: [
+          `launchctl limit maxfiles soft limit = ${soft} (macOS default is 256).`,
+          'GUI apps launched by launchd — including OrbStack/Docker Desktop — inherit this soft limit.',
+          'Under load the runtime can exhaust it and fail with "too many open files" on its control socket (vmcontrol.sock), which surfaces as the runtime crashing (SIGKILL).',
+          'This is a risk indicator, not proof: the kernel ceiling (kern.maxfiles*) and per-container limits are separate.',
+        ],
+        fix: {
+          description:
+            "Update your container runtime to the latest version and fully quit + relaunch it (a well-behaved runtime raises its own soft limit on start). If it recurs, raise the login-session open-files limit using your organization's supported macOS administration method, then relaunch the runtime. typeclaw does not change this limit for you.",
+        },
+      }
+    },
+  }
+}
+
+// `launchctl limit maxfiles` prints `\tmaxfiles    <soft>    <hard>\n`, where
+// each field may be a number or the literal `unlimited`. We only need the soft
+// limit; return null on any shape we don't recognize so the check degrades to
+// `info` rather than a false warning.
+export function parseLaunchctlMaxFilesSoft(raw: string): number | null {
+  const line = raw.split('\n').find((l) => l.includes('maxfiles'))
+  if (line === undefined) return null
+  const fields = line.trim().split(/\s+/)
+  const soft = fields[1]
+  if (soft === undefined) return null
+  if (soft === 'unlimited') return Number.POSITIVE_INFINITY
+  const parsed = Number.parseInt(soft, 10)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+async function readLaunchctlMaxFiles(): Promise<string | null> {
+  const bun = (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
+  if (bun === undefined) return null
+  try {
+    const proc = bun.spawn(['launchctl', 'limit', 'maxfiles'], { stdout: 'pipe', stderr: 'ignore' })
+    const stdout = await new Response(proc.stdout).text()
+    const exitCode = await proc.exited
+    if (exitCode !== 0) return null
+    return stdout
+  } catch {
+    return null
   }
 }
 

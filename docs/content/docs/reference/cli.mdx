@@ -152,6 +152,12 @@ typeclaw doctor --only docker,config               # narrow to categories
 
 Categories: `docker`, `config`, `secrets`, `network`, `git`, plus per-plugin checks.
 
+### macOS open-files limit
+
+On macOS, `doctor` warns (category `hostd`, check `hostd.macos-maxfiles`) when the login session's open-files **soft** limit is low. macOS ships a per-process default of 256 (`launchctl limit maxfiles`), and GUI apps launched by launchd — including **OrbStack** and **Docker Desktop** — inherit it. Under load the runtime can exhaust that limit and fail with `too many open files` on its control socket (e.g. `accept unix …/vmcontrol.sock: too many open files`), which surfaces as the runtime being killed (SIGKILL), often alongside DNS lookups failing with `no memory`.
+
+This is a **risk indicator**, not proof the running runtime inherited that exact limit — the kernel ceiling (`kern.maxfiles`, `kern.maxfilesperproc`) and per-container limits are separate. typeclaw does **not** change this limit for you. To clear the warning: update your container runtime to the latest version and fully quit + relaunch it (a well-behaved runtime raises its own soft limit on start); if it recurs, raise the login-session limit using your organization's supported macOS administration method, then relaunch the runtime. If you collect diagnostics for an OrbStack/Docker report, capture `launchctl limit maxfiles`, the runtime's log around the `vmcontrol.sock` errors, and `~/.orbstack/log/` (OrbStack).
+
 ## Update
 
 ```sh
