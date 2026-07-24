@@ -71,6 +71,7 @@ import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-b
 import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
 import { enforceAndPinToolFiles, writeToolOutputNoFollow } from './tool-file-safety'
+import { createKeyedSemaphore } from './tools/keyed-semaphore'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
 import { webFetchTool } from './tools/webfetch'
 import { webSearchTool } from './tools/websearch'
@@ -81,6 +82,32 @@ import { webSearchTool } from './tools/websearch'
 // detector covers every tool category — plugin tools, TypeClaw system tools,
 // and pi-coding-agent builtins — through one chokepoint.
 let sharedLoopGuard: LoopGuard = createLoopGuard()
+
+// Process-wide cap on how many sandboxed bash calls run their subprocess at
+// once. Each sandboxed bash spawns a bwrap child, and a single model tool-call
+// can fan that out into a heavy Node process (`bunx agent-browser` /
+// `bunx agent-messenger`) or a Chromium instance. The container runs with NO
+// docker `--memory` limit, so peak RSS is bounded only by the host/VM budget:
+// a burst of unbounded parallel tool-calls stacks their children into one RSS
+// spike that the OOM killer takes as a bare SIGKILL — no fatal-guard log, and a
+// restart into empty open/close sessions. Capping the concurrent spawns bounds
+// that worst-case multiplier. This is the parallel-bash sibling of the embedder
+// cap (612065bb, EMBED_CONCURRENCY).
+//
+// Chosen 4, not 1: the cap must stay >1 or independent read/grep/write/build
+// calls the model fired in parallel would serialize behind one slow build,
+// hurting latency for no memory reason (those are cheap). 4 keeps enough lanes
+// for latency-sensitive parallelism while still bounding the heavy-child stack;
+// a burst of browser/messenger spawns can pile at most 4 deep instead of
+// however many the model requested at once. Queue-and-wait, never skip — the
+// model asked for every command, so an over-cap call blocks for a slot rather
+// than being dropped.
+//
+// Single fixed key — the OOM budget is the whole PROCESS/VM, so the limit is
+// global, not per-session or per-key (mirrors EMBED_SEMAPHORE_KEY).
+export const MAX_CONCURRENT_SANDBOXED_BASH = 4
+const SANDBOXED_BASH_SEMAPHORE_KEY = 'sandboxed-bash'
+const sandboxedBashSemaphore = createKeyedSemaphore({ concurrency: MAX_CONCURRENT_SANDBOXED_BASH })
 
 // Internal, non-model-facing contract: a tool.before hook may set this key on
 // a bash call's args to inject env vars into the spawned process WITHOUT
@@ -614,9 +641,19 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
                   : {}),
               }
             : undefined
-        rawResult = await bashEnvStore.run(spawnEnvContext, () =>
-          tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate, ctx),
-        )
+        const runSpawn = (): Promise<ToolResult> =>
+          bashEnvStore.run(spawnEnvContext, () =>
+            tool.execute(toolCallId, mutableArgs as Static<TParams>, signal, onUpdate, ctx),
+          )
+        // Only bash spawns a sandboxed subprocess; the other builtins run
+        // in-process and cheaply, so they bypass the OOM concurrency cap. `run`
+        // is finally-safe, releasing the slot on success, throw, or timeout;
+        // threading the turn's signal means a queued call that aborts before
+        // admission never holds a slot.
+        rawResult =
+          tool.name === 'bash'
+            ? await sandboxedBashSemaphore.run(SANDBOXED_BASH_SEMAPHORE_KEY, runSpawn, signal)
+            : await runSpawn()
       } catch (error) {
         executionError = error
       } finally {

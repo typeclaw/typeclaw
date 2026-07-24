@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { readdirSync } from 'node:fs'
 import {
@@ -47,6 +47,7 @@ import {
   buildSandboxEnvPolicy,
   defaultBuiltinPiToolDefinitions,
   forgetSharedLoopGuardTool,
+  MAX_CONCURRENT_SANDBOXED_BASH,
   TYPECLAW_INTERNAL_BASH_ENV,
   wrapBuiltinToolDefinition,
   wrapPluginTool,
@@ -73,6 +74,14 @@ const lacksInodeAnchoring = process.platform !== 'linux'
 function textOfFirstContent(result: { content: { type: string; text?: string }[] }): string | undefined {
   const first = result.content[0]
   return first?.type === 'text' ? first.text : undefined
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
 }
 
 describe('zodToToolParameters', () => {
@@ -3780,6 +3789,239 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     )
     expect(seenInHook).toBeUndefined()
   })
+})
+
+// Linux-only (like the inode-anchoring tests): these drive REAL bwrap sandbox
+// setup, whose proc-bind safety probe only returns a cacheable definitive
+// verdict on a Linux userns host. On macOS/Windows it stays 'inconclusive' and
+// re-probes (seconds) on every call, blowing the timeout — the semaphore logic
+// under test is platform-independent, but the setup it wraps is not. CI runs the
+// suite on ubuntu, where the probe caches once and every call is fast.
+//
+// Separate from the role-derived-path-hiding block above because that block's
+// beforeEach resets the bwrap/proc caches, which would force a fresh probe on
+// every call here. This block warms the probe ONCE in beforeAll so the many
+// concurrent calls reuse the cached verdict — matching production, where a
+// container probes once at boot.
+describe.skipIf(lacksInodeAnchoring)('wrapBuiltinToolDefinition sandboxed bash concurrency cap (OOM guard)', () => {
+  const capTui: SessionOrigin = { kind: 'tui', sessionId: 'cap' }
+
+  function capBash(state: { active: number; peak: number; started: number }, gate: Promise<void>) {
+    return {
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute() {
+        state.active++
+        state.started++
+        state.peak = Math.max(state.peak, state.active)
+        try {
+          await gate
+          return { content: [{ type: 'text' as const, text: 'ran' }], details: undefined }
+        } finally {
+          state.active--
+        }
+      },
+    }
+  }
+
+  const capBoundary = {
+    ensureAvailable: async () => {},
+    buildCommand: buildSandboxedCommand,
+    resolveRuntime: async () => ({ env: {}, mounts: [] }),
+  }
+
+  async function capAgentDir(prefix: string): Promise<string> {
+    const agentDir = await mkdtemp(path.join(tmpdir(), prefix))
+    for (const dir of ['workspace/.config/gws', 'workspace/.agent-messenger', '.typeclaw/home', '.typeclaw/logs']) {
+      await mkdir(path.join(agentDir, dir), { recursive: true })
+    }
+    for (const file of ['.env', 'secrets.json', 'auth.json']) {
+      await writeFile(path.join(agentDir, file), '')
+    }
+    return agentDir
+  }
+
+  function wrapCapBash(
+    tool: ReturnType<typeof capBash> | ReturnType<typeof fakeCapBash>,
+    agentDir: string,
+    sessionId: string,
+  ): ReturnType<typeof wrapBuiltinToolDefinition> {
+    return wrapBuiltinToolDefinition(tool as never, {
+      agentDir,
+      sessionId,
+      hooks: createHookBus(),
+      getOrigin: () => capTui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: capBoundary,
+    })
+  }
+
+  function fakeCapBash(record: { command?: string }) {
+    return {
+      name: 'bash',
+      label: 'bash',
+      description: '',
+      parameters: Type.Object({ command: Type.String() }),
+      async execute(_id: string, params: { command: string }) {
+        record.command = params.command
+        return { content: [{ type: 'text' as const, text: 'ran' }], details: undefined }
+      },
+    }
+  }
+
+  // Real-time poll: sandbox setup does real filesystem I/O, so admission into
+  // execute() lands over milliseconds; a microtask spin would sample too early.
+  async function waitFor(predicate: () => boolean, timeoutMs = 15000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error('waitFor timed out')
+      await new Promise((r) => setTimeout(r, 5))
+    }
+  }
+
+  let warmDir: string
+
+  beforeAll(async () => {
+    // Populate the process-global bwrap/proc probe cache once so the concurrent
+    // batches below reach execute() promptly instead of racing slow probes.
+    warmDir = await capAgentDir('typeclaw-bash-cap-warm-')
+    await wrapCapBash(fakeCapBash({}), warmDir, 'cap-warm').execute(
+      'warm',
+      { command: 'echo warm' },
+      undefined,
+      undefined,
+      {} as never,
+    )
+  })
+
+  afterAll(async () => {
+    if (warmDir !== undefined) await rm(warmDir, { recursive: true, force: true })
+  })
+
+  test(`caps concurrent sandboxed bash executions at MAX_CONCURRENT_SANDBOXED_BASH (${MAX_CONCURRENT_SANDBOXED_BASH})`, async () => {
+    const n = MAX_CONCURRENT_SANDBOXED_BASH
+    const dirs = await Promise.all(Array.from({ length: n + 1 }, () => capAgentDir('typeclaw-bash-cap-')))
+    try {
+      const state = { active: 0, peak: 0, started: 0 }
+      const gate = deferred<void>()
+      const wrapped = dirs.map((dir, i) => wrapCapBash(capBash(state, gate.promise), dir, `bash-cap-${i}`))
+
+      // when: fire cap + 1 concurrent calls, all sharing the same gate
+      const runs = wrapped.map((w, i) =>
+        w.execute(`call-${i}`, { command: 'sleep 1' }, undefined, undefined, {} as never),
+      )
+      // wait until the cap is saturated, then let any straggler setup settle
+      await waitFor(() => state.started >= n)
+      await new Promise((r) => setTimeout(r, 200))
+
+      // then: at most `n` are inside execute at once; the (n+1)th is queued
+      expect(state.started).toBe(n)
+      expect(state.peak).toBe(n)
+
+      gate.resolve()
+      await Promise.all(runs)
+
+      // and: the queued call ran after a slot freed — nothing was dropped
+      expect(state.started).toBe(n + 1)
+      expect(state.peak).toBe(n)
+    } finally {
+      await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+    }
+  }, 60000)
+
+  test('releases a concurrency slot when a sandboxed bash call throws', async () => {
+    // `n` calls that all throw run CONCURRENTLY: they saturate the cap, then each
+    // must release its slot on the throw. A fresh call afterwards proves the cap
+    // freed up — if any throw leaked its slot, the semaphore would still be full
+    // and the fresh call would block forever. (Concurrent, not sequential, so the
+    // calls share one in-flight bwrap probe instead of each paying it in series.)
+    const n = MAX_CONCURRENT_SANDBOXED_BASH
+    const failDirs = await Promise.all(Array.from({ length: n }, () => capAgentDir('typeclaw-bash-cap-throw-')))
+    const okDir = await capAgentDir('typeclaw-bash-cap-throw-ok-')
+    try {
+      // given: cap-many concurrent calls that each throw. Unique commands per
+      // call so the loop guard never trips on a repeat.
+      const failures = failDirs.map((dir, i) => {
+        const failing = fakeCapBash({})
+        failing.execute = async () => {
+          throw new Error('boom')
+        }
+        return expect(
+          wrapCapBash(failing, dir, `bash-cap-throw-${i}`).execute(
+            `fail-${i}`,
+            { command: `echo throw-${i}` },
+            undefined,
+            undefined,
+            {} as never,
+          ),
+        ).rejects.toThrow('boom')
+      })
+      await Promise.all(failures)
+
+      // when: a fresh call runs after all slots should have been released
+      const record: { command?: string } = {}
+      const result = await wrapCapBash(fakeCapBash(record), okDir, 'bash-cap-throw-ok').execute(
+        'ok',
+        { command: 'echo throw-ok' },
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      // then: the throwing calls did not leak their slots
+      expect(textOfFirstContent(result)).toBe('ran')
+    } finally {
+      await Promise.all([...failDirs, okDir].map((dir) => rm(dir, { recursive: true, force: true })))
+    }
+  }, 60000)
+
+  test('a queued sandboxed bash call that aborts before admission does not hold a slot', async () => {
+    const n = MAX_CONCURRENT_SANDBOXED_BASH
+    const heldDirs = await Promise.all(Array.from({ length: n }, () => capAgentDir('typeclaw-bash-cap-abort-')))
+    const queuedDir = await capAgentDir('typeclaw-bash-cap-abort-q-')
+    try {
+      const state = { active: 0, peak: 0, started: 0 }
+      const gate = deferred<void>()
+
+      // given: cap slots saturated by blocking calls
+      const held = heldDirs.map((dir, i) =>
+        wrapCapBash(capBash(state, gate.promise), dir, `bash-cap-abort-${i}`).execute(
+          `held-${i}`,
+          { command: 'sleep 1' },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      )
+      await waitFor(() => state.started >= n)
+      await new Promise((r) => setTimeout(r, 200))
+      expect(state.started).toBe(n)
+
+      // when: a further call queues (setup completes, then it blocks on the full
+      // semaphore), then aborts before a slot frees
+      const controller = new AbortController()
+      const queued = wrapCapBash(capBash(state, gate.promise), queuedDir, 'bash-cap-abort-q').execute(
+        'queued',
+        { command: 'sleep 1' },
+        controller.signal,
+        undefined,
+        {} as never,
+      )
+      await new Promise((r) => setTimeout(r, 200))
+      controller.abort()
+      await expect(queued).rejects.toThrow()
+
+      // then: the aborted call never entered execute
+      expect(state.started).toBe(n)
+
+      gate.resolve()
+      await Promise.all(held)
+    } finally {
+      await Promise.all([...heldDirs, queuedDir].map((dir) => rm(dir, { recursive: true, force: true })))
+    }
+  }, 60000)
 })
 
 describe('buildSandboxEnvPolicy exposable .env names', () => {
