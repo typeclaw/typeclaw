@@ -187,6 +187,17 @@ export const MAX_TYPING_HEARTBEAT_MS = 2 * 60 * 1000
 export const SESSION_IDLE_MS = 30 * 60 * 1000
 export const SESSION_GC_INTERVAL_MS = 60 * 1000
 
+// Hard ceiling on concurrently-warm LiveSessions. Each one pins a full
+// in-memory AgentSession (open SessionManager + transcript, ~50-200MB RSS),
+// so without a count cap a burst of active conversations across many
+// channels/threads stacks RSS with no limit — the idle GC only reclaims after
+// SESSION_IDLE_MS of inactivity, which is far too late under load. When at cap
+// and a new session must be created, the router first evicts the
+// least-recently-active *evictable* session (same skip-conditions as the idle
+// GC). 10 comfortably covers normal multi-channel use while capping the worst
+// case; bump this if a deployment legitimately runs more simultaneous rooms.
+export const MAX_LIVE_SESSIONS = 10
+
 // Hard cap on tool-initiated outbound sends per (chat:thread) per turn.
 // The original loop-incident emitted ~50 sends in one turn; even
 // legitimate split replies rarely cross 8. 10 leaves headroom for
@@ -830,6 +841,12 @@ type LiveSession = {
   // soft-TTL grace decision against the current transcript size to weigh reuse
   // vs rollover. 0 when no transcript path is available, which disables grace.
   baseContextBytes: number
+  // Count of route() calls currently between obtaining this session and
+  // enqueuing their inbound. A routing inbound in that window is neither
+  // draining nor queued yet, so without this guard capacity eviction could
+  // tear the session down and strand the inbound (drain() no-ops on a
+  // destroyed session). Non-zero pins the session against eviction.
+  routing: number
   firstUnprocessedAt: number
   currentTurnAuthorId: string | null
   currentTurnAuthorIds: Set<string>
@@ -1576,6 +1593,17 @@ export type CreateChannelRouterOptions = {
   // work in the resume greeting. Background-only: a foreground child returns its
   // result inline, so it is not orphaned by the bounce. Omitted means none.
   listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+  // Test seam: awaited inside route() at the membership-resolution point, i.e.
+  // exactly the window where a session is obtained but its inbound is not yet
+  // enqueued. Lets tests hold a session mid-route to exercise the `routing`
+  // eviction pin. Omitted (production) is a no-op.
+  onRouteMembership?: (keyId: string) => Promise<void>
+  // Test seam: fired synchronously inside acquireLiveForRoute right after
+  // ensureLive resolves and BEFORE the `routing` pin is taken — the exact
+  // microtask gap in which a concurrent capacity sweep could evict the freshly
+  // resolved session. Lets a test deterministically simulate that eviction to
+  // prove the pin-then-revalidate retry. Omitted (production) is a no-op.
+  onEnsuredForRoute?: (live: LiveSession) => void
 }
 
 export type RestartCommandContext = {
@@ -1634,6 +1662,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const onReload = options.onReload
   const onRestart = options.onRestart
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
+  const onRouteMembership = options.onRouteMembership
+  const onEnsuredForRoute = options.onEnsuredForRoute
   const liveSessions = new Map<string, LiveSession>()
   const creating = new Map<string, Promise<LiveSession>>()
   // Restart-resume reservations, keyed by channelKeyId. Installed by
@@ -2182,6 +2212,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         promptInFlight: false,
         lastInboundAt: now(),
         baseContextBytes: 0,
+        routing: 0,
         firstUnprocessedAt: 0,
         currentTurnAuthorId: null,
         currentTurnAuthorIds: new Set(),
@@ -2284,33 +2315,63 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         await persistPromise
         throw new StaleLiveSessionError(keyId)
       }
-      if (isColdStart) {
-        // Install before the slow prefetch so a concurrent teardown/shutdown can
-        // see and dispose this session during the network fetch.
-        liveSessions.set(keyId, live)
-        const adapterConfig = options.configForAdapter(key.adapter)
-        // Overlap the disk mapping-write with the network history prefetch —
-        // they are independent. allSettled lets a persist failure take priority
-        // (and unwind the install) even if prefetch also rejects.
-        const prefetchPromise = adapterConfig
-          ? prefetchChannelContext(live, adapterConfig, triggeringMessageId)
-          : Promise.resolve()
-        const [persistResult, prefetchResult] = await Promise.allSettled([persistPromise, prefetchPromise])
-        if (persistResult.status === 'rejected') {
-          await unwindInstalledLive(keyId, live)
-          throw persistResult.reason
+      // Single choke-point both install branches flow through: reserve a live
+      // slot (evicting LRU sessions if at cap) BEFORE the awaits below, so the
+      // count ceiling holds atomically across concurrent distinct-key
+      // creations. The reservation is released the instant this session lands in
+      // `liveSessions` (from then on `liveSessions.size` accounts for it — a
+      // reservation held past the insert would double-count against a concurrent
+      // creator) and in the finally as a backstop for the throw-before-insert
+      // paths (stale rollover / rehydrate persist failure), which release() no-ops.
+      //
+      // Once installed, the session is pinned with `routing` for the rest of
+      // ensureLive: the cold-start install exposes it in `liveSessions` BEFORE
+      // the prefetch await (so a concurrent teardown can dispose it during the
+      // fetch), which is exactly the window a concurrent capacity sweep could
+      // otherwise pick this brand-new session — routing=0, not yet queued — as
+      // its LRU victim and strand the triggering inbound. route() re-pins with
+      // its own routing++ the instant ensureLive returns (no await between), so
+      // the pin never lapses between here and the membership window.
+      const releaseCapacitySlot = makeCapacityRoom()
+      let pinnedForInstall = false
+      try {
+        if (isColdStart) {
+          // Install before the slow prefetch so a concurrent teardown/shutdown can
+          // see and dispose this session during the network fetch.
+          liveSessions.set(keyId, live)
+          live.routing++
+          pinnedForInstall = true
+          releaseCapacitySlot()
+          const adapterConfig = options.configForAdapter(key.adapter)
+          // Overlap the disk mapping-write with the network history prefetch —
+          // they are independent. allSettled lets a persist failure take priority
+          // (and unwind the install) even if prefetch also rejects.
+          const prefetchPromise = adapterConfig
+            ? prefetchChannelContext(live, adapterConfig, triggeringMessageId)
+            : Promise.resolve()
+          const [persistResult, prefetchResult] = await Promise.allSettled([persistPromise, prefetchPromise])
+          if (persistResult.status === 'rejected') {
+            await unwindInstalledLive(keyId, live)
+            throw persistResult.reason
+          }
+          if (prefetchResult.status === 'rejected') {
+            await unwindInstalledLive(keyId, live)
+            throw prefetchResult.reason
+          }
+          if (adapterConfig) logger.info(`[channels] ${keyId}: ensureLive prefetched-context`)
+        } else {
+          // Rehydrate has no prefetch to overlap, so settle the mapping write
+          // before installing — a failed persist must fail ensureLive without
+          // leaving a warm session behind for later inbounds to reuse.
+          await persistPromise
+          liveSessions.set(keyId, live)
+          live.routing++
+          pinnedForInstall = true
+          releaseCapacitySlot()
         }
-        if (prefetchResult.status === 'rejected') {
-          await unwindInstalledLive(keyId, live)
-          throw prefetchResult.reason
-        }
-        if (adapterConfig) logger.info(`[channels] ${keyId}: ensureLive prefetched-context`)
-      } else {
-        // Rehydrate has no prefetch to overlap, so settle the mapping write
-        // before installing — a failed persist must fail ensureLive without
-        // leaving a warm session behind for later inbounds to reuse.
-        await persistPromise
-        liveSessions.set(keyId, live)
+      } finally {
+        if (pinnedForInstall) live.routing--
+        releaseCapacitySlot()
       }
 
       // Snapshot the rendered base context size now, after prefetch and before
@@ -3329,6 +3390,31 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return result
   }
 
+  // Resolve the live session for an inbound and hand it back with its
+  // capacity-eviction `routing` pin already held. ensureLive releases its
+  // install-time pin in its own finally, so between ensureLive resolving and
+  // this caller running there is a microtask gap in which the (idle, unqueued)
+  // session is a valid LRU victim for a concurrent creation's capacity sweep —
+  // it could be destroyed before we pin it, leaving route() to enqueue onto a
+  // dead session whose drain() no-ops. The warm-reuse return path never pinned
+  // at all, so the same gap applies there. Guard uniformly: increment `routing`
+  // and, in the SAME synchronous tick (no await between), revalidate that this
+  // exact object is still the installed, non-destroyed session. If it was
+  // evicted in the gap, release and re-acquire. Each retry crosses `await
+  // ensureLive`, so this never spins synchronously; capacity admission bounds
+  // the loop (a genuinely over-capacity system with everything else pinned
+  // admits over cap rather than looping forever).
+  const acquireLiveForRoute = async (key: ChannelKey, event: InboundMessage): Promise<LiveSession> => {
+    const keyId = channelKeyId(key)
+    for (;;) {
+      const live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
+      onEnsuredForRoute?.(live)
+      live.routing++
+      if (liveSessions.get(keyId) === live && !live.destroyed) return live
+      live.routing--
+    }
+  }
+
   const route = async (event: InboundMessage): Promise<void> => {
     const adapterConfig = options.configForAdapter(event.adapter)
     if (!adapterConfig) return
@@ -3444,100 +3530,112 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const reservation = restartReservations.get(channelKeyId(key))
     if (reservation !== undefined) reservation.sawInbound = true
 
-    const live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
-    live.room = event.room
+    // Acquire the session with its capacity-eviction pin already held (see
+    // acquireLiveForRoute): the pin covers the whole membership-resolution
+    // window below, where the session is not yet draining or queued and would
+    // otherwise be a valid LRU victim for a concurrent creation's capacity
+    // sweep. The finally releases it once routing reaches the enqueue
+    // (promptQueue then keeps it un-evictable) or an early return. drain() and
+    // rollover for THIS inbound run after route() returns, so the pin never
+    // straddles them.
+    const live = await acquireLiveForRoute(key, event)
+    try {
+      live.room = event.room
+      const isNewAuthor = !live.participants.some((p) => p.authorId === event.authorId)
+      live.participants = updateParticipants(
+        live.participants,
+        event.authorId,
+        event.authorName,
+        now(),
+        event.authorIsBot,
+      )
+      void persistParticipants(live)
 
-    const isNewAuthor = !live.participants.some((p) => p.authorId === event.authorId)
-    live.participants = updateParticipants(
-      live.participants,
-      event.authorId,
-      event.authorName,
-      now(),
-      event.authorIsBot,
-    )
-    void persistParticipants(live)
-
-    // A previously-unseen author just spoke. The cached membership count
-    // (from /members or history-derived) was computed without them, so
-    // invalidate and warm in the background. We don't await — the warmup
-    // runs alongside this turn's `membershipForEngagement` call so the
-    // *next* turn sees fresh data, but the current turn still gets a
-    // fast answer (cache miss → cold fetch with timeout, or stale-ok).
-    if (isNewAuthor && live.key.workspace !== '@dm') {
-      const scoped = membershipScopeKey(live.key, live.room)
-      const cache = membershipCaches.get(scoped.adapter)
-      if (cache !== undefined) {
-        cache.invalidate(scoped)
-        void cache.warmUp(scoped).catch((err) => {
-          logger.warn(`[channels] membership warmup after new author failed for ${live.keyId}: ${describe(err)}`)
-        })
+      // A previously-unseen author just spoke. The cached membership count
+      // (from /members or history-derived) was computed without them, so
+      // invalidate and warm in the background. We don't await — the warmup
+      // runs alongside this turn's `membershipForEngagement` call so the
+      // *next* turn sees fresh data, but the current turn still gets a
+      // fast answer (cache miss → cold fetch with timeout, or stale-ok).
+      if (isNewAuthor && live.key.workspace !== '@dm') {
+        const scoped = membershipScopeKey(live.key, live.room)
+        const cache = membershipCaches.get(scoped.adapter)
+        if (cache !== undefined) {
+          cache.invalidate(scoped)
+          void cache.warmUp(scoped).catch((err) => {
+            logger.warn(`[channels] membership warmup after new author failed for ${live.keyId}: ${describe(err)}`)
+          })
+        }
       }
+
+      if (onRouteMembership !== undefined) await onRouteMembership(live.keyId)
+      const membership = await membershipForEngagement(live)
+
+      const effectiveHumans = countEffectiveHumans(live.participants, membership, now())
+      live.multiHumanGroup = isMultiHumanGroup(event.isDm, effectiveHumans)
+
+      const decision: EngagementDecision = decideEngagement({
+        message: event,
+        config: adapterConfig.engagement,
+        key: live.keyId,
+        ledger: stickyLedger,
+        now: now(),
+        participants: live.participants,
+        membership,
+        selfAliases: computeSelfAliases(),
+        botInThread: hasBotParticipated(live),
+      })
+
+      if (decision === 'observe') {
+        publishInbound(event, 'observe', live.sessionId)
+        // Log every observe so an unanswered mention is diagnosable from logs
+        // alone instead of "routed but no prompting" silence. The bracketed
+        // shape mirrors `prompting batch=` so log scraping can pair them.
+        logger.info(`[channels] ${live.keyId} observed id=${event.externalMessageId}`)
+        observe(live, event)
+        return
+      }
+
+      publishInbound(event, 'engage', live.sessionId)
+
+      // Arm cold-start bare-empty recovery only for the exact incident shape: the
+      // FIRST prompt (`turnSeq === 0`) of a freshly cold-started session that
+      // engaged via the solo-human answer-everything fallback — a lone human, no
+      // explicit mention/reply/DM, not a multi-human group. Recomputed on every
+      // engage so it self-clears once the first turn advances `turnSeq`; explicit
+      // address (mention/reply/DM) keeps the historical silent-on-empty path.
+      live.coldStartSoloFallbackTurnActive =
+        live.createdFromColdStart &&
+        live.turnSeq === 0 &&
+        effectiveHumans <= 1 &&
+        !event.authorIsBot &&
+        !event.isDm &&
+        !event.isBotMention &&
+        event.replyToBotMessageId === null &&
+        !live.multiHumanGroup
+
+      const engageReaction = autoReactOnEngage(event)
+
+      updateLoopGuard(live, event)
+
+      enqueue(live, event, engageReaction)
+
+      // Start showing "typing..." the moment we know we're going to engage,
+      // so users see the indicator during the debounce window — not just
+      // during LLM generation. drain() will keep it alive across iterations
+      // and the finally-block will stop it when the queue empties.
+      startTypingHeartbeat(live)
+
+      if (live.draining) {
+        // In-flight turn; let coalesce-on-drain pick it up. Same-author abort
+        // is a v0.2 enhancement once we have safe abort semantics through
+        // pi-coding-agent for in-flight tool calls.
+        return
+      }
+      scheduleDebouncedDrain(live)
+    } finally {
+      live.routing--
     }
-
-    const membership = await membershipForEngagement(live)
-
-    const effectiveHumans = countEffectiveHumans(live.participants, membership, now())
-    live.multiHumanGroup = isMultiHumanGroup(event.isDm, effectiveHumans)
-
-    const decision: EngagementDecision = decideEngagement({
-      message: event,
-      config: adapterConfig.engagement,
-      key: live.keyId,
-      ledger: stickyLedger,
-      now: now(),
-      participants: live.participants,
-      membership,
-      selfAliases: computeSelfAliases(),
-      botInThread: hasBotParticipated(live),
-    })
-
-    if (decision === 'observe') {
-      publishInbound(event, 'observe', live.sessionId)
-      // Log every observe so an unanswered mention is diagnosable from logs
-      // alone instead of "routed but no prompting" silence. The bracketed
-      // shape mirrors `prompting batch=` so log scraping can pair them.
-      logger.info(`[channels] ${live.keyId} observed id=${event.externalMessageId}`)
-      observe(live, event)
-      return
-    }
-
-    publishInbound(event, 'engage', live.sessionId)
-
-    // Arm cold-start bare-empty recovery only for the exact incident shape: the
-    // FIRST prompt (`turnSeq === 0`) of a freshly cold-started session that
-    // engaged via the solo-human answer-everything fallback — a lone human, no
-    // explicit mention/reply/DM, not a multi-human group. Recomputed on every
-    // engage so it self-clears once the first turn advances `turnSeq`; explicit
-    // address (mention/reply/DM) keeps the historical silent-on-empty path.
-    live.coldStartSoloFallbackTurnActive =
-      live.createdFromColdStart &&
-      live.turnSeq === 0 &&
-      effectiveHumans <= 1 &&
-      !event.authorIsBot &&
-      !event.isDm &&
-      !event.isBotMention &&
-      event.replyToBotMessageId === null &&
-      !live.multiHumanGroup
-
-    const engageReaction = autoReactOnEngage(event)
-
-    updateLoopGuard(live, event)
-
-    enqueue(live, event, engageReaction)
-
-    // Start showing "typing..." the moment we know we're going to engage,
-    // so users see the indicator during the debounce window — not just
-    // during LLM generation. drain() will keep it alive across iterations
-    // and the finally-block will stop it when the queue empties.
-    startTypingHeartbeat(live)
-
-    if (live.draining) {
-      // In-flight turn; let coalesce-on-drain pick it up. Same-author abort
-      // is a v0.2 enhancement once we have safe abort semantics through
-      // pi-coding-agent for in-flight tool calls.
-      return
-    }
-    scheduleDebouncedDrain(live)
   }
 
   const inboundAuthorOrigin = (event: InboundMessage): SessionOrigin => ({
@@ -5159,23 +5257,37 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (!live.destroyed) await tearDownLive(live)
   }
 
+  // Shared eviction-eligibility gate for both the idle GC and the capacity cap:
+  // a session with buffered work (queued prompts / pending reminders), a turn in
+  // flight (draining), an already-running teardown (destroyed), or a still-live
+  // background child (pinned) must never be torn down out from under that work.
+  // `label` only annotates the stuck-child override log. Single source of truth
+  // so the two eviction paths can't drift apart.
+  const isEvictable = (live: LiveSession, label: string): boolean => {
+    if (live.destroyed) return false
+    if (live.draining) return false
+    // A route() call has obtained this session but not yet enqueued its inbound
+    // (it may be awaiting membership); evicting now would strand that inbound.
+    if (live.routing > 0) return false
+    if (live.promptQueue.length > 0) return false
+    // pendingSystemReminders is checked alongside promptQueue because both
+    // represent pending work that drain() will process. Today's only
+    // populator (injectSubagentCompletionReminder) also fires drain()
+    // synchronously, which sets draining=true and shadows this guard via
+    // the line above — but the guard exists to keep the invariant honest
+    // for any future caller that queues a reminder without immediately
+    // waking the drain loop.
+    if (live.pendingSystemReminders.length > 0) return false
+    if (isPinnedByRunningChild(live.sessionId, live.keyId, label)) return false
+    return true
+  }
+
   const runIdleGc = async (): Promise<void> => {
     const t = now()
     const victims: LiveSession[] = []
     for (const live of liveSessions.values()) {
-      if (live.destroyed) continue
-      if (live.draining) continue
-      if (live.promptQueue.length > 0) continue
-      // pendingSystemReminders is checked alongside promptQueue because both
-      // represent pending work that drain() will process. Today's only
-      // populator (injectSubagentCompletionReminder) also fires drain()
-      // synchronously, which sets draining=true and shadows this guard via
-      // the line above — but the guard exists to keep the invariant honest
-      // for any future caller that queues a reminder without immediately
-      // waking the drain loop.
-      if (live.pendingSystemReminders.length > 0) continue
       if (t - live.lastInboundAt <= SESSION_IDLE_MS) continue
-      if (isPinnedByRunningChild(live.sessionId, live.keyId, 'idle_gc evicting')) continue
+      if (!isEvictable(live, 'idle_gc evicting')) continue
       victims.push(live)
     }
     for (const live of victims) {
@@ -5183,6 +5295,63 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.info(`[channels] ${live.keyId} idle_gc evicting after ${t - live.lastInboundAt}ms idle`)
       await tearDownLive(live)
     }
+  }
+
+  // Slots claimed by callers that have decided to admit a new session but have
+  // not yet inserted it into `liveSessions`. Effective occupancy is
+  // `liveSessions.size + reservedSlots`. The reservation is taken in the
+  // SYNCHRONOUS prefix of makeCapacityRoom() (before any await) and released at
+  // the caller's insert, so two concurrent distinct-key creations cannot both
+  // observe room and overshoot the cap (check-then-act across an await gap).
+  let reservedSlots = 0
+
+  // Reserve one slot for a session about to be installed, evicting
+  // least-recently-active EVICTABLE sessions first so that
+  // `liveSessions.size + reservedSlots` stays within MAX_LIVE_SESSIONS. Victim
+  // selection, map delete, and the reservation happen synchronously up front
+  // (no yield); teardown is then awaited out-of-band, matching the idle GC's
+  // ordering where a session leaves the map before its teardown settles (a
+  // concurrent inbound for that key cold-recreates, which is fine). When too
+  // few sessions are evictable (all busy/pinned/routing), the slot is still
+  // reserved and the newcomer is admitted OVER cap with a warn — never drop the
+  // user's inbound, never block. The returned release() must run once the
+  // caller has inserted (or abandoned) its session.
+  const makeCapacityRoom = (): (() => void) => {
+    // Victims are deleted from the map as they're picked, so `liveSessions.size`
+    // already reflects each removal — the loop just re-checks it plus the
+    // outstanding reservations against the ceiling until the new slot fits.
+    const victims: LiveSession[] = []
+    while (liveSessions.size + reservedSlots + 1 > MAX_LIVE_SESSIONS) {
+      let victim: LiveSession | undefined
+      for (const live of liveSessions.values()) {
+        if (!isEvictable(live, 'capacity_gc evicting')) continue
+        if (victim === undefined || live.lastInboundAt < victim.lastInboundAt) victim = live
+      }
+      if (victim === undefined) {
+        logger.warn(
+          `[channels] capacity_gc: admitting new session over cap (${liveSessions.size + reservedSlots} live/reserved, insufficient evictable sessions — all busy/pinned/routing)`,
+        )
+        break
+      }
+      victims.push(victim)
+      liveSessions.delete(victim.keyId)
+    }
+    reservedSlots++
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      reservedSlots--
+    }
+    void (async () => {
+      for (const victim of victims) {
+        logger.info(
+          `[channels] ${victim.keyId} capacity_gc evicting LRU session (at MAX_LIVE_SESSIONS=${MAX_LIVE_SESSIONS})`,
+        )
+        await tearDownLive(victim)
+      }
+    })()
+    return release
   }
 
   let gcTimer: ReturnType<typeof setInterval> | null = setInterval(() => {

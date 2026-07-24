@@ -53,6 +53,7 @@ import {
   SESSION_FRESHNESS_TTL_MS,
   buildInterruptedSubagentNotice,
   buildRestartResumeWakeReminder,
+  MAX_LIVE_SESSIONS,
   OBSERVED_MESSAGE_MAX_CHARS,
   RESTART_RESUME_WAKE_REMINDER,
   SESSION_GRACE_HARD_TTL_MS,
@@ -376,6 +377,9 @@ function makeRouter(
     saveChannelSessions?: (agentDir: string, sessions: readonly ChannelSessionRecord[]) => Promise<void>
     newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+    onCreateSession?: () => Promise<void>
+    onRouteMembership?: (keyId: string) => Promise<void>
+    onEnsuredForRoute?: (live: unknown) => void
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -399,6 +403,8 @@ function makeRouter(
     ...(options.listRunningBackgroundSubagentNames !== undefined
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
+    ...(options.onRouteMembership !== undefined ? { onRouteMembership: options.onRouteMembership } : {}),
+    ...(options.onEnsuredForRoute !== undefined ? { onEnsuredForRoute: options.onEnsuredForRoute } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -407,6 +413,7 @@ function makeRouter(
       error: (m) => options.logs?.push(`error:${m}`),
     },
     createSessionForChannel: async ({ origin, originRef, existingSessionId, existingSessionFile }) => {
+      if (options.onCreateSession !== undefined) await options.onCreateSession()
       options.factoryCalls?.push({
         ...(existingSessionId !== undefined ? { existingSessionId } : {}),
         ...(existingSessionFile !== undefined ? { existingSessionFile } : {}),
@@ -11612,6 +11619,453 @@ describe('ChannelRouter idle session GC', () => {
     // then
     expect(router.liveCount()).toBe(0)
     expect(logs.some((l) => l.includes('dispose'))).toBe(true)
+  })
+})
+
+// A hard ceiling on concurrently-warm LiveSessions. Each LiveSession pins a
+// full in-memory AgentSession (~50-200MB RSS); without a count cap a burst of
+// active conversations across many channels/threads stacks RSS with no limit
+// (the idle GC only reclaims after 30min of inactivity). When at cap and a new
+// session must be created, the router evicts the least-recently-active ELIGIBLE
+// session (by lastInboundAt), mirroring the idle GC's skip-conditions so a
+// draining / queued / child-pinned session is never the victim. These tests
+// drive creation via distinct-channel inbounds and observe eviction via
+// liveCount(), the FakeSession dispose/abort counters, and the capacity_gc log.
+describe('ChannelRouter max-live-session capacity cap', () => {
+  // Create one engaged session per channel c1..cN, each at a strictly
+  // increasing clock so lastInboundAt is ordered oldest→newest by index.
+  // Returns the keys so callers can assert which one was evicted.
+  async function fillChannels(
+    router: ChannelRouter,
+    nowRef: { value: number },
+    count: number,
+    startAt = 1000,
+  ): Promise<ChannelKey[]> {
+    const keys: ChannelKey[] = []
+    for (let i = 0; i < count; i++) {
+      nowRef.value = startAt + i
+      const chat = `c${i + 1}`
+      const key: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat, thread: null }
+      keys.push(key)
+      await router.route(inbound({ chat, externalMessageId: `m-${chat}` }))
+      await router.__testing!.flushDebounce(key)
+    }
+    return keys
+  }
+
+  test('MAX_LIVE_SESSIONS is a sane, non-trivial default', () => {
+    // guards against a future edit that accidentally cripples multi-channel use
+    expect(MAX_LIVE_SESSIONS).toBeGreaterThanOrEqual(8)
+  })
+
+  test('creating one session past the cap evicts the LRU-by-lastInboundAt session', async () => {
+    // given: exactly MAX_LIVE_SESSIONS warm sessions, c1 the least-recently-active
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: a NEW channel forces a session over the cap
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    await router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: still at cap (one evicted, one added), and the LRU victim (c1 =
+    // sessions[0]) was disposed the same way the idle GC disposes — abort+dispose
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+    expect(sessions[0]!.aborted).toBe(1)
+    expect(sessions[0]!.disposed).toBe(1)
+    // the second-oldest and the newcomer are untouched
+    expect(sessions[1]!.aborted).toBe(0)
+    expect(sessions[1]!.disposed).toBe(0)
+  })
+
+  test('capacity eviction is logged in the idle_gc style', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { nowRef, logs })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    await router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await router.__testing!.flushDebounce(overflowKey)
+
+    expect(logs.some((l) => l.includes('capacity_gc evicting'))).toBe(true)
+  })
+
+  test('a draining session is never the eviction victim even when it is the LRU', async () => {
+    // given: c1 is the oldest (LRU) AND mid-turn (draining). c2..cN are newer.
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+
+    // c1 first, at the oldest clock, with a prompt held open so it stays draining
+    nowRef.value = 1000
+    const c1: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null }
+    await router.route(inbound({ chat: 'c1', externalMessageId: 'm-c1' }))
+    let releaseC1: () => void = () => {}
+    const c1Held = new Promise<void>((r) => {
+      releaseC1 = r
+    })
+    sessions[0]!.onPrompt = async () => {
+      await c1Held
+    }
+    const c1Draining = router.__testing!.flushDebounce(c1)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+    expect(router.liveCount()).toBe(1)
+
+    // fill the rest of the cap with newer channels (c2..c{MAX})
+    for (let i = 1; i < MAX_LIVE_SESSIONS; i++) {
+      nowRef.value = 1000 + i
+      const chat = `c${i + 1}`
+      const key: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat, thread: null }
+      await router.route(inbound({ chat, externalMessageId: `m-${chat}` }))
+      await router.__testing!.flushDebounce(key)
+    }
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: overflow forces an eviction
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    await router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: the draining c1 (the LRU) is skipped; the next-LRU eligible (c2 =
+    // sessions[1]) is evicted instead. c1 is never aborted/disposed.
+    expect(sessions[0]!.aborted).toBe(0)
+    expect(sessions[0]!.disposed).toBe(0)
+    expect(sessions[1]!.aborted).toBe(1)
+    expect(sessions[1]!.disposed).toBe(1)
+
+    // cleanup: release the held turn so the process can exit
+    releaseC1()
+    await c1Draining
+  })
+
+  test('a child-pinned session is never the eviction victim even when it is the LRU', async () => {
+    // given: c1 (the oldest) has a still-running background subagent → pinned
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_1' ? 1000 : null),
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: overflow forces an eviction
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    await router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: the pinned c1 (LRU) is skipped; the next-LRU eligible (c2) is evicted
+    expect(sessions[0]!.aborted).toBe(0)
+    expect(sessions[0]!.disposed).toBe(0)
+    expect(sessions[1]!.aborted).toBe(1)
+    expect(sessions[1]!.disposed).toBe(1)
+  })
+
+  test('when every at-cap session is ineligible, the inbound is served over-cap with a warn (never dropped)', async () => {
+    // given: ALL sessions are child-pinned → nothing is evictable
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      logs,
+      newestRunningChildSubagentStartedAt: () => 1000, // every session pinned
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: a new inbound arrives with no evictable victim
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    await router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: the message is served (a real session exists, temporarily over cap),
+    // nobody was evicted, and the over-cap condition is warned — never dropped.
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS + 1)
+    expect(sessions.every((s) => s.aborted === 0)).toBe(true)
+    expect(logs.some((l) => l.includes('warn:') && l.includes('capacity_gc') && l.includes('over cap'))).toBe(true)
+    // and the newcomer actually processed the inbound
+    expect(sessions[MAX_LIVE_SESSIONS]!.prompts.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test('reusing an existing warm session never triggers capacity eviction', async () => {
+    // given: exactly at cap
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    const keys = await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: a follow-up lands on an EXISTING channel (no new session needed)
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    await router.route(inbound({ chat: 'c1', externalMessageId: 'm-c1-again', text: 'still here?' }))
+    await router.__testing!.flushDebounce(keys[0]!)
+
+    // then: nothing was evicted — the warm session was reused
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+    expect(sessions.every((s) => s.aborted === 0)).toBe(true)
+    expect(sessions).toHaveLength(MAX_LIVE_SESSIONS)
+  })
+
+  test('concurrent distinct-channel admissions from size 9 never exceed the cap', async () => {
+    // given: 9 warm evictable sessions (one under cap). The 10th+11th creations
+    // (the two concurrent newcomers) are gated so they suspend mid-creation and
+    // then resume back-to-back into the capacity choke-point.
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let unblock: () => void = () => {}
+    const gate = new Promise<void>((r) => {
+      unblock = r
+    })
+    const { router } = makeRouter(dir, {
+      nowRef,
+      onCreateSession: async () => {
+        if (router.liveCount() >= MAX_LIVE_SESSIONS - 1) await gate
+      },
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS - 1)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS - 1)
+
+    // when: two NEW channels admitted concurrently
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const a: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-a', thread: null }
+    const b: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-b', thread: null }
+    const p1 = router.route(inbound({ chat: 'c-a', externalMessageId: 'm-a' }))
+    const p2 = router.route(inbound({ chat: 'c-b', externalMessageId: 'm-b' }))
+    unblock()
+    await Promise.all([p1, p2])
+    await router.__testing!.flushDebounce(a)
+    await router.__testing!.flushDebounce(b)
+
+    // then: the cap is never exceeded — the second admission saw the first's
+    // reservation and evicted to make room
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+  })
+
+  test('concurrent distinct-channel admissions from exactly cap never exceed the cap', async () => {
+    // given: exactly MAX_LIVE_SESSIONS warm evictable sessions; the two newcomers
+    // are gated so they resume into the choke-point back-to-back.
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let unblock: () => void = () => {}
+    const gate = new Promise<void>((r) => {
+      unblock = r
+    })
+    const { router } = makeRouter(dir, {
+      nowRef,
+      onCreateSession: async () => {
+        if (router.liveCount() >= MAX_LIVE_SESSIONS) await gate
+      },
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: two more NEW channels admitted concurrently
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 100
+    const a: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-a', thread: null }
+    const b: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-b', thread: null }
+    const p1 = router.route(inbound({ chat: 'c-a', externalMessageId: 'm-a' }))
+    const p2 = router.route(inbound({ chat: 'c-b', externalMessageId: 'm-b' }))
+    unblock()
+    await Promise.all([p1, p2])
+    await router.__testing!.flushDebounce(a)
+    await router.__testing!.flushDebounce(b)
+
+    // then: each admission evicted one LRU to make room; still exactly at cap
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+  })
+
+  test('a session mid-route (past ensureLive, before enqueue) is never the eviction victim', async () => {
+    // given: c1 is the oldest (LRU). We hold ITS route in the membership window
+    // (post-ensureLive, pre-enqueue) via onRouteMembership, so it is neither
+    // draining nor queued — exactly the window the `routing` pin protects.
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let releaseMembership: () => void = () => {}
+    const membershipHeld = new Promise<void>((r) => {
+      releaseMembership = r
+    })
+    let c1AtMembership = false
+    let holdNext = false
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      logs,
+      onRouteMembership: async (keyId) => {
+        if (holdNext && keyId === 'discord-bot:g1:c1:') {
+          c1AtMembership = true
+          await membershipHeld
+        }
+      },
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: a follow-up on c1 (the LRU) enters route() and blocks at membership
+    // (confirmed via the flag), so it is mid-route — not draining, not queued,
+    // lastInboundAt not yet bumped — hence still the LRU. Then a NEW channel
+    // forces capacity eviction WHILE c1 is held, and we only release c1 after
+    // the eviction has fired.
+    holdNext = true
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 50
+    const c1: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null }
+    const c1Route = router.route(inbound({ chat: 'c1', externalMessageId: 'm-c1-again', text: 'still here?' }))
+    await waitFor(() => c1AtMembership)
+
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    const overflowRoute = router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await waitFor(() => logs.some((l) => l.includes('capacity_gc evicting')))
+
+    // now that the eviction has run against the held c1, let c1 finish
+    releaseMembership()
+    await Promise.all([c1Route, overflowRoute])
+    await router.__testing!.flushDebounce(c1)
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: c1 (the mid-route LRU) was NEVER the victim — the next-LRU eligible
+    // session (c2) was evicted instead
+    expect(sessions[0]!.aborted).toBe(0)
+    expect(sessions[0]!.disposed).toBe(0)
+    expect(sessions[1]!.disposed).toBe(1)
+  })
+
+  test('recovers to the ceiling from an over-cap state on the next evictable creation', async () => {
+    // given: cap+1 sessions, all evictable (drive it there by admitting one over
+    // cap while everything was momentarily pinned, then unpin)
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let allPinned = true
+    const { router } = makeRouter(dir, {
+      nowRef,
+      newestRunningChildSubagentStartedAt: () => (allPinned ? 1000 : null),
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    // admit one over cap while everything is pinned → size cap+1
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 10
+    const over: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-over', thread: null }
+    await router.route(inbound({ chat: 'c-over', externalMessageId: 'm-over' }))
+    await router.__testing!.flushDebounce(over)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS + 1)
+
+    // when: sessions become evictable and a new channel is created
+    allPinned = false
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 200
+    const fresh: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-fresh', thread: null }
+    await router.route(inbound({ chat: 'c-fresh', externalMessageId: 'm-fresh' }))
+    await router.__testing!.flushDebounce(fresh)
+
+    // then: the over-cap creation evicted ENOUGH victims to land back at the
+    // ceiling (cap+1 → evict 2, insert 1 → cap), not merely one (which would
+    // plateau at cap+1)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+  })
+
+  test('a cold-starting session is never evicted during its own prefetch window', async () => {
+    // given: a cold channel install exposes the new session in liveSessions
+    // BEFORE its history prefetch await (channel prefetch tail defaults to 10),
+    // so a blocking history callback holds the brand-new session in the map
+    // while its triggering inbound is not yet queued. All the pre-existing
+    // sessions are child-pinned, so the cold-starter is the ONLY session a
+    // concurrent capacity sweep could pick — the exact window the fix guards.
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let releaseHistory: () => void = () => {}
+    const historyHeld = new Promise<void>((r) => {
+      releaseHistory = r
+    })
+    let holdHistory = false
+    let coldStartInPrefetch = false
+    // pin every already-established filler (ses_fake_1..N) but NOT the cold
+    // starter (ses_fake_{N+1}), so the sweep's only eligible candidate is the
+    // cold-starting session unless its prefetch-window `routing` pin protects it.
+    const pinnedIds = new Set<string>()
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      newestRunningChildSubagentStartedAt: (sessionId) => (pinnedIds.has(sessionId) ? 1000 : null),
+    })
+    router.registerHistory('discord-bot', async () => {
+      if (holdHistory) {
+        coldStartInPrefetch = true
+        await historyHeld
+      }
+      return { ok: true, messages: [] }
+    })
+    await fillChannels(router, nowRef, MAX_LIVE_SESSIONS)
+    for (let i = 1; i <= MAX_LIVE_SESSIONS; i++) pinnedIds.add(`ses_fake_${i}`)
+    expect(router.liveCount()).toBe(MAX_LIVE_SESSIONS)
+
+    // when: a NEW channel cold-starts and blocks in prefetch (now in the map,
+    // over cap since every filler is pinned), then ANOTHER new channel forces a
+    // capacity sweep while the cold-starter is held mid-prefetch
+    holdHistory = true
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 50
+    const coldKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-cold', thread: null }
+    const coldRoute = router.route(inbound({ chat: 'c-cold', externalMessageId: 'm-cold' }))
+    await waitFor(() => coldStartInPrefetch)
+
+    holdHistory = false
+    nowRef.value = 1000 + MAX_LIVE_SESSIONS + 60
+    const overflowKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c-overflow', thread: null }
+    const overflowRoute = router.route(inbound({ chat: 'c-overflow', externalMessageId: 'm-overflow' }))
+    await waitFor(() => sessions.length > MAX_LIVE_SESSIONS + 1)
+
+    releaseHistory()
+    await Promise.all([coldRoute, overflowRoute])
+    await router.__testing!.flushDebounce(coldKey)
+    await router.__testing!.flushDebounce(overflowKey)
+
+    // then: the cold-starting session (sessions[MAX], the c-cold one) was never
+    // aborted/disposed — it was pinned against eviction throughout its prefetch
+    const coldSession = sessions[MAX_LIVE_SESSIONS]!
+    expect(coldSession.aborted).toBe(0)
+    expect(coldSession.disposed).toBe(0)
+  })
+
+  test('re-acquires when the ensured session is evicted in the pre-pin handoff gap', async () => {
+    // given: ensureLive releases its install pin in its own finally, so there is
+    // a microtask gap between ensureLive resolving and route() taking the
+    // `routing` pin. onEnsuredForRoute fires synchronously in exactly that gap;
+    // on the FIRST acquisition it simulates a concurrent capacity sweep by
+    // destroying the just-resolved session, so revalidation must fail and
+    // acquireLiveForRoute must re-acquire a fresh, live session rather than
+    // enqueue onto the dead one (whose drain() would no-op → stranded inbound).
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let evictNext = true
+    const evicted: unknown[] = []
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      onEnsuredForRoute: (live) => {
+        if (!evictNext) return
+        evictNext = false
+        const l = live as { destroyed: boolean }
+        l.destroyed = true
+        evicted.push(live)
+      },
+    })
+
+    // when
+    await router.route(inbound({ chat: 'c1', externalMessageId: 'm1', text: 'hi bot' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the first session was rejected (destroyed in the gap), a second was
+    // acquired, and the inbound reached THAT live session's prompt — not stranded
+    expect(evicted).toHaveLength(1)
+    expect(sessions.length).toBeGreaterThanOrEqual(2)
+    const delivered = sessions.find((s) => s.prompts.length > 0)
+    expect(delivered).toBeDefined()
+    expect(delivered!.disposed).toBe(0)
+    expect(router.liveCount()).toBe(1)
   })
 })
 
