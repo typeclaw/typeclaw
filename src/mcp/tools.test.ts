@@ -234,6 +234,28 @@ describe('createMcpDispatcherTools', () => {
     expect(received).toEqual(args)
   })
 
+  test('mcp_call honors the target tool\'s declared fileOperands.nonFile operands', async () => {
+    let received: Record<string, unknown> | undefined
+    const connection = fakeConnection('search', [
+      {
+        name: 'search_web',
+        description: 'Web search',
+        inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+        fileOperands: { nonFile: ['query'] },
+      },
+    ])
+    connection.callTool = async (_tool, args) => {
+      received = args
+      return { content: [{ type: 'text', text: 'ok' }] }
+    }
+    const [, , callTool] = createMcpDispatcherTools(fakeManager({ search: connection }))
+    await callTool.execute(
+      { server: 'search', tool: 'search_web', args: { query: 'SPPN 3/2017' } },
+      toolContext(),
+    )
+    expect(received).toEqual({ query: 'SPPN 3/2017' })
+  })
+
   test.each(['/v1/../../tmp/result.txt', '/v1/%2e%2e/tmp/result.txt', '/v1\\..\\tmp', '/v1//repos'])(
     'mcp_call rejects traversal-shaped API route %s before invoking the server',
     async (route) => {

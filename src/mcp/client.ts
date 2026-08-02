@@ -7,12 +7,17 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { CallToolResultSchema, type CallToolResult, type ListToolsRequest } from '@modelcontextprotocol/sdk/types.js'
 
 import type { McpServer } from '@/config/config'
+import type { ToolFileOperands } from '@/plugin'
 import { resolveSecret } from '@/secrets/resolve'
 
 export type McpToolInfo = {
   name: string
   description: string
   inputSchema: unknown
+  // Declared by MCP servers via the tool's `_meta['x-file-operands']`; consumed
+  // by the mcp_call dispatcher so the file-operand scanner honors tool-authored
+  // nonFile operand paths instead of rejecting free-text args that look path-shaped.
+  fileOperands?: ToolFileOperands
 }
 
 // The SDK defaults each request to 60s; typeclaw boot should fail fast enough
@@ -28,12 +33,19 @@ export type McpConnection = {
   close(): Promise<void>
 }
 
+function readDeclaredFileOperands(meta: Record<string, unknown> | undefined): ToolFileOperands | undefined {
+  if (typeof meta !== 'object' || meta === null) return undefined
+  const declared = meta['x-file-operands']
+  if (typeof declared !== 'object' || declared === null) return undefined
+  return declared as ToolFileOperands
+}
+
 export type McpSdkClient = {
   listTools(
     params?: ListToolsRequest['params'],
     options?: RequestOptions,
   ): Promise<{
-    tools: { name: string; description?: string; inputSchema: unknown }[]
+    tools: { name: string; description?: string; inputSchema: unknown; _meta?: Record<string, unknown> }[]
     nextCursor?: string
   }>
   callTool(
@@ -112,6 +124,7 @@ export function createMcpConnection(
           name: tool.name,
           description: tool.description ?? '',
           inputSchema: tool.inputSchema,
+          fileOperands: readDeclaredFileOperands(tool._meta),
         })),
       )
       cursor = result.nextCursor

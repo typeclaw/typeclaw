@@ -94,11 +94,21 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
       const toolArgs = args.args ?? {}
+      // Honor the target tool's own `_meta['x-file-operands']` declaration
+      // (e.g. nonFile free-text args) instead of scanning every string as a
+      // potential local file operand.
+      let targetFileOperands: McpToolInfo['fileOperands']
+      try {
+        targetFileOperands = (await safeListTools(connection)).find((item) => item.name === resolved.tool)?.fileOperands
+      } catch {
+        targetFileOperands = undefined
+      }
       const pinned = await enforceAndPinToolFiles({
         tool: 'mcp_call',
         args: toolArgs,
         agentDir: ctx.agentDir,
         genericInputs: true,
+        fileOperands: targetFileOperands,
         logger: ctx.logger,
         signal: ctx.signal,
       })
