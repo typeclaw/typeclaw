@@ -38,18 +38,18 @@ If slash command registration returns 403, re-invite with `applications.commands
 
 ## Capabilities
 
-| Feature                  | Supported | Notes                                                                                                                                                                                                 |
-| ------------------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Outbound messages        | yes       |                                                                                                                                                                                                       |
-| Reactions (add + remove) | yes       |                                                                                                                                                                                                       |
-| Message editing          | yes       | `channel_edit` maps to `PATCH /channels/{id}/messages/{id}`; edits the bot's own messages only (`50005` otherwise)                                                                                    |
-| Typing indicator         | yes       | Fire-and-forget; auto-expires ~10s; re-fired every 8s; no explicit stop                                                                                                                               |
-| Channel-name resolution  | yes       |                                                                                                                                                                                                       |
-| Self identity            | yes       |                                                                                                                                                                                                       |
-| History                  | yes       | Limit 100 messages                                                                                                                                                                                    |
-| Attachments              | yes       | Land in channel root even when session is in a thread (SDK posts multipart-only; text and file can't go in one threaded round-trip)                                                                   |
-| Membership               | yes       | Requires `GUILD_MEMBERS` privileged intent; returns 403 without it                                                                                                                                    |
-| Cross-channel reads      | full      | One of only two adapters (with `slack-bot`) that back all three `channel_read` modes (`history`, `message`, `list`) — see [Cross-channel reads](/docs/reference/channel-adapters#cross-channel-reads) |
+| Feature                  | Supported | Notes                                                                                                                                                 |
+| ------------------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Outbound messages        | yes       |                                                                                                                                                       |
+| Reactions (add + remove) | yes       |                                                                                                                                                       |
+| Message editing          | yes       | `channel_edit` maps to `PATCH /channels/{id}/messages/{id}`; edits the bot's own messages only (`50005` otherwise)                                    |
+| Typing indicator         | yes       | Fire-and-forget; auto-expires ~10s; re-fired every 8s; no explicit stop                                                                               |
+| Channel-name resolution  | yes       |                                                                                                                                                       |
+| Self identity            | yes       |                                                                                                                                                       |
+| History                  | yes       | Limit 100 messages                                                                                                                                    |
+| Attachments              | yes       | Land in channel root even when session is in a thread (SDK posts multipart-only; text and file can't go in one threaded round-trip)                   |
+| Membership               | yes       | Requires `GUILD_MEMBERS` privileged intent; returns 403 without it                                                                                    |
+| Cross-channel reads      | full      | Backs all three `channel_read` modes (`history`, `message`, `list`) — see [Cross-channel reads](/docs/reference/channel-adapters#cross-channel-reads) |
 
 ## Slash commands
 
