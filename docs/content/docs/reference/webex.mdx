@@ -81,6 +81,7 @@ CLI: `typeclaw channel add webex` (interactive). **Do not use `channel set`** fo
 | Channel-name resolution | yes       | Resolves space titles via the Spaces API, 24h cache                                            |
 | Self identity           | yes       |                                                                                                |
 | History                 | yes       | Limit 100 messages; prefetch is rate-limited per room (explicit `channel_history` bypasses it) |
+| Cross-channel reads     | full      | `channel_read` can list spaces, read their history, and fetch one message by id                |
 | Attachments             | yes       | Inbound fetch + outbound upload; text and one file post in a single multipart call             |
 | Membership              | partial   | The membership API exposes no bot/human type field, so only the agent's own account is typed   |
 
