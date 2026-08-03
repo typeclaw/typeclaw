@@ -36,6 +36,7 @@ CLI: `typeclaw channel add webex-bot` (interactive), `typeclaw channel set webex
 | Channel-name resolution | yes       | Resolves room titles via the Spaces API                                                                      |
 | Self identity           | yes       | From `testAuth` (the bot's own person record)                                                                |
 | History                 | partial   | Single page (newest-first, reversed); the Webex messages API exposes no pagination cursor                    |
+| Cross-channel reads     | full      | `channel_read` can list spaces, read their history, and fetch one message by id                              |
 | Attachments             | inbound   | Inbound files are fetchable via `channel_fetch_attachment`; outbound file upload is not supported by the SDK |
 | Threading               | no        | `sendMessage` has no `parentId`; thread replies post to the room root (logged as a warning)                  |
 | Membership              | partial   | The membership API can't split bot/human counts; group reports humans = total − 1, bots = 1                  |
