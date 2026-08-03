@@ -5,6 +5,7 @@ import type {
   WebexMembership,
   WebexMessage,
   WebexPerson,
+  WebexSpace,
 } from 'agent-messenger/webexbot'
 
 import {
@@ -23,11 +24,18 @@ import type { ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type {
   ChannelHistoryMessage,
+  ChannelListEntry,
   ChannelSelfIdentityResolver,
   FetchAttachmentCallback,
   FetchHistoryArgs,
   FetchHistoryResult,
   HistoryCallback,
+  GetMessageArgs,
+  GetMessageResult,
+  ListCallback,
+  ListChannelsArgs,
+  ListChannelsResult,
+  MessageGetCallback,
   OutboundCallback,
   OutboundMessage,
   ResolvedChannelNames,
@@ -186,6 +194,37 @@ export function createWebexHistoryCallback(deps: {
   }
 }
 
+export function createWebexMessageGetCallback(deps: {
+  client: Pick<WebexBotClient, 'getMessage'>
+  logger: WebexBotAdapterLogger
+  botPersonIdRef: () => string | null
+}): MessageGetCallback {
+  return async (args: GetMessageArgs): Promise<GetMessageResult> => {
+    try {
+      const message = await deps.client.getMessage(args.messageId)
+      return { ok: true, message: mapWebexHistoryMessage(message, deps.botPersonIdRef()) }
+    } catch (err) {
+      deps.logger.warn(`[webex-bot] message get failed: ${describeError(err)}`)
+      throw err
+    }
+  }
+}
+
+export function createWebexListCallback(deps: {
+  client: Pick<WebexBotClient, 'listSpaces'>
+  logger: WebexBotAdapterLogger
+}): ListCallback {
+  return async (args: ListChannelsArgs): Promise<ListChannelsResult> => {
+    try {
+      const spaces = await deps.client.listSpaces({ max: clampLimit(args.limit, 100) })
+      return { ok: true, entries: spaces.map(mapWebexSpace) }
+    } catch (err) {
+      deps.logger.warn(`[webex-bot] channel list failed: ${describeError(err)}`)
+      throw err
+    }
+  }
+}
+
 export function createWebexMembershipResolver(deps: {
   client: Pick<WebexBotClient, 'listMemberships'>
   logger: WebexBotAdapterLogger
@@ -310,6 +349,12 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
   }
 
   const historyCallback = createWebexHistoryCallback({ client, logger, botPersonIdRef: () => botPerson?.ref ?? null })
+  const messageGetCallback = createWebexMessageGetCallback({
+    client,
+    logger,
+    botPersonIdRef: () => botPerson?.ref ?? null,
+  })
+  const listCallback = createWebexListCallback({ client, logger })
   const membershipResolver = createWebexMembershipResolver({
     client,
     logger,
@@ -400,6 +445,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       options.router.registerChannelNameResolver('webex-bot', channelResolver)
       options.router.registerSelfIdentity('webex-bot', selfIdentityResolver)
       options.router.registerHistory('webex-bot', historyCallback)
+      options.router.registerMessageGet('webex-bot', messageGetCallback)
+      options.router.registerList('webex-bot', listCallback)
       options.router.registerFetchAttachment('webex-bot', fetchAttachmentCallback)
       options.router.registerMembership('webex-bot', membershipResolver)
       options.router.registerEditMessage('webex-bot', editMessageCallback)
@@ -409,6 +456,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
         options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
         options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
         options.router.unregisterHistory('webex-bot', historyCallback)
+        options.router.unregisterMessageGet('webex-bot', messageGetCallback)
+        options.router.unregisterList('webex-bot', listCallback)
         options.router.unregisterFetchAttachment('webex-bot', fetchAttachmentCallback)
         options.router.unregisterMembership('webex-bot', membershipResolver)
         options.router.unregisterEditMessage('webex-bot', editMessageCallback)
@@ -441,6 +490,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
       options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
       options.router.unregisterHistory('webex-bot', historyCallback)
+      options.router.unregisterMessageGet('webex-bot', messageGetCallback)
+      options.router.unregisterList('webex-bot', listCallback)
       options.router.unregisterFetchAttachment('webex-bot', fetchAttachmentCallback)
       options.router.unregisterMembership('webex-bot', membershipResolver)
       options.router.unregisterEditMessage('webex-bot', editMessageCallback)
@@ -475,6 +526,15 @@ function mapWebexHistoryMessage(msg: WebexMessage, botPersonId: string | null): 
     isBot: botPersonId !== null && msg.personRef === botPersonId,
     replyToBotMessageId: msg.parentRef ?? null,
     ...(attachments.length > 0 ? { attachments } : {}),
+  }
+}
+
+function mapWebexSpace(space: WebexSpace): ChannelListEntry {
+  return {
+    chat: space.id,
+    name: space.title !== '' ? space.title : space.id,
+    kind: space.type === 'direct' ? 'dm' : 'group',
+    isMember: true,
   }
 }
 

@@ -39,7 +39,7 @@ export const ADAPTER_READ_CAPABILITIES: Record<AdapterId, readonly ReadCapabilit
   teams: ['history'],
   'telegram-bot': [],
   webex: ['history', 'message-get', 'list'],
-  'webex-bot': ['history'],
+  'webex-bot': ['history', 'message-get', 'list'],
 }
 
 export type WriteCapability = 'message-edit'
