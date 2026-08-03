@@ -12,6 +12,8 @@ import {
   createTypingCallback,
   createWebexAdapter,
   createWebexHistoryCallback,
+  createWebexListCallback,
+  createWebexMessageGetCallback,
   type WebexAdapterLogger,
 } from './webex'
 import type { WebexInboundMessage } from './webex-classify'
@@ -99,13 +101,17 @@ function router(): ChannelRouter & { routed: InboundMessage[]; registered: strin
     registerTyping: (adapter: string) => registered.push(`typing:${adapter}`),
     unregisterTyping: (adapter: string) => unregistered.push(`typing:${adapter}`),
     setTypingCapability: (adapter: string, supported: boolean) =>
-      registered.push(`typing-cap:${adapter}=${String(supported)}`),
+      (supported ? registered : unregistered).push(`typing-cap:${adapter}=${String(supported)}`),
     registerChannelNameResolver: (adapter: string) => registered.push(`names:${adapter}`),
     unregisterChannelNameResolver: (adapter: string) => unregistered.push(`names:${adapter}`),
     registerSelfIdentity: (adapter: string) => registered.push(`self:${adapter}`),
     unregisterSelfIdentity: (adapter: string) => unregistered.push(`self:${adapter}`),
     registerHistory: (adapter: string) => registered.push(`history:${adapter}`),
     unregisterHistory: (adapter: string) => unregistered.push(`history:${adapter}`),
+    registerMessageGet: (adapter: string) => registered.push(`message-get:${adapter}`),
+    unregisterMessageGet: (adapter: string) => unregistered.push(`message-get:${adapter}`),
+    registerList: (adapter: string) => registered.push(`list:${adapter}`),
+    unregisterList: (adapter: string) => unregistered.push(`list:${adapter}`),
     registerFetchAttachment: (adapter: string) => registered.push(`fetch:${adapter}`),
     unregisterFetchAttachment: (adapter: string) => unregistered.push(`fetch:${adapter}`),
     registerMembership: (adapter: string) => registered.push(`membership:${adapter}`),
@@ -254,6 +260,8 @@ describe('createWebexAdapter', () => {
           testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
           listMemberships: async () => [],
           listMessages: async () => [],
+          listSpaces: async () => [],
+          getMessage: async () => webexMessage(),
           sendMessage: async () => ({ id: 'sent' }),
           uploadFile: async () => ({ id: 'uploaded' }),
         }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
@@ -271,6 +279,8 @@ describe('createWebexAdapter', () => {
       'names:webex',
       'self:webex',
       'history:webex',
+      'message-get:webex',
+      'list:webex',
       'fetch:webex',
       'membership:webex',
       'edit:webex',
@@ -297,6 +307,8 @@ describe('createWebexAdapter', () => {
           }),
           listMemberships: async () => [],
           listMessages: async () => [],
+          listSpaces: async () => [],
+          getMessage: async () => webexMessage(),
           sendMessage: async () => ({ id: 'sent' }),
           uploadFile: async () => ({ id: 'uploaded' }),
         }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
@@ -334,6 +346,8 @@ describe('createWebexAdapter', () => {
           testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
           listMemberships: async () => [],
           listMessages: async () => [],
+          listSpaces: async () => [],
+          getMessage: async () => webexMessage(),
           sendMessage: async () => ({ id: 'sent' }),
           uploadFile: async () => ({ id: 'uploaded' }),
         }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
@@ -349,6 +363,8 @@ describe('createWebexAdapter', () => {
     expect(r.routed[0]?.isBotMention).toBe(true)
     expect(listener.stopped).toBe(true)
     expect(r.unregistered).toContain('outbound:webex')
+    expect(r.unregistered).toContain('message-get:webex')
+    expect(r.unregistered).toContain('list:webex')
   })
 
   test('inbound/routed logs print event refs', async () => {
@@ -370,6 +386,8 @@ describe('createWebexAdapter', () => {
           testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
           listMemberships: async () => [],
           listMessages: async () => [],
+          listSpaces: async () => [],
+          getMessage: async () => webexMessage(),
           sendMessage: async () => ({ id: 'sent' }),
           uploadFile: async () => ({ id: 'uploaded' }),
         }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
@@ -393,6 +411,118 @@ describe('createWebexAdapter', () => {
     expect(inboundLine).toContain('id=99999999-8888-7777-6666-555555555555')
     expect(inboundLine).toContain('room=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
     expect(inboundLine).not.toContain('Y2lz')
+  })
+
+  test('rolls back read callbacks when listener start fails', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    listener.start = async () => {
+      throw new Error('start failed')
+    }
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          listMemberships: async () => [],
+          listMessages: async () => [],
+          listSpaces: async () => [],
+          getMessage: async () => webexMessage(),
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    await expect(adapter.start()).rejects.toThrow('start failed')
+
+    expect(r.unregistered).toHaveLength(r.registered.length)
+    expect(r.unregistered).toContain('message-get:webex')
+    expect(r.unregistered).toContain('list:webex')
+  })
+})
+
+describe('webex arbitrary reads', () => {
+  test('lists spaces with Webex ids, titles, kinds, membership, and the requested limit', async () => {
+    const calls: Array<{ type?: string; max?: number } | undefined> = []
+    const cb = createWebexListCallback({
+      client: {
+        listSpaces: async (options) => {
+          calls.push(options)
+          return [
+            {
+              id: 'room-group',
+              title: 'Planning',
+              type: 'group',
+              isLocked: false,
+              lastActivity: '',
+              created: '',
+              creatorId: 'user-1',
+            },
+            {
+              id: 'room-direct',
+              title: 'Alice',
+              type: 'direct',
+              isLocked: false,
+              lastActivity: '',
+              created: '',
+              creatorId: 'user-2',
+            },
+          ]
+        },
+      },
+      logger: logger(),
+    })
+
+    const result = await cb({ workspace: 'webex', limit: 25, cursor: 'ignored-by-upstream' })
+
+    expect(calls).toEqual([{ max: 25 }])
+    expect(result).toEqual({
+      ok: true,
+      entries: [
+        { chat: 'room-group', name: 'Planning', kind: 'group', isMember: true },
+        { chat: 'room-direct', name: 'Alice', kind: 'dm', isMember: true },
+      ],
+    })
+  })
+
+  test('maps one upstream message identically to Webex history', async () => {
+    const cb = createWebexMessageGetCallback({
+      client: {
+        getMessage: async (messageId) => webexMessage({ ref: messageId, text: 'hello', personRef: 'bot-1' }),
+      },
+      logger: logger(),
+      botPersonIdRef: () => 'bot-1',
+    })
+
+    const result = await cb({ chat: 'room-1', thread: null, messageId: 'message-1' })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected message')
+    expect(result.message).toMatchObject({ externalMessageId: 'message-1', text: 'hello', isBot: true })
+  })
+
+  test('rethrows list and message failures so the router reports adapter-error', async () => {
+    const log = logger()
+    const failure = new Error('upstream unavailable')
+    const list = createWebexListCallback({
+      client: { listSpaces: async () => Promise.reject(failure) },
+      logger: log,
+    })
+    const get = createWebexMessageGetCallback({
+      client: { getMessage: async () => Promise.reject(failure) },
+      logger: log,
+      botPersonIdRef: () => null,
+    })
+
+    await expect(list({ workspace: 'webex', limit: 10 })).rejects.toBe(failure)
+    await expect(get({ chat: 'room-1', thread: null, messageId: 'message-1' })).rejects.toBe(failure)
+    expect(log.lines).toContain('warn:[webex] channel list failed: upstream unavailable')
+    expect(log.lines).toContain('warn:[webex] message get failed: upstream unavailable')
   })
 })
 

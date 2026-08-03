@@ -38,7 +38,7 @@ export const ADAPTER_READ_CAPABILITIES: Record<AdapterId, readonly ReadCapabilit
   'slack-bot': ['history', 'message-get', 'list'],
   teams: ['history'],
   'telegram-bot': [],
-  webex: ['history'],
+  webex: ['history', 'message-get', 'list'],
   'webex-bot': ['history'],
 }
 
