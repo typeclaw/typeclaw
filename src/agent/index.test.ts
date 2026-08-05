@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 
 import { defineTool as definePiTool, SessionManager } from '@mariozechner/pi-coding-agent'
 import { Type } from 'typebox'
@@ -68,12 +68,16 @@ function silentLogger() {
 }
 
 let agentDir: string
+let savedAgentMessengerConfigDir: string | undefined
 
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-agent-'))
+  savedAgentMessengerConfigDir = process.env.AGENT_MESSENGER_CONFIG_DIR
 })
 
 afterEach(async () => {
+  if (savedAgentMessengerConfigDir === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
+  else process.env.AGENT_MESSENGER_CONFIG_DIR = savedAgentMessengerConfigDir
   await rm(agentDir, { recursive: true, force: true })
 })
 
@@ -247,8 +251,9 @@ describe('createResourceLoader', () => {
 
     // then
     const prompt = loader.getSystemPrompt() ?? ''
-    expect(prompt).not.toContain('## Runtime')
+    expect(prompt).not.toContain('## Runtime\n')
     expect(prompt).not.toContain('TypeClaw runtime version')
+    expect(prompt).toContain('## Runtime paths')
   })
 
   test('renders the runtime block under "## Runtime" when runtimeVersion is provided', async () => {
@@ -278,6 +283,50 @@ describe('createResourceLoader', () => {
     expect(runtimeIdx).toBeGreaterThan(-1)
     expect(originIdx).toBeGreaterThan(-1)
     expect(runtimeIdx).toBeLessThan(originIdx)
+  })
+
+  test('honors the live AGENT_MESSENGER_CONFIG_DIR override', async () => {
+    // given
+    process.env.AGENT_MESSENGER_CONFIG_DIR = '/runtime/config/agent-messenger'
+
+    // when
+    const loader = await createResourceLoader({ agentDir })
+
+    // then
+    const prompt = loader.getSystemPrompt() ?? ''
+    expect(prompt).toContain(`- Agent folder: \`${agentDir}\``)
+    expect(prompt).toContain('- `AGENT_MESSENGER_CONFIG_DIR`: `/runtime/config/agent-messenger`')
+  })
+
+  test.each([
+    ['absent', undefined],
+    ['empty', ''],
+  ] as const)('falls back to HOME when AGENT_MESSENGER_CONFIG_DIR is %s', async (_name, value) => {
+    // given
+    if (value === undefined) delete process.env.AGENT_MESSENGER_CONFIG_DIR
+    else process.env.AGENT_MESSENGER_CONFIG_DIR = value
+
+    // when
+    const loader = await createResourceLoader({ agentDir })
+
+    // then
+    const prompt = loader.getSystemPrompt() ?? ''
+    expect(prompt).toContain(`- Runtime process \`HOME\`: \`${homedir()}\` (tool sandboxes may differ)`)
+    expect(prompt).toContain(`- \`AGENT_MESSENGER_CONFIG_DIR\`: \`${join(homedir(), '.config', 'agent-messenger')}\``)
+  })
+
+  test('normalizes a relative AGENT_MESSENGER_CONFIG_DIR against the process cwd', async () => {
+    // given
+    process.env.AGENT_MESSENGER_CONFIG_DIR = 'workspace/.config/agent-messenger'
+
+    // when
+    const loader = await createResourceLoader({ agentDir })
+
+    // then
+    const prompt = loader.getSystemPrompt() ?? ''
+    expect(prompt).toContain(
+      `- \`AGENT_MESSENGER_CONFIG_DIR\`: \`${resolve(process.cwd(), 'workspace/.config/agent-messenger')}\``,
+    )
   })
 
   test('full cache-suffix ordering: role block < gitNudge', async () => {
@@ -1029,6 +1078,24 @@ describe('composeSystemPrompt slim mode', () => {
 })
 
 describe('composeSystemPrompt branding', () => {
+  test.each([true, false])('includes runtime paths when branding is %s', (branding) => {
+    // given / when
+    const prompt = composeSystemPrompt({
+      branding,
+      self: '# Identity\n\nfoo',
+      runtimePaths: {
+        agentDir: '/agent',
+        homeDir: '/home/agent',
+        agentMessengerConfigDir: '/agent/workspace/.config/agent-messenger',
+      },
+      gitNudge: '',
+    })
+
+    // then
+    expect(prompt).toContain('## Runtime paths')
+    expect(prompt).toContain('- Agent folder: `/agent`')
+  })
+
   test('branding off drops the runtime block and every TypeClaw clue (full mode)', () => {
     const prompt = composeSystemPrompt({
       branding: false,
@@ -1115,6 +1182,20 @@ describe('createOverrideResourceLoader', () => {
     const prompt = loader.getSystemPrompt() ?? ''
     expect(prompt).toContain('## Runtime')
     expect(prompt).toContain('TypeClaw runtime version: 9.9.9.')
+  })
+
+  test('appends runtime paths to the production subagent override prompt', async () => {
+    // given
+    process.env.AGENT_MESSENGER_CONFIG_DIR = '/agent/workspace/.config/agent-messenger'
+
+    // when
+    const loader = await createOverrideResourceLoader('SUBAGENT PROMPT')
+
+    // then
+    const prompt = loader.getSystemPrompt() ?? ''
+    expect(prompt).toContain('## Runtime paths')
+    expect(prompt).toContain(`- Agent folder: \`${process.cwd()}\``)
+    expect(prompt).toContain('- `AGENT_MESSENGER_CONFIG_DIR`: `/agent/workspace/.config/agent-messenger`')
   })
 })
 

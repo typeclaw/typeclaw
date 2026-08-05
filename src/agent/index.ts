@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -67,7 +68,9 @@ import {
   DEFAULT_SUBAGENT_ROSTER,
   renderRuntimeBlock,
   renderRuntimeNondisclosureRule,
+  renderRuntimePathsBlock,
   stripRuntimeIdentityProse,
+  type RuntimePaths,
 } from './system-prompt'
 import { attachToolNotFoundNudge } from './tool-not-found-nudge'
 import { createBudgetState, type ToolResultBudget, wrapToolDefinitionWithBudget } from './tool-result-budget'
@@ -986,7 +989,8 @@ export async function createOverrideResourceLoader(
       ? `${systemPrompt}\n\n${renderRuntimeBlock(runtimeVersion)}`
       : systemPrompt
     : `${stripRuntimeIdentityProse(systemPrompt)}\n\n${renderRuntimeNondisclosureRule()}`
-  const finalPrompt = withOrigin(withRuntime, origin, permissions)
+  const withRuntimePaths = `${withRuntime}\n\n${renderRuntimePathsBlock(resolveRuntimePaths(process.cwd()))}`
+  const finalPrompt = withOrigin(withRuntimePaths, origin, permissions)
   const loader = new DefaultResourceLoader({
     cwd: process.cwd(),
     agentDir: process.cwd(),
@@ -1080,6 +1084,7 @@ export type SystemPromptComposition = {
   // Falls back to `DEFAULT_SUBAGENT_ROSTER` when omitted.
   subagentRoster?: string
   runtimeVersion?: string
+  runtimePaths?: RuntimePaths
   origin?: SessionOrigin
   roleContext?: SessionRoleContext
   mcpCatalog?: string
@@ -1096,11 +1101,12 @@ export type SystemPromptComposition = {
 // that differs).
 //
 // 0. runtime block — most stable: only changes on typeclaw releases (rare).
-// 1. origin block — stable across all sessions of the same kind.
-// 2. gitNudge — rare changes; agent folders force-commit sessions/ and
+// 1. runtime paths — stable for the current container boot.
+// 2. origin block — stable across all sessions of the same kind.
+// 3. gitNudge — rare changes; agent folders force-commit sessions/ and
 //    memory/ after every turn, so the dirty-files list is empty most of
 //    the time.
-// 3. proactive next-step nudge — deterministic per model family.
+// 4. proactive next-step nudge — deterministic per model family.
 //
 // The wall-clock anchor that used to live here as `## Now` moved out
 // entirely. It is now injected into the user turn at each `session.prompt`
@@ -1121,6 +1127,9 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   }
   if (!branding) {
     prompt = `${prompt}\n\n${renderRuntimeNondisclosureRule()}`
+  }
+  if (parts.runtimePaths !== undefined) {
+    prompt = `${prompt}\n\n${renderRuntimePathsBlock(parts.runtimePaths)}`
   }
   if (parts.origin !== undefined) {
     prompt = `${prompt}\n\n${renderSessionOrigin(parts.origin, Date.now(), parts.roleContext)}`
@@ -1223,6 +1232,7 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     self,
     subagentRoster,
     ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
+    runtimePaths: resolveRuntimePaths(agentDir),
     ...(options.origin !== undefined ? { origin: options.origin } : {}),
     ...(roleContext !== undefined ? { roleContext } : {}),
     ...(mcpCatalog !== undefined ? { mcpCatalog } : {}),
@@ -1268,6 +1278,18 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
   })
   await loader.reload()
   return loader
+}
+
+function resolveRuntimePaths(agentDir: string): RuntimePaths {
+  const homeDir = homedir()
+  const configuredAgentMessengerDir = process.env.AGENT_MESSENGER_CONFIG_DIR
+  const agentMessengerConfigDir =
+    configuredAgentMessengerDir !== undefined && configuredAgentMessengerDir !== ''
+      ? isAbsolute(configuredAgentMessengerDir)
+        ? configuredAgentMessengerDir
+        : resolve(process.cwd(), configuredAgentMessengerDir)
+      : join(homeDir, '.config', 'agent-messenger')
+  return { agentDir, homeDir, agentMessengerConfigDir }
 }
 
 function withOrigin(
