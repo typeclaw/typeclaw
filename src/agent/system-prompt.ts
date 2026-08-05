@@ -184,6 +184,27 @@ export function renderRuntimeBlock(version: string): string {
 TypeClaw runtime version: ${version}.`
 }
 
+export type RuntimePaths = {
+  agentDir: string
+  homeDir: string
+  agentMessengerConfigDir: string
+}
+
+// These values must come from the running process on every boot, not from
+// intended container constants. A memory shard retained
+// `/root/.config/agent-messenger/MEMORY.md` across the 0.46.2/0.47.0 HOME and
+// config-directory moves, then outranked the changed infrastructure because it
+// was never re-observed. The regenerated system prompt gives the model an
+// authoritative source that stays fresh when runtime wiring changes again.
+export function renderRuntimePathsBlock(paths: RuntimePaths): string {
+  return `## Runtime paths
+
+Current for this container boot; prefer these over remembered paths:
+- Agent folder: \`${paths.agentDir}\`
+- Runtime process \`HOME\`: \`${paths.homeDir}\` (tool sandboxes may differ)
+- \`AGENT_MESSENGER_CONFIG_DIR\`: \`${paths.agentMessengerConfigDir}\``
+}
+
 // Appended to the system prompt ONLY when `config.branding` is false. Branding
 // off rephrases the opening and drops the version block, but the literal
 // "typeclaw" still reaches the model through functional tokens it can't lose

@@ -8,11 +8,34 @@ import {
   DEFAULT_SUBAGENT_ROSTER,
   DEFAULT_SYSTEM_PROMPT,
   renderRuntimeNondisclosureRule,
+  renderRuntimePathsBlock,
   renderTurnRoleAnchor,
   renderTurnTimeAnchor,
   SLIM_SYSTEM_PROMPT,
   stripRuntimeIdentityProse,
 } from './system-prompt'
+
+describe('renderRuntimePathsBlock', () => {
+  test('renders the three live runtime paths as inline code', () => {
+    // given
+    const paths = {
+      agentDir: '/agent',
+      homeDir: '/home/agent',
+      agentMessengerConfigDir: '/agent/workspace/.config/agent-messenger',
+    }
+
+    // when
+    const block = renderRuntimePathsBlock(paths)
+
+    // then
+    expect(block).toBe(`## Runtime paths
+
+Current for this container boot; prefer these over remembered paths:
+- Agent folder: \`/agent\`
+- Runtime process \`HOME\`: \`/home/agent\` (tool sandboxes may differ)
+- \`AGENT_MESSENGER_CONFIG_DIR\`: \`/agent/workspace/.config/agent-messenger\``)
+  })
+})
 
 describe('subagent orchestration — explicit research routing', () => {
   // Guards the regression where an explicit "do a research" directive was answered
