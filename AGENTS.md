@@ -30,7 +30,7 @@ bun run debug:prompt --origin cron         # just one
 bun run debug:prompt --origin channel --no-git-nudge
 ```
 
-`composeSystemPrompt` (`src/agent/index.ts`) is the right entry point if you're adding a new section. The cache-suffix contract (least-volatile first → identity → runtime → origin+role → git → memory → now) is enforced by both the helper and `scripts/dump-system-prompt.test.ts`. Reorder one without the other and CI fails. The trailing `## Now` block is pinned last to keep the cache prefix stable across sessions — don't move it.
+`composeSystemPrompt` (`src/agent/index.ts`) is the right entry point if you're adding a new section. The cache-suffix contract (least-volatile first → identity → runtime → runtime paths → origin+role → git → memory → now) is enforced by both the helper and `scripts/dump-system-prompt.test.ts`. Reorder one without the other and CI fails. The trailing `## Now` block is pinned last to keep the cache prefix stable across sessions — don't move it.
 
 Memory is injected per turn into the user prompt; the system prompt never contains long-term memory; vector memory is always on. The memory plugin's `session.turn.start` hook renders de-duplicated direct shards (under budget) or top-K hybrid-search results (over budget) into `event.retrievalContext.results`, which the four turn-drivers (server TUI, channel router, cron consumer, subagent runner) append to the user text.
 

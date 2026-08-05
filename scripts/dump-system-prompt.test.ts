@@ -19,6 +19,7 @@ describe('dumpSystemPrompt', () => {
       expect(out).toContain('# Identity')
       expect(out).toContain('## Runtime')
       expect(out).toContain('TypeClaw runtime version: 1.2.3-debug.')
+      expect(out).toContain('## Runtime paths')
       expect(out).toContain('## Session origin')
       expect(out).toContain('## Your role in this session')
       expect(out).not.toContain('# Memory')
@@ -32,6 +33,7 @@ describe('dumpSystemPrompt', () => {
     const out = dumpSystemPrompt('subagent')
 
     expect(out).toContain('## Runtime')
+    expect(out).toContain('## Runtime paths')
     expect(out).toContain('## Session origin')
     expect(out).toContain('## Your role in this session')
     expect(out).not.toContain('## Now')
@@ -176,6 +178,7 @@ describe('dumpSystemPrompt', () => {
       'DEFAULT_SYSTEM_PROMPT (base)',
       'Identity (IDENTITY.md + SOUL.md)',
       'Runtime block',
+      'Runtime paths',
       'Session origin',
       'Role context',
       'Git nudge',
@@ -188,6 +191,7 @@ describe('dumpSystemPrompt', () => {
       'SLIM_SYSTEM_PROMPT (base)',
       'Identity (IDENTITY.md + SOUL.md)',
       'Runtime block',
+      'Runtime paths',
       'Session origin',
       'Role context',
     ])
@@ -195,7 +199,7 @@ describe('dumpSystemPrompt', () => {
 
   test('subagent breakdown reflects production override path: override + runtime + origin/role', () => {
     const names = dumpSystemPromptWithBreakdown('subagent').sections.map((s) => s.name)
-    expect(names).toEqual(['Subagent override prompt', 'Runtime block', 'Session origin + role'])
+    expect(names).toEqual(['Subagent override prompt', 'Runtime block', 'Runtime paths', 'Session origin + role'])
     expect(names).not.toContain('SLIM_SYSTEM_PROMPT (base)')
     expect(names).not.toContain('DEFAULT_SYSTEM_PROMPT (base)')
     expect(names).not.toContain('Identity (IDENTITY.md + SOUL.md)')
@@ -231,7 +235,8 @@ describe('dumpSystemPrompt', () => {
     const idx = (needle: string) => out.indexOf(needle)
 
     expect(idx('## IDENTITY.md')).toBeLessThan(idx('TypeClaw runtime version:'))
-    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('## Session origin'))
+    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('## Runtime paths'))
+    expect(idx('## Runtime paths')).toBeLessThan(idx('## Session origin'))
     expect(idx('## Session origin')).toBeLessThan(idx('## Your role in this session'))
     expect(idx('## Your role in this session')).toBeLessThan(idx('git reports 2 uncommitted files'))
   })
@@ -241,7 +246,8 @@ describe('dumpSystemPrompt', () => {
     const idx = (needle: string) => out.indexOf(needle)
 
     expect(idx('## IDENTITY.md')).toBeLessThan(idx('TypeClaw runtime version:'))
-    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('You are running an unattended cron job.'))
+    expect(idx('TypeClaw runtime version:')).toBeLessThan(idx('## Runtime paths'))
+    expect(idx('## Runtime paths')).toBeLessThan(idx('You are running an unattended cron job.'))
     expect(idx('You are running an unattended cron job.')).toBeLessThan(idx('## Your role in this session'))
   })
 

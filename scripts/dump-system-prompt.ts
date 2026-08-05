@@ -4,11 +4,17 @@ import { parseArgs } from 'node:util'
 
 import { composeSystemPrompt, deriveSystemPromptMode, renderTurnTimeAnchor, type SystemPromptMode } from '@/agent'
 import type { SessionOrigin, SessionRoleContext } from '@/agent/session-origin'
+import { renderRuntimePathsBlock, type RuntimePaths } from '@/agent/system-prompt'
 
 type OriginKind = 'tui' | 'cron' | 'channel' | 'subagent'
 const ALL_KINDS: readonly OriginKind[] = ['tui', 'cron', 'channel', 'subagent'] as const
 
 const PLACEHOLDER_RUNTIME_VERSION = '1.2.3-debug'
+const PLACEHOLDER_RUNTIME_PATHS: RuntimePaths = {
+  agentDir: '/agent',
+  homeDir: '/home/agent',
+  agentMessengerConfigDir: '/agent/workspace/.config/agent-messenger',
+}
 
 // Fixed wall-clock for the per-turn `<current-time>` anchor. The dumper
 // needs a deterministic timestamp so successive runs produce byte-identical
@@ -188,7 +194,7 @@ export function dumpSystemPromptWithBreakdown(
 // (and the plugin-subagent path in run/index.ts), both of which set
 // `systemPromptOverride: subagent.systemPrompt`. That routes through
 // `createOverrideResourceLoader`, which emits only:
-//   <override string> + runtime block + origin (with role)
+//   <override string> + runtime block + runtime paths + origin (with role)
 // No DEFAULT/SLIM base, no IDENTITY/SOUL, no git-nudge.
 //
 // Without this branch, the dumper would report a misleadingly large slim
@@ -197,12 +203,14 @@ export function dumpSystemPromptWithBreakdown(
 function dumpSubagentOverridePrompt(): DumpResult {
   const fixture = buildFixture('subagent')
   const runtimeBlock = `## Runtime\n\nTypeClaw runtime version: ${PLACEHOLDER_RUNTIME_VERSION}.`
+  const runtimePathsBlock = renderRuntimePathsBlock(PLACEHOLDER_RUNTIME_PATHS)
   const originBlock = `## Session origin\n\nYou are a \`${(fixture.origin as { subagent: string }).subagent}\` subagent spawned by parent session\n\`${(fixture.origin as { parentSessionId: string }).parentSessionId}\`. Stay narrowly within the task you were given.\nReturn cleanly when done; do not sprawl into unrelated work.\n\n## Your role in this session\n\nRole: \`${fixture.roleContext.role}\`. Permissions: ${fixture.roleContext.permissions.map((p) => `\`${p}\``).join(', ')}.\n\nThis is the role the runtime resolved at session creation. Tool calls\nand channel admission are gated by these permissions; a \`blocked:\` or\n"denied by permissions" message means the current actor lacks the\npermission the guard was looking for. See the \`typeclaw-permissions\`\nskill for what each role can do and how to grant access.`
 
-  const prompt = `${PLACEHOLDER_SUBAGENT_OVERRIDE}\n\n${runtimeBlock}\n\n${originBlock}`
+  const prompt = `${PLACEHOLDER_SUBAGENT_OVERRIDE}\n\n${runtimeBlock}\n\n${runtimePathsBlock}\n\n${originBlock}`
   const sections: SectionBreakdown[] = [
     mkSection('Subagent override prompt', PLACEHOLDER_SUBAGENT_OVERRIDE),
     mkSection('Runtime block', runtimeBlock),
+    mkSection('Runtime paths', runtimePathsBlock),
     mkSection('Session origin + role', originBlock),
   ]
   return {
@@ -222,6 +230,7 @@ function dumpDefaultLoaderPrompt(kind: Exclude<OriginKind, 'subagent'>, options:
     mode,
     self: PLACEHOLDER_SELF,
     runtimeVersion: PLACEHOLDER_RUNTIME_VERSION,
+    runtimePaths: PLACEHOLDER_RUNTIME_PATHS,
     origin: fixture.origin,
     roleContext: fixture.roleContext,
     gitNudge: wantGitNudge ? PLACEHOLDER_GIT_NUDGE : '',
@@ -236,6 +245,7 @@ function dumpDefaultLoaderPrompt(kind: Exclude<OriginKind, 'subagent'>, options:
     mkSection(baseLabel, base),
     mkSection('Identity (IDENTITY.md + SOUL.md)', parts.self),
     mkSection('Runtime block', `## Runtime\n\nTypeClaw runtime version: ${parts.runtimeVersion}.`),
+    mkSection('Runtime paths', renderRuntimePathsBlock(parts.runtimePaths)),
     mkSection('Session origin', extractSection(prompt, '## Session origin', '## Your role in this session')),
     mkSection(
       'Role context',
