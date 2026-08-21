@@ -33,6 +33,7 @@ export type ChannelSessionRecord = {
     status: 'pending' | 'completed'
     attemptedCarriers: (string | null)[]
     dismissalAttempted?: true
+    requestChangesAttempted?: true
   }
 }
 
@@ -237,6 +238,7 @@ function isValidGithubReviewRound(value: unknown, record: Record<string, unknown
     value.attemptedCarriers.length > 0 &&
     value.attemptedCarriers.every((thread) => thread === null || typeof thread === 'string') &&
     value.attemptedCarriers.some((thread) => thread === value.carrierThread) &&
-    (value.dismissalAttempted === undefined || value.dismissalAttempted === true)
+    (value.dismissalAttempted === undefined || value.dismissalAttempted === true) &&
+    (value.requestChangesAttempted === undefined || value.requestChangesAttempted === true)
   )
 }
