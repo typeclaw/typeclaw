@@ -1,7 +1,7 @@
 import { toRef } from '@/channels/adapters/webex-id-ref'
 import { MEMBERSHIP_FRESHNESS_MS, type MembershipCount } from '@/channels/membership'
 import type { AdapterId } from '@/channels/schema'
-import type { ChannelSelfIdentity, ReactionRef } from '@/channels/types'
+import type { ChannelSelfIdentity, GithubReviewFollowupRound, ReactionRef } from '@/channels/types'
 
 export type ChannelParticipant = {
   authorId: string
@@ -39,6 +39,7 @@ export type SessionOrigin =
       chat: string
       chatName?: string
       thread: string | null
+      githubReviewRound?: GithubReviewFollowupRound
       parentChat?: string
       parentChatName?: string
       lastInboundAuthorId?: string

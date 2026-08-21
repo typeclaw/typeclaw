@@ -12,6 +12,7 @@ import {
   type ChannelRouter,
 } from '@/channels/router'
 import { ADAPTER_IDS, type AdapterId } from '@/channels/schema'
+import type { GithubReviewFollowupRound } from '@/channels/types'
 
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 import { renderOutboundEcho, TOOL_RESULT_PREFIX } from './channel-reply'
@@ -22,6 +23,7 @@ export type ChannelSendOrigin = {
   workspace: string
   chat: string
   thread: string | null
+  githubReviewRound?: GithubReviewFollowupRound
 }
 
 export type CreateChannelSendToolOptions = {
@@ -233,6 +235,14 @@ export function createChannelSendTool({
         wantsResolve,
         moreWorkThisTurn: false,
         getReviewState: (req) => router.getReviewState(req),
+        ...(origin !== undefined &&
+        origin.adapter === adapter &&
+        origin.workspace === params.workspace &&
+        origin.chat === params.chat &&
+        origin.thread === (params.thread ?? null) &&
+        origin.githubReviewRound !== undefined
+          ? { round: origin.githubReviewRound }
+          : {}),
       })
       if (rereview.block) {
         logger.warn(formatChannelToolFailure('channel_send', rereview.reason))
@@ -262,6 +272,12 @@ export function createChannelSendTool({
           }
         }
         if (resolve.kind === 'already-resolved') {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: params.workspace,
+            prNumber: parseGithubPrNumber(params.chat),
+            thread: params.thread ?? null,
+          })
           return {
             content: [{ type: 'text' as const, text: alreadyResolvedHint(params.thread ?? null) }],
             details: { ok: true },
@@ -277,6 +293,12 @@ export function createChannelSendTool({
           resolveMissNotice = resolveMissHint(params.thread ?? null)
         } else {
           recordResolvedThreadFromSend(sessionId, params.workspace, params.chat, params.thread ?? null)
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: params.workspace,
+            prNumber: parseGithubPrNumber(params.chat),
+            thread: params.thread ?? null,
+          })
         }
       }
 
@@ -344,6 +366,11 @@ export function createChannelSendTool({
       }
     },
   })
+}
+
+function parseGithubPrNumber(chat: string): number {
+  const match = /^pr:(\d+)$/.exec(chat)
+  return match === null ? 0 : Number(match[1])
 }
 
 function missingReviewThreadResolveChoiceError(input: {

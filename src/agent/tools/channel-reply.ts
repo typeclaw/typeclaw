@@ -12,6 +12,7 @@ import {
   type ChannelRouter,
 } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'
+import type { GithubReviewFollowupRound } from '@/channels/types'
 
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 import { fenceRuntimeNotice, fenceToolResult } from './runtime-notice'
@@ -21,6 +22,7 @@ export type ChannelReplyOrigin = {
   workspace: string
   chat: string
   thread: string | null
+  githubReviewRound?: GithubReviewFollowupRound
 }
 
 export type CreateChannelReplyToolOptions = {
@@ -224,6 +226,7 @@ export function createChannelReplyTool({
         wantsResolve: params.resolve_review_thread === true,
         moreWorkThisTurn: keepTurnAlive,
         getReviewState: (req) => router.getReviewState(req),
+        ...(origin.githubReviewRound !== undefined ? { round: origin.githubReviewRound } : {}),
       })
       if (rereview.block) {
         logger.warn(formatChannelToolFailure('channel_reply', rereview.reason))
@@ -249,6 +252,12 @@ export function createChannelReplyTool({
           }
         }
         if (resolve.kind === 'already-resolved') {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: origin.workspace,
+            prNumber: parseGithubPrNumber(origin.chat),
+            thread: origin.thread,
+          })
           return {
             content: [{ type: 'text' as const, text: alreadyResolvedHint(origin.thread) }],
             details: { ok: true, ...(keepTurnAlive ? { more_work_this_turn: true } : {}) },
@@ -259,6 +268,13 @@ export function createChannelReplyTool({
         // receipt that hides the miss. Mirrors channel_send.
         if (resolve.kind === 'no-match') {
           resolveMissNotice = resolveMissHint(origin.thread)
+        } else {
+          router.finishGithubReviewRoundCloseout?.({
+            sessionId,
+            workspace: origin.workspace,
+            prNumber: parseGithubPrNumber(origin.chat),
+            thread: origin.thread,
+          })
         }
       }
 
@@ -343,6 +359,11 @@ export function createChannelReplyTool({
       }
     },
   })
+}
+
+function parseGithubPrNumber(chat: string): number {
+  const match = /^pr:(\d+)$/.exec(chat)
+  return match === null ? 0 : Number(match[1])
 }
 
 // Returns the denial string when a terminal github PR review-thread text reply
