@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'bun:test'
 
-import { createDeliveryDedup } from './dedup'
+import { createBoundedMap, createDeliveryDedup } from './dedup'
+
+describe('createBoundedMap', () => {
+  it('evicts the least-recently inserted entry once it reaches the cap', () => {
+    const values = createBoundedMap<string, number>(2)
+    values.set('a', 1)
+    values.set('b', 2)
+    values.set('c', 3)
+
+    expect(values.has('a')).toBe(false)
+    expect(values.get('b')).toBe(2)
+    expect(values.get('c')).toBe(3)
+    expect(values.size()).toBe(2)
+  })
+})
 
 describe('createDeliveryDedup', () => {
   it('keeps recent deliveries and evicts least-recently inserted ids', () => {

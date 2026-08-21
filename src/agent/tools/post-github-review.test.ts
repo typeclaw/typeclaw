@@ -162,6 +162,53 @@ describe('post_github_review', () => {
     expect((await first).details).toMatchObject({ ok: true })
   })
 
+  test('serializes concurrent formal verdicts from sibling thread sessions', async () => {
+    const resolverStarted = Promise.withResolvers<void>()
+    const releaseResolver = Promise.withResolvers<void>()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => {
+        resolverStarted.resolve()
+        await releaseResolver.promise
+        return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      return { ok: true, reviewId: 50, state: 'APPROVED' }
+    })
+    const first = run(
+      createPostGithubReviewTool({
+        router: channelRouter,
+        origin: { ...githubOrigin, thread: '101' },
+        sessionId,
+      }),
+      { event: 'APPROVE', body: 'summary' },
+    )
+    const second = run(
+      createPostGithubReviewTool({
+        router: channelRouter,
+        origin: { ...githubOrigin, thread: '202' },
+        sessionId: 'concurrent-session',
+      }),
+      { event: 'APPROVE', body: 'summary' },
+    )
+    await resolverStarted.promise
+    releaseResolver.resolve()
+    const [landed, concurrent] = await Promise.all([first, second])
+
+    expect(landed.details).toMatchObject({ ok: true })
+    expect(concurrent.details).toMatchObject({
+      ok: false,
+      error:
+        'Another session in this agent is already submitting a formal review verdict for this pull request. ' +
+        'Only one verdict may land per PR — do not submit a second review; the in-flight one will post.',
+    })
+    expect(submissions).toBe(1)
+  })
+
   test('posts a duplicate REQUEST_CHANGES as one top-level PR comment', async () => {
     configureReviewVerdictCoordinator({
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
@@ -296,6 +343,38 @@ describe('post_github_review', () => {
     expect((await run(tool, { event: 'REQUEST_CHANGES', body: 'follow-up' })).details).toMatchObject({ ok: false })
     expect(submissions).toBe(1)
     expect(comments).toHaveLength(0)
+  })
+
+  test('blocks a sequential sibling verdict on the recent-landed cooldown', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => 'sha-1',
+    })
+    const channelRouter = router()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      return { ok: true, reviewId: 51, state: 'APPROVED' }
+    })
+    const firstTool = createPostGithubReviewTool({
+      router: channelRouter,
+      origin: { ...githubOrigin, thread: '101' },
+      sessionId,
+    })
+    const secondTool = createPostGithubReviewTool({
+      router: channelRouter,
+      origin: { ...githubOrigin, thread: '202' },
+      sessionId: 'concurrent-session',
+    })
+
+    expect((await run(firstTool, { event: 'APPROVE', body: 'first' })).details).toMatchObject({ ok: true })
+    const second = await run(secondTool, { event: 'APPROVE', body: 'follow-up' })
+
+    expect(second.details).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('already holds a standing APPROVED review'),
+    })
+    expect(submissions).toBe(1)
   })
 
   test('keeps adversarial finding paths inside a single Markdown code span', async () => {

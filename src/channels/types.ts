@@ -46,11 +46,19 @@ export type InboundAttachment = {
   sizeBytes?: number
 }
 
+export type GithubReviewFollowupRound = {
+  workspace: string
+  prNumber: number
+  headSha: string
+  carrierThread: string | null
+}
+
 export type InboundMessage = {
   adapter: AdapterId
   workspace: string
   chat: string
   thread: string | null
+  githubReviewRound?: GithubReviewFollowupRound
   // Structural "this message lives in a thread room" signal, kept SEPARATE
   // from `thread`. `thread` is a reply-routing field whose meaning differs per
   // platform: Slack puts the thread ts here (so `thread !== null` ⇒ thread

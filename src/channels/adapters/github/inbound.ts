@@ -1,13 +1,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 import type { GithubReviewOn } from '@/channels/schema'
-import type { InboundMessage } from '@/channels/types'
+import type { GithubReviewFollowupRound, InboundMessage } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { removeRequestedReviewer } from './decoy-reviewer'
-import type { DeliveryDedup } from './dedup'
+import { createBoundedMap, type BoundedMap, type DeliveryDedup } from './dedup'
 import { isGithubEventAllowed } from './event-allowlist'
 import { encodeGithubReactionRef, type GithubReactionTarget } from './reactions'
 import { fetchSelfReviewBlocking } from './review-state'
@@ -85,21 +85,23 @@ export async function processVerifiedGithubDelivery(
   input: { event: string; delivery: string; payload: Record<string, unknown> },
 ): Promise<void> {
   const { event, delivery, payload } = input
-  if (delivery !== '') {
+  const action = readString(payload, 'action')
+  const isSynchronize = event === 'pull_request' && action === 'synchronize'
+  if (!isSynchronize && delivery !== '') {
     if (options.dedup.has(delivery)) {
       options.logger.info(`[github] duplicate delivery ignored id=${delivery}`)
       return
     }
     // Reserve the delivery id synchronously, BEFORE the awaits below, so a live
     // webhook and the recovery sweep can never both clear the dedup gate for the
-    // same event and route it twice. JS is single-threaded: nothing else runs
-    // between this has-check and add, so the reservation is atomic. The awaits
-    // and classify that follow are all throw-safe, so reserving early cannot
-    // strand a routable event.
+    // same event and route it twice. Synchronize uses its own synchronous,
+    // releasable head-SHA reservation so a failed redelivery can retry. JS is
+    // single-threaded: nothing else runs between this has-check and add, so the
+    // reservation is atomic. The awaits and classify that follow are all
+    // throw-safe, so reserving early cannot strand a routable event.
     options.dedup.add(delivery)
   }
 
-  const action = readString(payload, 'action')
   if (!isGithubEventAllowed(options.allowlist(), event, action)) return
 
   const selfId = options.selfId()
@@ -121,7 +123,7 @@ export async function processVerifiedGithubDelivery(
   // so it runs OFF the ACK path (like the decoy-reviewer drop) and only wakes a
   // session when an obligation is outstanding. Returning here also keeps
   // synchronize out of the generic awareness-only fallthrough below.
-  if (event === 'pull_request' && action === 'synchronize') {
+  if (isSynchronize) {
     scheduleReviewFollowup({ payload, selfLogin, options })
     return
   }
@@ -214,6 +216,33 @@ function defaultScheduleBackgroundTask(task: () => Promise<void>): void {
   void task().catch(() => {})
 }
 
+const MAX_REVIEW_FOLLOWUP_ATTEMPTS = 3
+const REVIEW_FOLLOWUP_DEDUP_LIMIT = 1000
+
+type ReviewFollowupDedupState = {
+  reservations: BoundedMap<string, 'pending' | 'completed'>
+  failures: BoundedMap<string, number>
+}
+
+// This state cannot live in createGithubWebhookHandler's closure because the
+// exported processVerifiedGithubDelivery core is also called directly by the
+// recovery sweep. Keying by the shared options identity gives both paths one
+// handler-scoped state while allowing it to be garbage-collected. It stays
+// separate from options.dedup because that add-only delivery cache has no
+// release path, which would recreate the transient-failure retry hole here.
+const reviewFollowupDedupByHandler = new WeakMap<GithubWebhookHandlerOptions, ReviewFollowupDedupState>()
+
+function reviewFollowupDedup(options: GithubWebhookHandlerOptions): ReviewFollowupDedupState {
+  const existing = reviewFollowupDedupByHandler.get(options)
+  if (existing !== undefined) return existing
+  const created: ReviewFollowupDedupState = {
+    reservations: createBoundedMap(REVIEW_FOLLOWUP_DEDUP_LIMIT),
+    failures: createBoundedMap(REVIEW_FOLLOWUP_DEDUP_LIMIT),
+  }
+  reviewFollowupDedupByHandler.set(options, created)
+  return created
+}
+
 function scheduleReviewFollowup(input: {
   payload: Record<string, unknown>
   selfLogin: string | null
@@ -239,15 +268,18 @@ function scheduleReviewFollowup(input: {
     options.logger.warn(`[github] synchronize for ${repository.owner}/${repository.name}#${pullNumber} has no head sha`)
     return
   }
-  const followupKey = `synchronize-followup:${repository.owner}/${repository.name}#${pullNumber}:${headSha}`
-  if (options.dedup.has(followupKey)) return
-  options.dedup.add(followupKey)
+  const followupKey = `${repository.owner}/${repository.name}#${pullNumber}:${headSha}`
+  const followupDedup = reviewFollowupDedup(options)
+  if (followupDedup.reservations.has(followupKey)) return
+  if ((followupDedup.failures.get(followupKey) ?? 0) >= MAX_REVIEW_FOLLOWUP_ATTEMPTS) return
+  followupDedup.reservations.set(followupKey, 'pending')
 
   const reviewOn = options.reviewOn?.() ?? 'review_requested'
   const fetchImpl = options.fetchImpl ?? fetch
   const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
   const target = `${repository.owner}/${repository.name}#${pullNumber}`
   schedule(async () => {
+    let completed = false
     try {
       const token = await authToken({ repoSlug: `${repository.owner}/${repository.name}` })
       const threads = await listUnresolvedSelfReviewThreads({
@@ -276,25 +308,73 @@ function scheduleReviewFollowup(input: {
           fetchImpl,
         })
         if (blocking.ok) selfBlocking = blocking.selfBlocking
-        else options.logger.warn(`[github] review-state recheck failed for ${target}: ${blocking.error}`)
+        else {
+          options.logger.warn(`[github] review-state recheck failed for ${target}: ${blocking.error}`)
+          // Thread and verdict obligations form one follow-up attempt. Routing
+          // only the known threads would mark this SHA complete and permanently
+          // lose a blocking-review obligation, so fail the whole attempt and let
+          // a redelivery retry both lookups before anything is routed.
+          return
+        }
       }
 
-      if (threads.threads.length === 0 && !selfBlocking) return
-      options.route(
-        withApprovalPolicy(
-          buildReviewFollowupInbound({
-            repository,
-            pullNumber,
-            headSha,
-            threads: threads.threads,
-            selfBlocking,
-            title: readString(pr, 'title'),
-          }),
-          options.allowApprove?.() ?? true,
-        ),
-      )
+      if (threads.threads.length === 0) {
+        if (selfBlocking) {
+          const round = buildReviewRound(repository, pullNumber, headSha, null)
+          options.route(
+            withApprovalPolicy(
+              buildReviewFollowupInbound({
+                repository,
+                pullNumber,
+                headSha,
+                thread: null,
+                selfBlocking: true,
+                round,
+                title: readString(pr, 'title'),
+              }),
+              options.allowApprove?.() ?? true,
+            ),
+          )
+        }
+        completed = true
+        return
+      }
+
+      const round = selfBlocking
+        ? buildReviewRound(repository, pullNumber, headSha, String(threads.threads[0]!.rootCommentId))
+        : undefined
+      for (const [index, thread] of threads.threads.entries()) {
+        // Deliver the PR-level blocking obligation through exactly one sibling
+        // thread session. A landed verdict is already fanned across every live
+        // sibling PR session by injectPrVerdictActivity, while asking all of them
+        // to submit it would recreate a cross-session verdict race.
+        const carriesBlockingObligation = selfBlocking && index === 0
+        options.route(
+          withApprovalPolicy(
+            buildReviewFollowupInbound({
+              repository,
+              pullNumber,
+              headSha,
+              thread,
+              selfBlocking: carriesBlockingObligation,
+              ...(round !== undefined ? { round } : {}),
+              title: readString(pr, 'title'),
+            }),
+            options.allowApprove?.() ?? true,
+          ),
+        )
+      }
+      completed = true
     } catch (err) {
       options.logger.warn(`[github] review followup failed for ${target}: ${describeError(err)}`)
+    } finally {
+      if (completed) {
+        followupDedup.reservations.set(followupKey, 'completed')
+        followupDedup.failures.delete(followupKey)
+      } else {
+        followupDedup.reservations.delete(followupKey)
+        followupDedup.failures.set(followupKey, (followupDedup.failures.get(followupKey) ?? 0) + 1)
+      }
     }
   })
 }
@@ -303,23 +383,25 @@ function buildReviewFollowupInbound(input: {
   repository: { owner: string; name: string }
   pullNumber: number
   headSha: string
-  threads: readonly UnresolvedSelfReviewThread[]
+  thread: UnresolvedSelfReviewThread | null
   selfBlocking: boolean
+  round?: GithubReviewFollowupRound
   title: string | null
 }): InboundMessage {
-  const { repository, pullNumber, headSha, threads, selfBlocking, title } = input
+  const { repository, pullNumber, headSha, thread, selfBlocking, round, title } = input
   const titleSegment = title !== null && title.trim() !== '' ? `: "${title}"` : ''
   const text =
     `PR #${pullNumber}${titleSegment} received new commits (now at ${headSha.slice(0, 7)}). ` +
-    followupInstruction(threads, selfBlocking)
+    followupInstruction(thread, selfBlocking)
 
   return {
     adapter: 'github',
     workspace: `${repository.owner}/${repository.name}`,
     chat: `pr:${pullNumber}`,
-    thread: null,
+    thread: thread === null ? null : String(thread.rootCommentId),
+    ...(round !== undefined ? { githubReviewRound: round } : {}),
     text,
-    externalMessageId: `pr-${pullNumber}-recheck-${headSha}`,
+    externalMessageId: `pr-${pullNumber}-recheck-${headSha}${thread === null ? '' : `-thread-${thread.rootCommentId}`}`,
     authorId: 'github-system',
     authorName: 'github',
     authorIsBot: false,
@@ -332,15 +414,27 @@ function buildReviewFollowupInbound(input: {
   }
 }
 
-function followupInstruction(threads: readonly UnresolvedSelfReviewThread[], selfBlocking: boolean): string {
+function buildReviewRound(
+  repository: { owner: string; name: string },
+  prNumber: number,
+  headSha: string,
+  carrierThread: string | null,
+): GithubReviewFollowupRound {
+  return {
+    workspace: `${repository.owner}/${repository.name}`,
+    prNumber,
+    headSha,
+    carrierThread,
+  }
+}
+
+function followupInstruction(thread: UnresolvedSelfReviewThread | null, selfBlocking: boolean): string {
   const threadPart =
-    threads.length > 0
-      ? `You have ${threads.length} unresolved review thread(s) you authored on this PR. ` +
-        `For each, check whether the new commits addressed your concern, then act on THAT thread ` +
-        `by passing its root comment id as \`thread\` to channel_send: if addressed, reply with a short ` +
-        `acknowledgement and resolve_review_thread: true; if not, reply with resolve_review_thread: false ` +
-        `(or leave it). Use the id — not the file/line — as \`thread\`; the file/line is only to tell the ` +
-        `threads apart:\n${threads.map(renderThreadLine).join('\n')}\n`
+    thread !== null
+      ? `This session is scoped to one unresolved review thread you authored. Check whether the new commits ` +
+        `addressed its concern. If addressed, use channel_reply with a short acknowledgement and ` +
+        `resolve_review_thread: true; if not, reply with resolve_review_thread: false (or leave it):\n` +
+        `${renderThreadLine(thread)}\n`
       : ''
   // A held CHANGES_REQUESTED never clears itself: GitHub keeps the block until a
   // fresh APPROVE/COMMENT/dismiss, so a blocking follow-up must always end with a
