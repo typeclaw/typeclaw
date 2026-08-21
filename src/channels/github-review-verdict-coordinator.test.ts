@@ -2,9 +2,12 @@ import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
   __resetReviewVerdictGuardForTest,
+  configureReviewVerdictCoordinator,
   completeGithubReviewRound,
   canPromoteGithubReviewRoundTo,
   createApproveIdempotencyGuard,
+  guardGithubReviewRoundDismissal,
+  releaseGithubReviewRoundDismissal,
   registerGithubReviewRound,
   restoreGithubReviewRound,
   type EffectiveApprovalResolver,
@@ -60,6 +63,55 @@ describe('review verdict idempotency guard', () => {
 
     expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
     expect(reads).toBe(0)
+  })
+
+  test('rejects a non-carrier dismissal before the authoritative head read', async () => {
+    let headReads = 0
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => {
+        headReads += 1
+        return ROUND.headSha
+      },
+    })
+    registerGithubReviewRound(ROUND)
+
+    const decision = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-non-carrier',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '202',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(headReads).toBe(0)
+  })
+
+  test('allows only one carrier dismissal attempt per round', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => ROUND.headSha,
+    })
+    registerGithubReviewRound(ROUND)
+    const first = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-first',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '101',
+    })
+    expect(first).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-first')
+
+    const second = await guardGithubReviewRoundDismissal({
+      callId: 'dismiss-second',
+      workspace: WS,
+      prNumber: 60,
+      round: ROUND,
+      thread: '101',
+    })
+    expect(second).toMatchObject({ block: true, kind: 'round-ineligible' })
   })
 
   test('rejects a verdict with missing metadata while a round is pending for the PR', async () => {

@@ -141,9 +141,10 @@ type Reservation = {
   token: number
   createdAt: number
   headSha: string | null
-  verdict: ReviewVerdict
+  verdict: ReviewVerdict | 'DISMISSED'
   workspace: string
   prNumber: number
+  roundKey?: string
 }
 
 // headSha === null is the UNCERTAINTY sentinel: the command succeeded but the head
@@ -167,6 +168,7 @@ type ReviewRoundState = {
   round: GithubReviewFollowupRound
   status: 'pending' | 'completed'
   attemptedCarriers: Set<string | null>
+  dismissalAttempted: boolean
 }
 let reviewRounds = new Map<string, ReviewRoundState>()
 let tokenSeq = 0
@@ -184,7 +186,12 @@ export function registerGithubReviewRound(round: GithubReviewFollowupRound): Git
   }
   const existing = reviewRounds.get(key)
   if (existing !== undefined) return existing.round
-  reviewRounds.set(key, { round, status: 'pending', attemptedCarriers: new Set([round.carrierThread]) })
+  reviewRounds.set(key, {
+    round,
+    status: 'pending',
+    attemptedCarriers: new Set([round.carrierThread]),
+    dismissalAttempted: false,
+  })
   return round
 }
 
@@ -192,12 +199,14 @@ export function restoreGithubReviewRound(
   round: GithubReviewFollowupRound,
   status: ReviewRoundState['status'],
   attemptedCarriers: readonly (string | null)[] = [round.carrierThread],
+  dismissalAttempted = false,
 ): GithubReviewFollowupRound {
   const registered = registerGithubReviewRound(round)
   reviewRounds.set(githubReviewRoundKey(registered), {
     round: registered,
     status,
     attemptedCarriers: new Set(attemptedCarriers),
+    dismissalAttempted,
   })
   return registered
 }
@@ -205,11 +214,13 @@ export function restoreGithubReviewRound(
 export function githubReviewRoundPersistence(round: GithubReviewFollowupRound): {
   status: ReviewRoundState['status']
   attemptedCarriers: (string | null)[]
+  dismissalAttempted?: true
 } {
   const state = reviewRounds.get(githubReviewRoundKey(round))
   return {
     status: state?.status ?? 'pending',
     attemptedCarriers: Array.from(state?.attemptedCarriers ?? [round.carrierThread]),
+    ...(state?.dismissalAttempted === true ? { dismissalAttempted: true as const } : {}),
   }
 }
 
@@ -224,6 +235,7 @@ export function completeGithubReviewRound(round: GithubReviewFollowupRound): voi
     round: current?.round ?? round,
     status: 'completed',
     attemptedCarriers: current?.attemptedCarriers ?? new Set([round.carrierThread]),
+    dismissalAttempted: current?.dismissalAttempted ?? false,
   })
 }
 
@@ -244,7 +256,12 @@ export function promoteGithubReviewRound(
   const promoted = { ...active, carrierThread }
   const attemptedCarriers = new Set(current?.attemptedCarriers ?? [active.carrierThread])
   attemptedCarriers.add(carrierThread)
-  reviewRounds.set(key, { round: promoted, status: 'pending', attemptedCarriers })
+  reviewRounds.set(key, {
+    round: promoted,
+    status: 'pending',
+    attemptedCarriers,
+    dismissalAttempted: current?.dismissalAttempted ?? false,
+  })
   return promoted
 }
 
@@ -256,6 +273,58 @@ export function canPromoteGithubReviewRoundTo(round: GithubReviewFollowupRound, 
 export async function validateGithubReviewRound(round: GithubReviewFollowupRound): Promise<boolean> {
   const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
   return currentHead !== null && currentHead === round.headSha
+}
+
+export async function guardGithubReviewRoundDismissal(args: {
+  callId: string
+  workspace: string
+  prNumber: number
+  round?: GithubReviewFollowupRound
+  thread?: string | null
+}): Promise<ApproveBlock | null> {
+  const blocked = await evaluateRoundEligibility(args, processHeadShaResolver)
+  if (blocked !== null) return blocked
+  if (args.round === undefined) return null
+
+  const roundKey = githubReviewRoundKey(args.round)
+  const roundState = reviewRounds.get(roundKey)
+  if (roundState?.dismissalAttempted === true) {
+    return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  }
+
+  const key = prKey(args.workspace, args.prNumber)
+  const held = inFlightByPr.get(key)
+  if (held !== undefined && Date.now() - held.createdAt < LEASE_TTL_MS) {
+    return { block: true, kind: 'concurrent', reason: CONCURRENT_REASON }
+  }
+  const reservation: Reservation = {
+    key,
+    token: ++tokenSeq,
+    createdAt: Date.now(),
+    headSha: args.round.headSha,
+    verdict: 'DISMISSED',
+    workspace: args.workspace,
+    prNumber: args.prNumber,
+    roundKey,
+  }
+  inFlightByPr.set(key, reservation)
+  reservationByCall.set(args.callId, reservation)
+  if (roundState !== undefined) roundState.dismissalAttempted = true
+  return null
+}
+
+export function releaseGithubReviewRoundDismissal(callId: string, attempted = true): void {
+  const reservation = reservationByCall.get(callId)
+  if (reservation?.verdict !== 'DISMISSED') return
+  if (!attempted && reservation.roundKey !== undefined) {
+    const state = reviewRounds.get(reservation.roundKey)
+    if (state !== undefined) state.dismissalAttempted = false
+  }
+  releaseReservation(callId, reservation)
+}
+
+export function hasGithubReviewRoundDismissalAttempt(round: GithubReviewFollowupRound): boolean {
+  return reviewRounds.get(githubReviewRoundKey(round))?.dismissalAttempted === true
 }
 
 // Makes a formal `gh ... event=APPROVE|REQUEST_CHANGES` idempotent per PR across
@@ -302,36 +371,8 @@ export function createApproveIdempotencyGuard(deps: {
   return {
     async guard(args): Promise<ApproveBlock | null> {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
-      const pendingRoundForPr = Array.from(reviewRounds.values()).find(
-        (state) =>
-          state.status === 'pending' &&
-          state.round.workspace === args.workspace &&
-          state.round.prNumber === args.prNumber,
-      )
-      if (args.round === undefined && pendingRoundForPr !== undefined) {
-        return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
-      }
-      if (args.round !== undefined) {
-        if (args.round.workspace !== args.workspace || args.round.prNumber !== args.prNumber) {
-          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
-        }
-        const existing = reviewRounds.get(githubReviewRoundKey(args.round))
-        const activeRound = existing?.round ?? args.round
-        if (existing?.status === 'completed') {
-          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
-        }
-        if (activeRound.carrierThread !== (args.thread ?? null)) {
-          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
-        }
-        const currentRoundHead = await (deps.resolveHeadSha ?? processHeadShaResolver)({
-          workspace: activeRound.workspace,
-          prNumber: activeRound.prNumber,
-        })
-        if (currentRoundHead === null || currentRoundHead !== activeRound.headSha) {
-          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
-        }
-        registerGithubReviewRound(activeRound)
-      }
+      const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver)
+      if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
 
       // Reserve BEFORE the await so two calls racing into guard() for the same PR
@@ -420,7 +461,7 @@ export function createApproveIdempotencyGuard(deps: {
         // current head for the lag window) so a push-during-review cannot let a
         // same-verdict duplicate slip past on the new head. The lease stays held
         // across this await (finally below), so the window is not reopened.
-        if (args.succeeded && reservation.headSha !== null) {
+        if (args.succeeded && reservation.headSha !== null && reservation.verdict !== 'DISMISSED') {
           const postHeadSha =
             (await deps.resolveHeadSha?.({ workspace: reservation.workspace, prNumber: reservation.prNumber })) ?? null
           const landedHeadSha = postHeadSha !== null && postHeadSha === reservation.headSha ? postHeadSha : null
@@ -449,6 +490,43 @@ export function createApproveIdempotencyGuard(deps: {
       })
     },
   }
+}
+
+async function evaluateRoundEligibility(
+  args: {
+    workspace: string
+    prNumber: number
+    round?: GithubReviewFollowupRound
+    thread?: string | null
+  },
+  resolveHeadSha: HeadShaResolver,
+): Promise<ApproveBlock | null> {
+  const pendingRoundForPr = Array.from(reviewRounds.values()).find(
+    (state) =>
+      state.status === 'pending' && state.round.workspace === args.workspace && state.round.prNumber === args.prNumber,
+  )
+  if (args.round === undefined) {
+    return pendingRoundForPr === undefined
+      ? null
+      : { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  }
+  if (args.round.workspace !== args.workspace || args.round.prNumber !== args.prNumber) {
+    return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  }
+  const existing = reviewRounds.get(githubReviewRoundKey(args.round))
+  const activeRound = existing?.round ?? args.round
+  if (existing?.status === 'completed' || activeRound.carrierThread !== (args.thread ?? null)) {
+    return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  }
+  const currentRoundHead = await resolveHeadSha({
+    workspace: activeRound.workspace,
+    prNumber: activeRound.prNumber,
+  })
+  if (currentRoundHead === null || currentRoundHead !== activeRound.headSha) {
+    return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  }
+  registerGithubReviewRound(activeRound)
+  return null
 }
 
 // True only when a recently-landed record proves the GitHub NONE is read lag: same
