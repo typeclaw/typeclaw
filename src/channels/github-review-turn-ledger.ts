@@ -7,12 +7,13 @@
 // turn start, so a claim must be backed by an action in the SAME turn.
 
 export type ReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES'
+export type ReviewRoundOutcome = ReviewVerdict | 'DISMISSED'
 
 export type ReviewObserver = (args: {
   sessionId: string
   workspace: string
   prNumber: number
-  verdict: ReviewVerdict
+  verdict: ReviewRoundOutcome
 }) => void
 
 // A formal review LANDED this turn, of ANY state — the two decisive verdicts PLUS
@@ -102,6 +103,15 @@ export function recordReview(args: {
     prNumber: args.prNumber,
     state: args.verdict,
   })
+}
+
+export function recordVerifiedDismissal(args: { sessionId: string; workspace: string; prNumber: number }): void {
+  if (reviewObserver === null) return
+  try {
+    reviewObserver({ ...args, verdict: 'DISMISSED' })
+  } catch {
+    // A broken round wakeup must not turn a verified GitHub mutation into a tool failure.
+  }
 }
 
 export function recordReviewOutput(args: {

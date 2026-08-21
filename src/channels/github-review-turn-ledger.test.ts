@@ -6,6 +6,7 @@ import {
   hasReview,
   recordResolvedThread,
   recordReview,
+  recordVerifiedDismissal,
   recordReviewOutput,
   resetReviewTurn,
   setReviewObserver,
@@ -82,6 +83,17 @@ describe('review observer', () => {
     setReviewObserver((args) => seen.push(args))
     recordResolvedThread({ sessionId: S1, workspace: WS, prNumber: 12, rootCommentId: '555' })
     expect(seen).toEqual([])
+  })
+
+  test('a verified dismissal fires the round-completion observer without crediting a verdict', () => {
+    const seen: unknown[] = []
+    setReviewObserver((args) => seen.push(args))
+
+    recordVerifiedDismissal({ sessionId: S1, workspace: WS, prNumber: 12 })
+
+    expect(seen).toEqual([{ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'DISMISSED' }])
+    expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'APPROVE' })).toBe(false)
+    expect(hasReview({ sessionId: S1, workspace: WS, prNumber: 12, verdict: 'REQUEST_CHANGES' })).toBe(false)
   })
 })
 
