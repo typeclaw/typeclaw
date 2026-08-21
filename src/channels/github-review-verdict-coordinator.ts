@@ -121,6 +121,12 @@ function cooldownApplies(verdict: ReviewVerdict, effective: EffectiveVerdict): b
 // never strand a PR for long.
 const LEASE_TTL_MS = 5 * 60_000
 
+// A review round spans human-paced sibling sessions and can legitimately take
+// much longer than one command lease. Two hours leaves room for a careful PR
+// re-review while still guaranteeing that an abandoned round cannot gate later
+// verdicts indefinitely.
+export const REVIEW_ROUND_TTL_MS = 2 * 60 * 60_000
+
 // How long a just-landed verdict suppresses a redundant same-verdict re-submit on
 // the same head — a duplicate-review cooldown. It started as a narrow lag shield
 // for GitHub's ~10-18s read-after-write lag (the original ~10-18s-apart duplicates
@@ -167,29 +173,41 @@ const recentLandedByPr = new Map<string, LandedVerdict>()
 type ReviewRoundState = {
   round: GithubReviewFollowupRound
   status: 'pending' | 'completed'
+  createdAt: number
   attemptedCarriers: Set<string | null>
   dismissalAttempted: boolean
   requestChangesAttempted: boolean
 }
 let reviewRounds = new Map<string, ReviewRoundState>()
+let expiredReviewRoundKeys = new Set<string>()
 let tokenSeq = 0
 
 export function githubReviewRoundKey(round: GithubReviewFollowupRound): string {
   return `${round.workspace}#${round.prNumber}#${round.headSha}`
 }
 
-export function registerGithubReviewRound(round: GithubReviewFollowupRound): GithubReviewFollowupRound {
+export function registerGithubReviewRound(
+  round: GithubReviewFollowupRound,
+  createdAt = Date.now(),
+): GithubReviewFollowupRound | null {
   const key = githubReviewRoundKey(round)
+  if (expiredReviewRoundKeys.has(key)) return null
   for (const [candidateKey, state] of reviewRounds) {
+    if (activeReviewRoundState(candidateKey) === undefined) continue
     if (candidateKey !== key && state.round.workspace === round.workspace && state.round.prNumber === round.prNumber) {
       reviewRounds.delete(candidateKey)
     }
   }
-  const existing = reviewRounds.get(key)
+  const existing = activeReviewRoundState(key)
   if (existing !== undefined) return existing.round
+  if (Date.now() - createdAt >= REVIEW_ROUND_TTL_MS) {
+    expiredReviewRoundKeys.add(key)
+    return null
+  }
   reviewRounds.set(key, {
     round,
     status: 'pending',
+    createdAt,
     attemptedCarriers: new Set([round.carrierThread]),
     dismissalAttempted: false,
     requestChangesAttempted: false,
@@ -203,11 +221,14 @@ export function restoreGithubReviewRound(
   attemptedCarriers: readonly (string | null)[] = [round.carrierThread],
   dismissalAttempted = false,
   requestChangesAttempted = false,
-): GithubReviewFollowupRound {
-  const registered = registerGithubReviewRound(round)
+  createdAt = Date.now(),
+): GithubReviewFollowupRound | null {
+  const registered = registerGithubReviewRound(round, createdAt)
+  if (registered === null) return null
   reviewRounds.set(githubReviewRoundKey(registered), {
     round: registered,
     status,
+    createdAt,
     attemptedCarriers: new Set(attemptedCarriers),
     dismissalAttempted,
     requestChangesAttempted,
@@ -217,16 +238,19 @@ export function restoreGithubReviewRound(
 
 export function githubReviewRoundPersistence(round: GithubReviewFollowupRound): {
   status: ReviewRoundState['status']
+  createdAt: number
   attemptedCarriers: (string | null)[]
   dismissalAttempted?: true
   requestChangesAttempted?: true
-} {
-  const state = reviewRounds.get(githubReviewRoundKey(round))
+} | null {
+  const state = activeReviewRoundState(githubReviewRoundKey(round))
+  if (state === undefined) return null
   return {
-    status: state?.status ?? 'pending',
-    attemptedCarriers: Array.from(state?.attemptedCarriers ?? [round.carrierThread]),
-    ...(state?.dismissalAttempted === true ? { dismissalAttempted: true as const } : {}),
-    ...(state?.requestChangesAttempted === true ? { requestChangesAttempted: true as const } : {}),
+    status: state.status,
+    createdAt: state.createdAt,
+    attemptedCarriers: Array.from(state.attemptedCarriers),
+    ...(state.dismissalAttempted === true ? { dismissalAttempted: true as const } : {}),
+    ...(state.requestChangesAttempted === true ? { requestChangesAttempted: true as const } : {}),
   }
 }
 
@@ -236,18 +260,25 @@ export function forgetGithubReviewRound(round: GithubReviewFollowupRound): void 
 
 export function completeGithubReviewRound(round: GithubReviewFollowupRound): void {
   const key = githubReviewRoundKey(round)
-  const current = reviewRounds.get(key)
+  let current = activeReviewRoundState(key)
+  if (current === undefined) {
+    const registered = registerGithubReviewRound(round)
+    if (registered === null) return
+    current = activeReviewRoundState(key)
+    if (current === undefined) return
+  }
   reviewRounds.set(key, {
-    round: current?.round ?? round,
+    round: current.round,
     status: 'completed',
-    attemptedCarriers: current?.attemptedCarriers ?? new Set([round.carrierThread]),
-    dismissalAttempted: current?.dismissalAttempted ?? false,
-    requestChangesAttempted: current?.requestChangesAttempted ?? false,
+    createdAt: current.createdAt,
+    attemptedCarriers: current.attemptedCarriers,
+    dismissalAttempted: current.dismissalAttempted,
+    requestChangesAttempted: current.requestChangesAttempted,
   })
 }
 
 export function isGithubReviewRoundComplete(round: GithubReviewFollowupRound): boolean {
-  return reviewRounds.get(githubReviewRoundKey(round))?.status === 'completed'
+  return activeReviewRoundState(githubReviewRoundKey(round))?.status === 'completed'
 }
 
 export function promoteGithubReviewRound(
@@ -255,30 +286,36 @@ export function promoteGithubReviewRound(
   carrierThread: string | null,
 ): GithubReviewFollowupRound | null {
   const key = githubReviewRoundKey(round)
-  const current = reviewRounds.get(key)
-  if (current?.status === 'completed') return null
-  const active = current?.round ?? round
+  const current = activeReviewRoundState(key)
+  if (current === undefined || current.status === 'completed') return null
+  const active = current.round
   if (active.carrierThread !== round.carrierThread) return null
-  if (current?.attemptedCarriers.has(carrierThread) === true) return null
+  if (current.attemptedCarriers.has(carrierThread)) return null
   const promoted = { ...active, carrierThread }
-  const attemptedCarriers = new Set(current?.attemptedCarriers ?? [active.carrierThread])
+  const attemptedCarriers = new Set(current.attemptedCarriers)
   attemptedCarriers.add(carrierThread)
   reviewRounds.set(key, {
     round: promoted,
     status: 'pending',
+    createdAt: current.createdAt,
     attemptedCarriers,
-    dismissalAttempted: current?.dismissalAttempted ?? false,
-    requestChangesAttempted: current?.requestChangesAttempted ?? false,
+    dismissalAttempted: current.dismissalAttempted,
+    requestChangesAttempted: current.requestChangesAttempted,
   })
   return promoted
 }
 
 export function canPromoteGithubReviewRoundTo(round: GithubReviewFollowupRound, thread: string | null): boolean {
-  const current = reviewRounds.get(githubReviewRoundKey(round))
-  return current?.status !== 'completed' && current?.attemptedCarriers.has(thread) !== true
+  const current = activeReviewRoundState(githubReviewRoundKey(round))
+  return current !== undefined && current.status !== 'completed' && !current.attemptedCarriers.has(thread)
 }
 
-export async function validateGithubReviewRound(round: GithubReviewFollowupRound): Promise<boolean> {
+export async function validateGithubReviewRound(
+  round: GithubReviewFollowupRound,
+  createdAt?: number,
+): Promise<boolean> {
+  if (createdAt !== undefined && Date.now() - createdAt >= REVIEW_ROUND_TTL_MS) return false
+  if (expiredReviewRoundKeys.has(githubReviewRoundKey(round))) return false
   const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
   return currentHead !== null && currentHead === round.headSha
 }
@@ -295,7 +332,8 @@ export async function guardGithubReviewRoundDismissal(args: {
   if (args.round === undefined) return null
 
   const roundKey = githubReviewRoundKey(args.round)
-  const roundState = reviewRounds.get(roundKey)
+  const roundState = activeReviewRoundState(roundKey)
+  if (roundState === undefined) return null
   if (roundState?.dismissalAttempted === true) {
     return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
   }
@@ -325,18 +363,18 @@ export function releaseGithubReviewRoundDismissal(callId: string, attempted = tr
   const reservation = reservationByCall.get(callId)
   if (reservation?.verdict !== 'DISMISSED') return
   if (!attempted && reservation.roundKey !== undefined) {
-    const state = reviewRounds.get(reservation.roundKey)
+    const state = activeReviewRoundState(reservation.roundKey)
     if (state !== undefined) state.dismissalAttempted = false
   }
   releaseReservation(callId, reservation)
 }
 
 export function hasGithubReviewRoundDismissalAttempt(round: GithubReviewFollowupRound): boolean {
-  return reviewRounds.get(githubReviewRoundKey(round))?.dismissalAttempted === true
+  return activeReviewRoundState(githubReviewRoundKey(round))?.dismissalAttempted === true
 }
 
 export function resetGithubReviewRoundCompletion(round: GithubReviewFollowupRound): void {
-  const state = reviewRounds.get(githubReviewRoundKey(round))
+  const state = activeReviewRoundState(githubReviewRoundKey(round))
   if (state === undefined || state.status === 'completed') return
   // A verified mutation may outlive its publishing session or hit a transient
   // head read before the observer can record completion. Release operation
@@ -350,6 +388,7 @@ export function resetGithubReviewRoundCompletionForPr(
   workspace: string,
   prNumber: number,
 ): GithubReviewFollowupRound | null {
+  expireReviewRounds()
   const state = Array.from(reviewRounds.values()).find(
     (candidate) =>
       candidate.status === 'pending' &&
@@ -405,11 +444,12 @@ export function createApproveIdempotencyGuard(deps: {
   return {
     async guard(args): Promise<ApproveBlock | null> {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
-      const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver)
+      const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver, now)
       if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
 
-      const roundState = args.round === undefined ? undefined : reviewRounds.get(githubReviewRoundKey(args.round))
+      const roundState =
+        args.round === undefined ? undefined : activeReviewRoundState(githubReviewRoundKey(args.round), now)
       if (args.verdict === 'REQUEST_CHANGES' && roundState?.requestChangesAttempted === true) {
         return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
       }
@@ -430,7 +470,7 @@ export function createApproveIdempotencyGuard(deps: {
         verdict: args.verdict,
         workspace: args.workspace,
         prNumber: args.prNumber,
-        ...(args.round !== undefined ? { roundKey: githubReviewRoundKey(args.round) } : {}),
+        ...(roundState !== undefined ? { roundKey: githubReviewRoundKey(roundState.round) } : {}),
       }
       inFlightByPr.set(key, reservation)
       reservationByCall.set(args.callId, reservation)
@@ -449,7 +489,7 @@ export function createApproveIdempotencyGuard(deps: {
       const remote = await deps.resolveEffectiveApproval({ workspace: args.workspace, prNumber: args.prNumber })
       const allowedRoundSameStateRequest =
         args.verdict === 'REQUEST_CHANGES' &&
-        args.round !== undefined &&
+        roundState !== undefined &&
         remote.ok &&
         remote.effective === 'CHANGES_REQUESTED'
       if (remote.ok && duplicatesStanding(args.verdict, remote.effective) && !allowedRoundSameStateRequest) {
@@ -553,7 +593,9 @@ async function evaluateRoundEligibility(
     thread?: string | null
   },
   resolveHeadSha: HeadShaResolver,
+  now: () => number = Date.now,
 ): Promise<ApproveBlock | null> {
+  expireReviewRounds(now)
   const pendingRoundForPr = Array.from(reviewRounds.values()).find(
     (state) =>
       state.status === 'pending' && state.round.workspace === args.workspace && state.round.prNumber === args.prNumber,
@@ -564,9 +606,12 @@ async function evaluateRoundEligibility(
       : { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
   }
   if (args.round.workspace !== args.workspace || args.round.prNumber !== args.prNumber) {
+    if (expiredReviewRoundKeys.has(githubReviewRoundKey(args.round))) return null
     return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
   }
-  const existing = reviewRounds.get(githubReviewRoundKey(args.round))
+  const roundKey = githubReviewRoundKey(args.round)
+  if (expiredReviewRoundKeys.has(roundKey)) return null
+  const existing = activeReviewRoundState(roundKey, now)
   const activeRound = existing?.round ?? args.round
   if (existing?.status === 'completed' || activeRound.carrierThread !== (args.thread ?? null)) {
     return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
@@ -578,7 +623,7 @@ async function evaluateRoundEligibility(
   if (currentRoundHead === null || currentRoundHead !== activeRound.headSha) {
     return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
   }
-  registerGithubReviewRound(activeRound)
+  registerGithubReviewRound(activeRound, now())
   return null
 }
 
@@ -610,12 +655,25 @@ function releaseReservation(callId: string, reservation: Reservation): void {
 
 function resetRoundRequestChangesAttempt(reservation: Reservation): void {
   if (reservation.verdict !== 'REQUEST_CHANGES' || reservation.roundKey === undefined) return
-  const state = reviewRounds.get(reservation.roundKey)
+  const state = activeReviewRoundState(reservation.roundKey)
   if (state !== undefined && state.status === 'pending') state.requestChangesAttempted = false
 }
 
 function prKey(workspace: string, prNumber: number): string {
   return `${workspace}#${prNumber}`
+}
+
+function activeReviewRoundState(key: string, now: () => number = Date.now): ReviewRoundState | undefined {
+  const state = reviewRounds.get(key)
+  if (state === undefined) return undefined
+  if (now() - state.createdAt < REVIEW_ROUND_TTL_MS) return state
+  reviewRounds.delete(key)
+  expiredReviewRoundKeys.add(key)
+  return undefined
+}
+
+function expireReviewRounds(now: () => number = Date.now): void {
+  for (const key of reviewRounds.keys()) activeReviewRoundState(key, now)
 }
 
 // Test-only: clear the process-wide lease state between cases.
@@ -624,6 +682,7 @@ export function __resetReviewVerdictGuardForTest(): void {
   reservationByCall.clear()
   recentLandedByPr.clear()
   reviewRounds = new Map<string, ReviewRoundState>()
+  expiredReviewRoundKeys = new Set<string>()
   tokenSeq = 0
   processEffectiveResolver = async () => ({ ok: false })
   processHeadShaResolver = async () => null

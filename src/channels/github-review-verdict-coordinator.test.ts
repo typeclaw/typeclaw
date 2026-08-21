@@ -9,6 +9,7 @@ import {
   guardGithubReviewRoundDismissal,
   releaseGithubReviewRoundDismissal,
   registerGithubReviewRound,
+  REVIEW_ROUND_TTL_MS,
   restoreGithubReviewRound,
   type EffectiveApprovalResolver,
   type EffectiveVerdict,
@@ -137,6 +138,30 @@ describe('review verdict idempotency guard', () => {
     })
     expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
     expect(reads).toBe(0)
+  })
+
+  test('expires a pending round before it can deny a verdict with missing round metadata', async () => {
+    let reads = 0
+    let clock = Date.now()
+    restoreGithubReviewRound(ROUND, 'pending', ['101'], false, false, clock)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      now: () => clock,
+    })
+    clock += REVIEW_ROUND_TTL_MS + 1
+
+    const decision = await g.guard({
+      callId: 'expired-round-missing',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+    })
+
+    expect(decision).toBeNull()
+    expect(reads).toBe(1)
   })
 
   test('restores attempted carriers so failover does not retry them after restart', () => {
