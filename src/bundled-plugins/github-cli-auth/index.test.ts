@@ -11,10 +11,20 @@ import {
   TYPECLAW_INTERNAL_BASH_ENV,
   wrapBuiltinToolDefinition,
 } from '@/agent/plugin-tools'
-import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
+import { __resetReviewObserverForTest, setReviewObserver } from '@/channels/github-review-turn-ledger'
+import {
+  __resetReviewVerdictGuardForTest,
+  isGithubReviewRoundComplete,
+} from '@/channels/github-review-verdict-coordinator'
 import type { GithubTokenResolveResult } from '@/channels/github-token-bridge'
 import { noopPermissionService, type PermissionService } from '@/permissions'
-import { createHookBus, type PluginContext, type PluginLogger, type ToolBeforeEvent } from '@/plugin'
+import {
+  createHookBus,
+  type PluginContext,
+  type PluginLogger,
+  type ToolAfterEvent,
+  type ToolBeforeEvent,
+} from '@/plugin'
 import { buildSandboxedCommand } from '@/sandbox'
 
 import { resetGitAskPassHelperForTests } from './git-askpass'
@@ -54,7 +64,11 @@ function pluginContext(
     config: undefined,
     logger: opts.logger ?? noopLogger,
     permissions: opts.permissions ?? noopPermissionService,
-    github: { resolveTokenForRepo: resolve, hasAppTokenResolver: () => hasAppTokenResolver },
+    github: {
+      resolveTokenForRepo: resolve,
+      hasAppTokenResolver: () => hasAppTokenResolver,
+      getAppSelfLogin: () => 'review-bot',
+    },
     spawnSubagent: async () => {},
   }
 }
@@ -68,6 +82,18 @@ async function hookFor(
   const hook = exports.hooks?.['tool.before']
   if (!hook) throw new Error('plugin did not register tool.before')
   return hook
+}
+
+async function hooksFor(
+  resolve: (repoSlug: string) => Promise<GithubTokenResolveResult>,
+  hasAppTokenResolver = true,
+  opts: HookOpts = {},
+) {
+  const exports = await githubCliAuthPlugin.plugin(pluginContext(resolve, hasAppTokenResolver, opts))
+  const before = exports.hooks?.['tool.before']
+  const after = exports.hooks?.['tool.after']
+  if (!before || !after) throw new Error('plugin did not register bash hooks')
+  return { before, after }
 }
 
 function bashEvent(command: string): ToolBeforeEvent {
@@ -1484,6 +1510,7 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
   afterEach(() => {
     globalThis.fetch = originalFetch
     __resetReviewVerdictGuardForTest()
+    __resetReviewObserverForTest()
   })
 
   function reviewBashEvent(command: string, callId: string): ToolBeforeEvent {
@@ -1516,6 +1543,7 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
   // will post" when the blocked one never will.
   const STRANDING_REVIEW = 'cd /agent && gh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE'
   const CLEAN_REVIEW = 'gh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE'
+  const DISMISS_REVIEW = 'gh api -X PUT repos/acme/widgets/pulls/5/reviews/700/dismissals -f message="fixed"'
 
   test('a shape-blocked review submission releases the lease (succeeded:false) so a later session can still submit', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
@@ -1580,6 +1608,187 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     expect(tokenCalls).toBe(0)
     expect(fetchCalls).toBe(0)
   })
+
+  test('blocks a non-carrier round dismissal before token minting or GitHub reads', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    let tokenCalls = 0
+    let fetchCalls = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        fetchCalls += 1
+        return new Response('{}', { status: 200 })
+      },
+      { preconnect: () => {} },
+    )
+    const hook = await hookFor(async () => {
+      tokenCalls += 1
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+
+    const blocked = await hook(roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-non-carrier', '202'), hookCtx)
+
+    expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining('designated') })
+    expect(tokenCalls).toBe(0)
+    expect(fetchCalls).toBe(0)
+  })
+
+  test('records a dismissal only after mutation success and authoritative non-blocking verification', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubDismissedReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-success', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-success',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([{ sessionId: 's', workspace: 'acme/widgets', prNumber: 5, verdict: 'DISMISSED' }])
+  })
+
+  test('leaves the round pending when dismissal mutation fails', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubDismissedReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-failed', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    const round = event.origin?.kind === 'channel' ? event.origin.githubReviewRound : undefined
+    if (round === undefined) throw new Error('round missing')
+
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-failed',
+        result: { content: [{ type: 'text', text: 'gh: Validation Failed (HTTP 422)' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([])
+    expect(isGithubReviewRoundComplete(round)).toBe(false)
+  })
+
+  // The mutation's own output is attacker-adjacent evidence: `gh` can print a
+  // DISMISSED payload for a review that did not actually clear the standing block
+  // (wrong review id, a race, a partial GraphQL response). Completing the round on
+  // that alone re-strands every sibling close-out — the exact deadlock this path
+  // exists to prevent — so the authoritative re-read is the load-bearing check,
+  // not the mutation echo.
+  test('leaves the round pending when the mutation reports success but the block is still live', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubStillBlockingReviewFetch()
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+    const event = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-unverified', '101')
+    expect(await before(event, hookCtx)).toBeUndefined()
+    const round = event.origin?.kind === 'channel' ? event.origin.githubReviewRound : undefined
+    if (round === undefined) throw new Error('round missing')
+
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-unverified',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([])
+    expect(isGithubReviewRoundComplete(round)).toBe(false)
+  })
+
+  test('an unverified dismissal does not latch the round, so a retry completes it', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    // First authoritative read still reports the block; the second reports it
+    // cleared. If the failed first attempt latched dismissalAttempted, the retry
+    // would be rejected as round-ineligible and the round would strand.
+    stubReviewStateSequence(['CHANGES_REQUESTED', 'DISMISSED'])
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const seen: unknown[] = []
+    setReviewObserver((review) => seen.push(review))
+
+    const first = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-retry-1', '101')
+    expect(await before(first, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-retry-1',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+    expect(seen).toEqual([])
+
+    const retry = roundReviewBashEvent(DISMISS_REVIEW, 'dismiss-retry-2', '101')
+    expect(await before(retry, hookCtx)).toBeUndefined()
+    await after(
+      {
+        tool: 'bash',
+        sessionId: 's',
+        callId: 'dismiss-retry-2',
+        result: { content: [{ type: 'text', text: '{"id":700,"state":"DISMISSED"}' }] },
+      } satisfies ToolAfterEvent,
+      hookCtx,
+    )
+
+    expect(seen).toEqual([{ sessionId: 's', workspace: 'acme/widgets', prNumber: 5, verdict: 'DISMISSED' }])
+  })
+
+  function stubReviewStateSequence(states: readonly string[]): void {
+    let call = 0
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        if (url.includes('/pulls/5/reviews')) {
+          const state = states[Math.min(call, states.length - 1)]
+          call += 1
+          return new Response(JSON.stringify([{ state, user: { login: 'review-bot[bot]', type: 'Bot' } }]), {
+            status: 200,
+          })
+        }
+        const body = url.includes('/pulls/5') ? { head: { sha: 'sha-5' } } : null
+        return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 })
+      },
+      { preconnect: () => {} },
+    )
+  }
+
+  function stubDismissedReviewFetch(): void {
+    stubReviewStateSequence(['DISMISSED'])
+  }
+
+  function stubStillBlockingReviewFetch(): void {
+    stubReviewStateFetch('CHANGES_REQUESTED')
+  }
+
+  function stubReviewStateFetch(state: string): void {
+    globalThis.fetch = Object.assign(
+      async (input: string | URL | Request) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        const body = url.includes('/pulls/5/reviews')
+          ? [{ state, user: { login: 'review-bot[bot]', type: 'Bot' } }]
+          : url.includes('/pulls/5')
+            ? { head: { sha: 'sha-5' } }
+            : null
+        return new Response(JSON.stringify(body), { status: body === null ? 404 : 200 })
+      },
+      { preconnect: () => {} },
+    )
+  }
 })
 
 describe('github-cli-auth plugin — git in the sandbox /tmp bind', () => {

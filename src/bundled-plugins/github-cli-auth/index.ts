@@ -1,8 +1,11 @@
 import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
+import { recordVerifiedDismissal } from '@/channels/github-review-turn-ledger'
 import {
   configureReviewVerdictCoordinator,
   createSharedReviewVerdictGuard,
+  guardGithubReviewRoundDismissal,
+  releaseGithubReviewRoundDismissal,
 } from '@/channels/github-review-verdict-coordinator'
 import { hasEnvKey } from '@/init/env-file'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
@@ -15,6 +18,7 @@ import {
   effectiveGhTokensForAuthenticatedUserEndpoint,
   usesGhApiGraphqlEndpoint,
 } from './gh-command'
+import { detectReviewDismissal } from './gh-review-detect'
 import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
 import {
   analyzeGitCommand,
@@ -23,7 +27,7 @@ import {
   resolveGhDefaultRepoFromCwd,
 } from './git-command'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
-import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
+import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
 
 export default definePlugin({
@@ -140,15 +144,17 @@ export default definePlugin({
       const result = await resolveTokenForRepo(workspace)
       return result.kind === 'token' ? result.token : null
     }
+    const resolveEffectiveApproval = createGithubEffectiveApprovalResolver({
+      resolveToken,
+      selfLogin: ctx.github.getAppSelfLogin ?? (() => null),
+      isAppAuth: hasAppTokenResolver,
+    })
     configureReviewVerdictCoordinator({
-      resolveEffectiveApproval: createGithubEffectiveApprovalResolver({
-        resolveToken,
-        selfLogin: ctx.github.getAppSelfLogin ?? (() => null),
-        isAppAuth: hasAppTokenResolver,
-      }),
+      resolveEffectiveApproval,
       resolveHeadSha: createGithubHeadShaResolver({ resolveToken }),
     })
     const verdictGuard = createSharedReviewVerdictGuard()
+    const pendingDismissals = new Map<string, { workspace: string; prNumber: number }>()
 
     type HookResult = void | { block: true; reason: string }
 
@@ -223,16 +229,33 @@ export default definePlugin({
         }
       }
 
-      const review = await noteReviewCommand({ callId: event.callId, command })
       // guard() holds the lease expecting tool.after to release it. A later
       // tool.before block means tool.after never fires, so blockAfterLease()
       // releases the lease with succeeded:false. The static command analyzer runs
       // above and never claims a lease for a command it will reject.
       let leaseClaimed = false
+      let dismissalLeaseClaimed = false
       const blockAfterLease = async (block: HookResult & { block: true }): Promise<HookResult> => {
         if (leaseClaimed) await verdictGuard.release({ callId: event.callId, succeeded: false })
+        if (dismissalLeaseClaimed) releaseGithubReviewRoundDismissal(event.callId, false)
+        pendingDismissals.delete(event.callId)
         return block
       }
+      const dismissal = detectReviewDismissal(command)
+      if (dismissal !== null) {
+        const block = await guardGithubReviewRoundDismissal({
+          callId: event.callId,
+          workspace: dismissal.workspace,
+          prNumber: dismissal.prNumber,
+          ...(event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+            ? { round: event.origin.githubReviewRound, thread: event.origin.thread }
+            : {}),
+        })
+        if (block !== null) return block
+        dismissalLeaseClaimed = event.origin?.kind === 'channel' && event.origin.githubReviewRound !== undefined
+        pendingDismissals.set(event.callId, dismissal)
+      }
+      const review = await noteReviewCommand({ callId: event.callId, command })
       if (review.detected !== null) {
         const block = await verdictGuard.guard({
           callId: event.callId,
@@ -452,6 +475,33 @@ export default definePlugin({
         },
         'tool.after': async (event) => {
           checkGraphqlAuthNudge({ tool: event.tool, result: event.result })
+          const dismissal = pendingDismissals.get(event.callId)
+          pendingDismissals.delete(event.callId)
+          if (dismissal !== undefined) {
+            // Only an AUTHORITATIVELY verified dismissal may latch the round's
+            // one-attempt marker. Latching on a failed mutation — or on a
+            // succeeded mutation whose verifying read errored, where we cannot
+            // tell whether the block cleared — bars every retry AND suppresses
+            // carrier failover, stranding the round with all siblings gated
+            // forever. Unverified therefore releases the latch so the next
+            // attempt can re-read authoritative state.
+            let verified = false
+            try {
+              if (dismissalMutationSucceeded(event.result)) {
+                const effective = await resolveEffectiveApproval(dismissal)
+                if (effective.ok && effective.effective === 'DISMISSED') {
+                  recordVerifiedDismissal({
+                    sessionId: event.sessionId,
+                    workspace: dismissal.workspace,
+                    prNumber: dismissal.prNumber,
+                  })
+                  verified = true
+                }
+              }
+            } finally {
+              releaseGithubReviewRoundDismissal(event.callId, verified)
+            }
+          }
           const review = commitReviewIfSucceeded({
             sessionId: event.sessionId,
             callId: event.callId,
