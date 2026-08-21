@@ -66,6 +66,8 @@ export function createPostGithubReviewTool(options: {
           workspace: origin.workspace,
           prNumber,
           verdict,
+          ...(origin.githubReviewRound !== undefined ? { round: origin.githubReviewRound } : {}),
+          thread: origin.thread,
           retainDuplicateLease: params.event === 'REQUEST_CHANGES',
         })
         if (blocked !== null) {

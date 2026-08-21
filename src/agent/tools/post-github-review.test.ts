@@ -209,6 +209,43 @@ describe('post_github_review', () => {
     expect(submissions).toBe(1)
   })
 
+  test('rejects a non-carrier sibling verdict before the submitter', async () => {
+    let reads = 0
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => 'sha-round',
+    })
+    const channelRouter = router()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      return { ok: true, reviewId: 52, state: 'APPROVED' }
+    })
+    const tool = createPostGithubReviewTool({
+      router: channelRouter,
+      origin: {
+        ...githubOrigin,
+        thread: '202',
+        githubReviewRound: {
+          workspace: githubOrigin.workspace,
+          prNumber: 7,
+          headSha: 'sha-round',
+          carrierThread: '101',
+        },
+      },
+      sessionId: 'concurrent-session',
+    })
+
+    const result = await run(tool, { event: 'REQUEST_CHANGES', body: 'still blocked' })
+
+    expect(result.details).toMatchObject({ ok: false, error: expect.stringContaining('designated') })
+    expect(reads).toBe(0)
+    expect(submissions).toBe(0)
+  })
+
   test('posts a duplicate REQUEST_CHANGES as one top-level PR comment', async () => {
     configureReviewVerdictCoordinator({
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
