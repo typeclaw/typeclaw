@@ -28,7 +28,9 @@ import { waitFor } from '@/test-helpers/wait-for'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
+  guardGithubReviewRoundDismissal,
   isGithubReviewRoundComplete,
+  releaseGithubReviewRoundDismissal,
 } from './github-review-verdict-coordinator'
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
@@ -16659,6 +16661,128 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     await router.stop()
   }, 5_000)
+
+  test('a verified dismissal wakes siblings and clears the round after every addressed close-out', async () => {
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
+      resolveHeadSha: async () => 'sha-dismissed',
+    })
+    const { router, sessions } = makeRouter(dir)
+    const round = {
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-dismissed',
+      carrierThread: '101',
+    } as const
+    const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
+    await router.route(
+      inbound({ ...firstKey, externalMessageId: 'dismiss-101', text: 'thread 101', githubReviewRound: round }),
+    )
+    await router.route(
+      inbound({ ...secondKey, externalMessageId: 'dismiss-202', text: 'thread 202', githubReviewRound: round }),
+    )
+    expect(sessions).toHaveLength(2)
+    const resolved: string[] = []
+    router.registerReviewThreadResolver('github', async ({ rootCommentId }) => {
+      resolved.push(rootCommentId)
+      return { ok: true }
+    })
+    sessions.forEach((session) => {
+      session.onPrompt = () => session.setAssistantText('NO_REPLY')
+    })
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: 'acme/widgets',
+        prNumber: 7,
+        verdict: 'DISMISSED',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'completed' })
+    expect(
+      router.injectPrVerdictActivity({
+        workspace: 'acme/widgets',
+        prNumber: 7,
+        verdict: 'DISMISSED',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'delivered', count: 1 })
+    await waitFor(() => sessions[1]!.prompts.some((prompt) => prompt.includes('DISMISSED')))
+
+    for (const [sessionId, key] of [
+      ['ses_fake_1', firstKey],
+      ['ses_fake_2', secondKey],
+    ] as const) {
+      expect(
+        await router.resolveReviewThread({
+          adapter: 'github',
+          workspace: key.workspace,
+          chat: key.chat,
+          rootCommentId: key.thread,
+        }),
+      ).toMatchObject({ ok: true })
+      router.finishGithubReviewRoundCloseout?.({
+        sessionId,
+        workspace: key.workspace,
+        prNumber: 7,
+        thread: key.thread,
+      })
+    }
+    await router.stop()
+
+    expect(resolved.sort()).toEqual(['101', '202'])
+    expect((await loadChannelSessions(dir)).filter((record) => record.githubReviewRound !== undefined)).toEqual([])
+    __resetReviewVerdictGuardForTest()
+  })
+
+  test('a failed dismissal keeps the round pending and siblings gated', async () => {
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-pending',
+    })
+    const { router, sessions } = makeRouter(dir)
+    const round = {
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-pending',
+      carrierThread: '101',
+    } as const
+    const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
+    await router.route(
+      inbound({ ...firstKey, externalMessageId: 'failed-101', text: 'thread 101', githubReviewRound: round }),
+    )
+    await router.route(
+      inbound({ ...secondKey, externalMessageId: 'failed-202', text: 'thread 202', githubReviewRound: round }),
+    )
+    sessions.forEach((session) => {
+      session.onPrompt = () => session.setAssistantText('NO_REPLY')
+    })
+    expect(
+      await guardGithubReviewRoundDismissal({
+        callId: 'failed-dismissal',
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        round,
+        thread: '101',
+      }),
+    ).toBeNull()
+    releaseGithubReviewRoundDismissal('failed-dismissal')
+
+    await router.__testing!.flushDebounce(firstKey)
+    expect(router.__testing!.pendingReminderCount(secondKey)).toBe(0)
+    expect(router.__testing!.githubReviewRoundFor(secondKey)?.carrierThread).toBe('101')
+    await router.stop()
+    const persisted = (await loadChannelSessions(dir)).filter((record) => record.githubReviewRound !== undefined)
+    expect(persisted).toHaveLength(2)
+    expect(persisted.every((record) => record.githubReviewRound?.status === 'pending')).toBe(true)
+    expect(persisted.every((record) => record.githubReviewRound?.dismissalAttempted === true)).toBe(true)
+    expect(persisted.every((record) => record.githubReviewRound?.carrierThread === '101')).toBe(true)
+    __resetReviewVerdictGuardForTest()
+  })
 })
 
 describe('injectPrVerdictActivity (PR-keyed verdict liveness)', () => {

@@ -53,13 +53,14 @@ import {
 } from './engagement'
 import { checkFalseReceipt } from './github-false-receipt'
 import { evaluateRereviewGuard } from './github-rereview-guard'
-import { resetReviewTurn, type ReviewOutputState } from './github-review-turn-ledger'
+import { resetReviewTurn, type ReviewOutputState, type ReviewRoundOutcome } from './github-review-turn-ledger'
 import {
   canPromoteGithubReviewRoundTo,
   completeGithubReviewRound,
   forgetGithubReviewRound,
   githubReviewRoundKey,
   githubReviewRoundPersistence,
+  hasGithubReviewRoundDismissalAttempt,
   isGithubReviewRoundComplete,
   promoteGithubReviewRound,
   registerGithubReviewRound,
@@ -1540,13 +1541,13 @@ export type ChannelRouter = {
   injectPrVerdictActivity: (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }) => { kind: 'delivered'; count: number }
   completeGithubReviewRound?: (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }) => Promise<{ kind: 'completed' | 'no-round' }>
   finishGithubReviewRoundCloseout?: (args: {
@@ -2318,6 +2319,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             resolvedRecord.githubReviewRound,
             restoredRoundStatus,
             resolvedRecord.githubReviewRound.attemptedCarriers,
+            resolvedRecord.githubReviewRound.dismissalAttempted === true,
           )
         } else {
           logger.info(`[channels] ${keyId}: dropped stale persisted github review round`)
@@ -3195,6 +3197,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const failoverGithubReviewRound = async (live: LiveSession): Promise<void> => {
     const round = live.githubReviewRound
     if (round === null || isGithubReviewRoundComplete(round)) return
+    if (hasGithubReviewRoundDismissalAttempt(round)) {
+      const key = githubReviewRoundKey(round)
+      for (const sibling of liveSessions.values()) {
+        if (sibling.githubReviewRound !== null && githubReviewRoundKey(sibling.githubReviewRound) === key) {
+          persistGithubReviewRound(sibling, sibling.githubReviewRound)
+        }
+      }
+      return
+    }
     const carrierIsLive = Array.from(liveSessions.values()).some(
       (candidate) =>
         !candidate.destroyed &&
@@ -6289,7 +6300,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const injectPrVerdictActivity = (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }): { kind: 'delivered'; count: number } => {
     const chat = `pr:${args.prNumber}`
@@ -6313,7 +6324,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const completeRoundForVerifiedVerdict = async (args: {
     workspace: string
     prNumber: number
-    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    verdict: ReviewRoundOutcome
     sessionId: string
   }): Promise<{ kind: 'completed' | 'no-round' }> => {
     const chat = `pr:${args.prNumber}`
