@@ -16,7 +16,7 @@ import {
 } from '@/channels/github-review-verdict-coordinator'
 import type { ToolResult } from '@/plugin'
 
-import { commitReviewIfSucceeded, noteReviewCommand } from './review-recorder'
+import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
 
 const SESSION = 'ses_recorder'
 const WS = 'acme/widgets'
@@ -35,6 +35,11 @@ const SUCCESS_OUTPUT = '{"id":1,"node_id":"PRR_abc","state":"APPROVED"}'
 const FAILURE_OUTPUT = 'gh: Validation Failed (HTTP 422)'
 
 describe('review recorder', () => {
+  test('accepts only an explicit DISMISSED mutation result', () => {
+    expect(dismissalMutationSucceeded(textResult('{"id":1,"state":"DISMISSED"}'))).toBe(true)
+    expect(dismissalMutationSucceeded(textResult('gh: Validation Failed (HTTP 422)'))).toBe(false)
+    expect(dismissalMutationSucceeded(textResult('{"id":1,"state":"CHANGES_REQUESTED"}'))).toBe(false)
+  })
   test('credits the ledger when an inline-field APPROVE succeeds', async () => {
     await noteReviewCommand({
       callId: 'c1',

@@ -77,6 +77,11 @@ export type CommitReviewResult = {
   landedFromResult: DetectedReview | null
 }
 
+export function dismissalMutationSucceeded(result: ToolResult): boolean {
+  const text = collectText(result.content)
+  return !FAILURE_MARKERS.some((marker) => text.includes(marker)) && /"state"\s*:\s*"DISMISSED"/.test(text)
+}
+
 export function commitReviewIfSucceeded(args: {
   sessionId: string
   callId: string
