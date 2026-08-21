@@ -261,6 +261,12 @@ export function createChannelSendTool({
             details: { ok: false, error: resolve.error },
           }
         }
+        if (resolve.kind === 'already-resolved') {
+          return {
+            content: [{ type: 'text' as const, text: alreadyResolvedHint(params.thread ?? null) }],
+            details: { ok: true },
+          }
+        }
         // `no-match`: the thread listed cleanly but nothing is rooted at this
         // comment (gone, or a mispaired id from the bare-id follow-up list). It
         // stays non-blocking so a genuinely-deleted thread's ack still posts,
@@ -360,7 +366,11 @@ function missingReviewThreadResolveChoiceError(input: {
   )
 }
 
-type ResolveOutcome = { kind: 'resolved' } | { kind: 'no-match' } | { kind: 'block'; error: string }
+type ResolveOutcome =
+  | { kind: 'resolved' }
+  | { kind: 'already-resolved' }
+  | { kind: 'no-match' }
+  | { kind: 'block'; error: string }
 
 async function resolveReviewThreadBeforeSend(
   router: ChannelRouter,
@@ -378,9 +388,15 @@ async function resolveReviewThreadBeforeSend(
     chat: target.chat,
     rootCommentId: target.thread,
   })
-  if (result.ok) return { kind: 'resolved' }
+  if (result.ok) return { kind: result.alreadyResolved === true ? 'already-resolved' : 'resolved' }
   if (result.code === 'no-match') return { kind: 'no-match' }
   return { kind: 'block', error: `could not resolve review thread: ${result.error}` }
+}
+
+function alreadyResolvedHint(thread: string | null): string {
+  return fenceRuntimeNotice(
+    `review thread ${JSON.stringify(thread)} was already resolved; no acknowledgement comment was posted.`,
+  )
 }
 
 // The model asked to resolve but no thread was rooted at this comment. Fenced

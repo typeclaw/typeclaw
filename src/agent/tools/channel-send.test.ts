@@ -868,5 +868,33 @@ describe('createChannelSendTool', () => {
       expect(result.details).toEqual({ ok: true })
       expect(order).toEqual(['resolve:RC_kwABC', 'send'])
     })
+
+    test('reports success without posting when the thread was already resolved', async () => {
+      const calls: OutboundMessage[] = []
+      const tool = createChannelSendTool({
+        router: {
+          ...fakeRouter(async (msg) => {
+            calls.push(msg)
+            return { ok: true }
+          }),
+          resolveReviewThread: async () => ({ ok: true, alreadyResolved: true }),
+        },
+      })
+
+      const result = await runTool(tool, {
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:585',
+        thread: 'RC_kwABC',
+        text: 'Verified — fix looks solid.',
+        resolve_review_thread: true,
+      })
+
+      expect(calls).toHaveLength(0)
+      expect(result.details).toEqual({ ok: true })
+      const rendered = (result.content[0] as { text: string }).text
+      expect(rendered).toContain('already resolved')
+      expect(rendered).toContain('no acknowledgement comment was posted')
+    })
   })
 })
