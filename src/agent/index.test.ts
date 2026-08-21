@@ -1237,6 +1237,40 @@ describe('buildChannelTools', () => {
     expect(buildChannelTools(makeRouter(), channelOrigin).map((tool) => tool.name)).not.toContain('post_github_review')
   })
 
+  test('channel tools read promoted review-round identity from the live origin', async () => {
+    const router = makeRouter()
+    const threadOrigin: SessionOrigin = { ...githubOrigin, thread: '202' }
+    let liveOrigin: SessionOrigin = threadOrigin
+    const tools = buildChannelTools(router, threadOrigin, 'github-session', () => liveOrigin)
+    const reply = tools.find((tool) => tool.name === 'channel_reply')
+    if (reply === undefined) throw new Error('channel_reply missing')
+    liveOrigin = {
+      ...threadOrigin,
+      githubReviewRound: {
+        workspace: 'acme/widgets',
+        prNumber: 7,
+        headSha: 'sha-round',
+        carrierThread: '101',
+      },
+    }
+    const context = {} as Parameters<typeof reply.execute>[4]
+
+    const result = await reply.execute(
+      'round-live-origin',
+      {
+        text: 'This thread concern is addressed.',
+        more_work_this_turn: false,
+        resolve_review_thread: true,
+      },
+      undefined,
+      undefined,
+      context,
+    )
+
+    expect((result.content[0] as { text: string }).text).toContain('designated to submit the formal verdict')
+    await router.stop()
+  })
+
   test('exposes channel_send and channel_read when origin is cron (not channel-routed)', () => {
     // given
     const router = makeRouter()

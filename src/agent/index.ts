@@ -734,11 +734,20 @@ export function buildChannelTools(
   if (!channelRouter) return []
   const tools: ToolDefinition[] = []
   if (origin?.kind === 'channel') {
+    // adapter/workspace/chat/thread are session-key fields and never vary across
+    // a session's turns, so they stay snapshotted. The review round does: it is
+    // stamped per follow-up inbound, so reading it off the creation-time snapshot
+    // would hand every turn a stale (usually absent) round and silently disable
+    // carrier scoping in production while origin-injecting unit tests still pass.
     const channelOrigin = {
       adapter: origin.adapter,
       workspace: origin.workspace,
       chat: origin.chat,
       thread: origin.thread,
+      get githubReviewRound() {
+        const current = getOrigin?.()
+        return current?.kind === 'channel' ? current.githubReviewRound : origin.githubReviewRound
+      },
     }
     tools.push(
       createChannelReplyTool({
