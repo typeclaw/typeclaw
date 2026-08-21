@@ -66,14 +66,14 @@ CLI: `typeclaw channel add github` (interactive; offers to create a Cloudflare t
 
 These extend the [shared base config](/docs/reference/channel-adapters) for `channels.github`:
 
-| Field            | Type                                      | Default              | Notes                                                     |
-| ---------------- | ----------------------------------------- | -------------------- | --------------------------------------------------------- |
-| `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted |
-| `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on         |
-| `eventAllowlist` | string[]                                  | (11 defaults)        | Events that trigger the adapter                           |
-| `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start        |
-| `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                     |
-| `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT            |
+| Field            | Type                                      | Default              | Notes                                                                                                            |
+| ---------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
+| `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
+| `eventAllowlist` | string[]                                  | (11 defaults)        | Events that trigger the adapter                                                                                  |
+| `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
+| `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
+| `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
 
 Default `eventAllowlist`:
 
@@ -93,18 +93,18 @@ pull_request_review.submitted
 
 ## Capabilities
 
-| Feature                  | Supported | Notes                                                  |
-| ------------------------ | --------- | ------------------------------------------------------ |
-| Outbound messages        | yes       |                                                        |
-| Reactions (add + remove) | yes       |                                                        |
-| Typing indicator         | no        | GitHub has no typing API                               |
-| Channel-name resolution  | yes       |                                                        |
-| Self identity            | yes       |                                                        |
-| History                  | yes       |                                                        |
-| Attachments              | no        | Outbound upload and inbound byte fetch are unavailable |
-| Membership               | yes       |                                                        |
-| Review threads           | yes       |                                                        |
-| Review state             | yes       | APPROVE or COMMENT (see `review.approve`)              |
+| Feature                  | Supported | Notes                                                     |
+| ------------------------ | --------- | --------------------------------------------------------- |
+| Outbound messages        | yes       |                                                           |
+| Reactions (add + remove) | yes       |                                                           |
+| Typing indicator         | no        | GitHub has no typing API                                  |
+| Channel-name resolution  | yes       |                                                           |
+| Self identity            | yes       |                                                           |
+| History                  | yes       |                                                           |
+| Attachments              | no        | Outbound upload and inbound byte fetch are unavailable    |
+| Membership               | yes       |                                                           |
+| Review threads           | yes       |                                                           |
+| Review state             | yes       | APPROVE or COMMENT, plus dismissal (see `review.approve`) |
 
 ## Review behavior
 
@@ -113,6 +113,14 @@ Reviews fire on the event named in `review.on` (default `review_requested`).
 - **PAT mode**: the bot is requested by its GitHub login.
 - **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer.
 - Team-reviewer requests are honored when the bot is a member of the requested team.
+
+### Push re-review
+
+A push to an open PR (`pull_request.synchronize`) is not treated as a message. It re-checks the bot's own outstanding obligations on that PR — unresolved review threads it authored, and a standing `CHANGES_REQUESTED` — and wakes a session only when one is outstanding. Each unresolved thread is followed up in its own thread-scoped session, so a push and a human reply on the same thread cannot produce duplicate acknowledgements.
+
+When a standing block also has to clear, one thread is designated the round's carrier and is alone eligible to submit the formal verdict, so concurrent siblings cannot land conflicting verdicts. Resolving a thread is never gated on carriership; it is gated only by GitHub's authoritative review state. If the carrier's turn ends without a verified verdict, another sibling is promoted. A round is bounded by a TTL and is dropped once expired or once the PR head moves on; `typeclaw doctor` reports a round still pending.
+
+Requires `pull_request.synchronize` in `eventAllowlist`. It is in the shipped defaults, but a pinned `eventAllowlist` that omits it silently disables push re-review — `doctor` warns when that happens.
 
 ## Webhook lifecycle
 
