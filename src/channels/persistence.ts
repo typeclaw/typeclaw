@@ -8,7 +8,7 @@ import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
 import type { ChannelKey, GithubReviewFollowupRound } from './types'
 
-const FILE_VERSION = 6
+const FILE_VERSION = 7
 
 // `sessionFile` is the basename (not the full path) of the JSONL transcript
 // for this (adapter, workspace, chat, thread) tuple. pi-coding-agent writes
@@ -31,6 +31,7 @@ export type ChannelSessionRecord = {
   participants: ChannelParticipant[]
   githubReviewRound?: GithubReviewFollowupRound & {
     status: 'pending' | 'completed'
+    createdAt: number
     attemptedCarriers: (string | null)[]
     dismissalAttempted?: true
     requestChangesAttempted?: true
@@ -49,6 +50,11 @@ type FileV5 = {
 
 type FileV6 = {
   version: 6
+  sessions: ChannelSessionRecord[]
+}
+
+type FileV7 = {
+  version: 7
   sessions: ChannelSessionRecord[]
 }
 
@@ -92,7 +98,7 @@ export async function loadChannelSessions(
   }
   const version = (parsed as { version?: unknown }).version
   if (version === FILE_VERSION) {
-    const file = parsed as FileV6
+    const file = parsed as FileV7
     if (!Array.isArray(file.sessions)) return []
     return dedupe(file.sessions.filter(isValidRecord))
   }
@@ -100,6 +106,11 @@ export async function loadChannelSessions(
     const file = parsed as FileV5
     if (!Array.isArray(file.sessions)) return []
     return dedupe(file.sessions.filter(isValidRecord))
+  }
+  if (version === 6) {
+    const file = parsed as FileV6
+    if (!Array.isArray(file.sessions)) return []
+    return dedupe(file.sessions.filter(isValidV6Record).map(dropLegacyGithubReviewRound))
   }
   if (version === 4) {
     const file = parsed as FileV4
@@ -116,7 +127,7 @@ export async function saveChannelSessions(
   logger: ChannelSessionsLogger = consoleLogger,
 ): Promise<void> {
   const path = channelsSessionsPath(agentDir)
-  const payload: FileV6 = { version: FILE_VERSION, sessions: dedupe(sessions) }
+  const payload: FileV7 = { version: FILE_VERSION, sessions: dedupe(sessions) }
   try {
     await mkdir(dirname(path), { recursive: true })
     const tmp = `${path}.tmp`
@@ -181,6 +192,12 @@ function migrateV4Record(record: ChannelSessionRecord): ChannelSessionRecord {
   }
 }
 
+function dropLegacyGithubReviewRound(record: ChannelSessionRecord): ChannelSessionRecord {
+  const { githubReviewRound: _expiredLegacyRound, ...rest } = record
+  void _expiredLegacyRound
+  return rest
+}
+
 function recordKey(record: ChannelSessionRecord): string {
   return `${record.adapter}:${record.workspace}:${record.chat}:${record.thread ?? ''}`
 }
@@ -220,6 +237,13 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
   )
 }
 
+function isValidV6Record(v: unknown): v is ChannelSessionRecord {
+  if (!isObject(v)) return false
+  const { githubReviewRound: _legacyRound, ...record } = v
+  void _legacyRound
+  return isValidRecord(record)
+}
+
 function isValidGithubReviewRound(value: unknown, record: Record<string, unknown>): boolean {
   if (!isObject(value)) return false
   return (
@@ -233,6 +257,9 @@ function isValidGithubReviewRound(value: unknown, record: Record<string, unknown
     record.chat === `pr:${value.prNumber}` &&
     typeof value.headSha === 'string' &&
     value.headSha.length > 0 &&
+    typeof value.createdAt === 'number' &&
+    Number.isFinite(value.createdAt) &&
+    value.createdAt >= 0 &&
     (value.carrierThread === null || typeof value.carrierThread === 'string') &&
     Array.isArray(value.attemptedCarriers) &&
     value.attemptedCarriers.length > 0 &&
