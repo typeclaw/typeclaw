@@ -42,10 +42,6 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
   if (!isCloseoutAttempt(input)) return ALLOW
 
   const round = matchingRound(input)
-  if (round !== null && !isGithubReviewRoundComplete(round) && round.carrierThread !== input.thread) {
-    return { block: true, reason: WAIT_FOR_ROUND_CARRIER }
-  }
-
   const state = await input.getReviewState({ adapter: 'github', workspace: input.workspace, chat: input.chat })
 
   // Fail closed: an unverifiable review state is treated as a live block, so the
@@ -58,6 +54,10 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
     return ALLOW
   }
 
+  // Resolving a thread cannot create a conflicting formal verdict, so carrier
+  // eligibility is the wrong operand to deny here. The sticky-block check below
+  // covers the real stranding risk from authoritative GitHub state and therefore
+  // self-corrects when an external actor clears the block; local round state does not.
   if (round !== null && isGithubReviewRoundComplete(round) && input.wantsResolve && input.thread !== null) {
     return ALLOW
   }
@@ -118,7 +118,3 @@ const INITIAL_REVIEW_REQUIRED =
   'review state, so it leaves the PR awaiting review. Submit the reviewer verdict via ' +
   '`gh api -X POST /repos/<owner>/<repo>/pulls/<N>/reviews` with event `APPROVE` when approval is enabled, ' +
   'or event `COMMENT` when approval is disabled, then narrate only if needed.'
-
-const WAIT_FOR_ROUND_CARRIER =
-  'Another sibling thread session is designated to submit the formal verdict for this review follow-up round. ' +
-  'Do not submit a verdict or close out this thread yet. Wait for the verified sibling verdict activity, then resolve only this thread.'

@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 
 import { evaluateRereviewGuard, type RereviewGuardInput } from './github-rereview-guard'
-import {
-  __resetReviewVerdictGuardForTest,
-  completeGithubReviewRound,
-  registerGithubReviewRound,
-} from './github-review-verdict-coordinator'
+import { __resetReviewVerdictGuardForTest, registerGithubReviewRound } from './github-review-verdict-coordinator'
 
 const ROUND = { workspace: 'acme/widgets', prNumber: 644, headSha: 'sha-round', carrierThread: '12345' } as const
 
@@ -45,7 +41,7 @@ describe('re-review stranding guard', () => {
     expect(decision).toEqual({ block: false })
   })
 
-  it('tells a non-carrier thread to wait while the round verdict is pending', async () => {
+  it('allows a non-carrier close-out when authoritative state says the block is gone', async () => {
     registerGithubReviewRound(ROUND)
     let queried = false
     const decision = await evaluateRereviewGuard(
@@ -54,35 +50,25 @@ describe('re-review stranding guard', () => {
         round: ROUND,
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: true, approve: true }
+          return { ok: true, selfBlocking: false, approve: true }
         },
       }),
     )
-    expect(decision.block).toBe(true)
-    if (decision.block) expect(decision.reason).toContain('designated')
-    expect(queried).toBe(false)
-  })
-
-  it('allows a thread-specific resolve after a verified REQUEST_CHANGES completes the round', async () => {
-    registerGithubReviewRound(ROUND)
-    completeGithubReviewRound(ROUND)
-    const decision = await evaluateRereviewGuard(input({ round: ROUND, getReviewState: stateOk(true) }))
     expect(decision).toEqual({ block: false })
+    expect(queried).toBe(true)
   })
 
-  it('still blocks a PR-level all-fixed claim after a REQUEST_CHANGES completes the round', async () => {
+  it('uses the authoritative sticky-block guard for a non-carrier close-out during a pending round', async () => {
     registerGithubReviewRound(ROUND)
-    completeGithubReviewRound(ROUND)
     const decision = await evaluateRereviewGuard(
       input({
         round: ROUND,
-        thread: null,
-        wantsResolve: false,
-        text: 'Verified, everything is fixed.',
+        thread: '202',
         getReviewState: stateOk(true),
       }),
     )
     expect(decision.block).toBe(true)
+    if (decision.block) expect(decision.reason).toContain('APPROVE')
   })
 
   it('branches the denial to dismissal when approval is disabled', async () => {

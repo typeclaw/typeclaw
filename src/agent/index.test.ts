@@ -1237,13 +1237,13 @@ describe('buildChannelTools', () => {
     expect(buildChannelTools(makeRouter(), channelOrigin).map((tool) => tool.name)).not.toContain('post_github_review')
   })
 
-  test('channel tools read promoted review-round identity from the live origin', async () => {
+  test('state-mutating review tools read promoted round identity from the live origin', async () => {
     const router = makeRouter()
     const threadOrigin: SessionOrigin = { ...githubOrigin, thread: '202' }
     let liveOrigin: SessionOrigin = threadOrigin
     const tools = buildChannelTools(router, threadOrigin, 'github-session', () => liveOrigin)
-    const reply = tools.find((tool) => tool.name === 'channel_reply')
-    if (reply === undefined) throw new Error('channel_reply missing')
+    const review = tools.find((tool) => tool.name === 'post_github_review')
+    if (review === undefined) throw new Error('post_github_review missing')
     liveOrigin = {
       ...threadOrigin,
       githubReviewRound: {
@@ -1253,21 +1253,20 @@ describe('buildChannelTools', () => {
         carrierThread: '101',
       },
     }
-    const context = {} as Parameters<typeof reply.execute>[4]
+    const context = {} as Parameters<typeof review.execute>[4]
 
-    const result = await reply.execute(
+    const result = await review.execute(
       'round-live-origin',
       {
-        text: 'This thread concern is addressed.',
-        more_work_this_turn: false,
-        resolve_review_thread: true,
+        event: 'REQUEST_CHANGES',
+        body: 'The blocking concern remains.',
       },
       undefined,
       undefined,
       context,
     )
 
-    expect((result.content[0] as { text: string }).text).toContain('designated to submit the formal verdict')
+    expect((result.content[0] as { text: string }).text).toContain('assigned the formal verdict to another sibling')
     await router.stop()
   })
 
