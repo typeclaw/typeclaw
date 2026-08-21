@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 
-import { detectReviewOutput, detectReviewSubmission, detectReviewSubmissionAttempt } from './gh-review-detect'
+import {
+  detectReviewDismissal,
+  detectReviewOutput,
+  detectReviewSubmission,
+  detectReviewSubmissionAttempt,
+} from './gh-review-detect'
 
 describe('detectReviewSubmission — REST --input', () => {
   test('APPROVE in the input file is detected', () => {
@@ -92,6 +97,19 @@ describe('detectReviewSubmission — gh pr review porcelain', () => {
       command: 'gh pr review 42 --comment -b "thoughts" -R acme/widgets',
     })
     expect(result).toBeNull()
+  })
+})
+
+describe('detectReviewDismissal', () => {
+  test('detects a PUT to one review dismissal endpoint', () => {
+    expect(
+      detectReviewDismissal('gh api -X PUT /repos/acme/widgets/pulls/42/reviews/700/dismissals -f message="fixed"'),
+    ).toEqual({ workspace: 'acme/widgets', prNumber: 42 })
+  })
+
+  test('does not classify a read or review submission as a dismissal', () => {
+    expect(detectReviewDismissal('gh api /repos/acme/widgets/pulls/42/reviews')).toBeNull()
+    expect(detectReviewDismissal('gh api -X POST /repos/acme/widgets/pulls/42/reviews -f event=APPROVE')).toBeNull()
   })
 })
 
