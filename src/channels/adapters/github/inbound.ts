@@ -388,7 +388,13 @@ function scheduleReviewFollowup(input: {
         followupDedup.failures.delete(followupKey)
       } else {
         followupDedup.reservations.delete(followupKey)
-        followupDedup.failures.set(followupKey, (followupDedup.failures.get(followupKey) ?? 0) + 1)
+        const failures = (followupDedup.failures.get(followupKey) ?? 0) + 1
+        followupDedup.failures.set(followupKey, failures)
+        if (failures >= MAX_REVIEW_FOLLOWUP_ATTEMPTS) {
+          options.logger.warn(
+            `[github] review followup retry cap exhausted for ${target} head=${headSha} attempts=${failures}; a new head or adapter restart is required to retry`,
+          )
+        }
       }
     }
   })

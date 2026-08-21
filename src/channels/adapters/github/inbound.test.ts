@@ -1880,10 +1880,12 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
   it('bounds failed followup retries for a persistently failing repo', async () => {
     const routed: InboundMessage[] = []
     const tasks: Array<() => Promise<void>> = []
+    const warns: string[] = []
     const handler = recheckHandler({
       fetchImpl: fakeFetch(() => new Response('boom', { status: 500 })),
       routed,
       tasks,
+      warns,
     })
     const body = JSON.stringify(synchronizePayload('always-fails'))
 
@@ -1894,6 +1896,9 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
 
     expect(tasks).toHaveLength(3)
     expect(routed).toHaveLength(0)
+    expect(warns.some((warning) => warning.includes('retry cap exhausted') && warning.includes('acme/project#7'))).toBe(
+      true,
+    )
   })
 
   it('re-reviews a held CHANGES_REQUESTED even with no unresolved threads', async () => {
