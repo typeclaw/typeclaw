@@ -1,4 +1,4 @@
-import type { ReviewVerdict } from './github-review-turn-ledger'
+import type { ReviewRoundOutcome } from './github-review-turn-ledger'
 
 // A formal review verdict (APPROVE / REQUEST_CHANGES) that LANDED on a PR, fanned
 // out over the broadcast bus so the OTHER live sessions reviewing the same PR
@@ -17,7 +17,7 @@ import type { ReviewVerdict } from './github-review-turn-ledger'
 export type PrVerdictActivityPayload = {
   workspace: string
   prNumber: number
-  verdict: ReviewVerdict
+  verdict: ReviewRoundOutcome
   sessionId: string
 }
 
@@ -39,8 +39,8 @@ export function parsePrVerdictActivityPayload(payload: unknown): PrVerdictActivi
   return { workspace: p.workspace, prNumber: p.prNumber, verdict, sessionId: p.sessionId }
 }
 
-function parseVerdict(value: unknown): ReviewVerdict | null {
-  return value === 'APPROVE' || value === 'REQUEST_CHANGES' ? value : null
+function parseVerdict(value: unknown): ReviewRoundOutcome | null {
+  return value === 'APPROVE' || value === 'REQUEST_CHANGES' || value === 'DISMISSED' ? value : null
 }
 
 // Advisory and deliberately soft (per the design review): it must not suppress a
@@ -48,7 +48,16 @@ function parseVerdict(value: unknown): ReviewVerdict | null {
 // only a REDUNDANT same-intent verdict and explicitly preserves inline-thread
 // replies. The hard guards remain the correctness boundary; this only trims wasted
 // sibling work before they fire.
-export function renderPrVerdictStandDownReminder(args: { prNumber: number; verdict: ReviewVerdict }): string {
+export function renderPrVerdictStandDownReminder(args: { prNumber: number; verdict: ReviewRoundOutcome }): string {
+  if (args.verdict === 'DISMISSED') {
+    return (
+      `<system-reminder>\n` +
+      `The designated carrier verified that its blocking review for PR #${args.prNumber} is DISMISSED. ` +
+      `Do not submit another formal verdict for this follow-up round. Close out this session's addressed ` +
+      `review thread as normal; leave it open if its concern remains unresolved.\n` +
+      `</system-reminder>`
+    )
+  }
   return (
     `<system-reminder>\n` +
     `Another session in this agent has already posted a formal ${args.verdict} review for PR #${args.prNumber}. ` +

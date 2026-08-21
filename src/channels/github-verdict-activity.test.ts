@@ -74,6 +74,11 @@ describe('parsePrVerdictActivityPayload', () => {
 })
 
 describe('renderPrVerdictStandDownReminder', () => {
+  test('renders verified dismissal activity as permission to close addressed threads', () => {
+    const text = renderPrVerdictStandDownReminder({ prNumber: 42, verdict: 'DISMISSED' })
+    expect(text).toContain('DISMISSED')
+    expect(text).toContain('Close out')
+  })
   test('names the verdict and PR, and scopes the stand-down to redundant verdicts only', () => {
     const text = renderPrVerdictStandDownReminder({ prNumber: 42, verdict: 'APPROVE' })
     expect(text).toContain('<system-reminder>')
