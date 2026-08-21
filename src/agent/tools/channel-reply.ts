@@ -248,6 +248,12 @@ export function createChannelReplyTool({
             details: { ok: false, error: resolve.error },
           }
         }
+        if (resolve.kind === 'already-resolved') {
+          return {
+            content: [{ type: 'text' as const, text: alreadyResolvedHint(origin.thread) }],
+            details: { ok: true, ...(keepTurnAlive ? { more_work_this_turn: true } : {}) },
+          }
+        }
         // `no-match` stays non-blocking (the thread may be genuinely gone) but
         // the resolve did NOT run, so tell the model instead of posting a clean
         // receipt that hides the miss. Mirrors channel_send.
@@ -368,7 +374,11 @@ function missingReviewThreadResolveChoiceError(input: {
 // success. Every hard failure — wrong author, permission denial, HTTP 404 on a
 // misdirected lookup, transient API error — blocks, so the agent never claims a
 // thread is settled when the resolve did not actually run.
-type ResolveOutcome = { kind: 'resolved' } | { kind: 'no-match' } | { kind: 'block'; error: string }
+type ResolveOutcome =
+  | { kind: 'resolved' }
+  | { kind: 'already-resolved' }
+  | { kind: 'no-match' }
+  | { kind: 'block'; error: string }
 
 async function resolveReviewThreadBeforeReply(
   router: ChannelRouter,
@@ -389,9 +399,15 @@ async function resolveReviewThreadBeforeReply(
     chat: origin.chat,
     rootCommentId: origin.thread,
   })
-  if (result.ok) return { kind: 'resolved' }
+  if (result.ok) return { kind: result.alreadyResolved === true ? 'already-resolved' : 'resolved' }
   if (result.code === 'no-match') return { kind: 'no-match' }
   return { kind: 'block', error: `could not resolve review thread: ${result.error}` }
+}
+
+function alreadyResolvedHint(thread: string | null): string {
+  return fenceRuntimeNotice(
+    `review thread ${JSON.stringify(thread)} was already resolved; no acknowledgement comment was posted.`,
+  )
 }
 
 // The model asked to resolve but no thread was rooted at this comment. Fenced

@@ -502,10 +502,10 @@ export type ReviewThreadResolveRequest = {
   rootCommentId: string
 }
 
-// `already-resolved` is a success-shaped no-op: the thread was closed before we
-// got here (a duplicate turn, a manual resolve), so the desired end state holds
-// and the caller should treat it like `ok: true`. `not-author` is a hard
-// refusal: the root comment is not the bot's, so resolving would erase a
+// `alreadyResolved` is a success-shaped no-op: the thread was closed before we
+// got here (a duplicate turn, a manual resolve), so the desired end state holds,
+// but the caller MUST NOT post a second close-out receipt. `not-author` is a
+// hard refusal: the root comment is not the bot's, so resolving would erase a
 // human's open question — the caller must NOT proceed as if it closed the loop.
 //
 // `no-match` is the ONLY non-blocking failure: the PR's threads listed cleanly

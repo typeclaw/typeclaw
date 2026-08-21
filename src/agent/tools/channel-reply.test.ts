@@ -841,6 +841,28 @@ describe('channel_reply resolve_review_thread', () => {
     expect(result.details).toEqual({ ok: true })
   })
 
+  test('reports success without posting when the thread was already resolved', async () => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelReplyTool({
+      router: fakeRouter(
+        async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        },
+        { resolveReviewThread: async () => ({ ok: true, alreadyResolved: true }) },
+      ),
+      origin: githubThreadOrigin,
+    })
+
+    const result = await runTool(tool, { text: 'Verified — fix looks solid.', resolve_review_thread: true })
+
+    expect(calls).toHaveLength(0)
+    expect(result.details).toEqual({ ok: true })
+    const rendered = (result.content[0] as { text: string }).text
+    expect(rendered).toContain('already resolved')
+    expect(rendered).toContain('no acknowledgement comment was posted')
+  })
+
   test('blocks the reply when the resolve fails', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelReplyTool({
@@ -960,19 +982,27 @@ describe('channel_reply resolve_review_thread', () => {
 
   test('does not attempt resolution on an explicit false (thread stays open)', async () => {
     let resolveCalled = false
+    let sent = 0
     const tool = createChannelReplyTool({
-      router: fakeRouter(async () => ({ ok: true }), {
-        resolveReviewThread: async () => {
-          resolveCalled = true
+      router: fakeRouter(
+        async () => {
+          sent++
           return { ok: true }
         },
-      }),
+        {
+          resolveReviewThread: async () => {
+            resolveCalled = true
+            return { ok: true, alreadyResolved: true }
+          },
+        },
+      ),
       origin: githubThreadOrigin,
     })
 
     await runTool(tool, { text: 'plain reply', resolve_review_thread: false })
 
     expect(resolveCalled).toBe(false)
+    expect(sent).toBe(1)
   })
 })
 
