@@ -169,6 +169,7 @@ type ReviewRoundState = {
   status: 'pending' | 'completed'
   attemptedCarriers: Set<string | null>
   dismissalAttempted: boolean
+  requestChangesAttempted: boolean
 }
 let reviewRounds = new Map<string, ReviewRoundState>()
 let tokenSeq = 0
@@ -191,6 +192,7 @@ export function registerGithubReviewRound(round: GithubReviewFollowupRound): Git
     status: 'pending',
     attemptedCarriers: new Set([round.carrierThread]),
     dismissalAttempted: false,
+    requestChangesAttempted: false,
   })
   return round
 }
@@ -200,6 +202,7 @@ export function restoreGithubReviewRound(
   status: ReviewRoundState['status'],
   attemptedCarriers: readonly (string | null)[] = [round.carrierThread],
   dismissalAttempted = false,
+  requestChangesAttempted = false,
 ): GithubReviewFollowupRound {
   const registered = registerGithubReviewRound(round)
   reviewRounds.set(githubReviewRoundKey(registered), {
@@ -207,6 +210,7 @@ export function restoreGithubReviewRound(
     status,
     attemptedCarriers: new Set(attemptedCarriers),
     dismissalAttempted,
+    requestChangesAttempted,
   })
   return registered
 }
@@ -215,12 +219,14 @@ export function githubReviewRoundPersistence(round: GithubReviewFollowupRound): 
   status: ReviewRoundState['status']
   attemptedCarriers: (string | null)[]
   dismissalAttempted?: true
+  requestChangesAttempted?: true
 } {
   const state = reviewRounds.get(githubReviewRoundKey(round))
   return {
     status: state?.status ?? 'pending',
     attemptedCarriers: Array.from(state?.attemptedCarriers ?? [round.carrierThread]),
     ...(state?.dismissalAttempted === true ? { dismissalAttempted: true as const } : {}),
+    ...(state?.requestChangesAttempted === true ? { requestChangesAttempted: true as const } : {}),
   }
 }
 
@@ -236,6 +242,7 @@ export function completeGithubReviewRound(round: GithubReviewFollowupRound): voi
     status: 'completed',
     attemptedCarriers: current?.attemptedCarriers ?? new Set([round.carrierThread]),
     dismissalAttempted: current?.dismissalAttempted ?? false,
+    requestChangesAttempted: current?.requestChangesAttempted ?? false,
   })
 }
 
@@ -261,6 +268,7 @@ export function promoteGithubReviewRound(
     status: 'pending',
     attemptedCarriers,
     dismissalAttempted: current?.dismissalAttempted ?? false,
+    requestChangesAttempted: current?.requestChangesAttempted ?? false,
   })
   return promoted
 }
@@ -327,6 +335,32 @@ export function hasGithubReviewRoundDismissalAttempt(round: GithubReviewFollowup
   return reviewRounds.get(githubReviewRoundKey(round))?.dismissalAttempted === true
 }
 
+export function resetGithubReviewRoundCompletion(round: GithubReviewFollowupRound): void {
+  const state = reviewRounds.get(githubReviewRoundKey(round))
+  if (state === undefined || state.status === 'completed') return
+  // A verified mutation may outlive its publishing session or hit a transient
+  // head read before the observer can record completion. Release operation
+  // latches so the carrier can retry and failover remains available instead of
+  // leaving the pending round permanently stranded.
+  state.dismissalAttempted = false
+  state.requestChangesAttempted = false
+}
+
+export function resetGithubReviewRoundCompletionForPr(
+  workspace: string,
+  prNumber: number,
+): GithubReviewFollowupRound | null {
+  const state = Array.from(reviewRounds.values()).find(
+    (candidate) =>
+      candidate.status === 'pending' &&
+      candidate.round.workspace === workspace &&
+      candidate.round.prNumber === prNumber,
+  )
+  if (state === undefined) return null
+  resetGithubReviewRoundCompletion(state.round)
+  return state.round
+}
+
 // Makes a formal `gh ... event=APPROVE|REQUEST_CHANGES` idempotent per PR across
 // turns, sessions, and (in-process) concurrent fan-out. Three layers, in order:
 //
@@ -375,6 +409,11 @@ export function createApproveIdempotencyGuard(deps: {
       if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
 
+      const roundState = args.round === undefined ? undefined : reviewRounds.get(githubReviewRoundKey(args.round))
+      if (args.verdict === 'REQUEST_CHANGES' && roundState?.requestChangesAttempted === true) {
+        return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+      }
+
       // Reserve BEFORE the await so two calls racing into guard() for the same PR
       // cannot both observe an empty map: the loser sees the winner's in-flight
       // lease and is blocked. An expired lease (tool.after never fired) is
@@ -391,9 +430,11 @@ export function createApproveIdempotencyGuard(deps: {
         verdict: args.verdict,
         workspace: args.workspace,
         prNumber: args.prNumber,
+        ...(args.round !== undefined ? { roundKey: githubReviewRoundKey(args.round) } : {}),
       }
       inFlightByPr.set(key, reservation)
       reservationByCall.set(args.callId, reservation)
+      if (args.verdict === 'REQUEST_CHANGES' && roundState !== undefined) roundState.requestChangesAttempted = true
 
       // Resolve the head SHA only AFTER the lease is held, so this await cannot
       // widen the reserve-before-await race the lease closes above.
@@ -401,16 +442,25 @@ export function createApproveIdempotencyGuard(deps: {
       reservation.headSha = headSha
 
       // Layer 2: GitHub is the authoritative, sole source of truth for a standing
-      // verdict. A standing same verdict is a real duplicate; DISMISSED and the
-      // opposite decisive verdict are genuine supersessions that must pass here
-      // (the 35287f99 invariant). A read error fails OPEN.
+      // verdict. A standing same verdict is a real duplicate except for the one
+      // carrier REQUEST_CHANGES required to complete a new-head follow-up round;
+      // DISMISSED and the opposite decisive verdict are genuine supersessions
+      // that must pass here (the 35287f99 invariant). A read error fails OPEN.
       const remote = await deps.resolveEffectiveApproval({ workspace: args.workspace, prNumber: args.prNumber })
-      if (remote.ok && duplicatesStanding(args.verdict, remote.effective)) {
+      const allowedRoundSameStateRequest =
+        args.verdict === 'REQUEST_CHANGES' &&
+        args.round !== undefined &&
+        remote.ok &&
+        remote.effective === 'CHANGES_REQUESTED'
+      if (remote.ok && duplicatesStanding(args.verdict, remote.effective) && !allowedRoundSameStateRequest) {
         // Standing verdict upstream already matches. Block, and release the lease
         // now: a blocked command never reaches tool.after, so release() won't run
         // for this callId. Leaving the lease set would resurrect the strand bug —
         // the GitHub read is authoritative for the standing case.
-        if (args.retainDuplicateLease !== true) releaseReservation(args.callId, reservation)
+        if (args.retainDuplicateLease !== true) {
+          resetRoundRequestChangesAttempt(reservation)
+          releaseReservation(args.callId, reservation)
+        }
         return {
           block: true,
           kind: 'duplicate',
@@ -433,10 +483,12 @@ export function createApproveIdempotencyGuard(deps: {
       // decisive state that contradicts a redundant re-submit. A read error skips it
       // (fails open) so a transient failure cannot strand a re-verdict.
       if (
+        !allowedRoundSameStateRequest &&
         remote.ok &&
         cooldownApplies(args.verdict, remote.effective) &&
         recentlyLandedSame(key, args.verdict, headSha, now)
       ) {
+        resetRoundRequestChangesAttempt(reservation)
         releaseReservation(args.callId, reservation)
         return {
           block: true,
@@ -472,6 +524,7 @@ export function createApproveIdempotencyGuard(deps: {
           })
         }
       } finally {
+        if (!args.succeeded) resetRoundRequestChangesAttempt(reservation)
         releaseReservation(args.callId, reservation)
       }
     },
@@ -553,6 +606,12 @@ function releaseReservation(callId: string, reservation: Reservation): void {
   if (current !== undefined && current.token === reservation.token) {
     inFlightByPr.delete(reservation.key)
   }
+}
+
+function resetRoundRequestChangesAttempt(reservation: Reservation): void {
+  if (reservation.verdict !== 'REQUEST_CHANGES' || reservation.roundKey === undefined) return
+  const state = reviewRounds.get(reservation.roundKey)
+  if (state !== undefined && state.status === 'pending') state.requestChangesAttempted = false
 }
 
 function prKey(workspace: string, prNumber: number): string {

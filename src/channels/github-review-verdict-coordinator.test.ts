@@ -45,10 +45,15 @@ describe('review verdict idempotency guard', () => {
 
   test('rejects a non-carrier round verdict before any authoritative read', async () => {
     let reads = 0
+    let headReads = 0
     const g = createApproveIdempotencyGuard({
       resolveEffectiveApproval: async () => {
         reads += 1
         return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => {
+        headReads += 1
+        return ROUND.headSha
       },
     })
 
@@ -63,6 +68,7 @@ describe('review verdict idempotency guard', () => {
 
     expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
     expect(reads).toBe(0)
+    expect(headReads).toBe(0)
   })
 
   test('rejects a non-carrier dismissal before the authoritative head read', async () => {
@@ -151,6 +157,41 @@ describe('review verdict idempotency guard', () => {
       thread: '101',
     })
     expect(decision).toBeNull()
+  })
+
+  test('allows one carrier REQUEST_CHANGES against a standing same-state verdict for the round', async () => {
+    const g = makeGuard({ [`${WS}#60`]: 'CHANGES_REQUESTED' })
+    const first = await g.guard({
+      callId: 'round-same-state-first',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(first).toBeNull()
+    await g.release({ callId: 'round-same-state-first', succeeded: true })
+
+    const second = await g.guard({
+      callId: 'round-same-state-second',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(second).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('still deduplicates a standing same-state REQUEST_CHANGES outside a round', async () => {
+    const g = makeGuard({ [`${WS}#60`]: 'CHANGES_REQUESTED' })
+    const decision = await g.guard({
+      callId: 'same-state-no-round',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'standing' })
   })
 
   test('rejects a designated carrier when the round head is no longer current', async () => {
