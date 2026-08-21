@@ -1490,6 +1490,25 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     return { tool: 'bash', sessionId: 's', callId, args: { command } }
   }
 
+  function roundReviewBashEvent(command: string, callId: string, thread: string): ToolBeforeEvent {
+    return {
+      ...reviewBashEvent(command, callId),
+      origin: {
+        kind: 'channel',
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:5',
+        thread,
+        githubReviewRound: {
+          workspace: 'acme/widgets',
+          prNumber: 5,
+          headSha: 'sha-5',
+          carrierThread: '101',
+        },
+      },
+    }
+  }
+
   // A review-submission command whose VERDICT is detected (so guard() claims the
   // in-flight lease) but whose SHAPE is blocked by analyzeGhCommand (the `cd … &&`
   // composition) — the production path that stranded PR #1112's approve. The lease
@@ -1537,6 +1556,29 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     // then: the legitimate concurrent-duplicate guard still fires (only a BLOCKED
     // first submission releases early)
     expect(second).toMatchObject({ block: true })
+  })
+
+  test('blocks a non-carrier round verdict before token minting or GitHub reads', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    let tokenCalls = 0
+    let fetchCalls = 0
+    globalThis.fetch = Object.assign(
+      async () => {
+        fetchCalls += 1
+        return new Response('{}', { status: 200 })
+      },
+      { preconnect: () => {} },
+    )
+    const hook = await hookFor(async () => {
+      tokenCalls += 1
+      return { kind: 'token', token: 'ghs_minted' }
+    })
+
+    const blocked = await hook(roundReviewBashEvent(CLEAN_REVIEW, 'round-call', '202'), hookCtx)
+
+    expect(blocked).toMatchObject({ block: true, reason: expect.stringContaining('designated') })
+    expect(tokenCalls).toBe(0)
+    expect(fetchCalls).toBe(0)
   })
 })
 
