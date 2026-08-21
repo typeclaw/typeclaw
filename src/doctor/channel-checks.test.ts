@@ -78,6 +78,7 @@ describe('buildChannelChecks', () => {
       'channel.kakaotalk.credentials',
       'channel.github.credentials',
       'channel.github.webhook-delivery',
+      'channel.github.event-allowlist',
     ])
   })
 
@@ -441,6 +442,38 @@ describe('buildChannelChecks', () => {
       const cwd = makeTmpAgentDir({ github: {} })
       const result = await runCheck('channel.github.webhook-delivery', ctxFor(cwd))
       expect(result.status).toBe('info')
+    })
+  })
+
+  describe('github event allowlist', () => {
+    test('warns when a pinned allowlist omits pull_request.synchronize', async () => {
+      const cwd = makeTmpAgentDir({ github: { eventAllowlist: ['issues.opened'] } })
+
+      const result = await runCheck('channel.github.event-allowlist', ctxFor(cwd))
+
+      expect(result.status).toBe('warning')
+      expect(result.message).toContain('pull_request.synchronize')
+      expect(result.details?.join(' ')).toContain('future default events')
+      expect(result.details?.join(' ')).toContain('open review threads will never be rechecked on push')
+    })
+
+    test('does not warn when eventAllowlist is absent and tracks defaults', async () => {
+      const cwd = makeTmpAgentDir({ github: {} })
+
+      const result = await runCheck('channel.github.event-allowlist', ctxFor(cwd))
+
+      expect(result.status).toBe('ok')
+      expect(result.message).toContain('tracks the shipped defaults')
+    })
+
+    test('does not warn when a pinned allowlist includes pull_request.synchronize', async () => {
+      const cwd = makeTmpAgentDir({
+        github: { eventAllowlist: ['issues.opened', 'pull_request.synchronize'] },
+      })
+
+      const result = await runCheck('channel.github.event-allowlist', ctxFor(cwd))
+
+      expect(result.status).toBe('ok')
     })
   })
 })

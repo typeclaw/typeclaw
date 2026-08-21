@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { type AdapterId, type ChannelsConfig } from '@/channels'
@@ -38,6 +39,7 @@ export function buildChannelChecks(): DoctorCheck[] {
     kakaotalkCredentials(),
     githubCredentials(),
     githubWebhookDelivery(),
+    githubEventAllowlist(),
   ]
 }
 
@@ -361,6 +363,43 @@ function githubWebhookDelivery(): DoctorCheck {
   }
 }
 
+function githubEventAllowlist(): DoctorCheck {
+  return {
+    name: 'channel.github.event-allowlist',
+    category: 'channels',
+    description: 'github eventAllowlist preserves push-triggered review followups',
+    applies: (ctx) => ctx.hasAgentFolder,
+    async run(ctx) {
+      const cfg = safeLoadConfig(ctx)
+      if (cfg === null) return configInvalidResult()
+      const github = cfg.channels.github
+      if (github === undefined || github.enabled === false) {
+        return { status: 'skipped', message: 'github not configured' }
+      }
+
+      const pinned = readPinnedGithubEventAllowlist(ctx)
+      if (pinned === null) {
+        return { status: 'ok', message: 'github eventAllowlist tracks the shipped defaults' }
+      }
+      if (pinned.includes('pull_request.synchronize')) {
+        return { status: 'ok', message: 'github pinned eventAllowlist includes pull_request.synchronize' }
+      }
+      return {
+        status: 'warning',
+        message: 'github pinned eventAllowlist omits pull_request.synchronize',
+        details: [
+          'An explicitly pinned array will not inherit future default events.',
+          'With this omission, open review threads will never be rechecked on push.',
+        ],
+        fix: {
+          description:
+            'Remove channels.github.eventAllowlist to track defaults, or add `pull_request.synchronize` explicitly.',
+        },
+      }
+    },
+  }
+}
+
 async function runTokenAdapterCheck(
   ctx: CheckContext,
   adapter: Extract<AdapterId, 'slack-bot' | 'discord-bot' | 'telegram-bot' | 'webex-bot'>,
@@ -481,6 +520,26 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
 function readDeclaredChannels(ctx: CheckContext): ChannelsConfig | null {
   const cfg = safeLoadConfig(ctx)
   return cfg?.channels ?? null
+}
+
+function readPinnedGithubEventAllowlist(ctx: CheckContext): string[] | null {
+  // The parsed config always contains the schema default, so it cannot tell an
+  // operator-pinned array from an omitted key that tracks shipped defaults.
+  // Re-read the raw host-stage file to preserve that distinction for this check.
+  try {
+    const parsed = JSON.parse(readFileSync(join(ctx.cwd, 'typeclaw.json'), 'utf8')) as unknown
+    if (!isObjectRecord(parsed)) return null
+    const channels = parsed.channels
+    if (!isObjectRecord(channels)) return null
+    const github = channels.github
+    if (!isObjectRecord(github) || !Object.hasOwn(github, 'eventAllowlist')) return null
+    const allowlist = github.eventAllowlist
+    if (!Array.isArray(allowlist) || !allowlist.every((event): event is string => typeof event === 'string'))
+      return null
+    return allowlist
+  } catch {
+    return null
+  }
 }
 
 function safeLoadConfig(ctx: CheckContext): ReturnType<typeof loadConfigSync> | null {
