@@ -1,4 +1,6 @@
 import { classifyReviewClaim, isPositiveWarnCloseout } from './github-review-claim'
+import { isGithubReviewRoundComplete } from './github-review-verdict-coordinator'
+import type { GithubReviewFollowupRound } from './types'
 import type { ReviewStateResult } from './types'
 
 // The re-review stranding guard. A bot that resolves a review thread (or posts a
@@ -23,6 +25,7 @@ export type RereviewGuardInput = {
   moreWorkThisTurn: boolean
   getReviewState: (req: { adapter: 'github'; workspace: string; chat: string }) => Promise<ReviewStateResult>
   workspace: string
+  round?: GithubReviewFollowupRound
 }
 
 export type RereviewGuardDecision = { block: false } | { block: true; reason: string }
@@ -38,6 +41,11 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
   // text-claim path fires regardless (caught by isCloseoutAttempt below).
   if (!isCloseoutAttempt(input)) return ALLOW
 
+  const round = matchingRound(input)
+  if (round !== null && !isGithubReviewRoundComplete(round) && round.carrierThread !== input.thread) {
+    return { block: true, reason: WAIT_FOR_ROUND_CARRIER }
+  }
+
   const state = await input.getReviewState({ adapter: 'github', workspace: input.workspace, chat: input.chat })
 
   // Fail closed: an unverifiable review state is treated as a live block, so the
@@ -50,7 +58,19 @@ export async function evaluateRereviewGuard(input: RereviewGuardInput): Promise<
     return ALLOW
   }
 
+  if (round !== null && isGithubReviewRoundComplete(round) && input.wantsResolve && input.thread !== null) {
+    return ALLOW
+  }
+
   return { block: true, reason: state.approve ? STICKY_BLOCK_APPROVE_ENABLED : STICKY_BLOCK_APPROVE_DISABLED }
+}
+
+function matchingRound(input: RereviewGuardInput): GithubReviewFollowupRound | null {
+  const round = input.round
+  if (round === undefined) return null
+  const match = /^pr:(\d+)$/.exec(input.chat)
+  if (match === null || Number(match[1]) !== round.prNumber || input.workspace !== round.workspace) return null
+  return round
 }
 
 // Trigger when the model asks to resolve a thread (only meaningful with a
@@ -98,3 +118,7 @@ const INITIAL_REVIEW_REQUIRED =
   'review state, so it leaves the PR awaiting review. Submit the reviewer verdict via ' +
   '`gh api -X POST /repos/<owner>/<repo>/pulls/<N>/reviews` with event `APPROVE` when approval is enabled, ' +
   'or event `COMMENT` when approval is disabled, then narrate only if needed.'
+
+const WAIT_FOR_ROUND_CARRIER =
+  'Another sibling thread session is designated to submit the formal verdict for this review follow-up round. ' +
+  'Do not submit a verdict or close out this thread yet. Wait for the verified sibling verdict activity, then resolve only this thread.'
