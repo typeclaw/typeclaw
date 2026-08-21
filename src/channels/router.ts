@@ -1999,7 +1999,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       void _removed
       mappings[idx] = rest
     } else {
-      mappings[idx] = { ...record, githubReviewRound: { ...round, ...githubReviewRoundPersistence(round) } }
+      const state = githubReviewRoundPersistence(round)
+      if (state === null) {
+        const { githubReviewRound: _expired, ...rest } = record
+        void _expired
+        mappings[idx] = rest
+      } else {
+        mappings[idx] = { ...record, githubReviewRound: { ...round, ...state } }
+      }
     }
     void persist()
   }
@@ -2315,7 +2322,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       let restoredRound: GithubReviewFollowupRound | null = null
       let restoredRoundStatus: 'pending' | 'completed' | null = null
       if (resolvedRecord?.githubReviewRound !== undefined) {
-        if (await validateGithubReviewRound(resolvedRecord.githubReviewRound)) {
+        if (
+          await validateGithubReviewRound(resolvedRecord.githubReviewRound, resolvedRecord.githubReviewRound.createdAt)
+        ) {
           restoredRoundStatus = resolvedRecord.githubReviewRound.status
           restoredRound = restoreGithubReviewRound(
             resolvedRecord.githubReviewRound,
@@ -2323,9 +2332,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             resolvedRecord.githubReviewRound.attemptedCarriers,
             resolvedRecord.githubReviewRound.dismissalAttempted === true,
             resolvedRecord.githubReviewRound.requestChangesAttempted === true,
+            resolvedRecord.githubReviewRound.createdAt,
           )
         } else {
-          logger.info(`[channels] ${keyId}: dropped stale persisted github review round`)
+          logger.info(
+            `[channels] ${keyId}: dropped stale or expired persisted github review round pr=${resolvedRecord.githubReviewRound.workspace}#${resolvedRecord.githubReviewRound.prNumber}`,
+          )
         }
       }
 
@@ -2391,7 +2403,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastInboundAt: now(),
         participants,
         ...(restoredRound !== null && restoredRoundStatus !== null
-          ? { githubReviewRound: { ...restoredRound, ...githubReviewRoundPersistence(restoredRound) } }
+          ? (() => {
+              const state = githubReviewRoundPersistence(restoredRound)
+              return state === null ? {} : { githubReviewRound: { ...restoredRound, ...state } }
+            })()
           : {}),
       }
       if (mappings) {
@@ -3218,16 +3233,29 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
     if (round.carrierThread !== live.key.thread && carrierIsLive) return
 
-    const waiter = Array.from(liveSessions.values())
-      .filter(
-        (candidate) =>
-          !candidate.destroyed &&
-          candidate.githubReviewRound !== null &&
-          githubReviewRoundKey(candidate.githubReviewRound) === githubReviewRoundKey(round) &&
-          canPromoteGithubReviewRoundTo(round, candidate.key.thread),
-      )
+    const candidates = Array.from(liveSessions.values()).filter(
+      (candidate) =>
+        !candidate.destroyed &&
+        candidate.githubReviewRound !== null &&
+        githubReviewRoundKey(candidate.githubReviewRound) === githubReviewRoundKey(round) &&
+        candidate.key.thread !== round.carrierThread,
+    )
+    const waiter = candidates
+      .filter((candidate) => canPromoteGithubReviewRoundTo(round, candidate.key.thread))
       .sort((a, b) => a.keyId.localeCompare(b.keyId))[0]
-    if (waiter === undefined) return
+    if (waiter === undefined) {
+      const state = githubReviewRoundPersistence(round)
+      if (candidates.length === 0) {
+        logger.warn(
+          `[channels] github review round failover found no live waiter pr=${round.workspace}#${round.prNumber} head=${round.headSha} carrier=${round.carrierThread ?? 'root'}; retry the review after the round expires`,
+        )
+      } else {
+        logger.warn(
+          `[channels] github review round exhausted all candidate carriers pr=${round.workspace}#${round.prNumber} head=${round.headSha} carrier=${round.carrierThread ?? 'root'} attempted=${(state?.attemptedCarriers ?? []).map((thread) => thread ?? 'root').join(',')}; retry the review after the round expires`,
+        )
+      }
+      return
+    }
 
     const promoted = promoteGithubReviewRound(round, waiter.key.thread)
     if (promoted === null) return
@@ -6352,14 +6380,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (round === null || round === undefined) {
       const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber)
       if (resetRound !== null) persistMatchingGithubReviewRound(resetRound)
+      logger.warn(
+        `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: no publisher session with round state session=${args.sessionId}`,
+      )
       return { kind: 'no-round' }
     }
 
     const activeRound = registerGithubReviewRound(round)
+    if (activeRound === null) {
+      logger.warn(
+        `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: round expired`,
+      )
+      return { kind: 'no-round' }
+    }
     const publisherThread = publisher?.key.thread ?? persistedPublisher?.thread ?? null
-    if (activeRound.carrierThread !== publisherThread || !(await validateGithubReviewRound(activeRound))) {
+    if (activeRound.carrierThread !== publisherThread) {
       resetGithubReviewRoundCompletion(activeRound)
       persistMatchingGithubReviewRound(activeRound)
+      logger.warn(
+        `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: publisher thread=${publisherThread ?? 'root'} is not carrier=${activeRound.carrierThread ?? 'root'}`,
+      )
+      return { kind: 'no-round' }
+    }
+    if (!(await validateGithubReviewRound(activeRound))) {
+      resetGithubReviewRoundCompletion(activeRound)
+      persistMatchingGithubReviewRound(activeRound)
+      logger.warn(
+        `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: head mismatch or unavailable expected=${activeRound.headSha}`,
+      )
       return { kind: 'no-round' }
     }
     completeGithubReviewRound(activeRound)

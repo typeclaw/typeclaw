@@ -38,6 +38,7 @@ import {
   guardGithubReviewRoundDismissal,
   isGithubReviewRoundComplete,
   releaseGithubReviewRoundDismissal,
+  REVIEW_ROUND_TTL_MS,
 } from './github-review-verdict-coordinator'
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
@@ -16497,6 +16498,7 @@ describe('GitHub review follow-up round composition', () => {
           headSha: 'sha-old',
           carrierThread: '101',
           status: 'pending',
+          createdAt: Date.now(),
           attemptedCarriers: ['101'],
         },
       },
@@ -16508,6 +16510,42 @@ describe('GitHub review follow-up round composition', () => {
     const { router } = makeRouter(dir)
 
     await router.route(inbound({ ...key, externalMessageId: 'reopen', text: 'new inbound after restart' }))
+
+    expect(router.__testing!.githubReviewRoundFor(key)).toBeNull()
+    expect(
+      (await loadChannelSessions(dir)).find((record) => record.thread === '101')?.githubReviewRound,
+    ).toBeUndefined()
+
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('drops an expired persisted pending round on reopen even when the head is unchanged', async () => {
+    const dir = await tempDir()
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await saveChannelSessions(dir, [
+      {
+        ...key,
+        sessionId: 'ses_expired',
+        participants: [],
+        githubReviewRound: {
+          workspace: 'acme/widgets',
+          prNumber: 7,
+          headSha: 'sha-round',
+          carrierThread: '101',
+          status: 'pending',
+          createdAt: Date.now() - REVIEW_ROUND_TTL_MS - 1,
+          attemptedCarriers: ['101'],
+        },
+      },
+    ])
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => 'sha-round',
+    })
+    const { router } = makeRouter(dir)
+
+    await router.route(inbound({ ...key, externalMessageId: 'reopen-expired', text: 'new inbound after restart' }))
 
     expect(router.__testing!.githubReviewRoundFor(key)).toBeNull()
     expect(
@@ -16597,7 +16635,8 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
       resolveHeadSha: async () => currentHead,
     })
-    const { router } = makeRouter(dir)
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs })
     const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
@@ -16621,6 +16660,7 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_fake_1',
       }),
     ).toEqual({ kind: 'no-round' })
+    expect(logs.some((log) => log.includes('head mismatch') && log.includes('acme/widgets#7'))).toBe(true)
     currentHead = round.headSha
     expect(
       await guardGithubReviewRoundDismissal({
@@ -16643,7 +16683,8 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
       resolveHeadSha: async () => 'sha-round',
     })
-    const { router } = makeRouter(dir)
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs })
     const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
@@ -16666,6 +16707,7 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'missing-session',
       }),
     ).toEqual({ kind: 'no-round' })
+    expect(logs.some((log) => log.includes('no publisher session') && log.includes('acme/widgets#7'))).toBe(true)
     expect(
       await guardGithubReviewRoundDismissal({
         callId: 'dismiss-after-missing-publisher',
@@ -16690,7 +16732,9 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => currentHead,
     })
     const saved: Array<readonly ChannelSessionRecord[]> = []
+    const logs: string[] = []
     const { router, sessions } = makeRouter(dir, {
+      logs,
       saveChannelSessions: async (_agentDir, records) => {
         saved.push(structuredClone(records))
       },
@@ -16740,6 +16784,7 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_fake_2',
       }),
     ).toEqual({ kind: 'no-round' })
+    expect(logs.some((log) => log.includes('is not carrier') && log.includes('acme/widgets#7'))).toBe(true)
     currentHead = 'sha-new'
     expect(
       await router.completeGithubReviewRound?.({
@@ -16749,6 +16794,7 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_fake_1',
       }),
     ).toEqual({ kind: 'no-round' })
+    expect(logs.some((log) => log.includes('head mismatch') && log.includes('acme/widgets#7'))).toBe(true)
     currentHead = 'sha-round'
 
     sessions.forEach((session, index) => {
@@ -16838,6 +16884,46 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     await router.stop()
   }, 5_000)
+
+  test('warns when failover has no live waiter', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await router.route(inbound({ ...key, externalMessageId: 'no-waiter', githubReviewRound: round }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+
+    await router.__testing!.flushDebounce(key)
+
+    expect(logs.some((log) => log.includes('failover found no live waiter') && log.includes('acme/widgets#7'))).toBe(
+      true,
+    )
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('warns when failover exhausts every candidate carrier', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
+    await router.route(inbound({ ...firstKey, externalMessageId: 'exhaust-101', githubReviewRound: round }))
+    await router.route(inbound({ ...secondKey, externalMessageId: 'exhaust-202', githubReviewRound: round }))
+    for (const session of sessions) session.onPrompt = () => session.setAssistantText('NO_REPLY')
+
+    await router.__testing!.flushDebounce(secondKey)
+    await router.__testing!.flushDebounce(firstKey)
+    await waitFor(() => logs.some((log) => log.includes('exhausted all candidate carriers')))
+
+    expect(logs.some((log) => log.includes('attempted=101,202') && log.includes('acme/widgets#7'))).toBe(true)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
 
   test('a verified dismissal wakes siblings and clears the round after every addressed close-out', async () => {
     __resetReviewObserverForTest()
