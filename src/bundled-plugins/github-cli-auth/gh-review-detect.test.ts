@@ -79,6 +79,14 @@ describe('detectReviewSubmission — gh pr review porcelain', () => {
     })
   })
 
+  test('gh pr review PR-URL --approve', () => {
+    expect(
+      detectReviewSubmission({
+        command: 'gh pr review https://github.com/acme/widgets/pull/42 --approve',
+      }),
+    ).toEqual({ workspace: 'acme/widgets', prNumber: 42, verdict: 'APPROVE', source: 'pr-review' })
+  })
+
   test('gh pr review --comment is not tracked', () => {
     const result = detectReviewSubmission({
       command: 'gh pr review 42 --comment -b "thoughts" -R acme/widgets',

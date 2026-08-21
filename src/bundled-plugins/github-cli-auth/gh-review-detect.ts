@@ -267,10 +267,22 @@ function detectPrReview(args: readonly string[]): DetectedReview | null {
         ? 'REQUEST_CHANGES'
         : null
   if (verdict === null) return null
-  const workspace = repoFromFlag(args)
-  const prNumber = prNumberArg(args)
+  const urlTarget = prUrlTarget(args)
+  const workspace = repoFromFlag(args) ?? urlTarget?.workspace ?? null
+  const prNumber = prNumberArg(args) ?? urlTarget?.prNumber ?? null
   if (workspace === null || prNumber === null) return null
   return { workspace, prNumber, verdict, source: 'pr-review' }
+}
+
+function prUrlTarget(args: readonly string[]): { workspace: string; prNumber: number } | null {
+  for (const arg of args) {
+    const match = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(arg)
+    if (match === null) continue
+    const prNumber = Number(match[3])
+    if (!Number.isSafeInteger(prNumber)) return null
+    return { workspace: `${match[1]}/${match[2]}`, prNumber }
+  }
+  return null
 }
 
 function repoFromFlag(args: readonly string[]): string | null {
