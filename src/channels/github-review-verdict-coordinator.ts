@@ -1,4 +1,5 @@
 import type { ReviewVerdict } from './github-review-turn-ledger'
+import type { GithubReviewFollowupRound } from './types'
 
 // Raw latest-decisive state. DISMISSED is kept DISTINCT from NONE on purpose: a
 // genuine dismissal means a fresh same-verdict re-review is legitimate and must
@@ -25,7 +26,7 @@ export type HeadShaResolver = (target: { workspace: string; prNumber: number }) 
 
 export type ApproveBlock = {
   block: true
-  kind: 'concurrent' | 'duplicate'
+  kind: 'concurrent' | 'duplicate' | 'round-ineligible'
   reason: string
   duplicateSource?: 'standing' | 'recent'
   leaseRetained?: boolean
@@ -37,6 +38,8 @@ export type ReviewVerdictGuard = {
     workspace: string
     prNumber: number
     verdict: ReviewVerdict
+    round?: GithubReviewFollowupRound
+    thread?: string | null
     retainDuplicateLease?: boolean
   }) => Promise<ApproveBlock | null>
   release: (args: { callId: string; succeeded: boolean }) => Promise<void>
@@ -92,6 +95,10 @@ function duplicateReason(verdict: ReviewVerdict): string {
 const CONCURRENT_REASON =
   'Another session in this agent is already submitting a formal review verdict for this pull request. ' +
   'Only one verdict may land per PR — do not submit a second review; the in-flight one will post.'
+
+const ROUND_INELIGIBLE_REASON =
+  'This review follow-up round assigned the formal verdict to another sibling thread session. ' +
+  'Do not submit a formal verdict from this session; wait for the designated sibling verdict activity, then close out only this thread.'
 
 // The standing verdict a fresh attempt would duplicate. APPROVE duplicates a
 // standing APPROVED; REQUEST_CHANGES duplicates a standing CHANGES_REQUESTED.
@@ -156,7 +163,100 @@ type LandedVerdict = { verdict: ReviewVerdict; headSha: string | null; landedAt:
 const inFlightByPr = new Map<string, Reservation>()
 const reservationByCall = new Map<string, Reservation>()
 const recentLandedByPr = new Map<string, LandedVerdict>()
+type ReviewRoundState = {
+  round: GithubReviewFollowupRound
+  status: 'pending' | 'completed'
+  attemptedCarriers: Set<string | null>
+}
+let reviewRounds = new Map<string, ReviewRoundState>()
 let tokenSeq = 0
+
+export function githubReviewRoundKey(round: GithubReviewFollowupRound): string {
+  return `${round.workspace}#${round.prNumber}#${round.headSha}`
+}
+
+export function registerGithubReviewRound(round: GithubReviewFollowupRound): GithubReviewFollowupRound {
+  const key = githubReviewRoundKey(round)
+  for (const [candidateKey, state] of reviewRounds) {
+    if (candidateKey !== key && state.round.workspace === round.workspace && state.round.prNumber === round.prNumber) {
+      reviewRounds.delete(candidateKey)
+    }
+  }
+  const existing = reviewRounds.get(key)
+  if (existing !== undefined) return existing.round
+  reviewRounds.set(key, { round, status: 'pending', attemptedCarriers: new Set([round.carrierThread]) })
+  return round
+}
+
+export function restoreGithubReviewRound(
+  round: GithubReviewFollowupRound,
+  status: ReviewRoundState['status'],
+  attemptedCarriers: readonly (string | null)[] = [round.carrierThread],
+): GithubReviewFollowupRound {
+  const registered = registerGithubReviewRound(round)
+  reviewRounds.set(githubReviewRoundKey(registered), {
+    round: registered,
+    status,
+    attemptedCarriers: new Set(attemptedCarriers),
+  })
+  return registered
+}
+
+export function githubReviewRoundPersistence(round: GithubReviewFollowupRound): {
+  status: ReviewRoundState['status']
+  attemptedCarriers: (string | null)[]
+} {
+  const state = reviewRounds.get(githubReviewRoundKey(round))
+  return {
+    status: state?.status ?? 'pending',
+    attemptedCarriers: Array.from(state?.attemptedCarriers ?? [round.carrierThread]),
+  }
+}
+
+export function forgetGithubReviewRound(round: GithubReviewFollowupRound): void {
+  reviewRounds.delete(githubReviewRoundKey(round))
+}
+
+export function completeGithubReviewRound(round: GithubReviewFollowupRound): void {
+  const key = githubReviewRoundKey(round)
+  const current = reviewRounds.get(key)
+  reviewRounds.set(key, {
+    round: current?.round ?? round,
+    status: 'completed',
+    attemptedCarriers: current?.attemptedCarriers ?? new Set([round.carrierThread]),
+  })
+}
+
+export function isGithubReviewRoundComplete(round: GithubReviewFollowupRound): boolean {
+  return reviewRounds.get(githubReviewRoundKey(round))?.status === 'completed'
+}
+
+export function promoteGithubReviewRound(
+  round: GithubReviewFollowupRound,
+  carrierThread: string | null,
+): GithubReviewFollowupRound | null {
+  const key = githubReviewRoundKey(round)
+  const current = reviewRounds.get(key)
+  if (current?.status === 'completed') return null
+  const active = current?.round ?? round
+  if (active.carrierThread !== round.carrierThread) return null
+  if (current?.attemptedCarriers.has(carrierThread) === true) return null
+  const promoted = { ...active, carrierThread }
+  const attemptedCarriers = new Set(current?.attemptedCarriers ?? [active.carrierThread])
+  attemptedCarriers.add(carrierThread)
+  reviewRounds.set(key, { round: promoted, status: 'pending', attemptedCarriers })
+  return promoted
+}
+
+export function canPromoteGithubReviewRoundTo(round: GithubReviewFollowupRound, thread: string | null): boolean {
+  const current = reviewRounds.get(githubReviewRoundKey(round))
+  return current?.status !== 'completed' && current?.attemptedCarriers.has(thread) !== true
+}
+
+export async function validateGithubReviewRound(round: GithubReviewFollowupRound): Promise<boolean> {
+  const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
+  return currentHead !== null && currentHead === round.headSha
+}
 
 // Makes a formal `gh ... event=APPROVE|REQUEST_CHANGES` idempotent per PR across
 // turns, sessions, and (in-process) concurrent fan-out. Three layers, in order:
@@ -202,6 +302,36 @@ export function createApproveIdempotencyGuard(deps: {
   return {
     async guard(args): Promise<ApproveBlock | null> {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
+      const pendingRoundForPr = Array.from(reviewRounds.values()).find(
+        (state) =>
+          state.status === 'pending' &&
+          state.round.workspace === args.workspace &&
+          state.round.prNumber === args.prNumber,
+      )
+      if (args.round === undefined && pendingRoundForPr !== undefined) {
+        return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+      }
+      if (args.round !== undefined) {
+        if (args.round.workspace !== args.workspace || args.round.prNumber !== args.prNumber) {
+          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+        }
+        const existing = reviewRounds.get(githubReviewRoundKey(args.round))
+        const activeRound = existing?.round ?? args.round
+        if (existing?.status === 'completed') {
+          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+        }
+        if (activeRound.carrierThread !== (args.thread ?? null)) {
+          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+        }
+        const currentRoundHead = await (deps.resolveHeadSha ?? processHeadShaResolver)({
+          workspace: activeRound.workspace,
+          prNumber: activeRound.prNumber,
+        })
+        if (currentRoundHead === null || currentRoundHead !== activeRound.headSha) {
+          return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+        }
+        registerGithubReviewRound(activeRound)
+      }
       const key = prKey(args.workspace, args.prNumber)
 
       // Reserve BEFORE the await so two calls racing into guard() for the same PR
@@ -356,6 +486,7 @@ export function __resetReviewVerdictGuardForTest(): void {
   inFlightByPr.clear()
   reservationByCall.clear()
   recentLandedByPr.clear()
+  reviewRounds = new Map<string, ReviewRoundState>()
   tokenSeq = 0
   processEffectiveResolver = async () => ({ ok: false })
   processHeadShaResolver = async () => null

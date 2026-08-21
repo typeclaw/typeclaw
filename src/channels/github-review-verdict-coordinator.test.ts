@@ -2,12 +2,17 @@ import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
   __resetReviewVerdictGuardForTest,
+  completeGithubReviewRound,
+  canPromoteGithubReviewRoundTo,
   createApproveIdempotencyGuard,
+  registerGithubReviewRound,
+  restoreGithubReviewRound,
   type EffectiveApprovalResolver,
   type EffectiveVerdict,
 } from './github-review-verdict-coordinator'
 
 const WS = 'acme/widgets'
+const ROUND = { workspace: WS, prNumber: 60, headSha: 'sha-round', carrierThread: '101' } as const
 
 function resolver(map: Record<string, EffectiveVerdict | 'error'>): EffectiveApprovalResolver {
   return async ({ workspace, prNumber }) => {
@@ -22,13 +27,108 @@ describe('review verdict idempotency guard', () => {
     __resetReviewVerdictGuardForTest()
   })
   function makeGuard(map: Record<string, EffectiveVerdict | 'error'> = {}, now?: () => number) {
-    return createApproveIdempotencyGuard({ resolveEffectiveApproval: resolver(map), now })
+    return createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver(map),
+      resolveHeadSha: async ({ prNumber }) => (prNumber === ROUND.prNumber ? ROUND.headSha : null),
+      now,
+    })
   }
 
   test('allows the first APPROVE when the bot has no prior verdict', async () => {
     const g = makeGuard()
     const decision = await g.guard({ callId: 'a1', workspace: WS, prNumber: 5, verdict: 'APPROVE' })
     expect(decision).toBeNull()
+  })
+
+  test('rejects a non-carrier round verdict before any authoritative read', async () => {
+    let reads = 0
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+    })
+
+    const decision = await g.guard({
+      callId: 'round-non-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '202',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(reads).toBe(0)
+  })
+
+  test('rejects a verdict with missing metadata while a round is pending for the PR', async () => {
+    let reads = 0
+    registerGithubReviewRound(ROUND)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+    })
+    const decision = await g.guard({
+      callId: 'round-missing',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(reads).toBe(0)
+  })
+
+  test('restores attempted carriers so failover does not retry them after restart', () => {
+    restoreGithubReviewRound({ ...ROUND, carrierThread: '202' }, 'pending', ['101', '202'])
+    expect(canPromoteGithubReviewRoundTo(ROUND, '101')).toBe(false)
+    expect(canPromoteGithubReviewRoundTo(ROUND, '202')).toBe(false)
+    expect(canPromoteGithubReviewRoundTo(ROUND, '303')).toBe(true)
+  })
+
+  test('allows only the designated carrier to acquire the ordinary verdict lease', async () => {
+    const g = makeGuard()
+    const decision = await g.guard({
+      callId: 'round-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toBeNull()
+  })
+
+  test('rejects a designated carrier when the round head is no longer current', async () => {
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-new',
+    })
+    const decision = await g.guard({
+      callId: 'round-stale-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('a completed round remains ineligible for another formal verdict', async () => {
+    completeGithubReviewRound(ROUND)
+    const g = makeGuard()
+    const decision = await g.guard({
+      callId: 'round-completed',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: ROUND,
+      thread: '101',
+    })
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
   })
 
   test('blocks a second verdict while the first is still in flight (concurrent sessions, same container)', async () => {
