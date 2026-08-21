@@ -21,6 +21,13 @@ import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
 import { writeTodos } from '@/agent/todo/store'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
+import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
+import {
+  __resetReviewObserverForTest,
+  recordReview,
+  recordVerifiedDismissal,
+  setReviewObserver,
+} from '@/channels/github-review-turn-ledger'
 import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
@@ -16511,7 +16518,171 @@ describe('GitHub review follow-up round composition', () => {
     await router.stop()
   })
 
+  test('lands the carrier same-state REQUEST_CHANGES through the observer and then allows sibling close-out', async () => {
+    __resetReviewObserverForTest()
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-round',
+    })
+    const { router } = makeRouter(dir)
+    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
+    await router.route(inbound({ ...firstKey, externalMessageId: 'round-101', githubReviewRound: round }))
+    await router.route(inbound({ ...secondKey, externalMessageId: 'round-202', githubReviewRound: round }))
+
+    const submitted: string[] = []
+    router.registerReviewSubmitter('github', async ({ event }) => {
+      submitted.push(event)
+      return { ok: true, reviewId: 81, state: 'CHANGES_REQUESTED' }
+    })
+    const completed = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
+    setReviewObserver((review) => {
+      void router.completeGithubReviewRound?.(review).then(completed.resolve)
+    })
+    const reviewTool = createPostGithubReviewTool({
+      router,
+      origin: { ...firstKey, githubReviewRound: round },
+      sessionId: 'ses_fake_1',
+    })
+    const reviewResult = await reviewTool.execute(
+      'review-call',
+      { event: 'REQUEST_CHANGES', body: 'The blocking concern remains.' },
+      undefined,
+      undefined,
+      {} as Parameters<typeof reviewTool.execute>[4],
+    )
+
+    expect(reviewResult.details).toMatchObject({ ok: true, state: 'CHANGES_REQUESTED' })
+    expect(submitted).toEqual(['REQUEST_CHANGES'])
+    expect(await completed.promise).toEqual({ kind: 'completed' })
+
+    const order: string[] = []
+    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewThreadResolver('github', async ({ rootCommentId }) => {
+      order.push(`resolve:${rootCommentId}`)
+      return { ok: true }
+    })
+    router.registerOutbound('github', async () => {
+      order.push('reply')
+      return { ok: true }
+    })
+    const replyTool = createChannelReplyTool({
+      router,
+      origin: { ...secondKey, githubReviewRound: round },
+      sessionId: 'ses_fake_2',
+    })
+    const replyResult = await replyTool.execute(
+      'reply-call',
+      { text: 'This thread concern is addressed.', resolve_review_thread: true },
+      undefined,
+      undefined,
+      {} as Parameters<typeof replyTool.execute>[4],
+    )
+
+    expect(replyResult.details).toMatchObject({ ok: true })
+    expect(order).toEqual(['resolve:202', 'reply'])
+    __resetReviewObserverForTest()
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases a dismissal latch when transient head validation prevents completion', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    let currentHead: string | null = 'sha-round'
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
+      resolveHeadSha: async () => currentHead,
+    })
+    const { router } = makeRouter(dir)
+    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
+    expect(
+      await guardGithubReviewRoundDismissal({
+        callId: 'dismiss-first',
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        round,
+        thread: '101',
+      }),
+    ).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-first')
+    currentHead = null
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        verdict: 'DISMISSED',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'no-round' })
+    currentHead = round.headSha
+    expect(
+      await guardGithubReviewRoundDismissal({
+        callId: 'dismiss-retry',
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        round,
+        thread: '101',
+      }),
+    ).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-retry', false)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases a dismissal latch when the verified publisher is no longer live', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
+      resolveHeadSha: async () => 'sha-round',
+    })
+    const { router } = makeRouter(dir)
+    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
+    expect(
+      await guardGithubReviewRoundDismissal({
+        callId: 'dismiss-missing-publisher',
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        round,
+        thread: '101',
+      }),
+    ).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-missing-publisher')
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        verdict: 'DISMISSED',
+        sessionId: 'missing-session',
+      }),
+    ).toEqual({ kind: 'no-round' })
+    expect(
+      await guardGithubReviewRoundDismissal({
+        callId: 'dismiss-after-missing-publisher',
+        workspace: round.workspace,
+        prNumber: round.prNumber,
+        round,
+        thread: '101',
+      }),
+    ).toBeNull()
+    releaseGithubReviewRoundDismissal('dismiss-after-missing-publisher', false)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('promotes one waiter after carrier silence and completes both thread close-outs once', async () => {
+    __resetReviewObserverForTest()
+    __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     let currentHead = 'sha-round'
     configureReviewVerdictCoordinator({
@@ -16538,6 +16709,10 @@ describe('GitHub review follow-up round composition', () => {
       externalMessageId: 'round-202',
       text: 'review round thread 202',
       githubReviewRound: round,
+    })
+    const roundCompleted = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
+    setReviewObserver((review) => {
+      void router.completeGithubReviewRound?.(review).then(roundCompleted.resolve)
     })
 
     const initialStarted = Promise.withResolvers<void>()
@@ -16587,12 +16762,13 @@ describe('GitHub review follow-up round composition', () => {
         }
         if (text.includes('You are now the carrier')) {
           formalSubmissions += 1
-          await router.completeGithubReviewRound?.({
+          recordReview({
             workspace: 'acme/widgets',
             prNumber: 7,
             verdict: 'REQUEST_CHANGES',
             sessionId: 'ses_fake_2',
           })
+          expect(await roundCompleted.promise).toEqual({ kind: 'completed' })
           const result = await router.resolveReviewThread({
             adapter: 'github',
             workspace: 'acme/widgets',
@@ -16658,11 +16834,14 @@ describe('GitHub review follow-up round composition', () => {
     const latest = saved.at(-1) ?? []
     expect(latest.filter((record) => record.githubReviewRound !== undefined)).toHaveLength(0)
 
+    __resetReviewObserverForTest()
     __resetReviewVerdictGuardForTest()
     await router.stop()
   }, 5_000)
 
   test('a verified dismissal wakes siblings and clears the round after every addressed close-out', async () => {
+    __resetReviewObserverForTest()
+    __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     configureReviewVerdictCoordinator({
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
@@ -16693,14 +16872,12 @@ describe('GitHub review follow-up round composition', () => {
       session.onPrompt = () => session.setAssistantText('NO_REPLY')
     })
 
-    expect(
-      await router.completeGithubReviewRound?.({
-        workspace: 'acme/widgets',
-        prNumber: 7,
-        verdict: 'DISMISSED',
-        sessionId: 'ses_fake_1',
-      }),
-    ).toEqual({ kind: 'completed' })
+    const completed = Promise.withResolvers<{ kind: 'completed' | 'no-round' }>()
+    setReviewObserver((review) => {
+      void router.completeGithubReviewRound?.(review).then(completed.resolve)
+    })
+    recordVerifiedDismissal({ workspace: 'acme/widgets', prNumber: 7, sessionId: 'ses_fake_1' })
+    expect(await completed.promise).toEqual({ kind: 'completed' })
     expect(
       router.injectPrVerdictActivity({
         workspace: 'acme/widgets',
@@ -16734,6 +16911,7 @@ describe('GitHub review follow-up round composition', () => {
 
     expect(resolved.sort()).toEqual(['101', '202'])
     expect((await loadChannelSessions(dir)).filter((record) => record.githubReviewRound !== undefined)).toEqual([])
+    __resetReviewObserverForTest()
     __resetReviewVerdictGuardForTest()
   })
 

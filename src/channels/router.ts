@@ -65,6 +65,8 @@ import {
   promoteGithubReviewRound,
   registerGithubReviewRound,
   restoreGithubReviewRound,
+  resetGithubReviewRoundCompletion,
+  resetGithubReviewRoundCompletionForPr,
   validateGithubReviewRound,
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
@@ -2320,6 +2322,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             restoredRoundStatus,
             resolvedRecord.githubReviewRound.attemptedCarriers,
             resolvedRecord.githubReviewRound.dismissalAttempted === true,
+            resolvedRecord.githubReviewRound.requestChangesAttempted === true,
           )
         } else {
           logger.info(`[channels] ${keyId}: dropped stale persisted github review round`)
@@ -6337,12 +6340,28 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.key.chat === chat &&
         live.githubReviewRound !== null,
     )
-    const round = publisher?.githubReviewRound
-    if (round === null || round === undefined) return { kind: 'no-round' }
+    const persistedPublisher = mappings?.find(
+      (record) =>
+        record.sessionId === args.sessionId &&
+        record.adapter === 'github' &&
+        record.workspace === args.workspace &&
+        record.chat === chat &&
+        record.githubReviewRound !== undefined,
+    )
+    const round = publisher?.githubReviewRound ?? persistedPublisher?.githubReviewRound
+    if (round === null || round === undefined) {
+      const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber)
+      if (resetRound !== null) persistMatchingGithubReviewRound(resetRound)
+      return { kind: 'no-round' }
+    }
 
     const activeRound = registerGithubReviewRound(round)
-    if (activeRound.carrierThread !== publisher?.key.thread) return { kind: 'no-round' }
-    if (!(await validateGithubReviewRound(activeRound))) return { kind: 'no-round' }
+    const publisherThread = publisher?.key.thread ?? persistedPublisher?.thread ?? null
+    if (activeRound.carrierThread !== publisherThread || !(await validateGithubReviewRound(activeRound))) {
+      resetGithubReviewRoundCompletion(activeRound)
+      persistMatchingGithubReviewRound(activeRound)
+      return { kind: 'no-round' }
+    }
     completeGithubReviewRound(activeRound)
     const key = githubReviewRoundKey(round)
     for (const live of liveSessions.values()) {
@@ -6355,6 +6374,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     logger.info(`[channels] github review round completed pr=${chat} verdict=${args.verdict}`)
     return { kind: 'completed' }
+  }
+
+  const persistMatchingGithubReviewRound = (round: GithubReviewFollowupRound): void => {
+    const key = githubReviewRoundKey(round)
+    for (const live of liveSessions.values()) {
+      if (live.githubReviewRound !== null && githubReviewRoundKey(live.githubReviewRound) === key) {
+        persistGithubReviewRound(live, live.githubReviewRound)
+      }
+    }
   }
 
   const finishGithubReviewRoundCloseout = (args: {
