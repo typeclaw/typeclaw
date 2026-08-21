@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { type AdapterId, type ChannelsConfig } from '@/channels'
+import { REVIEW_ROUND_TTL_MS } from '@/channels/github-review-verdict-coordinator'
+import { loadChannelSessions, type ChannelSessionRecord } from '@/channels/persistence'
 import { loadConfigSync, validateConfig } from '@/config'
 import { readEnvFile } from '@/init'
 import { SecretsBackend } from '@/secrets'
@@ -40,6 +42,7 @@ export function buildChannelChecks(): DoctorCheck[] {
     githubCredentials(),
     githubWebhookDelivery(),
     githubEventAllowlist(),
+    githubReviewRoundState(),
   ]
 }
 
@@ -398,6 +401,59 @@ function githubEventAllowlist(): DoctorCheck {
       }
     },
   }
+}
+
+const GITHUB_REVIEW_ROUND_WARNING_AGE_MS = 30 * 60_000
+
+function githubReviewRoundState(): DoctorCheck {
+  return {
+    name: 'channel.github.review-round',
+    category: 'channels',
+    description: 'github review follow-up rounds are not stranded',
+    applies: (ctx) => ctx.hasAgentFolder,
+    async run(ctx) {
+      const channels = readDeclaredChannels(ctx)
+      if (channels === null) return configInvalidResult()
+      if (!isAdapterActive(channels, 'github')) {
+        return { status: 'skipped', message: 'github not configured' }
+      }
+
+      const records = await loadChannelSessions(ctx.cwd, { info: () => {}, warn: () => {}, error: () => {} })
+      const pendingByRound = new Map<string, NonNullable<ChannelSessionRecord['githubReviewRound']>>()
+      for (const record of records) {
+        const round = record.githubReviewRound
+        if (round?.status !== 'pending') continue
+        pendingByRound.set(`${round.workspace}#${round.prNumber}#${round.headSha}`, round)
+      }
+      const pending = Array.from(pendingByRound.values())
+      if (pending.length === 0) return { status: 'ok', message: 'github has no pending review follow-up round' }
+
+      const now = Date.now()
+      const details = pending.map((round) => {
+        const ageMs = Math.max(0, now - round.createdAt)
+        return `${round.workspace}#${round.prNumber} head=${round.headSha} carrier=${round.carrierThread ?? 'root'} age=${formatAge(ageMs)}`
+      })
+      const oldestAgeMs = Math.max(...pending.map((round) => Math.max(0, now - round.createdAt)))
+      const status = oldestAgeMs >= GITHUB_REVIEW_ROUND_WARNING_AGE_MS ? 'warning' : 'info'
+      return {
+        status,
+        message: `github has ${pending.length} pending review follow-up round(s); oldest age=${formatAge(oldestAgeMs)}`,
+        details,
+        fix: {
+          description:
+            `Complete the formal verdict from the named carrier. If it is stranded, retry after the ` +
+            `${formatAge(REVIEW_ROUND_TTL_MS)} TTL; expiry is checked before gating, and a restart prunes expired persisted state.`,
+        },
+      }
+    },
+  }
+}
+
+function formatAge(ageMs: number): string {
+  const totalMinutes = Math.floor(ageMs / 60_000)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return hours > 0 ? `${hours}h${minutes}m` : `${minutes}m`
 }
 
 async function runTokenAdapterCheck(

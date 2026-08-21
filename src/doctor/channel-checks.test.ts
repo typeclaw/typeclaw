@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { saveChannelSessions } from '@/channels/persistence'
 import { SecretsBackend } from '@/secrets'
 
 import { buildChannelChecks } from './channel-checks'
@@ -79,6 +80,7 @@ describe('buildChannelChecks', () => {
       'channel.github.credentials',
       'channel.github.webhook-delivery',
       'channel.github.event-allowlist',
+      'channel.github.review-round',
     ])
   })
 
@@ -474,6 +476,47 @@ describe('buildChannelChecks', () => {
       const result = await runCheck('channel.github.event-allowlist', ctxFor(cwd))
 
       expect(result.status).toBe('ok')
+    })
+  })
+
+  describe('github review round', () => {
+    test('is ok when no review follow-up round is pending', async () => {
+      const cwd = makeTmpAgentDir({ github: {} })
+
+      const result = await runCheck('channel.github.review-round', ctxFor(cwd))
+
+      expect(result.status).toBe('ok')
+      expect(result.message).toContain('no pending')
+    })
+
+    test('warns with PR identity, age, and recovery when a round remains pending', async () => {
+      const cwd = makeTmpAgentDir({ github: {} })
+      await saveChannelSessions(cwd, [
+        {
+          adapter: 'github',
+          workspace: 'acme/widgets',
+          chat: 'pr:17',
+          thread: '101',
+          participants: [],
+          githubReviewRound: {
+            workspace: 'acme/widgets',
+            prNumber: 17,
+            headSha: 'sha-round',
+            carrierThread: '101',
+            status: 'pending',
+            createdAt: Date.now() - 31 * 60_000,
+            attemptedCarriers: ['101'],
+          },
+        },
+      ])
+
+      const result = await runCheck('channel.github.review-round', ctxFor(cwd))
+
+      expect(result.status).toBe('warning')
+      expect(result.details?.join(' ')).toContain('acme/widgets#17')
+      expect(result.details?.join(' ')).toContain('age=31m')
+      expect(result.fix?.description).toContain('retry after')
+      expect(result.fix?.description).toContain('restart')
     })
   })
 })
