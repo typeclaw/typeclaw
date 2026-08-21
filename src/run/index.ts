@@ -836,10 +836,13 @@ async function startAgentRuntime(
   })
   registerBootCleanup(() => prVerdictActivityBridge.stop())
   setReviewObserver((review) => {
-    stream.publish({
-      target: { kind: 'broadcast' },
-      payload: { kind: 'pr.verdict-activity', ...review },
-    })
+    void (async () => {
+      await channelManager.router.completeGithubReviewRound?.(review)
+      stream.publish({
+        target: { kind: 'broadcast' },
+        payload: { kind: 'pr.verdict-activity', ...review },
+      })
+    })()
   })
   registerBootCleanup(() => setReviewObserver(null))
 

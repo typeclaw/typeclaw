@@ -54,6 +54,18 @@ import {
 import { checkFalseReceipt } from './github-false-receipt'
 import { evaluateRereviewGuard } from './github-rereview-guard'
 import { resetReviewTurn, type ReviewOutputState } from './github-review-turn-ledger'
+import {
+  canPromoteGithubReviewRoundTo,
+  completeGithubReviewRound,
+  forgetGithubReviewRound,
+  githubReviewRoundKey,
+  githubReviewRoundPersistence,
+  isGithubReviewRoundComplete,
+  promoteGithubReviewRound,
+  registerGithubReviewRound,
+  restoreGithubReviewRound,
+  validateGithubReviewRound,
+} from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
@@ -98,6 +110,7 @@ import type {
   GetMessageResult,
   HistoryCallback,
   InboundAttachment,
+  GithubReviewFollowupRound,
   InboundMessage,
   InboundReferenceContext,
   ListCallback,
@@ -752,6 +765,7 @@ type QueuedInbound = {
   // happened to dequeue it. Zero means "unknown" (the formatter omits the
   // prefix for those).
   ts: number
+  githubReviewRound?: GithubReviewFollowupRound
 }
 
 type ObservedInbound = {
@@ -807,11 +821,17 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // TEXT was rejected: a wakeup body that happened to equal a nudge constant
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
-type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup' }
+type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup'; githubReviewRoundKey?: string }
 
 const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
 
 const wakeupReminder = (text: string): PendingSystemReminder => ({ text, kind: 'wakeup' })
+
+const githubReviewRoundWakeupReminder = (text: string, round: GithubReviewFollowupRound): PendingSystemReminder => ({
+  text,
+  kind: 'wakeup',
+  githubReviewRoundKey: githubReviewRoundKey(round),
+})
 
 type LiveSession = {
   key: ChannelKey
@@ -844,6 +864,7 @@ type LiveSession = {
   participants: ChannelParticipant[]
   resolvedNames: ResolvedChannelNames
   originRef: { current: SessionOrigin | undefined }
+  githubReviewRound: GithubReviewFollowupRound | null
   promptQueue: QueuedInbound[]
   contextBuffer: ObservedInbound[]
   // Attachments of the messages composing the in-flight turn. drain()
@@ -1522,6 +1543,18 @@ export type ChannelRouter = {
     verdict: 'APPROVE' | 'REQUEST_CHANGES'
     sessionId: string
   }) => { kind: 'delivered'; count: number }
+  completeGithubReviewRound?: (args: {
+    workspace: string
+    prNumber: number
+    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    sessionId: string
+  }) => Promise<{ kind: 'completed' | 'no-round' }>
+  finishGithubReviewRoundCloseout?: (args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    thread: string | null
+  }) => void
   noteGithubReviewOutput: (args: {
     sessionId: string
     workspace: string
@@ -1593,6 +1626,8 @@ export type ChannelRouter = {
     isTypingActive: (key: ChannelKey) => boolean
     stopTyping: (key: ChannelKey) => Promise<void>
     typingHeartbeatIntervalFor: (adapter: ChannelKey['adapter']) => number
+    githubReviewRoundFor: (key: ChannelKey) => GithubReviewFollowupRound | null | undefined
+    pendingReminderCount: (key: ChannelKey) => number | undefined
     runIdleGc: () => Promise<void>
     // Returns the seeded author state on the live session matching
     // `key`, or undefined when no live session exists. Tests use this
@@ -1945,6 +1980,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await next
   }
 
+  const persistGithubReviewRound = (live: LiveSession, round: GithubReviewFollowupRound | null): void => {
+    if (mappings === null) return
+    const idx = mappings.findIndex(
+      (record) =>
+        record.adapter === live.key.adapter &&
+        record.workspace === live.key.workspace &&
+        record.chat === live.key.chat &&
+        (record.thread ?? null) === (live.key.thread ?? null),
+    )
+    if (idx < 0) return
+    const record = mappings[idx]!
+    if (round === null) {
+      const { githubReviewRound: _removed, ...rest } = record
+      void _removed
+      mappings[idx] = rest
+    } else {
+      mappings[idx] = { ...record, githubReviewRound: { ...round, ...githubReviewRoundPersistence(round) } }
+    }
+    void persist()
+  }
+
   const createForChannel: CreateSessionForChannel =
     options.createSessionForChannel ??
     (async ({ key, existingSessionId, existingSessionFile, origin, originRef }) => {
@@ -2222,6 +2278,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           thread: record.thread,
           participants: record.participants,
           lastInboundAt: 0,
+          ...(record.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
         }
         if (mappings) {
           const idx = mappings.findIndex(
@@ -2252,6 +2309,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           lastInboundAt: now(),
         }
       }
+      let restoredRound: GithubReviewFollowupRound | null = null
+      let restoredRoundStatus: 'pending' | 'completed' | null = null
+      if (resolvedRecord?.githubReviewRound !== undefined) {
+        if (await validateGithubReviewRound(resolvedRecord.githubReviewRound)) {
+          restoredRoundStatus = resolvedRecord.githubReviewRound.status
+          restoredRound = restoreGithubReviewRound(
+            resolvedRecord.githubReviewRound,
+            restoredRoundStatus,
+            resolvedRecord.githubReviewRound.attemptedCarriers,
+          )
+        } else {
+          logger.info(`[channels] ${keyId}: dropped stale persisted github review round`)
+        }
+      }
+
       const phase = resolvedRecord?.sessionId === undefined ? 'cold-start' : 'rehydrate'
       logger.info(`[channels] ${keyId}: ensureLive begin (${phase})`)
       const participants = (resolvedRecord?.participants ?? []) as ChannelParticipant[]
@@ -2278,6 +2350,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         chat: key.chat,
         ...(resolvedNames.chatName !== undefined ? { chatName: resolvedNames.chatName } : {}),
         thread: key.thread,
+        ...(restoredRound !== null ? { githubReviewRound: restoredRound } : {}),
         ...(room?.parentChat !== undefined ? { parentChat: room.parentChat } : {}),
         ...(room?.parentChatName !== undefined ? { parentChatName: room.parentChatName } : {}),
         ...(triggeringAuthorId !== undefined ? { lastInboundAuthorId: triggeringAuthorId } : {}),
@@ -2312,6 +2385,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         ...(transcriptPath ? { sessionFile: basename(transcriptPath) } : {}),
         lastInboundAt: now(),
         participants,
+        ...(restoredRound !== null && restoredRoundStatus !== null
+          ? { githubReviewRound: { ...restoredRound, ...githubReviewRoundPersistence(restoredRound) } }
+          : {}),
       }
       if (mappings) {
         const idx = mappings.findIndex(
@@ -2350,6 +2426,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         participants,
         resolvedNames,
         originRef,
+        githubReviewRound: restoredRound,
         promptQueue: [],
         pendingSystemReminders: [],
         willingnessReminderIteration: false,
@@ -2574,6 +2651,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const result = await fetchHistory(live.key.adapter, {
       chat: live.key.chat,
       thread: live.key.thread,
+      ...(live.githubReviewRound !== null ? { githubReviewRound: live.githubReviewRound } : {}),
       limit: requested,
       prefetch: true,
     })
@@ -3103,6 +3181,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       chat: live.key.chat,
       ...(live.resolvedNames.chatName !== undefined ? { chatName: live.resolvedNames.chatName } : {}),
       thread: live.key.thread,
+      ...(live.githubReviewRound !== null ? { githubReviewRound: live.githubReviewRound } : {}),
       ...(live.room?.parentChat !== undefined ? { parentChat: live.room.parentChat } : {}),
       ...(live.room?.parentChatName !== undefined ? { parentChatName: live.room.parentChatName } : {}),
       ...(live.currentTurnAuthorId !== null ? { lastInboundAuthorId: live.currentTurnAuthorId } : {}),
@@ -3111,6 +3190,52 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ...(membership !== null ? { membership } : {}),
       ...(self !== undefined ? { self } : {}),
     }
+  }
+
+  const failoverGithubReviewRound = async (live: LiveSession): Promise<void> => {
+    const round = live.githubReviewRound
+    if (round === null || isGithubReviewRoundComplete(round)) return
+    const carrierIsLive = Array.from(liveSessions.values()).some(
+      (candidate) =>
+        !candidate.destroyed &&
+        candidate.githubReviewRound !== null &&
+        githubReviewRoundKey(candidate.githubReviewRound) === githubReviewRoundKey(round) &&
+        candidate.key.thread === round.carrierThread,
+    )
+    if (round.carrierThread !== live.key.thread && carrierIsLive) return
+
+    const waiter = Array.from(liveSessions.values())
+      .filter(
+        (candidate) =>
+          !candidate.destroyed &&
+          candidate.githubReviewRound !== null &&
+          githubReviewRoundKey(candidate.githubReviewRound) === githubReviewRoundKey(round) &&
+          canPromoteGithubReviewRoundTo(round, candidate.key.thread),
+      )
+      .sort((a, b) => a.keyId.localeCompare(b.keyId))[0]
+    if (waiter === undefined) return
+
+    const promoted = promoteGithubReviewRound(round, waiter.key.thread)
+    if (promoted === null) return
+    for (const sibling of liveSessions.values()) {
+      if (
+        sibling.githubReviewRound !== null &&
+        githubReviewRoundKey(sibling.githubReviewRound) === githubReviewRoundKey(round)
+      ) {
+        sibling.githubReviewRound = promoted
+        persistGithubReviewRound(sibling, promoted)
+      }
+    }
+    waiter.pendingSystemReminders.push(
+      githubReviewRoundWakeupReminder(
+        `<system-reminder>\nThe designated sibling ended without a verified formal review verdict. ` +
+          `You are now the carrier for PR #${round.prNumber} at ${round.headSha.slice(0, 7)}. ` +
+          `Submit exactly one formal verdict for this follow-up round before closing out your thread.\n</system-reminder>`,
+        promoted,
+      ),
+    )
+    logger.info(`[channels] ${waiter.keyId}: github review round carrier promoted`)
+    if (!waiter.draining) void drain(waiter)
   }
 
   const enqueueTodoOutcomeWrite = (
@@ -3365,6 +3490,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.currentTurnAuthorIds = new Set(batch.map((m) => m.authorId))
           live.currentTurnReactionRef = batch[batch.length - 1]!.reactionRef ?? null
           const trigger = batch[batch.length - 1]!
+          if (trigger.githubReviewRound !== undefined) {
+            live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound)
+          }
           live.currentTurnExplicitlyAddressed =
             trigger.isDm || trigger.isBotMention || trigger.replyToBotMessageId !== null
           live.currentTurnTypingThread = batch[batch.length - 1]!.typingThread ?? null
@@ -3629,6 +3757,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (!isAwaitingBackgroundChild(live, 'staged-fallback')) {
           await resolveStagedFallback(live)
         }
+        const logicalTurnStillOpen =
+          live.pendingSystemReminders.length > 0 ||
+          live.stagedFallbackCause !== null ||
+          live.promisedWorkOutstandingThisLogicalTurn
+        if (!logicalTurnStillOpen) await failoverGithubReviewRound(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
           live.lastTurnAuthorId = live.currentTurnAuthorId
@@ -4114,9 +4247,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       replyToBotMessageId: event.replyToBotMessageId,
       isDm: event.isDm,
       ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
+      ...(event.githubReviewRound !== undefined ? { githubReviewRound: event.githubReviewRound } : {}),
       receivedAt: now(),
       ts: event.ts,
     })
+    if (event.githubReviewRound !== undefined) {
+      live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound)
+      persistGithubReviewRound(live, live.githubReviewRound)
+    }
     // Make the typing anchor live BEFORE startTypingHeartbeat fires (route()
     // starts the heartbeat right after enqueue, ahead of drain). drain() later
     // refreshes it to the last inbound of a coalesced batch.
@@ -6172,6 +6310,78 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'delivered', count }
   }
 
+  const completeRoundForVerifiedVerdict = async (args: {
+    workspace: string
+    prNumber: number
+    verdict: 'APPROVE' | 'REQUEST_CHANGES'
+    sessionId: string
+  }): Promise<{ kind: 'completed' | 'no-round' }> => {
+    const chat = `pr:${args.prNumber}`
+    const publisher = Array.from(liveSessions.values()).find(
+      (live) =>
+        !live.destroyed &&
+        live.sessionId === args.sessionId &&
+        live.key.adapter === 'github' &&
+        live.key.workspace === args.workspace &&
+        live.key.chat === chat &&
+        live.githubReviewRound !== null,
+    )
+    const round = publisher?.githubReviewRound
+    if (round === null || round === undefined) return { kind: 'no-round' }
+
+    const activeRound = registerGithubReviewRound(round)
+    if (activeRound.carrierThread !== publisher?.key.thread) return { kind: 'no-round' }
+    if (!(await validateGithubReviewRound(activeRound))) return { kind: 'no-round' }
+    completeGithubReviewRound(activeRound)
+    const key = githubReviewRoundKey(round)
+    for (const live of liveSessions.values()) {
+      if (live.githubReviewRound === null || githubReviewRoundKey(live.githubReviewRound) !== key) continue
+      live.pendingSystemReminders = live.pendingSystemReminders.filter(
+        (reminder) => reminder.githubReviewRoundKey !== key,
+      )
+      live.githubReviewRound = activeRound
+      persistGithubReviewRound(live, activeRound)
+    }
+    logger.info(`[channels] github review round completed pr=${chat} verdict=${args.verdict}`)
+    return { kind: 'completed' }
+  }
+
+  const finishGithubReviewRoundCloseout = (args: {
+    sessionId: string
+    workspace: string
+    prNumber: number
+    thread: string | null
+  }): void => {
+    const chat = `pr:${args.prNumber}`
+    const live = Array.from(liveSessions.values()).find(
+      (candidate) =>
+        !candidate.destroyed &&
+        candidate.sessionId === args.sessionId &&
+        candidate.key.adapter === 'github' &&
+        candidate.key.workspace === args.workspace &&
+        candidate.key.chat === chat &&
+        candidate.key.thread === args.thread,
+    )
+    if (live?.githubReviewRound === null || live?.githubReviewRound === undefined) return
+    const round = live.githubReviewRound
+    if (!isGithubReviewRoundComplete(round)) return
+    live.githubReviewRound = null
+    persistGithubReviewRound(live, null)
+    const stillReferenced =
+      Array.from(liveSessions.values()).some(
+        (candidate) =>
+          candidate.githubReviewRound !== null &&
+          githubReviewRoundKey(candidate.githubReviewRound) === githubReviewRoundKey(round),
+      ) ||
+      (mappings?.some(
+        (record) =>
+          record.githubReviewRound !== undefined &&
+          githubReviewRoundKey(record.githubReviewRound) === githubReviewRoundKey(round),
+      ) ??
+        false)
+    if (!stillReferenced) forgetGithubReviewRound(round)
+  }
+
   // Stamp the review-output flag on the session that just landed a formal GitHub
   // review this turn. Matched by sessionId (the recorder records the exact
   // event.sessionId), and confirmed to be the right github PR live session so a
@@ -6464,6 +6674,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     getSelfAliases: computeSelfAliases,
     injectSubagentCompletionReminder,
     injectPrVerdictActivity,
+    completeGithubReviewRound: completeRoundForVerifiedVerdict,
+    finishGithubReviewRoundCloseout,
     noteGithubReviewOutput,
     markTurnSkipped,
     clearSticky,
@@ -6475,6 +6687,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     writeInterruptedSubagentHandoff,
     liveCount: () => liveSessions.size,
     __testing: {
+      githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
+      pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
       flushDebounce: async (key: ChannelKey) => {
         const live = liveSessions.get(channelKeyId(key))
         if (!live) return
