@@ -1658,6 +1658,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     warns?: string[]
     authToken?: GithubWebhookHandlerOptions['authToken']
     reviewOn?: 'review_requested' | 'opened' | 'off'
+    allowApprove?: boolean
   }) {
     return createGithubWebhookHandler({
       webhookSecret: 'secret',
@@ -1666,6 +1667,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       selfId: () => '99',
       selfLogin: () => 'typeclaw-bot[bot]',
       authType: () => 'app',
+      ...(input.allowApprove !== undefined ? { allowApprove: () => input.allowApprove! } : {}),
       ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
       fetchImpl: input.fetchImpl,
@@ -1916,7 +1918,32 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     // A held block never self-clears, so the inbound must demand a fresh verdict
     // and must NOT offer the silent-exit escape hatch that would strand the block.
     expect(msg.text).toContain('always end with a new verdict')
+    expect(msg.text).toContain('DISMISS')
+    expect(msg.text).not.toContain('COMMENT if approval is disabled')
     expect(msg.text).not.toContain('end your turn without replying')
+  })
+
+  it('does not append COMMENT-instead-of-APPROVE guidance to a blocking round when approval is disabled', async () => {
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = recheckHandler({
+      fetchImpl: followupFetch({ threads: [], reviews: [{ state: 'CHANGES_REQUESTED' }] }),
+      routed,
+      tasks,
+      allowApprove: false,
+    })
+
+    await handler(signedRequest(JSON.stringify(synchronizePayload('beef222')), 'pull_request', 'sync-cr-noapprove'))
+    await tasks[0]?.()
+
+    expect(routed).toHaveLength(1)
+    // The policy note is appended AFTER the follow-up instruction, so the generic
+    // wording would be the LAST directive the model reads and would override the
+    // dismissal. Assert the whole routed text, not just the instruction fragment.
+    const text = routed[0]!.text
+    expect(text).toContain('DISMISS')
+    expect(text).not.toContain('submit a `COMMENT` review instead of `APPROVE`')
+    expect(text).toContain('does not clear the block')
   })
 
   it('does not route when the latest self review is APPROVED and no threads remain', async () => {
