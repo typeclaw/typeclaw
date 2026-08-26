@@ -513,6 +513,90 @@ describe('review verdict idempotency guard', () => {
     expect(flip).toBeNull()
   })
 
+  // `standing` is the one block a caller may answer by publishing a PR-level
+  // fallback comment instead, so a landed fallback must arm the same cooldown a landed
+  // formal review does. Otherwise every sibling thread session of one PR sees the same
+  // `standing` block minutes apart and publishes its own copy of the review.
+  function makeStandingGuard(headSha: () => string, now?: () => number) {
+    return createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => headSha(),
+      now,
+    })
+  }
+
+  async function guardFallback(g: ReturnType<typeof makeStandingGuard>, callId: string, prNumber: number) {
+    return g.guard({ callId, workspace: WS, prNumber, verdict: 'REQUEST_CHANGES', retainDuplicateLease: true })
+  }
+
+  test('reports a landed fallback comment as a recent duplicate, denying a sibling the fallback path', async () => {
+    // given: one session answered the standing block by publishing the fallback comment
+    const g = makeStandingGuard(() => 'sha-abc')
+    expect(await guardFallback(g, 'a1', 70)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+    // when: a sibling thread session of the same PR reaches the same point later
+    const sibling = await guardFallback(g, 'a2', 70)
+    // then: it is denied outright rather than handed the fallback path again
+    expect(sibling).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'recent' })
+    expect(sibling?.leaseRetained).toBeUndefined()
+  })
+
+  test('leaves no cooldown record when the fallback comment failed to deliver', async () => {
+    const g = makeStandingGuard(() => 'sha-abc')
+    await guardFallback(g, 'a1', 71)
+    await g.release({ callId: 'a1', outcome: 'failed' })
+    expect(await guardFallback(g, 'a2', 71)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+  })
+
+  test('expires the landed-fallback cooldown so a later deliberate re-publication is not stranded', async () => {
+    let clock = 1_000
+    const g = makeStandingGuard(
+      () => 'sha-abc',
+      () => clock,
+    )
+    await guardFallback(g, 'a1', 72)
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+    clock += LAG_WINDOW_MS + 1
+    expect(await guardFallback(g, 'a2', 72)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+  })
+
+  test('allows a fresh fallback once the PR head advances past the landed one', async () => {
+    let sha = 'sha-old'
+    const g = makeStandingGuard(() => sha)
+    await guardFallback(g, 'a1', 73)
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+    sha = 'sha-new'
+    expect(await guardFallback(g, 'a2', 73)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+  })
+
+  test('pins a landed fallback to the head it was written for, so a push mid-delivery cannot shadow the new head', async () => {
+    // given: the fallback comment is composed for sha-old
+    let sha = 'sha-old'
+    const g = makeStandingGuard(() => sha)
+    await guardFallback(g, 'a1', 75)
+    // when: the author pushes while router.send() is still delivering that comment
+    sha = 'sha-new'
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+    // then: the first review of the new head is not shadowed by the old head's comment
+    expect(await guardFallback(g, 'a2', 75)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+  })
+
+  test('never lets a landed fallback shadow the opposite verdict or a dismissal', async () => {
+    let effective: EffectiveVerdict = 'CHANGES_REQUESTED'
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => ({ ok: true, effective }),
+      resolveHeadSha: async () => 'sha-abc',
+    })
+    await g.guard({ callId: 'a1', workspace: WS, prNumber: 74, verdict: 'REQUEST_CHANGES', retainDuplicateLease: true })
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+
+    expect(await g.guard({ callId: 'a2', workspace: WS, prNumber: 74, verdict: 'APPROVE' })).toBeNull()
+    await g.release({ callId: 'a2', outcome: 'failed' })
+
+    effective = 'DISMISSED'
+    expect(await g.guard({ callId: 'a3', workspace: WS, prNumber: 74, verdict: 'REQUEST_CHANGES' })).toBeNull()
+  })
+
   test('push-during-review: head advances between guard and release, so the duplicate is still blocked on the new head', async () => {
     // given: the head is sha-old when the review is authorized, but a push lands
     // before the review does, so the post-submit re-resolve sees sha-new

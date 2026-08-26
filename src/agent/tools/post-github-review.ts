@@ -76,8 +76,9 @@ export function createPostGithubReviewTool(options: {
             blocked.kind === 'duplicate' &&
             blocked.duplicateSource === 'standing'
           ) {
+            let fallbackLanded = false
             try {
-              return await postDuplicateRequestChangesComment({
+              const fallback = await postDuplicateRequestChangesComment({
                 router,
                 origin,
                 sessionId,
@@ -86,9 +87,18 @@ export function createPostGithubReviewTool(options: {
                 comments: (params.comments ?? []).map(toReviewFinding),
                 logger,
               })
+              fallbackLanded = fallback.landed
+              return fallback.result
             } finally {
+              // The retained lease only serializes OVERLAPPING siblings. Recording the
+              // landing is what stops the sequential ones: sibling thread sessions of
+              // the same PR finish minutes apart, and without this each would see the
+              // same `standing` block and publish its own copy of the review.
               if (blocked.leaseRetained === true) {
-                await verdictGuard.release({ callId: coordinationCallId, outcome: 'failed' })
+                await verdictGuard.release({
+                  callId: coordinationCallId,
+                  outcome: fallbackLanded ? 'fallback-landed' : 'failed',
+                })
               }
             }
           }
@@ -164,7 +174,7 @@ async function postDuplicateRequestChangesComment(args: {
     },
     { accountingTarget: args.origin },
   )
-  if (!result.ok) return denied(args.logger, result.error, result.code)
+  if (!result.ok) return { landed: false, result: denied(args.logger, result.error, result.code) }
 
   recordReviewOutput({
     sessionId: args.sessionId,
@@ -180,15 +190,18 @@ async function postDuplicateRequestChangesComment(args: {
     ...(result.messageIds !== undefined ? { messageIds: result.messageIds } : {}),
   }
   return {
-    content: [
-      {
-        type: 'text' as const,
-        text: fenceToolResult(
-          'GitHub PR comment posted because the existing CHANGES_REQUESTED review is still active.',
-        ),
-      },
-    ],
-    details,
+    landed: true,
+    result: {
+      content: [
+        {
+          type: 'text' as const,
+          text: fenceToolResult(
+            'GitHub PR comment posted because the existing CHANGES_REQUESTED review is still active.',
+          ),
+        },
+      ],
+      details,
+    },
   }
 }
 

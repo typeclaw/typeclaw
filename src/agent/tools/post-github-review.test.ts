@@ -358,6 +358,110 @@ describe('post_github_review', () => {
     expect((await first).details).toMatchObject({ ok: true, fallback: 'comment' })
   })
 
+  // Regression: two sibling thread sessions of one PR each finished a
+  // re-review minutes apart, each hit the same standing CHANGES_REQUESTED block, and
+  // each published its own copy of the review as a top-level PR comment.
+  function standingChangesRequested(headSha: () => string) {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => headSha(),
+    })
+  }
+
+  test('publishes the duplicate-review comment once across sequential sibling sessions', async () => {
+    standingChangesRequested(() => 'sha-1')
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+
+    const first = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'first sibling',
+    })
+    const second = await run(
+      createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId: 'concurrent-session' }),
+      { event: 'REQUEST_CHANGES', body: 'second sibling' },
+    )
+
+    expect(first.details).toMatchObject({ ok: true, fallback: 'comment' })
+    expect(second.details).toMatchObject({ ok: false })
+    expect(comments).toHaveLength(1)
+  })
+
+  test('lets a sibling retry the duplicate-review comment when the first delivery failed', async () => {
+    standingChangesRequested(() => 'sha-1')
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      if (comments.length === 0) {
+        comments.push(message)
+        return { ok: false, error: 'GitHub API 502' }
+      }
+      comments.push(message)
+      return { ok: true }
+    })
+
+    const failed = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'first sibling',
+    })
+    const retry = await run(
+      createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId: 'concurrent-session' }),
+      { event: 'REQUEST_CHANGES', body: 'second sibling' },
+    )
+
+    expect(failed.details).toMatchObject({ ok: false })
+    expect(retry.details).toMatchObject({ ok: true, fallback: 'comment' })
+    expect(comments).toHaveLength(2)
+  })
+
+  test('publishes a fresh duplicate-review comment once the PR head advances', async () => {
+    let head = 'sha-1'
+    standingChangesRequested(() => head)
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+    const tool = createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId })
+
+    expect((await run(tool, { event: 'REQUEST_CHANGES', body: 'before push' })).details).toMatchObject({ ok: true })
+    head = 'sha-2'
+    expect((await run(tool, { event: 'REQUEST_CHANGES', body: 'after push' })).details).toMatchObject({ ok: true })
+    expect(comments).toHaveLength(2)
+  })
+
+  test('scopes the duplicate-review comment suppression to one pull request', async () => {
+    standingChangesRequested(() => 'sha-1')
+    const channelRouter = router()
+    const comments: OutboundMessage[] = []
+    channelRouter.registerOutbound('github', async (message) => {
+      comments.push(message)
+      return { ok: true }
+    })
+
+    const onPr7 = await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'REQUEST_CHANGES',
+      body: 'pr 7',
+    })
+    const onPr8 = await run(
+      createPostGithubReviewTool({
+        router: channelRouter,
+        origin: { ...githubOrigin, chat: 'pr:8' },
+        sessionId: 'concurrent-session',
+      }),
+      { event: 'REQUEST_CHANGES', body: 'pr 8' },
+    )
+
+    expect(onPr7.details).toMatchObject({ ok: true, fallback: 'comment' })
+    expect(onPr8.details).toMatchObject({ ok: true, fallback: 'comment' })
+    expect(comments).toHaveLength(2)
+  })
+
   test('keeps a recent-landed REQUEST_CHANGES cooldown duplicate denied without an authoritative standing block', async () => {
     configureReviewVerdictCoordinator({
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),

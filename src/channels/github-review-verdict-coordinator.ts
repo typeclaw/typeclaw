@@ -510,6 +510,40 @@ export function createApproveIdempotencyGuard(deps: {
         roundState !== undefined &&
         remote.ok &&
         remote.effective === 'CHANGES_REQUESTED'
+
+      // Layer 3 — duplicate-review cooldown. A recently-landed SAME verdict on the
+      // SAME (or uncertain) head blocks a redundant re-publication for the window. It
+      // fires on a bare NONE (read-after-write lag, the original shield) AND on the
+      // now-indexed SAME standing verdict (the PR #1042 fan-out, where siblings fired
+      // minutes apart, each after GitHub had already indexed the prior). It must NOT
+      // fire on a DISMISSED or the opposite decisive verdict: those are genuine
+      // supersessions, so the cooldown is gated to the ambiguous states (NONE, or the
+      // same standing verdict) and skipped for any decisive state that contradicts a
+      // redundant re-submit. A read error skips it (fails open) so a transient failure
+      // cannot strand a re-verdict.
+      //
+      // This is checked BEFORE the standing block below, and the order is load-bearing.
+      // `standing` is the one block a caller may answer by publishing a PR-level
+      // fallback comment instead, so a `standing` verdict on a PR that already got that
+      // comment would let every sibling thread session publish its own copy, which is
+      // how one PR collected two full reviews. Reporting `recent` here denies the whole publication
+      // instead, which is the accurate answer once a same-verdict output already landed.
+      if (
+        !allowedRoundSameStateRequest &&
+        remote.ok &&
+        cooldownApplies(args.verdict, remote.effective) &&
+        recentlyLandedSame(key, args.verdict, headSha, now)
+      ) {
+        resetRoundRequestChangesAttempt(reservation)
+        releaseReservation(args.callId, reservation)
+        return {
+          block: true,
+          kind: 'duplicate',
+          reason: duplicateReason(args.verdict),
+          duplicateSource: 'recent',
+        }
+      }
+
       if (remote.ok && duplicatesStanding(args.verdict, remote.effective) && !allowedRoundSameStateRequest) {
         // Standing verdict upstream already matches. Block, and release the lease
         // now: a blocked command never reaches tool.after, so release() won't run
@@ -528,34 +562,6 @@ export function createApproveIdempotencyGuard(deps: {
         }
       }
 
-      // Layer 3 — duplicate-review cooldown. A recently-landed SAME verdict on the
-      // SAME (or uncertain) head blocks a redundant re-submit for the window. It
-      // fires on a bare NONE (read-after-write lag, the original shield) AND on the
-      // now-indexed SAME standing verdict (the PR #1042 fan-out, where siblings fired
-      // minutes apart after indexing) — `duplicatesStanding` above already returned
-      // here for that case, so reaching this line on a same-standing-verdict means
-      // only that the lease-released duplicate is being re-tried; either way the
-      // cooldown holds. It must NOT fire on a DISMISSED or the opposite decisive
-      // verdict: those are genuine supersessions, so the cooldown is gated to the
-      // ambiguous states (NONE, or the same standing verdict) and skipped for any
-      // decisive state that contradicts a redundant re-submit. A read error skips it
-      // (fails open) so a transient failure cannot strand a re-verdict.
-      if (
-        !allowedRoundSameStateRequest &&
-        remote.ok &&
-        cooldownApplies(args.verdict, remote.effective) &&
-        recentlyLandedSame(key, args.verdict, headSha, now)
-      ) {
-        resetRoundRequestChangesAttempt(reservation)
-        releaseReservation(args.callId, reservation)
-        return {
-          block: true,
-          kind: 'duplicate',
-          reason: duplicateReason(args.verdict),
-          duplicateSource: 'recent',
-        }
-      }
-
       return null
     },
 
@@ -563,17 +569,27 @@ export function createApproveIdempotencyGuard(deps: {
       const reservation = reservationByCall.get(args.callId)
       if (reservation === undefined) return
       try {
-        // The pre-submit head can go stale: if the PR head advanced between the
-        // guard() capture and the review landing, GitHub attaches the review to the
-        // NEWER head while reservation.headSha holds the older one. Re-resolve the
-        // head AFTER a successful submit and store what we can prove: the resolved
-        // head only when pre==post, else the null uncertainty sentinel (matches any
-        // current head for the lag window) so a push-during-review cannot let a
-        // same-verdict duplicate slip past on the new head. The lease stays held
-        // across this await (finally below), so the window is not reopened.
+        // A FORMAL review's pre-submit head can go stale: if the PR head advanced
+        // between the guard() capture and the review landing, GitHub attaches the
+        // review to the NEWER head while reservation.headSha holds the older one.
+        // Re-resolve the head AFTER a successful submit and store what we can prove:
+        // the resolved head only when pre==post, else the null uncertainty sentinel
+        // (matches any current head for the lag window) so a push-during-review
+        // cannot let a same-verdict duplicate slip past on the new head. The lease
+        // stays held across this await (finally below), so the window is not reopened.
+        //
+        // A FALLBACK comment has no such ambiguity and must NOT take the sentinel.
+        // It is an issue comment, which GitHub associates with no head at all, and
+        // its body was written for reservation.headSha. Storing the sentinel for it
+        // would make a push landing mid-delivery shadow EVERY head, so the first
+        // genuine review of the new head would be denied as `recent` — an
+        // over-broad guard blocking real work. Pin it to the head it was written for.
         if (args.outcome !== 'failed' && reservation.headSha !== null && reservation.verdict !== 'DISMISSED') {
           const postHeadSha =
-            (await deps.resolveHeadSha?.({ workspace: reservation.workspace, prNumber: reservation.prNumber })) ?? null
+            args.outcome === 'fallback-landed'
+              ? reservation.headSha
+              : ((await deps.resolveHeadSha?.({ workspace: reservation.workspace, prNumber: reservation.prNumber })) ??
+                null)
           const landedHeadSha = postHeadSha !== null && postHeadSha === reservation.headSha ? postHeadSha : null
           recentLandedByPr.set(reservation.key, {
             verdict: reservation.verdict,
