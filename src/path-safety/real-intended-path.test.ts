@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
+  RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG,
   RECOVER_MISSING,
   RECOVER_MISSING_OR_UNSEARCHABLE,
   realIntendedPath,
@@ -86,13 +87,49 @@ describe('realIntendedPathSync — unsearchable ancestor (the /root regression)'
   })
 })
 
+describe('realIntendedPathSync — oversized component', () => {
+  test('ENAMETOOLONG walks to a resolvable prefix when denylist recovery is opted in', () => {
+    const parent = path.resolve(path.sep, 'agent', 'public', 'gate')
+    const oversized = '긴'.repeat(100)
+    const leaf = path.join(parent, oversized)
+    const deniedReal = path.resolve(path.sep, 'agent', 'memory')
+
+    expect(Buffer.byteLength(oversized, 'utf8')).toBeGreaterThan(255)
+    expect(
+      realIntendedPathSync(
+        leaf,
+        (candidate) => {
+          if (candidate === leaf) throw errno('ENAMETOOLONG')
+          if (candidate === parent) return deniedReal
+          throw errno('ENOENT')
+        },
+        { recoverable: RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG },
+      ),
+    ).toBe(path.join(deniedReal, oversized))
+  })
+
+  test('ENAMETOOLONG remains fatal under the default and allowlist-oriented sets', () => {
+    const target = path.resolve(path.sep, 'agent', 'public', 'x')
+
+    expect(() => realIntendedPathSync(target, unsearchableUntilRoot('ENAMETOOLONG'))).toThrow(/synthetic ENAMETOOLONG/)
+    expect(() =>
+      realIntendedPathSync(target, unsearchableUntilRoot('ENAMETOOLONG'), { recoverable: RECOVER_MISSING }),
+    ).toThrow(/synthetic ENAMETOOLONG/)
+    expect(() =>
+      realIntendedPathSync(target, unsearchableUntilRoot('ENAMETOOLONG'), {
+        recoverable: RECOVER_MISSING_OR_UNSEARCHABLE,
+      }),
+    ).toThrow(/synthetic ENAMETOOLONG/)
+  })
+})
+
 describe('realIntendedPathSync — non-recoverable errors stay fatal', () => {
-  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'ENAMETOOLONG', 'EIO']) {
+  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'EIO']) {
     test(`${code} rethrows even with the broadest recoverable set`, () => {
       const target = path.resolve(path.sep, 'agent', 'public', 'x')
       expect(() =>
         realIntendedPathSync(target, unsearchableUntilRoot(code), {
-          recoverable: RECOVER_MISSING_OR_UNSEARCHABLE,
+          recoverable: RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG,
         }),
       ).toThrow(new RegExp(`synthetic ${code}`))
     })
@@ -106,7 +143,7 @@ describe('realIntendedPathSync — non-recoverable errors stay fatal', () => {
         () => {
           throw new Error('bare failure')
         },
-        { recoverable: RECOVER_MISSING_OR_UNSEARCHABLE },
+        { recoverable: RECOVER_MISSING_OR_UNSEARCHABLE_OR_NAME_TOO_LONG },
       ),
     ).toThrow(/bare failure/)
   })

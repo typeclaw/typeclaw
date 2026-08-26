@@ -45,6 +45,13 @@ function localOnlyLstat(agentDir: string): (candidate: string) => Stats {
   }
 }
 
+function linuxNameMaxRealpath(candidate: string): string {
+  if (Buffer.byteLength(path.basename(candidate), 'utf8') > 255) {
+    throw Object.assign(new Error('name too long'), { code: 'ENAMETOOLONG' })
+  }
+  return realpathSync.native(candidate)
+}
+
 describe('private-surface-read guard — builtin file tools', () => {
   test('blocks reading a file inside a hidden dir (relative and absolute)', () => {
     expect(check('read', { path: 'workspace/notes.md' })?.block).toBe(true)
@@ -116,7 +123,7 @@ describe('private-surface-read guard — fail-closed across ALL tools (not a whi
     expect(result?.reason).not.toMatch(/internal guard error/i)
   })
 
-  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'ENAMETOOLONG', 'EIO']) {
+  for (const code of ['ELOOP', 'ENOTDIR', 'EPERM', 'EIO']) {
     test(`blocks with a generic reason when realpathSync.native reports ${code}`, () => {
       // Must resolve like the guard does: a POSIX literal would not match on Windows.
       const inaccessible = path.resolve(AGENT, 'public/protected.md')
@@ -159,6 +166,32 @@ describe('private-surface-read guard — fail-closed across ALL tools (not a whi
 
     expect(result?.block).toBe(true)
     expect(result?.reason).toMatch(/internal guard error/i)
+  })
+
+  test('allows long Korean and English plugin prose without an internal guard error', () => {
+    const agentDir = realpathSync(mkdtempSync(path.join(tmpdir(), 'typeclaw-long-plugin-prose-')))
+    const koreanBody = '장기 기억에 남길 일반적인 사용자 지침입니다. '.repeat(10)
+    const englishBody = 'This is ordinary user guidance that should be written to long-term memory. '.repeat(5)
+    const internalErrors: unknown[] = []
+
+    expect(Buffer.byteLength(koreanBody, 'utf8')).toBeGreaterThan(255)
+    expect(Buffer.byteLength(englishBody, 'utf8')).toBeGreaterThan(255)
+    for (const body of [koreanBody, englishBody]) {
+      expect(
+        checkPrivateSurfaceReadGuard(
+          {
+            tool: 'memory_append',
+            args: { body },
+            agentDir,
+            hidden: privilegedHidden,
+            fileOperands: { nonFile: ['body'] },
+            toolProvenance: 'plugin',
+          },
+          { realpathNative: linuxNameMaxRealpath, onInternalError: (error) => internalErrors.push(error) },
+        ),
+      ).toBeUndefined()
+    }
+    expect(internalErrors).toEqual([])
   })
 
   test('blocks find_entry reading a hidden transcript via top-level path', () => {
@@ -490,6 +523,26 @@ describe('private-surface-read guard — traversal + scope', () => {
     expect(check('read', { path: './workspace/./x' })?.block).toBe(true)
   })
 
+  test('blocks traversal-normalized canonical secrets before resolving an oversized component', () => {
+    const oversized = 'x'.repeat(300)
+    const internalErrors: unknown[] = []
+    const result = checkPrivateSurfaceReadGuard(
+      {
+        tool: 'plugin_reader',
+        args: { value: `${oversized}/../secrets.json` },
+        agentDir: AGENT,
+        hidden: privilegedHidden,
+        toolProvenance: 'plugin',
+      },
+      { realpathNative: linuxNameMaxRealpath, onInternalError: (error) => internalErrors.push(error) },
+    )
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('secrets.json')
+    expect(result?.reason).not.toMatch(/internal guard error/i)
+    expect(internalErrors).toEqual([])
+  })
+
   test('covers the secret files across ALL tools (one deny-list, not delegated to secretExfilRead)', () => {
     expect(check('read', { path: '/agent/.env' })?.block).toBe(true)
     expect(check('read', { path: '.env' })?.block).toBe(true)
@@ -665,6 +718,29 @@ describe('private-surface-read guard — symlink bypass defense', () => {
       hidden,
     })
     expect(result?.block).toBe(true)
+  })
+
+  test('blocks an oversized tail below a symlink prefix into a hidden directory', () => {
+    const { agentDir, hidden } = makeAgentWithSymlinks()
+    const oversized = '기억'.repeat(50)
+    const internalErrors: unknown[] = []
+
+    expect(Buffer.byteLength(oversized, 'utf8')).toBeGreaterThan(255)
+    const result = checkPrivateSurfaceReadGuard(
+      {
+        tool: 'plugin_reader',
+        args: { value: path.join('public', 'mem-link', oversized) },
+        agentDir,
+        hidden,
+        toolProvenance: 'plugin',
+      },
+      { realpathNative: linuxNameMaxRealpath, onInternalError: (error) => internalErrors.push(error) },
+    )
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain(path.join(agentDir, 'memory'))
+    expect(result?.reason).not.toMatch(/internal guard error/i)
+    expect(internalErrors).toEqual([])
   })
 
   test('blocks the symlink via a NESTED arg shape (look_at images[].path)', () => {
@@ -1138,6 +1214,21 @@ describe('private-surface-read guard — honors a tool author fileOperands.nonFi
         fileOperands: { nonFile: ['query'] },
       })?.block,
     ).toBe(true)
+  })
+
+  test('blocks canonical secret files and directories despite declared nonFile operands', () => {
+    for (const value of ['secrets.json', '.env', '.typeclaw/home/credentials.json']) {
+      expect(
+        checkPrivateSurfaceReadGuard({
+          tool: 'unknown_plugin_reader',
+          args: { value },
+          agentDir: AGENT,
+          hidden: privilegedHidden,
+          fileOperands: { nonFile: ['value'] },
+          toolProvenance: 'plugin',
+        })?.block,
+      ).toBe(true)
+    }
   })
 
   test('blocks a colliding channel_send plugin local text operand from reading a canonical credential', () => {
