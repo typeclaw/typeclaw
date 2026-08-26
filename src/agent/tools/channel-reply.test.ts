@@ -73,7 +73,9 @@ function fakeRouter(
     resolveReviewThread: options.resolveReviewThread ?? (async () => ({ ok: true })),
     registerReviewStateResolver: () => {},
     unregisterReviewStateResolver: () => {},
-    getReviewState: options.getReviewState ?? (async () => ({ ok: true, selfBlocking: false, approve: true })),
+    getReviewState:
+      options.getReviewState ??
+      (async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })),
     registerReviewSubmitter: () => {},
     unregisterReviewSubmitter: () => {},
     submitReview: async () => ({ ok: true, reviewId: 1, state: 'COMMENTED' }),
@@ -1233,7 +1235,7 @@ describe('channel_reply re-review stranding guard', () => {
             resolveCalled = true
             return { ok: true }
           },
-          getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
+          getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }),
         },
       ),
       origin: githubThreadOrigin,
@@ -1255,7 +1257,7 @@ describe('channel_reply re-review stranding guard', () => {
           calls.push(msg)
           return { ok: true }
         },
-        { getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }) },
+        { getReviewState: async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }) },
       ),
       origin: githubThreadOrigin,
     })
@@ -1268,6 +1270,8 @@ describe('channel_reply re-review stranding guard', () => {
 
   test('resolves and acknowledges a non-carrier sibling once GitHub says the block is gone', async () => {
     const round = {
+      kind: 'push',
+      roundId: 'test-round',
       workspace: 'acme/widgets',
       prNumber: 644,
       headSha: 'sha-round',
@@ -1282,7 +1286,7 @@ describe('channel_reply re-review stranding guard', () => {
           return { ok: true }
         },
         {
-          getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }),
+          getReviewState: async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }),
           resolveReviewThread: async () => {
             order.push('resolve')
             return { ok: true }
@@ -1336,7 +1340,7 @@ describe('channel_reply re-review stranding guard', () => {
       router: fakeRouter(async () => ({ ok: true }), {
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: true, approve: true }
+          return { ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }
         },
       }),
       origin: githubThreadOrigin,
@@ -1359,7 +1363,7 @@ describe('channel_reply re-review stranding guard', () => {
           calls.push(msg)
           return { ok: true }
         },
-        { getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }) },
+        { getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }) },
       ),
       origin: { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:649', thread: null },
     })
@@ -1381,7 +1385,7 @@ describe('channel_reply re-review stranding guard', () => {
           calls.push(msg)
           return { ok: true }
         },
-        { getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }) },
+        { getReviewState: async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }) },
       ),
       origin: { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:649', thread: null },
     })
@@ -1404,6 +1408,7 @@ describe('channel_reply re-review stranding guard', () => {
           getReviewState: async () => ({
             ok: true,
             selfBlocking: false,
+            selfBlockingReviewId: null,
             approve: true,
             reviewDecision: 'REVIEW_REQUIRED',
           }),

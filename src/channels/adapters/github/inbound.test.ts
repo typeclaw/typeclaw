@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import { createHmac } from 'node:crypto'
 
+import { __resetReviewVerdictGuardForTest } from '@/channels/github-review-verdict-coordinator'
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
@@ -1179,6 +1180,241 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
   })
 })
 
+describe('createGithubWebhookHandler — reply review rounds', () => {
+  function replyRoundHandler(input: {
+    routed: InboundMessage[]
+    fetchImpl: typeof fetch
+    generateReviewRoundId?: () => string
+  }): (req: Request) => Promise<Response> {
+    return createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request_review_comment.created'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot[bot]',
+      authToken: async () => 'tok',
+      fetchImpl: input.fetchImpl,
+      generateReviewRoundId: input.generateReviewRoundId,
+      logger,
+      route: (message) => input.routed.push(message),
+    })
+  }
+
+  function replyRoundFetch(input: {
+    parentAuthors?: Record<number, Record<string, unknown>>
+    reviewState?: 'blocking' | 'blocking-without-id' | 'clear' | 'failed'
+    calls?: string[]
+  }): typeof fetch {
+    return fakeFetch((url) => {
+      input.calls?.push(url)
+      const parentMatch = /\/pulls\/comments\/(\d+)$/.exec(url)
+      if (parentMatch !== null) {
+        const parentId = Number(parentMatch[1])
+        const author = input.parentAuthors?.[parentId] ?? { login: 'typeclaw-bot[bot]', id: 99, type: 'Bot' }
+        return new Response(JSON.stringify({ id: parentId, user: author }), { status: 200 })
+      }
+      if (url.includes('/pulls/') && url.includes('/reviews')) {
+        if (input.reviewState === 'failed') return new Response('boom', { status: 500 })
+        const reviews =
+          input.reviewState === 'clear'
+            ? [{ id: 7001, state: 'APPROVED', user: { login: 'typeclaw-bot[bot]', type: 'Bot' } }]
+            : [
+                {
+                  ...(input.reviewState === 'blocking-without-id' ? {} : { id: 7001 }),
+                  state: 'CHANGES_REQUESTED',
+                  user: { login: 'typeclaw-bot[bot]', type: 'Bot' },
+                },
+              ]
+        return new Response(JSON.stringify(reviews), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    })
+  }
+
+  async function expectQualifyingControlToArm(delivery: string): Promise<void> {
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => `${delivery}-round`,
+    })
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 909, headSha: 'sha-control' })),
+        'pull_request_review_comment',
+        delivery,
+      ),
+    )
+    expect(routed[0]?.githubReviewRound?.roundId).toBe(`${delivery}-round`)
+  }
+
+  it('coalesces replies to different self-authored threads and keeps the first thread as carrier', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    let nonce = 0
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => `reply-${++nonce}`,
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, id: 201, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-first',
+      ),
+    )
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 102, id: 202, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-second',
+      ),
+    )
+
+    expect(routed).toHaveLength(2)
+    expect(routed[0]?.githubReviewRound).toEqual({
+      kind: 'reply',
+      roundId: 'reply-1',
+      workspace: 'acme/project',
+      prNumber: 7,
+      headSha: 'sha-one',
+      carrierThread: '101',
+    })
+    expect(routed[1]?.githubReviewRound).toEqual(routed[0]?.githubReviewRound)
+    expect(routed[0]?.thread).toBe('101')
+    expect(routed[1]?.thread).toBe('102')
+    expect(nonce).toBe(1)
+  })
+
+  it('makes a lone qualifying reply the carrier of a singleton round', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({}),
+      generateReviewRoundId: () => 'singleton-reply',
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-singleton',
+      ),
+    )
+
+    expect(routed[0]?.githubReviewRound?.roundId).toBe('singleton-reply')
+    expect(routed[0]?.githubReviewRound?.carrierThread).toBe('101')
+  })
+
+  it('does not arm a round or read review state for a reply rooted by a human', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const calls: string[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({
+        parentAuthors: { 101: { login: 'alice', id: 10, type: 'User' } },
+        calls,
+      }),
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-human-root',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(calls.filter((url) => url.includes('/reviews'))).toHaveLength(0)
+    await expectQualifyingControlToArm('reply-round-human-root-control')
+  })
+
+  it('does not arm a round or make network calls for a top-level inline comment', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const calls: string[] = []
+    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ calls }) })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: null, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-top-level',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(calls).toHaveLength(0)
+    await expectQualifyingControlToArm('reply-round-top-level-control')
+  })
+
+  it('does not arm a round when the bot has no effective blocking review', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ reviewState: 'clear' }) })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-clear',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    await expectQualifyingControlToArm('reply-round-clear-control')
+  })
+
+  it('does not arm a round when the blocking review has no stable id', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({ reviewState: 'blocking-without-id' }),
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-missing-review-id',
+      ),
+    )
+
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    await expectQualifyingControlToArm('reply-round-missing-review-id-control')
+  })
+
+  it('fails open and routes the reply without a round when review-state lookup fails', async () => {
+    __resetReviewVerdictGuardForTest()
+    const routed: InboundMessage[] = []
+    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ reviewState: 'failed' }) })
+
+    const response = await handler(
+      signedRequest(
+        JSON.stringify(reviewCommentPayload({ inReplyToId: 101, headSha: 'sha-one' })),
+        'pull_request_review_comment',
+        'reply-round-failed-state',
+      ),
+    )
+
+    expect(response.status).toBe(200)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.thread).toBe('101')
+    expect(routed[0]?.githubReviewRound).toBeUndefined()
+    await expectQualifyingControlToArm('reply-round-failed-state-control')
+  })
+})
+
 describe('createGithubWebhookHandler — self-author drop', () => {
   function selfAuthoredHandler(
     routed: InboundMessage[],
@@ -1671,6 +1907,7 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
       ...(input.allowApprove !== undefined ? { allowApprove: () => input.allowApprove! } : {}),
       ...(input.reviewOn !== undefined ? { reviewOn: () => input.reviewOn! } : {}),
       authToken: input.authToken ?? (async () => 'tok'),
+      generateReviewRoundId: () => 'round-id',
       fetchImpl: input.fetchImpl,
       scheduleBackgroundTask: (task) => {
         input.tasks.push(task)
@@ -2004,6 +2241,8 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     expect(routed[0]!.text).toContain('CHANGES_REQUESTED')
     expect(routed[0]!.text).not.toContain('end your turn without replying')
     expect(routed[0]!.githubReviewRound).toEqual({
+      kind: 'push',
+      roundId: 'round-id',
       workspace: 'acme/project',
       prNumber: 7,
       headSha: 'abc1234def',
@@ -2030,8 +2269,22 @@ describe('createGithubWebhookHandler — pull_request.synchronize recheck', () =
     await tasks[0]?.()
 
     expect(routed.map((message) => message.githubReviewRound)).toEqual([
-      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
-      { workspace: 'acme/project', prNumber: 7, headSha: 'round-sha', carrierThread: '100' },
+      {
+        kind: 'push',
+        roundId: 'round-id',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'round-sha',
+        carrierThread: '100',
+      },
+      {
+        kind: 'push',
+        roundId: 'round-id',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'round-sha',
+        carrierThread: '100',
+      },
     ])
   })
 
@@ -2315,14 +2568,25 @@ function issueCommentPayload(options: { pullRequest: boolean; body?: string }): 
   }
 }
 
-function reviewCommentPayload(options: { inReplyToId?: number | null; body?: string } = {}): Record<string, unknown> {
+function reviewCommentPayload(
+  options: {
+    inReplyToId?: number | null
+    body?: string
+    id?: number
+    prNumber?: number
+    headSha?: string
+  } = {},
+): Record<string, unknown> {
   const inReplyToId = options.inReplyToId === undefined ? 101 : options.inReplyToId
   return {
     action: 'created',
     repository: repo(),
-    pull_request: { number: 7 },
+    pull_request: {
+      number: options.prNumber ?? 7,
+      ...(options.headSha !== undefined ? { head: { sha: options.headSha } } : {}),
+    },
     comment: {
-      id: 102,
+      id: options.id ?? 102,
       ...(inReplyToId !== null ? { in_reply_to_id: inReplyToId } : {}),
       body: options.body ?? 'review',
       created_at: '2026-01-01T00:00:00Z',

@@ -1247,6 +1247,8 @@ describe('buildChannelTools', () => {
     liveOrigin = {
       ...threadOrigin,
       githubReviewRound: {
+        kind: 'push',
+        roundId: 'test-round',
         workspace: 'acme/widgets',
         prNumber: 7,
         headSha: 'sha-round',

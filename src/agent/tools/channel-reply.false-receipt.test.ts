@@ -57,7 +57,7 @@ function fakeRouter(onSend: (msg: OutboundMessage) => SendResult = () => ({ ok: 
     resolveReviewThread: async () => ({ ok: true }),
     registerReviewStateResolver: () => {},
     unregisterReviewStateResolver: () => {},
-    getReviewState: async () => ({ ok: true, selfBlocking: false, approve: true }),
+    getReviewState: async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }),
     registerReviewSubmitter: () => {},
     unregisterReviewSubmitter: () => {},
     submitReview: async () => ({ ok: true, reviewId: 1, state: 'COMMENTED' }),

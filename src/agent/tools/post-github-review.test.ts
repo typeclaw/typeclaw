@@ -230,6 +230,8 @@ describe('post_github_review', () => {
         ...githubOrigin,
         thread: '202',
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'test-round',
           workspace: githubOrigin.workspace,
           prNumber: 7,
           headSha: 'sha-round',

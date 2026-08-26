@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import type { ReviewVerdict } from './github-review-turn-ledger'
 import type { GithubReviewFollowupRound } from './types'
 
@@ -135,6 +137,11 @@ const LEASE_TTL_MS = 5 * 60_000
 // verdicts indefinitely.
 export const REVIEW_ROUND_TTL_MS = 2 * 60 * 60_000
 
+// Reply fan-out only needs to cover one reviewer run, its prescribed retry,
+// and carrier promotion; keeping it short prevents a later conversation about
+// the same review from inheriting an abandoned gate.
+export const REPLY_REVIEW_ROUND_TTL_MS = 30 * 60_000
+
 // How long a just-landed verdict suppresses a redundant same-verdict re-submit on
 // the same head — a duplicate-review cooldown. It started as a narrow lag shield
 // for GitHub's ~10-18s read-after-write lag (the original ~10-18s-apart duplicates
@@ -149,6 +156,7 @@ export const REVIEW_ROUND_TTL_MS = 2 * 60 * 60_000
 // stays well under the lease TTL and short enough that a deliberate human-driven
 // re-approval of the identical commit is the only thing it can delay.
 const RECENT_LANDED_TTL_MS = 5 * 60_000
+const COMPLETED_REPLY_REVIEW_ROUND_GRACE_MS = 5 * 60_000
 
 type Reservation = {
   key: string
@@ -188,27 +196,64 @@ type ReviewRoundState = {
 }
 let reviewRounds = new Map<string, ReviewRoundState>()
 let expiredReviewRoundKeys = new Set<string>()
+type ReplyReviewRoundGeneration = { round: GithubReviewFollowupRound; createdAt: number }
+let replyReviewRoundGenerations = new Map<string, ReplyReviewRoundGeneration>()
 let tokenSeq = 0
 
 export function githubReviewRoundKey(round: GithubReviewFollowupRound): string {
-  return `${round.workspace}#${round.prNumber}#${round.headSha}`
+  return `${round.workspace}#${round.prNumber}#${round.headSha}#${round.roundId}`
+}
+
+export function registerOrJoinReplyReviewRound(input: {
+  workspace: string
+  prNumber: number
+  headSha: string
+  blockingReviewId: number
+  thread: string
+  now?: () => number
+  generateRoundId?: () => string
+}): GithubReviewFollowupRound {
+  const now = input.now ?? Date.now
+  const currentTime = now()
+  const correlationKey = JSON.stringify([input.workspace, input.prNumber, input.headSha, input.blockingReviewId])
+  const existing = replyReviewRoundGenerations.get(correlationKey)
+  if (existing !== undefined) {
+    const state = activeReviewRoundState(githubReviewRoundKey(existing.round), now)
+    const completedGraceExpired =
+      state?.status === 'completed' && currentTime - existing.createdAt >= COMPLETED_REPLY_REVIEW_ROUND_GRACE_MS
+    if (state !== undefined && !completedGraceExpired) return existing.round
+    replyReviewRoundGenerations.delete(correlationKey)
+  }
+
+  const round: GithubReviewFollowupRound = {
+    kind: 'reply',
+    roundId: (input.generateRoundId ?? randomUUID)(),
+    workspace: input.workspace,
+    prNumber: input.prNumber,
+    headSha: input.headSha,
+    carrierThread: input.thread,
+  }
+  replyReviewRoundGenerations.set(correlationKey, { round, createdAt: currentTime })
+  registerGithubReviewRound(round, currentTime, now)
+  return round
 }
 
 export function registerGithubReviewRound(
   round: GithubReviewFollowupRound,
   createdAt = Date.now(),
+  now: () => number = Date.now,
 ): GithubReviewFollowupRound | null {
   const key = githubReviewRoundKey(round)
   if (expiredReviewRoundKeys.has(key)) return null
   for (const [candidateKey, state] of reviewRounds) {
-    if (activeReviewRoundState(candidateKey) === undefined) continue
+    if (activeReviewRoundState(candidateKey, now) === undefined) continue
     if (candidateKey !== key && state.round.workspace === round.workspace && state.round.prNumber === round.prNumber) {
       reviewRounds.delete(candidateKey)
     }
   }
-  const existing = activeReviewRoundState(key)
+  const existing = activeReviewRoundState(key, now)
   if (existing !== undefined) return existing.round
-  if (Date.now() - createdAt >= REVIEW_ROUND_TTL_MS) {
+  if (now() - createdAt >= reviewRoundTtlMs(round)) {
     expiredReviewRoundKeys.add(key)
     return null
   }
@@ -331,7 +376,7 @@ export async function validateGithubReviewRound(
   round: GithubReviewFollowupRound,
   createdAt?: number,
 ): Promise<boolean> {
-  if (createdAt !== undefined && Date.now() - createdAt >= REVIEW_ROUND_TTL_MS) return false
+  if (createdAt !== undefined && Date.now() - createdAt >= reviewRoundTtlMs(round)) return false
   if (expiredReviewRoundKeys.has(githubReviewRoundKey(round))) return false
   const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
   return currentHead !== null && currentHead === round.headSha
@@ -633,8 +678,16 @@ async function evaluateRoundEligibility(
   expireReviewRounds(now)
   const pendingRoundForPr = Array.from(reviewRounds.values()).find(
     (state) =>
-      state.status === 'pending' && state.round.workspace === args.workspace && state.round.prNumber === args.prNumber,
+      state.status === 'pending' &&
+      state.round.kind === 'push' &&
+      state.round.workspace === args.workspace &&
+      state.round.prNumber === args.prNumber,
   )
+  // Pushes invalidate the whole PR's prior verdict, so their round legitimately
+  // owns every verdict attempt until one sibling carries it. Reply rounds only
+  // coordinate the stamped siblings answering one blocking review: their
+  // non-carriers are rejected below, while unrelated round-less sessions remain
+  // covered by the in-flight, standing, and recent-landing duplicate guards.
   if (args.round === undefined) {
     return pendingRoundForPr === undefined
       ? null
@@ -701,10 +754,14 @@ function prKey(workspace: string, prNumber: number): string {
 function activeReviewRoundState(key: string, now: () => number = Date.now): ReviewRoundState | undefined {
   const state = reviewRounds.get(key)
   if (state === undefined) return undefined
-  if (now() - state.createdAt < REVIEW_ROUND_TTL_MS) return state
+  if (now() - state.createdAt < reviewRoundTtlMs(state.round)) return state
   reviewRounds.delete(key)
   expiredReviewRoundKeys.add(key)
   return undefined
+}
+
+function reviewRoundTtlMs(round: GithubReviewFollowupRound): number {
+  return round.kind === 'reply' ? REPLY_REVIEW_ROUND_TTL_MS : REVIEW_ROUND_TTL_MS
 }
 
 function expireReviewRounds(now: () => number = Date.now): void {
@@ -732,6 +789,7 @@ export function __resetReviewVerdictGuardForTest(): void {
   recentLandedByPr.clear()
   reviewRounds = new Map<string, ReviewRoundState>()
   expiredReviewRoundKeys = new Set<string>()
+  replyReviewRoundGenerations = new Map<string, ReplyReviewRoundGeneration>()
   tokenSeq = 0
   processEffectiveResolver = async () => ({ ok: false })
   processHeadShaResolver = async () => null

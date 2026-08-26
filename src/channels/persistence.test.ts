@@ -86,6 +86,84 @@ describe('loadChannelSessions', () => {
     expect(out[0]?.githubReviewRound).toBeUndefined()
   })
 
+  test('loads a legacy v7 review round as a stable push generation', async () => {
+    const dir = await tempDir()
+    const path = channelsSessionsPath(dir)
+    await mkdir(join(dir, 'channels'), { recursive: true })
+    const legacy = {
+      version: 7,
+      sessions: [
+        {
+          adapter: 'github',
+          workspace: 'acme/widgets',
+          chat: 'pr:7',
+          thread: '101',
+          participants: [],
+          githubReviewRound: {
+            workspace: 'acme/widgets',
+            prNumber: 7,
+            headSha: 'sha-round',
+            carrierThread: '101',
+            status: 'pending',
+            createdAt: 1234,
+            attemptedCarriers: ['101'],
+          },
+        },
+      ],
+    }
+    await writeFile(path, JSON.stringify(legacy))
+
+    const first = await loadChannelSessions(dir, silentLogger)
+    const second = await loadChannelSessions(dir, silentLogger)
+
+    expect(first[0]?.githubReviewRound).toMatchObject({
+      kind: 'push',
+      roundId: 'legacy:acme/widgets#7#sha-round',
+    })
+    expect(second[0]?.githubReviewRound?.roundId).toBe(first[0]?.githubReviewRound?.roundId)
+  })
+
+  test('rejects malformed current review-round identities', async () => {
+    const dir = await tempDir()
+    const path = channelsSessionsPath(dir)
+    await mkdir(join(dir, 'channels'), { recursive: true })
+    const round = {
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+      status: 'pending',
+      createdAt: 1234,
+      attemptedCarriers: ['101'],
+    }
+    await writeFile(
+      path,
+      JSON.stringify({
+        version: 7,
+        sessions: [
+          {
+            adapter: 'github',
+            workspace: 'acme/widgets',
+            chat: 'pr:7',
+            thread: '101',
+            participants: [],
+            githubReviewRound: { ...round, kind: 'other', roundId: 'round-id' },
+          },
+          {
+            adapter: 'github',
+            workspace: 'acme/widgets',
+            chat: 'pr:7',
+            thread: '202',
+            participants: [],
+            githubReviewRound: { ...round, kind: 'reply', roundId: '' },
+          },
+        ],
+      }),
+    )
+
+    expect(await loadChannelSessions(dir, silentLogger)).toEqual([])
+  })
+
   test('migrates v4 Webex room ids to refs and leaves existing refs unchanged', async () => {
     const dir = await tempDir()
     const path = channelsSessionsPath(dir)
@@ -300,6 +378,8 @@ describe('saveChannelSessions', () => {
         sessionId: 'ses_round',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'round-pending',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-round',
@@ -325,6 +405,8 @@ describe('saveChannelSessions', () => {
         sessionId: 'ses_completed_round',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'round-completed',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-round',

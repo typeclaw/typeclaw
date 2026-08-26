@@ -8,17 +8,28 @@ import {
   canPromoteGithubReviewRoundTo,
   createApproveIdempotencyGuard,
   guardGithubReviewRoundDismissal,
+  githubReviewRoundKey,
   isGithubReviewRoundComplete,
+  REPLY_REVIEW_ROUND_TTL_MS,
   releaseGithubReviewRoundDismissal,
   registerGithubReviewRound,
+  registerOrJoinReplyReviewRound,
   REVIEW_ROUND_TTL_MS,
   restoreGithubReviewRound,
+  validateGithubReviewRound,
   type EffectiveApprovalResolver,
   type EffectiveVerdict,
 } from './github-review-verdict-coordinator'
 
 const WS = 'acme/widgets'
-const ROUND = { workspace: WS, prNumber: 60, headSha: 'sha-round', carrierThread: '101' } as const
+const ROUND = {
+  kind: 'push',
+  roundId: 'round-60',
+  workspace: WS,
+  prNumber: 60,
+  headSha: 'sha-round',
+  carrierThread: '101',
+} as const
 
 function resolver(map: Record<string, EffectiveVerdict | 'error'>): EffectiveApprovalResolver {
   return async ({ workspace, prNumber }) => {
@@ -142,6 +153,54 @@ describe('review verdict idempotency guard', () => {
     expect(reads).toBe(0)
   })
 
+  test('allows a round-less publisher while a reply round is pending for the PR', async () => {
+    let reads = 0
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-unrelated' } as const
+    registerGithubReviewRound(replyRound)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => ROUND.headSha,
+    })
+
+    const decision = await g.guard({
+      callId: 'reply-round-unrelated',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+    })
+
+    expect(decision).toBeNull()
+    expect(reads).toBe(1)
+  })
+
+  test('still rejects a non-carrier sibling carrying a pending reply round', async () => {
+    let reads = 0
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-non-carrier' } as const
+    registerGithubReviewRound(replyRound)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => {
+        reads += 1
+        return { ok: true, effective: 'NONE' }
+      },
+      resolveHeadSha: async () => ROUND.headSha,
+    })
+
+    const decision = await g.guard({
+      callId: 'reply-round-non-carrier',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: replyRound,
+      thread: '202',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(reads).toBe(0)
+  })
+
   test('expires a pending round before it can deny a verdict with missing round metadata', async () => {
     let reads = 0
     let clock = Date.now()
@@ -164,6 +223,178 @@ describe('review verdict idempotency guard', () => {
 
     expect(decision).toBeNull()
     expect(reads).toBe(1)
+  })
+
+  test('expires reply rounds after 30 minutes while an equally old push round remains active', async () => {
+    const createdAt = Date.now() - REPLY_REVIEW_ROUND_TTL_MS
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-round' } as const
+    const pushRound = { ...ROUND, prNumber: 61, roundId: 'push-round' } as const
+
+    expect(restoreGithubReviewRound(replyRound, 'pending', ['101'], false, false, createdAt)).toBeNull()
+    expect(restoreGithubReviewRound(pushRound, 'pending', ['101'], false, false, createdAt)).toEqual(pushRound)
+  })
+
+  test('expires active reply state after 30 minutes without shortening a push round', async () => {
+    const createdAt = Date.now()
+    let clock = createdAt
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-active' } as const
+    const pushRound = { ...ROUND, prNumber: 61, roundId: 'push-active' } as const
+    registerGithubReviewRound(replyRound, createdAt)
+    registerGithubReviewRound(pushRound, createdAt)
+    clock += REPLY_REVIEW_ROUND_TTL_MS
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => null,
+      now: () => clock,
+    })
+
+    expect(await g.guard({ callId: 'reply-expired', workspace: WS, prNumber: 60, verdict: 'APPROVE' })).toBeNull()
+    expect(await g.guard({ callId: 'push-active', workspace: WS, prNumber: 61, verdict: 'APPROVE' })).toMatchObject({
+      block: true,
+      kind: 'round-ineligible',
+    })
+  })
+
+  test('validates persisted reply and push rounds against their distinct lifetimes', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async ({ prNumber }) => (prNumber === 60 ? 'sha-round' : 'sha-push'),
+    })
+    const createdAt = Date.now() - REPLY_REVIEW_ROUND_TTL_MS
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-validation' } as const
+    const pushRound = {
+      ...ROUND,
+      prNumber: 61,
+      headSha: 'sha-push',
+      roundId: 'push-validation',
+    } as const
+
+    expect(await validateGithubReviewRound(replyRound, createdAt)).toBe(false)
+    expect(await validateGithubReviewRound(pushRound, createdAt)).toBe(true)
+  })
+
+  test('keeps separate generation keys for otherwise identical rounds', () => {
+    const first = { ...ROUND, roundId: 'generation-1' }
+    const second = { ...ROUND, roundId: 'generation-2' }
+
+    expect(githubReviewRoundKey(first)).not.toBe(githubReviewRoundKey(second))
+  })
+
+  test('registers sibling replies as one generation with the first thread as carrier', () => {
+    let nonce = 0
+    const common = {
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      now: () => 1_000,
+      generateRoundId: () => `reply-${++nonce}`,
+    }
+
+    const first = registerOrJoinReplyReviewRound({ ...common, thread: '101' })
+    const second = registerOrJoinReplyReviewRound({ ...common, thread: '202' })
+
+    expect(first).toEqual({ ...ROUND, kind: 'reply', roundId: 'reply-1' })
+    expect(second).toEqual(first)
+    expect(nonce).toBe(1)
+  })
+
+  test('makes a lone reply the carrier of its singleton generation', () => {
+    const round = registerOrJoinReplyReviewRound({
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '303',
+      now: () => 1_000,
+      generateRoundId: () => 'singleton',
+    })
+
+    expect(round.kind).toBe('reply')
+    expect(round.roundId).toBe('singleton')
+    expect(round.carrierThread).toBe('303')
+  })
+
+  test('does not coalesce replies across blocking review, head, or PR correlations', () => {
+    let nonce = 0
+    const common = {
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '101',
+      now: () => 1_000,
+      generateRoundId: () => `correlation-${++nonce}`,
+    }
+
+    const baseline = registerOrJoinReplyReviewRound(common)
+    const reviewChanged = registerOrJoinReplyReviewRound({ ...common, blockingReviewId: 7002 })
+    const headChanged = registerOrJoinReplyReviewRound({ ...common, headSha: 'sha-other' })
+    const prChanged = registerOrJoinReplyReviewRound({ ...common, prNumber: 61 })
+
+    expect(new Set([baseline.roundId, reviewChanged.roundId, headChanged.roundId, prChanged.roundId]).size).toBe(4)
+  })
+
+  test('starts a new reply generation after the previous generation expires', () => {
+    let clock = 1_000
+    let nonce = 0
+    const common = {
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '101',
+      now: () => clock,
+      generateRoundId: () => `expiry-${++nonce}`,
+    }
+    const first = registerOrJoinReplyReviewRound(common)
+
+    clock += REPLY_REVIEW_ROUND_TTL_MS
+    const next = registerOrJoinReplyReviewRound({ ...common, thread: '202' })
+
+    expect(next.roundId).not.toBe(first.roundId)
+    expect(next.carrierThread).toBe('202')
+  })
+
+  test('starts a new reply generation after a completed generation grace period', () => {
+    let clock = 1_000
+    let nonce = 0
+    const common = {
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '101',
+      now: () => clock,
+      generateRoundId: () => `completed-${++nonce}`,
+    }
+    const first = registerOrJoinReplyReviewRound(common)
+    completeGithubReviewRound(first)
+
+    clock += 5 * 60_000
+    const next = registerOrJoinReplyReviewRound({ ...common, thread: '202' })
+
+    expect(next.roundId).not.toBe(first.roundId)
+    expect(next.carrierThread).toBe('202')
+  })
+
+  test('clears reply generation correlations with the test reset', () => {
+    let nonce = 0
+    const input = {
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '101',
+      now: () => 1_000,
+      generateRoundId: () => `reset-${++nonce}`,
+    }
+    const first = registerOrJoinReplyReviewRound(input)
+
+    __resetReviewVerdictGuardForTest()
+    const next = registerOrJoinReplyReviewRound(input)
+
+    expect(next.roundId).not.toBe(first.roundId)
   })
 
   test('restores attempted carriers so failover does not retry them after restart', () => {
@@ -868,7 +1099,14 @@ describe('review round restoration is monotonic', () => {
     __resetReviewVerdictGuardForTest()
   })
 
-  const LATE_ROUND = { workspace: WS, prNumber: 90, headSha: 'sha-90', carrierThread: '101' }
+  const LATE_ROUND = {
+    kind: 'push',
+    roundId: 'round-90',
+    workspace: WS,
+    prNumber: 90,
+    headSha: 'sha-90',
+    carrierThread: '101',
+  } as const
 
   test('a stale pending record cannot reopen a round this process already completed', () => {
     // given: a registered round that was completed while a sibling sat idle

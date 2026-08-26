@@ -47,6 +47,8 @@ export type InboundAttachment = {
 }
 
 export type GithubReviewFollowupRound = {
+  kind: 'push' | 'reply'
+  roundId: string
   workspace: string
   prNumber: number
   headSha: string
