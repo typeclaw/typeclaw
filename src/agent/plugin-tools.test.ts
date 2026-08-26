@@ -22,8 +22,6 @@ import { defineTool as definePiTool } from '@mariozechner/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
-import bunHygienePlugin from '@/bundled-plugins/bun-hygiene'
-import guardPlugin from '@/bundled-plugins/guard'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
@@ -31,7 +29,7 @@ import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
 import { DeclaredSkillBinUnresolvedError, IncidentLedger, readIncidentLedger, RemediationRegistry } from '@/operations'
 import { createPermissionService } from '@/permissions/permissions'
-import { createHookBus, defineTool, loadPlugins, type PluginRegistry, type ToolResult } from '@/plugin'
+import { createHookBus, defineTool, type PluginRegistry, type ToolResult } from '@/plugin'
 import { emptyRegistry } from '@/plugin/registry'
 import {
   buildSandboxedCommand,
@@ -148,33 +146,31 @@ describe('wrapPluginTool', () => {
         hookArgs.push(structuredClone(event.args))
       },
     })
-    const guardAcknowledgements = new Map([['plugin_echo', new Set(['fixtureAck'])]])
     const wrapped = wrapPluginTool(tool, {
       pluginName: 'fixture',
-      toolName: 'plugin_echo',
+      toolName: 'write',
       agentDir: '/agent',
       sessionId: 's',
       logger: noopLogger,
       hooks,
-      guardAcknowledgements,
     })
 
     const parameters = wrapped.parameters as {
       properties?: Record<string, { properties?: Record<string, unknown>; additionalProperties?: boolean }>
     }
-    expect(Object.keys(parameters.properties?.acknowledgeGuards?.properties ?? {})).toEqual(['fixtureAck'])
+    expect(Object.keys(parameters.properties?.acknowledgeGuards?.properties ?? {})).toEqual(['nonWorkspaceWrite'])
     expect(parameters.properties?.acknowledgeGuards?.additionalProperties).toBe(false)
 
     const result = await wrapped.execute(
       'c',
-      { value: 'ok', acknowledgeGuards: { fixtureAck: true } },
+      { value: 'ok', acknowledgeGuards: { nonWorkspaceWrite: true } },
       undefined,
       undefined,
       {} as never,
     )
 
     expect(textOfFirstContent(result)).toBe('ok')
-    expect(hookArgs).toEqual([{ value: 'ok', acknowledgeGuards: { fixtureAck: true } }])
+    expect(hookArgs).toEqual([{ value: 'ok', acknowledgeGuards: { nonWorkspaceWrite: true } }])
     expect(executionArgs).toEqual([{ value: 'ok' }])
   })
 
@@ -198,12 +194,11 @@ describe('wrapPluginTool', () => {
       }),
       {
         pluginName: 'fixture',
-        toolName: 'plugin_echo',
+        toolName: 'write',
         agentDir: '/agent',
         sessionId: 's',
         logger: noopLogger,
         hooks,
-        guardAcknowledgements: new Map([['plugin_echo', new Set(['fixtureAck'])]]),
       },
     )
 
@@ -1106,7 +1101,6 @@ describe('wrapSystemTool', () => {
         agentDir,
         sessionId: 's',
         hooks,
-        guardAcknowledgements: new Map([['write', new Set(['nonWorkspaceWrite'])]]),
       })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
@@ -3067,7 +3061,6 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
         agentDir,
         sessionId: 's',
         hooks,
-        guardAcknowledgements: new Map([['edit', new Set(['nonWorkspaceWrite'])]]),
       })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
@@ -3386,33 +3379,11 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     expect(overrides.map((t) => t.name)).toEqual(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
   })
 
-  test('publishes the exact advisory acknowledgement schema owned by each tool', async () => {
-    const { registry } = await loadPlugins({
-      entries: [],
-      agentDir: '/agent',
-      configsByName: {},
-      bundled: [
-        { name: 'guard', version: undefined, source: '<bundled>', defined: guardPlugin },
-        { name: 'bun-hygiene', version: undefined, source: '<bundled>', defined: bunHygienePlugin },
-      ],
-    })
-    const registered = Object.fromEntries(
-      [...registry.guardAcknowledgements]
-        .map(([tool, keys]) => [tool, [...keys]] as const)
-        .sort(([left], [right]) => left.localeCompare(right)),
-    )
-    expect(registered).toEqual({
-      bash: ['globalInstall', 'nonBunPackageManager', 'nonBunPackageRunner'],
-      edit: ['nonWorkspaceWrite'],
-      read: ['imageReadRedirect'],
-      write: ['nonWorkspaceWrite'],
-    })
-
+  test('publishes the exact advisory acknowledgement schema owned by each tool', () => {
     const overrides = buildBuiltinPiToolOverrides({
       agentDir: '/agent',
       sessionId: 's',
       hooks: createHookBus(),
-      guardAcknowledgements: registry.guardAcknowledgements,
     })
     const schemas = Object.fromEntries(
       overrides.map((tool) => {

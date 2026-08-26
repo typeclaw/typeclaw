@@ -39,7 +39,6 @@ import type { PermissionService } from '@/permissions/permissions'
 import type {
   BuiltinToolRef,
   ContentPart,
-  GuardAcknowledgementRegistry,
   HookBus,
   PluginLogger,
   Tool,
@@ -48,7 +47,6 @@ import type {
   ToolFileOperands,
   ToolResult,
 } from '@/plugin'
-import { FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS } from '@/plugin/guard-acknowledgements'
 import {
   buildSandboxedCommand,
   canWriteAgentRootInSandbox,
@@ -83,6 +81,7 @@ import {
 } from '@/sandbox'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 
+import { GUARD_ACKNOWLEDGEMENTS } from './guard-acknowledgements'
 import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-guard'
 import { checkImageReadRedirect } from './multimodal/read-redirect'
 import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-bash-policy'
@@ -188,20 +187,6 @@ export function sanitizeBashSpawnEnvironment(
   return env
 }
 
-// Folds the whole declaration list: indexing element 0 would silently drop a
-// second first-party declaration, or a second tool on an existing one.
-const FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS: GuardAcknowledgementRegistry = (() => {
-  const registry = new Map<string, Set<string>>()
-  for (const { key, tools } of FIRST_PARTY_GUARD_ACKNOWLEDGEMENT_DECLARATIONS) {
-    for (const tool of tools) {
-      const keys = registry.get(tool) ?? new Set<string>()
-      keys.add(key)
-      registry.set(tool, keys)
-    }
-  }
-  return registry
-})()
-
 // pi-coding-agent 0.73 contract (load-bearing for hook coverage):
 //   - `createAgentSession({ tools: string[] })` is a name allowlist: only the
 //     listed names stay active, and that allowlist gates BOTH builtins and
@@ -298,7 +283,6 @@ export type WrapToolOptions = {
   // session whose `agent.abort` this points at. See `fireLoopAbort`.
   getAbort?: () => ((reason?: string) => void) | undefined
   getLoopGuardTurn?: () => number | undefined
-  guardAcknowledgements?: GuardAcknowledgementRegistry
 }
 
 export type BashSandboxBoundary = {
@@ -345,7 +329,6 @@ export type WrapSystemToolOptions = {
   // returning undefined keeps the existing fail-closed scan.
   resolvePreflightFileOperands?: (tool: string, args: Record<string, unknown>) => ToolFileOperands | undefined
   incidentLedger?: IncidentLedger
-  guardAcknowledgements?: GuardAcknowledgementRegistry
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
@@ -370,11 +353,10 @@ export function zodToToolParameters(schema: z.ZodType<unknown>): TSchema {
 }
 
 export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefinition {
-  const guardAcknowledgements = opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS
   const parameters = withGuardAcknowledgements(
     opts.toolName,
     zodToToolParameters(tool.parameters),
-    guardAcknowledgements,
+    GUARD_ACKNOWLEDGEMENTS,
   )
 
   return piDefineTool({
@@ -383,7 +365,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
     description: tool.description,
     parameters,
     async execute(toolCallId, params, signal) {
-      const envelope = extractGuardAcknowledgements(params, opts.toolName, guardAcknowledgements)
+      const envelope = extractGuardAcknowledgements(params, opts.toolName, GUARD_ACKNOWLEDGEMENTS)
       if (!envelope.ok) return errorResult(`invalid arguments: ${envelope.error}`)
 
       const validated = tool.parameters.safeParse(envelope.pluginArgs)
@@ -493,11 +475,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(
-      tool.name,
-      tool.parameters,
-      opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS,
-    ),
+    parameters: withGuardAcknowledgements(tool.name, tool.parameters, GUARD_ACKNOWLEDGEMENTS),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const mutableArgs = params as Record<string, unknown>
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
@@ -604,11 +582,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(
-      tool.name,
-      tool.parameters,
-      opts.guardAcknowledgements ?? FIRST_PARTY_GUARD_ACKNOWLEDGEMENTS,
-    ),
+    parameters: withGuardAcknowledgements(tool.name, tool.parameters, GUARD_ACKNOWLEDGEMENTS),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const mutableArgs = params as Record<string, unknown>
       const originalBashCommand =
@@ -1505,7 +1479,7 @@ function runFinalReadGuards(options: { tool: string; args: Record<string, unknow
 function withGuardAcknowledgements<TParams extends TSchema>(
   toolName: string,
   parameters: TParams,
-  registry: GuardAcknowledgementRegistry,
+  registry: ReadonlyMap<string, ReadonlySet<string>>,
 ): TParams {
   const allowedKeys = registry.get(toolName)
   if (allowedKeys === undefined || allowedKeys.size === 0) return parameters
@@ -1532,7 +1506,7 @@ function withGuardAcknowledgements<TParams extends TSchema>(
 function extractGuardAcknowledgements(
   params: unknown,
   toolName: string,
-  registry: GuardAcknowledgementRegistry,
+  registry: ReadonlyMap<string, ReadonlySet<string>>,
 ): { ok: true; pluginArgs: unknown; acknowledgements?: Record<string, boolean> } | { ok: false; error: string } {
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
     return { ok: true, pluginArgs: params }
