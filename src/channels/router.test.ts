@@ -417,6 +417,7 @@ function makeRouter(
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
+    onSessionCreated?: (session: FakeSession) => void
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -457,6 +458,7 @@ function makeRouter(
       origins.push(origin)
       options.originRefs?.push(originRef)
       const fake = new FakeSession()
+      options.onSessionCreated?.(fake)
       sessions.push(fake)
       const sessionId = existingSessionId ?? `ses_fake_${sessions.length}`
       return {
@@ -4204,7 +4206,7 @@ describe('ChannelRouter channel-turn protocol', () => {
           state: 'APPROVE',
         })
       }
-      emptyStopAfterToolWork(sessions[0]!)
+      strandOnUnansweredToolUse(sessions[0]!, 'github-review-output')
     }
     await router.__testing!.flushDebounce(githubKey)
 
@@ -4552,7 +4554,7 @@ describe('ChannelRouter channel-turn protocol', () => {
       router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'duplicate' })
       // given: model leaked meta-narration before / instead of NO_REPLY.
       // The skip guard must win — recovery would otherwise post this.
-      sessions[0]!.setAssistantText("Same story as before; I'll stay quiet here.")
+      sessions[0]!.setAssistantMidTurn("Same story as before; I'll stay quiet here.")
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -5983,14 +5985,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // Regression for the Kimi-on-Fireworks `kimi-k2p6-turbo` KakaoTalk silence
-  // bug: the model narrated a user-facing reply ("16x now") AND committed to a
-  // tool plan in the same message (stopReason='toolUse'), then the turn ended
-  // before any follow-up message that would have called channel_reply was
-  // persisted. The leaf is the assistant message itself, not a toolResult, so
-  // 'pre-tool' recovery does not apply. Without 'mid-turn' recovery the prose
-  // is silently dropped and the user sees nothing.
-  test('mid-turn recovery: recovers prose when leaf is a toolUse assistant with no follow-up', async () => {
+  test('mid-turn recovery: retries unfinished toolUse prose instead of publishing it as the reply', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6000,17 +5995,24 @@ describe('ChannelRouter channel-turn protocol', () => {
       return { ok: true }
     })
 
-    await router.route(inbound({ text: 'go 16x speed' }))
+    await router.route(inbound({ text: '설정 적용됐어?' }))
+    let attempt = 0
     sessions[0]!.onPrompt = () => {
-      sessions[0]!.setAssistantMidTurn('Running at 16x speed! Hold on a sec and I will grab a screenshot!')
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('Configuration parsed. Next I will run the remaining step.')
+        return
+      }
+      sessions[0]!.setAssistantText('설정이 적용됐어요.')
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(
-      logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=mid-turn')),
-    ).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('Running at 16x speed! Hold on a sec and I will grab a screenshot!')
+    expect(sent[0]!.text).toBe('설정이 적용됐어요.')
+    expect(sent.some((message) => message.text.includes('Configuration parsed'))).toBe(false)
+    expect(logs.some((message) => message.includes('source=mid-turn'))).toBe(false)
   })
 
   test('mid-turn recovery: applies the NO_REPLY guard to recovered prose', async () => {
@@ -6034,7 +6036,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  test('mid-turn recovery: applies the Kimi tool-call leak guard to recovered prose', async () => {
+  test('mid-turn recovery: never publishes tool-call-like unfinished prose while exhausting retries', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6052,8 +6054,9 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toHaveLength(0)
-    expect(logs.some((m) => m.includes('suppressed kimi_tool_call_leak'))).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(sent.some((message) => message.text.includes('tool_call_argument_begin'))).toBe(false)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
@@ -6136,7 +6139,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
   })
 
-  test('mid-turn recovery: applies the upstream empty-response sentinel guard to recovered prose', async () => {
+  test('mid-turn recovery: never publishes an unfinished upstream empty-response sentinel', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6155,17 +6158,16 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sent).toHaveLength(0)
-    expect(logs.some((m) => m.includes('suppressed upstream_empty_response_sentinel'))).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(sent.some((message) => message.text.includes('Empty response'))).toBe(false)
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // The leaf-assistant branch recovers ONLY 'stop' and 'toolUse'. length /
-  // error / aborted carry visible text too, but it's a truncation or an
-  // errored partial, not a deliberate reply — recovering it would post broken
-  // output. This is the load-bearing scoping of the mid-turn fix. The truncated
-  // prose is NEVER posted; instead the empty-turn guard retries the turn and,
-  // on exhaustion, posts the fallback (asserted in the empty-turn suite below).
+  // The leaf-assistant branch classifies unfinished `toolUse` separately from
+  // length / error / aborted truncations. None is a deliberate reply, but their
+  // recovery owners differ: toolUse continues from existing results, while the
+  // other stop reasons retain their provider/budget-specific paths.
   for (const stopReason of ['length', 'error', 'aborted'] as const) {
     test(`mid-turn recovery: does NOT recover a leaf assistant with stopReason='${stopReason}'`, async () => {
       const dir = await tempDir()
@@ -6912,14 +6914,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
   })
 
-  // Regression for the Kimi-on-Fireworks `kimi-k2p6-turbo` channel-silence
-  // bug observed on 2026-05-26: the model emitted text + a tool call
-  // (stopReason='toolUse'), the tool ran successfully, but the upstream
-  // pi-agent-core loop never produced a follow-up assistant message after
-  // the toolResult. The session JSONL ended with the toolResult as the leaf,
-  // `prompt()` resolved cleanly, and the channel router silently dropped the
-  // pre-tool commentary. User saw nothing in Discord.
-  test('pre-tool recovery: recovers assistant text when leaf is toolResult with no follow-up', async () => {
+  test('pre-tool recovery: retries unfinished prose instead of publishing it when the toolResult has no follow-up', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -6930,7 +6925,13 @@ describe('ChannelRouter channel-turn protocol', () => {
     })
 
     await router.route(inbound({ text: 'why is cron not working' }))
+    let attempt = 0
     sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt > 1) {
+        sessions[0]!.setAssistantText('Cron is configured and running.')
+        return
+      }
       // given: an assistant message with text + a tool call. The model never
       // produced a follow-up assistant message after the tool result, so the
       // leaf is the toolResult, NOT the assistant message.
@@ -6981,11 +6982,12 @@ describe('ChannelRouter channel-turn protocol', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(
-      logs.some((m) => m.includes('recovering assistant_text_without_channel_tool') && m.includes('source=pre-tool')),
-    ).toBe(true)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
     expect(sent).toHaveLength(1)
-    expect(sent[0]!.text).toBe('Sorry about that. I will look into the cron issue right now.')
+    expect(sent[0]!.text).toBe('Cron is configured and running.')
+    expect(sent.some((message) => message.text.includes('look into'))).toBe(false)
+    expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool source=pre-tool'))).toBe(false)
   })
 
   test('pre-tool recovery: still applies NO_REPLY / Kimi-leak / empty-sentinel guards', async () => {
@@ -7079,6 +7081,125 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toHaveLength(1)
     expect(sent[0]!.text).toBe('real reply')
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: retries the same turn and delivers the Korean conclusion', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '설정 된 건가요' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('')
+        return
+      }
+      sessions[0]!.setAssistantText('네, 설정이 적용됐어요.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['네, 설정이 적용됐어요.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_without_send'))).toBe(true)
+    expect(logs.some((message) => message.includes('no_reply'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: posts exactly one fallback after exhausting the shared retry budget', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'is it configured?' }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantMidTurn('')
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(
+      logs.filter(
+        (message) => message.includes('empty_turn_retry') && message.includes('stranded_toolUse_without_send'),
+      ),
+    ).toHaveLength(MAX_EMPTY_TURN_RETRIES)
+    expect(sent.map((message) => message.text)).toEqual([EMPTY_TURN_FALLBACK_TEXT])
+    expect(
+      logs.filter((message) =>
+        message.includes('empty_turn_fallback cause=stranded_toolUse_without_send_retries_exhausted'),
+      ),
+    ).toHaveLength(1)
+  })
+
+  test('stranded toolUse without a send: a queued fresh inbound supersedes recovery and is answered next', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'first question' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('')
+        await router.route(inbound({ text: 'new context', externalMessageId: 'm2' }))
+        return
+      }
+      sessions[0]!.setAssistantText('Answer using the new context.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('new context')
+    expect(sessions[0]!.prompts[1]).not.toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['Answer using the new context.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_without_send'))).toBe(false)
+    expect(logs.some((message) => message.includes('empty_turn_fallback'))).toBe(false)
+  })
+
+  test('stranded toolUse without a send: text-bearing narration stays private when fresh inbound is queued', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'first question' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('도구 결과를 확인한 다음 답변하겠습니다.')
+        await router.route(inbound({ text: 'new context', externalMessageId: 'm2' }))
+        return
+      }
+      sessions[0]!.setAssistantText('새 컨텍스트를 반영한 답변입니다.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('new context')
+    expect(sessions[0]!.prompts[1]).not.toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sent.map((message) => message.text)).toEqual(['새 컨텍스트를 반영한 답변입니다.'])
+    expect(sent.some((message) => message.text.includes('도구 결과'))).toBe(false)
+    expect(logs.some((message) => message.includes('cause=unfinished_toolUse_continuation_ineligible'))).toBe(true)
   })
 
   // Regression for the "I'll check right now" → silence bug (Discord channel,
@@ -10474,6 +10595,24 @@ describe('ChannelRouter peer-bot loop guard', () => {
     expect(lastPrompt).toContain('[SYSTEM MESSAGE — not from a human]')
     expect(lastPrompt).toContain('Do not acknowledge or reply to this notice')
     expect(lastPrompt).toContain('NO_REPLY')
+  })
+
+  test('a peer-bot loop-guard turn that emits NO_REPLY stays silent', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    for (let i = 0; i < 5; i++) {
+      await router.route(botInbound({ externalMessageId: `peer-${i}`, authorId: `peer-${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    expect(sent).toEqual([])
   })
 
   test('slow peer-bot ring (>60s gaps) still trips via since-human counter', async () => {
@@ -16200,6 +16339,54 @@ describe('resumeRestartHandoff', () => {
     expect(sessions[0]?.prompts.length).toBe(1)
   })
 
+  test('a restart reminder with no author keeps a stranded toolUse silent', async () => {
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        session.onPrompt = () => session.setAssistantMidTurn('')
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.resumeRestartHandoff(channelHandoff())
+    await waitFor(() => sessions[0]?.prompts.length === 1)
+
+    expect(sent).toEqual([])
+    expect(logs.some((message) => message.includes('stranded_toolUse_without_send'))).toBe(false)
+    expect(logs.some((message) => message.includes('empty_turn_fallback'))).toBe(false)
+  })
+
+  test('a restart reminder with no author keeps text-bearing unfinished toolUse narration silent', async () => {
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        session.onPrompt = () => session.setAssistantMidTurn('I will inspect the tool result before answering.')
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.resumeRestartHandoff(channelHandoff())
+    await waitFor(() => sessions[0]?.prompts.length === 1)
+
+    expect(sent).toEqual([])
+    expect(logs.some((message) => message.includes('cause=unfinished_toolUse_continuation_ineligible'))).toBe(true)
+    expect(logs.some((message) => message.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
+  })
+
   test('skips when the persisted mapping no longer names the handoff session', async () => {
     // given: the channel rolled over to a different session since the restart
     const dir = await tempDir()
@@ -17218,7 +17405,7 @@ describe('ChannelRouter background-child await suppression', () => {
     }
   }
 
-  test('a bare-empty stop while a background child runs stays silent instead of retrying', async () => {
+  test('a stranded toolUse while a background child runs stays silent instead of retrying', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
@@ -17230,7 +17417,7 @@ describe('ChannelRouter background-child await suppression', () => {
 
     // given: the model does tool work (spawning a background child), then ends the turn empty
     await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
-    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    sessions[0]!.onPrompt = () => strandOnUnansweredToolUse(sessions[0]!, 'background-child')
     await router.__testing!.flushDebounce(KEY)
 
     // then: the recovery ladder does not manufacture a status message
