@@ -5253,13 +5253,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // acknowledgements. The completion reminder re-wakes this session with the
     // real result, so silence here is delivery deferred, not delivery dropped.
     // Bounded by the same stuck-child backstop as GC/rollover: a wedged child
-    // stops pinning and the normal ladder resumes. A leaf carrying real text is
-    // deliberately NOT covered — recovering an answer the model already wrote is
-    // still correct while a child runs.
+    // stops pinning and the normal ladder resumes. A completed `stop` leaf
+    // carrying real text is deliberately NOT covered — recovering an answer the
+    // model already wrote is still correct while a child runs. Unfinished
+    // toolUse narration is covered because it is no longer publishable as an
+    // answer on any path.
     const awaitLeaf = recoverableAssistantText(live.session)
+    const awaitLeafIsUnfinishedToolUse = awaitLeaf?.source === 'mid-turn' || awaitLeaf?.source === 'pre-tool'
     if (
       live.currentTurnAuthorId !== null &&
-      (awaitLeaf === null || endsWithNoReplySignal(awaitLeaf.text)) &&
+      (awaitLeaf === null || awaitLeafIsUnfinishedToolUse || endsWithNoReplySignal(awaitLeaf.text)) &&
       isAwaitingBackgroundChild(live, 'empty_turn_recovery')
     ) {
       logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
@@ -5286,6 +5289,49 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         `[channels] ${live.keyId}: suppressed plain_text_tool_call_leak (retries exhausted, silent) ` +
           `text_len=${leakedText.length}`,
       )
+    }
+
+    const retryStrandedToolUse = async (cause: string, exhaustedCause: string): Promise<void> => {
+      if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
+        live.emptyTurnRetries++
+        const routerAbortReason =
+          live.abortReasonThisTurn !== null && live.abortReasonThisTurn.turnSeq === live.turnSeq
+            ? live.abortReasonThisTurn.reason
+            : undefined
+        const agentAbortReason =
+          live.session.agent.signal?.aborted === true ? live.session.getAbortReason?.() : undefined
+        const abortReason = routerAbortReason ?? agentAbortReason ?? 'unknown'
+        logger.warn(
+          `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
+            `cause=${cause} abort_reason=${abortReason}`,
+        )
+        live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
+        return
+      }
+      await postEmptyTurnFallback(live, exhaustedCause)
+    }
+
+    // A real asker who received nothing cannot distinguish unfinished tool-use
+    // narration from a completed answer. Posting that scratchpad can falsely
+    // claim completion in the wrong language or before the tool result is
+    // interpreted; treating it as deliberate silence strands the asker instead.
+    // Keep both textless and text-bearing unfinished shapes on the established
+    // bounded continuation ladder, while explicit NO_REPLY, queued fresh input,
+    // observation-only turns, and every earlier delivery-deferred guard retain
+    // their narrower silence contracts.
+    const unfinishedToolUse = awaitLeaf
+    const unfinishedToolUseWithoutReply =
+      unfinishedToolUse !== null &&
+      (unfinishedToolUse.source === 'mid-turn' || unfinishedToolUse.source === 'pre-tool') &&
+      (unfinishedToolUse.text.trim() === '' || !endsWithNoReplySignal(unfinishedToolUse.text))
+    if (
+      unfinishedToolUseWithoutReply &&
+      live.successfulChannelSends === successfulSendsBeforePrompt &&
+      live.currentTurnAuthorId !== null &&
+      live.promptQueue.length === 0
+    ) {
+      await retryStrandedToolUse('stranded_toolUse_without_send', 'stranded_toolUse_without_send_retries_exhausted')
+      return
     }
 
     // A send landed this turn, but the model may have posted a `more_work_this_turn: true`
@@ -5395,27 +5441,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // that accompanied the already-landed reply); only the no-prose strand
         // gets a retry-or-fallback.
         if (leafIsStrandedToolUse(live.session) && live.currentTurnAuthorId !== null) {
-          if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
-            live.emptyTurnRetries++
-            const routerAbortReason =
-              live.abortReasonThisTurn !== null && live.abortReasonThisTurn.turnSeq === live.turnSeq
-                ? live.abortReasonThisTurn.reason
-                : undefined
-            const agentAbortReason =
-              live.session.agent.signal?.aborted === true ? live.session.getAbortReason?.() : undefined
-            const abortReason = routerAbortReason ?? agentAbortReason ?? 'unknown'
-            logger.warn(
-              `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
-                `cause=stranded_toolUse_after_send abort_reason=${abortReason}`,
-            )
-            live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
-          } else {
-            await postEmptyTurnFallback(live, 'stranded_toolUse_retries_exhausted')
-          }
+          await retryStrandedToolUse('stranded_toolUse_after_send', 'stranded_toolUse_retries_exhausted')
         }
         return
       }
       if (live.session.sessionManager.getLeafEntry()?.id === live.lastSendLeafId) return
+    }
+
+    if (unfinishedToolUseWithoutReply) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=unfinished_toolUse_continuation_ineligible`)
+      return
     }
 
     let candidate = recoverableAssistantText(live.session)
@@ -5697,21 +5732,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       assistantText = extracted
     }
 
-    // `source` distinguishes the three recovery shapes for log triage:
+    // `source` distinguishes the completed recovery shapes for log triage:
     //   - 'leaf': the assistant message IS the leaf with stopReason 'stop'
     //     (existing behavior; model ended its turn with text but forgot to
     //     call channel_reply).
-    //   - 'mid-turn': the assistant message IS the leaf with stopReason
-    //     'toolUse'; the model narrated a reply, committed to a tool plan, and
-    //     the turn ended before a follow-up that would have called a channel
-    //     tool was persisted. The narration is the only user-facing text.
-    //   - 'pre-tool': the leaf is a toolResult (or other non-assistant entry)
-    //     and the assistant message lives upstream in the branch. This is the
-    //     Kimi-on-Fireworks `kimi-k2p6-turbo` failure mode where the post-tool
-    //     follow-up LLM call never produced a persisted assistant message, so
-    //     the model's pre-tool commentary is the only user-facing text we have.
-    //     Recovering it means the user gets *something* — strictly better than
-    //     the historical silent drop.
+    //   - 'length-leaf': the assistant message hit the output cap, leaked
+    //     reasoning was stripped, and a complete-looking answer survived.
+    // Unfinished 'mid-turn' / 'pre-tool' prose never reaches this egress: the
+    // terminal gate above either continues an eligible turn or preserves the
+    // silence contract that made continuation ineligible.
     // Egress-level GitHub review guards. The false-receipt and re-review
     // stranding guards live inside the channel_reply / channel_send tool
     // handlers, but recovery surfaces trailing assistant prose through a
@@ -7676,27 +7705,19 @@ async function raceWithTimeout<T>(work: Promise<T>, ms: number, label: string): 
 //     Observed against claude on a channel turn that fell silent (2026-06-12).
 //
 //   - source: 'mid-turn'
-//     The leaf IS an assistant message with `stopReason === 'toolUse'` that
-//     carries visible text. The model narrated a user-facing reply ("on it,
-//     bumping to 16x now") AND committed to a tool plan in the same message,
-//     but the turn ended before any follow-up assistant message that would
-//     have called `channel_reply` was persisted — the upstream pi-agent-core
-//     loop's post-tool follow-up never landed, or the run was aborted
-//     mid-loop. The model treated its visible prose as ambient narration; in
-//     a channel session that prose is dead text. Recovers it so the user gets
-//     the reply the model thought it had already given. Observed against
-//     Fireworks' `kimi-k2p6-turbo` on KakaoTalk: the agent posted speed-change
-//     status as narration, kept taking screenshots, and the user saw nothing.
-//     This is the leaf-is-assistant twin of the 'pre-tool' shape below.
+//     The leaf IS an assistant message with `stopReason === 'toolUse'`. Its
+//     visible text, if any, is unfinished narration rather than a trustworthy
+//     answer because the planned tool work never reached a follow-up assistant
+//     message. The caller uses this source to enter bounded continuation rather
+//     than publishing the narration.
 //
 //   - source: 'pre-tool'
 //     The leaf is a `toolResult` and the immediately-prior assistant message
 //     has `stopReason === 'toolUse'` (it called the tool that produced this
 //     toolResult). The upstream pi-agent-core loop SHOULD have made a
 //     follow-up LLM call after the tool returned, but that call either never
-//     happened or produced no persisted message. Recovers the assistant's
-//     pre-tool commentary so the user gets *something* — observed against
-//     Fireworks' `accounts/fireworks/routers/kimi-k2p6-turbo` on 2026-05-26.
+//     happened or produced no persisted message. The caller treats the
+//     assistant's commentary as unfinished and enters bounded continuation.
 //
 // Returns null when no recovery is appropriate:
 //   - No leaf, no messages in branch, branch is malformed
@@ -7719,9 +7740,8 @@ function recoverableAssistantText(
     if (leaf.message.stopReason === 'stop') {
       return { text: visibleAssistantText(leaf.message), source: 'leaf' }
     }
-    // The model committed to a tool plan but its visible prose never reached
-    // the channel and no follow-up message that would have called a channel
-    // tool was persisted. Recover the stranded prose.
+    // Preserve the unfinished shape for the caller's continuation ladder; its
+    // prose is not a final answer and must not be published directly.
     if (leaf.message.stopReason === 'toolUse') {
       return { text: visibleAssistantText(leaf.message), source: 'mid-turn' }
     }
@@ -7752,7 +7772,9 @@ function recoverableAssistantText(
     if (!parent) return null
     if (parent.type === 'message') {
       if (parent.message.role === 'assistant') {
-        return { text: visibleAssistantText(parent.message), source: 'pre-tool' }
+        return parent.message.stopReason === 'toolUse'
+          ? { text: visibleAssistantText(parent.message), source: 'pre-tool' }
+          : null
       }
       if (parent.message.role === 'user') return null
     }
