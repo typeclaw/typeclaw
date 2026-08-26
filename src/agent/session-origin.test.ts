@@ -205,6 +205,63 @@ describe('renderSessionOrigin', () => {
     expect(out).toMatch(/skip_response/)
   })
 
+  test('github PR review-round carrier is told to run one whole-PR re-review and post the verdict', () => {
+    const out = renderSessionOrigin({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/project',
+      chat: 'pr:7',
+      thread: 'thread-carrier',
+      githubReviewRound: {
+        kind: 'reply',
+        roundId: 'round-1',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'a'.repeat(40),
+        carrierThread: 'thread-carrier',
+      },
+    })
+
+    expect(out).toMatch(/This session is the review-round carrier/i)
+    expect(out).toMatch(/one whole-PR re-review/i)
+    expect(out).toMatch(/post the verdict/i)
+  })
+
+  test('github PR review-round non-carrier is told not to review or publish and to close only its thread', () => {
+    const out = renderSessionOrigin({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/project',
+      chat: 'pr:7',
+      thread: 'thread-sibling',
+      githubReviewRound: {
+        kind: 'reply',
+        roundId: 'round-1',
+        workspace: 'acme/project',
+        prNumber: 7,
+        headSha: 'a'.repeat(40),
+        carrierThread: 'thread-carrier',
+      },
+    })
+
+    expect(out).toMatch(/This session is not the review-round carrier/i)
+    expect(out).toMatch(/Do not spawn a reviewer, review, or publish findings/i)
+    expect(out).toMatch(/close out only this thread/i)
+  })
+
+  test('github PR session without a review round renders no carrier guidance', () => {
+    const out = renderSessionOrigin({
+      kind: 'channel',
+      adapter: 'github',
+      workspace: 'acme/project',
+      chat: 'pr:7',
+      thread: 'thread-sibling',
+    })
+
+    expect(out).not.toMatch(/review-round carrier/i)
+    expect(out).not.toMatch(/whole-PR re-review/i)
+  })
+
   test('github review-thread origin tells the bot to resolve the thread in the same reply', () => {
     const out = renderSessionOrigin({
       kind: 'channel',
