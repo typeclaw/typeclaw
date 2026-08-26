@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { readdirSync } from 'node:fs'
 import {
@@ -6124,6 +6124,72 @@ describe('loop guard integration', () => {
       wrapped.execute('c5', { url: 'https://example.com' }, undefined, undefined, {} as never),
     ).rejects.toThrow(/loop-guard/)
     expect(aborts).toBe(1)
+  })
+
+  test('logs a diagnostic warning identifying the session and reason when the loop guard fires an abort', async () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const tool = defineTool({
+        description: '',
+        parameters: z.object({ q: z.string() }),
+        async execute() {
+          return { content: [{ type: 'text', text: 'ok' }] }
+        },
+      })
+      const wrapped = wrapPluginTool(tool, {
+        pluginName: 'p1',
+        toolName: 'search',
+        agentDir: '/agent',
+        sessionId: 'loop-abort-diagnostic-session',
+        logger: noopLogger,
+        hooks: createHookBus(),
+        getAbort: () => () => {},
+      })
+
+      for (let i = 0; i < 4; i++) {
+        await wrapped.execute(`c${i}`, { q: 'a' }, undefined, undefined, {} as never)
+      }
+      expect(warnSpy).not.toHaveBeenCalled()
+
+      await wrapped.execute('c5', { q: 'a' }, undefined, undefined, {} as never)
+
+      const abortLog = warnSpy.mock.calls.map((call) => String(call[0])).find((m) => m.includes('site=loop_guard'))
+      expect(abortLog).toBeDefined()
+      expect(abortLog).toContain('session=loop-abort-diagnostic-session')
+      expect(abortLog).toContain('reason=loop_guard:block')
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  test('does not log an abort warning when no abort function is wired', async () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const tool = defineTool({
+        description: '',
+        parameters: z.object({ q: z.string() }),
+        async execute() {
+          return { content: [{ type: 'text', text: 'ok' }] }
+        },
+      })
+      const wrapped = wrapPluginTool(tool, {
+        pluginName: 'p1',
+        toolName: 'search',
+        agentDir: '/agent',
+        sessionId: 'loop-abort-no-getabort',
+        logger: noopLogger,
+        hooks: createHookBus(),
+      })
+
+      for (let i = 0; i < 4; i++) {
+        await wrapped.execute(`c${i}`, { q: 'a' }, undefined, undefined, {} as never)
+      }
+      await wrapped.execute('c5', { q: 'a' }, undefined, undefined, {} as never)
+
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).includes('site=loop_guard'))).toBe(false)
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   test('does not abort while calls are still under the block threshold', async () => {

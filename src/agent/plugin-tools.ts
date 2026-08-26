@@ -419,7 +419,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         opts.agentDir,
       )
       if (loopGate.blockNow) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
         return errorResult(loopGate.message)
       }
 
@@ -466,7 +466,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
 
       const resolved = loopGate.resolve(result)
       if ('deferredBlock' in resolved) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block', opts.sessionId)
         return errorResult(resolved.deferredBlock)
       }
       result = resolved.result
@@ -516,7 +516,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       }
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
         throw new Error(loopGate.message)
       }
       const guardResult = await runFinalWriteGuards({
@@ -573,7 +573,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       })
       const resolved = loopGate.resolve(restoredResult)
       if ('deferredBlock' in resolved) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block', opts.sessionId)
         throw new Error(resolved.deferredBlock)
       }
       const hookResult = resolved.result
@@ -641,7 +641,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
         throw new Error(loopGate.message)
       }
       const guardResult = await runFinalWriteGuards({
@@ -846,7 +846,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       }
       const resolved = loopGate.resolve({ content: result.content as ContentPart[], details: result.details })
       if ('deferredBlock' in resolved) {
-        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block')
+        fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block', opts.sessionId)
         throw new Error(resolved.deferredBlock)
       }
       const hookResult = resolved.result
@@ -1448,8 +1448,21 @@ export function __resetSharedLoopGuardForTests(): void {
 // 'aborted'). We use the signal-only `agent.abort`, never `session.abort`,
 // which would deadlock awaiting the very run this tool call belongs to. See
 // the matching pattern in src/channels/router.ts (policy-denied send cap).
-function fireLoopAbort(getAbort: (() => ((reason?: string) => void) | undefined) | undefined, reason: string): void {
-  getAbort?.()?.(reason)
+//
+// A signal-only abort leaves no trace in the transcript itself (the turn just
+// ends with stopReason 'aborted' and no follow-up call), so this is the only
+// place an operator can learn WHY from `typeclaw logs` — log before invoking
+// the abort, not after, so a getAbort() that turns out to be undefined never
+// reports an abort that didn't actually happen.
+function fireLoopAbort(
+  getAbort: (() => ((reason?: string) => void) | undefined) | undefined,
+  reason: string,
+  sessionId: string,
+): void {
+  const abort = getAbort?.()
+  if (abort === undefined) return
+  console.warn(`[agent] abort site=loop_guard session=${sessionId} reason=${reason}`)
+  abort(reason)
 }
 
 function errorResult(message: string) {
