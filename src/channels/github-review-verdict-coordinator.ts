@@ -32,6 +32,14 @@ export type ApproveBlock = {
   leaseRetained?: boolean
 }
 
+// What the reserved call actually published. `formal-landed` is a verified review
+// on `/pulls/{n}/reviews`; `fallback-landed` is the PR-level comment a caller posts
+// instead when a standing same verdict blocks the formal submit. Both are PR-level
+// review publications and must arm the duplicate cooldown, but only the formal one
+// may claim a verdict — hence an explicit outcome rather than a boolean `succeeded`,
+// which could not tell the two landings apart.
+export type ReviewOutputOutcome = 'failed' | 'formal-landed' | 'fallback-landed'
+
 export type ReviewVerdictGuard = {
   guard: (args: {
     callId: string
@@ -42,7 +50,7 @@ export type ReviewVerdictGuard = {
     thread?: string | null
     retainDuplicateLease?: boolean
   }) => Promise<ApproveBlock | null>
-  release: (args: { callId: string; succeeded: boolean }) => Promise<void>
+  release: (args: { callId: string; outcome: ReviewOutputOutcome }) => Promise<void>
   // Arms the read-after-write lag shield for a verdict that landed WITHOUT a prior
   // guard() reservation. The pre-execution detector can miss a review-submission
   // command shape, so the verdict is only recovered post-hoc from the REST result
@@ -431,8 +439,9 @@ export function resetGithubReviewRoundCompletionForPr(
 //      second engagement turn ~10s later starts after the first's lease released,
 //      and GitHub's reviews list still lags the write (reports NONE). A short-lived
 //      `recentLandedByPr` record — same verdict + (same OR uncertain head), written
-//      on a succeeded release, RECENT_LANDED_TTL_MS — disambiguates "NONE because
-//      lag" from "NONE because genuinely absent": only the former blocks. The head
+//      on any landed release (formal or fallback), RECENT_LANDED_TTL_MS —
+//      disambiguates "NONE because lag" from "NONE because genuinely absent": only
+//      the former blocks. The head
 //      is re-resolved at release time; if the PR head advanced during the submit the
 //      record stores a null head (uncertainty), which matches the current head so a
 //      push-during-review cannot leak a duplicate. Because it fires after a raw
@@ -562,7 +571,7 @@ export function createApproveIdempotencyGuard(deps: {
         // current head for the lag window) so a push-during-review cannot let a
         // same-verdict duplicate slip past on the new head. The lease stays held
         // across this await (finally below), so the window is not reopened.
-        if (args.succeeded && reservation.headSha !== null && reservation.verdict !== 'DISMISSED') {
+        if (args.outcome !== 'failed' && reservation.headSha !== null && reservation.verdict !== 'DISMISSED') {
           const postHeadSha =
             (await deps.resolveHeadSha?.({ workspace: reservation.workspace, prNumber: reservation.prNumber })) ?? null
           const landedHeadSha = postHeadSha !== null && postHeadSha === reservation.headSha ? postHeadSha : null
@@ -573,7 +582,7 @@ export function createApproveIdempotencyGuard(deps: {
           })
         }
       } finally {
-        if (!args.succeeded) resetRoundRequestChangesAttempt(reservation)
+        if (args.outcome !== 'formal-landed') resetRoundRequestChangesAttempt(reservation)
         releaseReservation(args.callId, reservation)
       }
     },

@@ -88,7 +88,7 @@ export function createPostGithubReviewTool(options: {
               })
             } finally {
               if (blocked.leaseRetained === true) {
-                await verdictGuard.release({ callId: coordinationCallId, succeeded: false })
+                await verdictGuard.release({ callId: coordinationCallId, outcome: 'failed' })
               }
             }
           }
@@ -135,7 +135,10 @@ export function createPostGithubReviewTool(options: {
         return { content: [{ type: 'text' as const, text: fenceToolResult(receipt) }], details }
       } finally {
         if (verdict !== null) {
-          await verdictGuard.release({ callId: coordinationCallId, succeeded: releaseAsLanded })
+          await verdictGuard.release({
+            callId: coordinationCallId,
+            outcome: releaseAsLanded ? 'formal-landed' : 'failed',
+          })
         }
       }
     },

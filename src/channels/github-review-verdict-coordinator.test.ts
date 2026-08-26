@@ -196,7 +196,7 @@ describe('review verdict idempotency guard', () => {
       thread: '101',
     })
     expect(first).toBeNull()
-    await g.release({ callId: 'round-same-state-first', succeeded: true })
+    await g.release({ callId: 'round-same-state-first', outcome: 'formal-landed' })
 
     const second = await g.guard({
       callId: 'round-same-state-second',
@@ -338,7 +338,7 @@ describe('review verdict idempotency guard', () => {
     })
     expect(concurrent).toMatchObject({ block: true, kind: 'concurrent' })
 
-    await g.release({ callId: 'a1', succeeded: false })
+    await g.release({ callId: 'a1', outcome: 'failed' })
     const next = await g.guard({ callId: 'a3', workspace: WS, prNumber: 54, verdict: 'REQUEST_CHANGES' })
     expect(next).toMatchObject({ block: true, kind: 'duplicate' })
   })
@@ -360,7 +360,7 @@ describe('review verdict idempotency guard', () => {
   test('releasing a failed verdict lets a later genuine verdict through', async () => {
     const g = makeGuard()
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 13, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: false })
+    await g.release({ callId: 'a1', outcome: 'failed' })
     const retry = await g.guard({ callId: 'a2', workspace: WS, prNumber: 13, verdict: 'APPROVE' })
     expect(retry).toBeNull()
   })
@@ -368,7 +368,7 @@ describe('review verdict idempotency guard', () => {
   test('after a succeeded APPROVE the next attempt defers to the resolver, which blocks once GitHub reports APPROVED', async () => {
     const g = makeGuard({ [`${WS}#15`]: 'APPROVED' })
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 15, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     const dup = await g.guard({ callId: 'a2', workspace: WS, prNumber: 15, verdict: 'APPROVE' })
     expect(dup?.block).toBe(true)
   })
@@ -377,7 +377,7 @@ describe('review verdict idempotency guard', () => {
     // given: the first APPROVE landed and the in-flight lease was released
     const g = makeGuard({})
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 16, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: GitHub's effective state has since moved off APPROVED (resolver defaults
     // to NONE) and a genuine re-approval fires — no headSha resolver, so the lag
     // shield cannot fire and GitHub stays authoritative
@@ -429,7 +429,7 @@ describe('review verdict idempotency guard', () => {
     clock += 5 * 60_000 + 1
     await g.guard({ callId: 'a2', workspace: WS, prNumber: 28, verdict: 'APPROVE' })
     // when: session 1's tool.after finally fires (stale)
-    await g.release({ callId: 'a1', succeeded: false })
+    await g.release({ callId: 'a1', outcome: 'failed' })
     // then: session 2 still holds the lease, so a third attempt is blocked
     const third = await g.guard({ callId: 'a3', workspace: WS, prNumber: 28, verdict: 'APPROVE' })
     expect(third?.block).toBe(true)
@@ -482,7 +482,7 @@ describe('review verdict idempotency guard', () => {
     // given: a first APPROVE landed and released, GitHub reviews read still stale (NONE)
     const g = makeShaGuard('sha-abc')
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 30, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: a second engagement turn fires a fresh APPROVE on the same head
     const dup = await g.guard({ callId: 'a2', workspace: WS, prNumber: 30, verdict: 'APPROVE' })
     // then: the lag shield resolves the NONE as a not-yet-indexed duplicate and blocks
@@ -497,7 +497,7 @@ describe('review verdict idempotency guard', () => {
     })
     let currentSha = 'sha-old'
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 31, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: the author pushes a new commit and a re-review fires on the new head
     currentSha = 'sha-new'
     const reapprove = await g.guard({ callId: 'a2', workspace: WS, prNumber: 31, verdict: 'APPROVE' })
@@ -508,7 +508,7 @@ describe('review verdict idempotency guard', () => {
   test('allows a flipped verdict on the same commit (APPROVE then REQUEST_CHANGES is a real supersession)', async () => {
     const g = makeShaGuard('sha-abc')
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 32, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     const flip = await g.guard({ callId: 'a2', workspace: WS, prNumber: 32, verdict: 'REQUEST_CHANGES' })
     expect(flip).toBeNull()
   })
@@ -524,7 +524,7 @@ describe('review verdict idempotency guard', () => {
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 40, verdict: 'APPROVE' })
     // when: the PR head advances before the successful submit is recorded
     currentSha = 'sha-new'
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // then: pre (sha-old) != post (sha-new), so the record stores the null
     // uncertainty sentinel; a second same-verdict review on the current head is
     // still caught as lag rather than slipping through on the SHA mismatch
@@ -542,7 +542,7 @@ describe('review verdict idempotency guard', () => {
     })
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 41, verdict: 'APPROVE' })
     currentSha = 'sha-new'
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: GitHub now reports the standing APPROVED and the author asks for a
     // re-review (REQUEST_CHANGES is a demotion) — layer 2 decides before the shield
     effective = 'APPROVED'
@@ -554,7 +554,7 @@ describe('review verdict idempotency guard', () => {
   test('a failed first verdict leaves no landed record, so a genuine retry passes', async () => {
     const g = makeShaGuard('sha-abc')
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 33, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: false })
+    await g.release({ callId: 'a1', outcome: 'failed' })
     const retry = await g.guard({ callId: 'a2', workspace: WS, prNumber: 33, verdict: 'APPROVE' })
     expect(retry).toBeNull()
   })
@@ -563,7 +563,7 @@ describe('review verdict idempotency guard', () => {
     let clock = 1_000
     const g = makeShaGuard('sha-abc', () => clock)
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 34, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     clock += LAG_WINDOW_MS + 1
     // with the record expired and the resolver reporting NONE, a re-approve passes
     const after = await g.guard({ callId: 'a2', workspace: WS, prNumber: 34, verdict: 'APPROVE' })
@@ -574,7 +574,7 @@ describe('review verdict idempotency guard', () => {
     let clock = 1_000
     const g = makeShaGuard('sha-abc', () => clock)
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 39, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     clock += LAG_WINDOW_MS - 1
     const dup = await g.guard({ callId: 'a2', workspace: WS, prNumber: 39, verdict: 'APPROVE' })
     expect(dup?.block).toBe(true)
@@ -589,7 +589,7 @@ describe('review verdict idempotency guard', () => {
     const g = makeShaGuard('sha-abc', () => clock)
     const first = await g.guard({ callId: 't1', workspace: WS, prNumber: 224, verdict: 'APPROVE' })
     expect(first).toBeNull()
-    await g.release({ callId: 't1', succeeded: true })
+    await g.release({ callId: 't1', outcome: 'formal-landed' })
     for (const callId of ['t2', 't3', 't4']) {
       clock += 5_000
       const dup = await g.guard({ callId, workspace: WS, prNumber: 224, verdict: 'APPROVE' })
@@ -601,7 +601,7 @@ describe('review verdict idempotency guard', () => {
     let clock = 1_000
     const g = makeShaGuard('sha-abc', () => clock)
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 42, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     clock += LAG_WINDOW_MS + 1
     const after = await g.guard({ callId: 'a2', workspace: WS, prNumber: 42, verdict: 'APPROVE' })
     expect(after).toBeNull()
@@ -620,7 +620,7 @@ describe('review verdict idempotency guard', () => {
       resolveHeadSha: async () => 'sha-abc',
     })
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 50, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: a fan-out sibling fires the same verdict on the same head minutes later
     const dup = await g.guard({ callId: 'a2', workspace: WS, prNumber: 50, verdict: 'APPROVE' })
     // then: the cooldown blocks the redundant duplicate (Layer 2 already blocks
@@ -632,7 +632,7 @@ describe('review verdict idempotency guard', () => {
     let clock = 1_000
     const g = makeShaGuard('sha-abc', () => clock)
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 51, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // just inside the 5-minute window — still blocked
     clock += 5 * 60_000 - 1_000
     const inside = await g.guard({ callId: 'a2', workspace: WS, prNumber: 51, verdict: 'APPROVE' })
@@ -651,7 +651,7 @@ describe('review verdict idempotency guard', () => {
       resolveHeadSha: async () => 'sha-abc',
     })
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 52, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: the approval is genuinely dismissed and a fresh re-APPROVE fires on
     // the SAME commit inside the cooldown window
     effective = 'DISMISSED'
@@ -664,7 +664,7 @@ describe('review verdict idempotency guard', () => {
   test('cooldown allows a flipped verdict on the same commit even within the window', async () => {
     const g = makeShaGuard('sha-abc')
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 53, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // a REQUEST_CHANGES after an APPROVE is a real supersession, never a duplicate
     const flip = await g.guard({ callId: 'a2', workspace: WS, prNumber: 53, verdict: 'REQUEST_CHANGES' })
     expect(flip).toBeNull()
@@ -708,7 +708,7 @@ describe('review verdict idempotency guard', () => {
     const instanceA = createApproveIdempotencyGuard(deps)
     const instanceB = createApproveIdempotencyGuard(deps)
     await instanceA.guard({ callId: 'a1', workspace: WS, prNumber: 35, verdict: 'APPROVE' })
-    await instanceA.release({ callId: 'a1', succeeded: true })
+    await instanceA.release({ callId: 'a1', outcome: 'formal-landed' })
     const dup = await instanceB.guard({ callId: 'b1', workspace: WS, prNumber: 35, verdict: 'APPROVE' })
     expect(dup?.block).toBe(true)
   })
@@ -717,7 +717,7 @@ describe('review verdict idempotency guard', () => {
     // given: the head SHA could not be resolved on either attempt
     const g = makeShaGuard(null)
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 36, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: a second same-verdict attempt arrives and GitHub reports NONE
     const dup = await g.guard({ callId: 'a2', workspace: WS, prNumber: 36, verdict: 'APPROVE' })
     // then: with no resolvable head to prove same-commit lag, the lag shield does
@@ -733,7 +733,7 @@ describe('review verdict idempotency guard', () => {
     })
     // given: an APPROVE landed at sha-abc
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 37, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // when: that approval is dismissed (GitHub now reports DISMISSED) and a
     // re-APPROVE on the SAME commit fires inside the lag window
     effective = 'DISMISSED'
@@ -750,7 +750,7 @@ describe('review verdict idempotency guard', () => {
       resolveHeadSha: async () => 'sha-abc',
     })
     await g.guard({ callId: 'a1', workspace: WS, prNumber: 38, verdict: 'APPROVE' })
-    await g.release({ callId: 'a1', succeeded: true })
+    await g.release({ callId: 'a1', outcome: 'formal-landed' })
     // GitHub now shows the standing APPROVED; a REQUEST_CHANGES is a demotion
     effective = 'APPROVED'
     const flip = await g.guard({ callId: 'a2', workspace: WS, prNumber: 38, verdict: 'REQUEST_CHANGES' })
