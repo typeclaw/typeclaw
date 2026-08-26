@@ -1,9 +1,9 @@
 import path from 'node:path'
 
+import { GUARD_IMAGE_READ_REDIRECT } from '@/bundled-plugins/guard/keys'
 import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '@/bundled-plugins/guard/policy'
-import { IMAGE_READ_REDIRECT_GUARD } from '@/plugin/guard-acknowledgements'
 
-export const GUARD_IMAGE_READ_REDIRECT = IMAGE_READ_REDIRECT_GUARD
+export { GUARD_IMAGE_READ_REDIRECT } from '@/bundled-plugins/guard/keys'
 
 // Mirrors the IMAGE_MIME_TYPES set in @mariozechner/pi-coding-agent
 // (dist/utils/mime.ts). Keeping the trigger surface aligned with the upstream

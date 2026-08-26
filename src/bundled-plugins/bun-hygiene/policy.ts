@@ -1,8 +1,7 @@
+import { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, GUARD_NON_BUN_PACKAGE_RUNNER } from '../guard/keys'
 import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '../guard/policy'
 
-export const GUARD_GLOBAL_INSTALL = 'globalInstall'
-export const GUARD_NON_BUN_PACKAGE_MANAGER = 'nonBunPackageManager'
-export const GUARD_NON_BUN_PACKAGE_RUNNER = 'nonBunPackageRunner'
+export { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, GUARD_NON_BUN_PACKAGE_RUNNER } from '../guard/keys'
 
 // Install managers write competing lockfiles and install trees, so they are
 // steered to bun.

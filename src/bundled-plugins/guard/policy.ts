@@ -1,4 +1,6 @@
-export const ACKNOWLEDGE_GUARDS = 'acknowledgeGuards'
+import { ACKNOWLEDGE_GUARDS } from './keys'
+
+export { ACKNOWLEDGE_GUARDS } from './keys'
 
 export type GuardBlock = { block: true; reason: string }
 
