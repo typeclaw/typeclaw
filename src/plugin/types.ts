@@ -321,11 +321,6 @@ export type PluginExports = {
   onDispose?: () => void | Promise<void>
 }
 
-export type GuardAcknowledgementDeclaration = {
-  readonly key: string
-  readonly tools: readonly string[]
-}
-
 // `typeclaw doctor` plugin extension surface. Each check is read-only by
 // default; declaring `fix.apply` opts the check into `typeclaw doctor --fix`,
 // where the host serializes plugin fixes, validates their `changedPaths`
@@ -373,7 +368,6 @@ export type PluginFixResult = {
 export type DefinedPlugin<TConfig = never> = {
   readonly configSchema?: z.ZodType<TConfig>
   readonly permissions?: readonly string[]
-  readonly guardAcknowledgements?: readonly GuardAcknowledgementDeclaration[]
   // Permission strings the owner wildcard sentinel MUST NOT auto-expand
   // to. Used by the bundled security plugin to keep audience-leak
   // (high-tier) bypasses off the owner role unless an operator grants
