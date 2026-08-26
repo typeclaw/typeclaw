@@ -2936,7 +2936,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
       }
       if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true && live.userStoppedTurnSeq !== live.turnSeq) {
-        logger.info(`[channels] ${live.keyId} terminal_after_channel_reply`)
+        logger.info(
+          `[channels] ${live.keyId} terminal_after_channel_reply site=terminal_after_channel_reply session=${live.sessionId} reason=terminal_after_channel_reply`,
+        )
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
         live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
         live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'terminal_after_channel_reply' }
@@ -3338,7 +3340,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await stopTypingHeartbeat(live)
     try {
       await live.session.abort()
-      logger.info(`[channels] ${live.keyId}: command /stop aborted current turn`)
+      logger.info(
+        `[channels] ${live.keyId}: command /stop aborted current turn site=user_stop session=${live.sessionId} reason=user_stop`,
+      )
     } catch (err) {
       logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
     }
@@ -5006,7 +5010,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const count = (live.policyDeniedToolSendsThisTurn.get(sendKey) ?? 0) + 1
         live.policyDeniedToolSendsThisTurn.set(sendKey, count)
         if (count >= MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN) {
-          logger.warn(`[channels] ${live.keyId}: aborting turn — ${count} policy-denied channel sends (last: ${code})`)
+          logger.warn(
+            `[channels] ${live.keyId}: aborting turn — ${count} policy-denied channel sends (last: ${code}) site=policy_denied_send_cap session=${live.sessionId} reason=policy_denied:${code}`,
+          )
           live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: `policy_denied:${code}` }
           if (live.session.agent.signal?.aborted !== true) live.session.agent.abort()
         }
@@ -5887,8 +5893,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.unsubTodoOutcome?.()
     live.unsubTodoOutcome = null
     await stopTypingHeartbeat(live)
+    // Captured before the abort call: `draining` flips false in drain()'s own
+    // finally once the turn it was guarding ends, so reading it here is the
+    // only reliable signal that this teardown cut off a turn actually in
+    // flight rather than an already-idle session.
+    const abortedInFlightTurn = live.draining
     try {
       await live.session.abort()
+      if (abortedInFlightTurn) {
+        logger.warn(`[channels] ${live.keyId} abort site=teardown session=${live.sessionId} reason=teardown`)
+      }
     } catch (err) {
       logger.warn(`[channels] abort failed for ${live.keyId}: ${describeError(err)}`)
     }
@@ -6003,6 +6017,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       await live.session
         .abort()
+        .then(() => {
+          logger.warn(
+            `[channels] ${live.keyId} abort site=graceful_restart session=${live.sessionId} reason=graceful_restart`,
+          )
+        })
         .catch((err) => logger.error(`[channels] graceful-restart abort failed: ${describeError(err)}`))
     }
   }
