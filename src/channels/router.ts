@@ -4941,6 +4941,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       accountingTarget.thread === (msg.thread ?? null)
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
+    // Credit sticky where the reply was PUBLISHED, not where it was accounted.
+    // The two diverge when a caller answers from one sub-surface but publishes
+    // to another in the same room — `postDuplicateRequestChangesComment` sends
+    // with `thread: null` while passing the review-thread session as
+    // `accountingTarget`. An inbound is keyed from its OWN tuple, so the human's
+    // follow-up consumes the root key and finds nothing: the reply was observed
+    // and silently dropped.
+    //
+    // Delivery-only, not both. A dual grant cannot be undone atomically —
+    // `clearSticky` clears one key, so `channel_disengage` on the originating
+    // thread would strand the root credit. It also buys nothing here: GitHub
+    // review-comment inbounds set `suppressSticky`, so they never reach the
+    // sticky gate and engage via `replyToBotMessageId` instead.
+    //
+    // Same adapter/workspace/chat only. `targets` are authors of the ACCOUNTING
+    // turn and author ids are namespaced per adapter, so redirecting a genuine
+    // cross-channel send would credit ids that cannot appear in that room.
+    const stickyGrantKeyId =
+      !deliveryMatchesAccounting &&
+      accountingTarget.adapter === msg.adapter &&
+      accountingTarget.workspace === msg.workspace &&
+      accountingTarget.chat === msg.chat
+        ? channelKeyId({
+            adapter: msg.adapter,
+            workspace: msg.workspace,
+            chat: msg.chat,
+            thread: msg.thread ?? null,
+          })
+        : keyId
     const sendKey = consecutiveSendKey(accountingTarget.chat, accountingTarget.thread)
     // Tool-source sends consume the captured quote candidate exactly
     // once per turn — the intervening-observed check runs HERE against
@@ -5151,7 +5180,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
         }
         if (targets.size > 0) {
-          grantStickyForReplyTargets(stickyLedger, keyId, Array.from(targets), adapterConfig.engagement, now())
+          grantStickyForReplyTargets(
+            stickyLedger,
+            stickyGrantKeyId,
+            Array.from(targets),
+            adapterConfig.engagement,
+            now(),
+          )
         }
       }
       const turnCount = live.consecutiveSends.get(sendKey) ?? 0

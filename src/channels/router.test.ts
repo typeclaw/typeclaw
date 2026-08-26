@@ -2218,6 +2218,129 @@ describe('ChannelRouter sticky credits', () => {
     expect(sessions[0]!.prompts[0]).toContain('You are in a group chat and are woken on every message')
   })
 
+  test('a reply published to the room root wakes the author there, not in the thread it was answered from', async () => {
+    // given a root room where BOTH humans have spoken, so the solo-human
+    // fallback is off and sticky is the only thing that can engage a plain
+    // follow-up, and alice engaged the bot inside a thread
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value = 1100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot yo' }))
+    await router.__testing!.flushDebounce(KEY)
+    sessions[0]!.prompts.length = 0
+
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    nowRef.value = 1200
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+
+    // when the answer is PUBLISHED to the room root while still being accounted
+    // to the thread session (the post_github_review fallback-comment shape)
+    nowRef.value = 1500
+    const result = await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+    expect(result.ok).toBe(true)
+
+    // then alice's plain follow-up on the root — the only surface she can see
+    // that reply on — engages instead of being silently observed
+    nowRef.value = 2000
+    await router.route(
+      inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: false, text: 'answered your point' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sessions[0]!.prompts[0]).toContain('answered your point')
+  })
+
+  test('a divergent-thread send credits only the delivery key, leaving no stranded thread credit', async () => {
+    // given the same divergent send as above
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+
+    // then the credit exists on the root and nothing is left on the thread, so a
+    // later disengage on either surface cannot strand a half of a paired grant
+    expect(router.clearSticky(threadKey).cleared).toBe(0)
+    expect(router.clearSticky(KEY).cleared).toBe(1)
+  })
+
+  test('a cross-chat send still credits its accounting session, not the destination', async () => {
+    // given a turn in c1 whose reply is delivered to a different chat entirely
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c2', thread: null, text: 'relaying this over here' },
+      { accountingTarget: KEY },
+    )
+
+    // then the delivery redirect does not apply: author ids are namespaced per
+    // room, so the credit stays where the turn actually happened
+    expect(router.clearSticky({ adapter: 'discord-bot', workspace: 'g1', chat: 'c2', thread: null }).cleared).toBe(0)
+    expect(router.clearSticky(KEY).cleared).toBe(1)
+  })
+
+  test('a root-published reply credits only its reply targets, not everyone in the room', async () => {
+    // given the divergent send answering alice, in a 2-human root room where
+    // the solo-human fallback is off
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true, text: 'bot hi' }))
+    await router.__testing!.flushDebounce(KEY)
+    nowRef.value = 1100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-1', isBotMention: true, text: 'bot yo' }))
+    await router.__testing!.flushDebounce(KEY)
+    const threadKey: ChannelKey = { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: 't1' }
+    nowRef.value = 1200
+    await router.route(
+      inbound({ thread: 't1', authorId: 'alice', externalMessageId: 'alice-t1', isBotMention: true, text: 'bot look' }),
+    )
+    await router.__testing!.flushDebounce(threadKey)
+    nowRef.value = 1500
+    await router.send(
+      { adapter: 'discord-bot', workspace: 'g1', chat: 'c1', thread: null, text: 'here is the review' },
+      { accountingTarget: threadKey },
+    )
+    sessions[0]!.prompts.length = 0
+
+    // when uncredited bob posts a plain comment on the root
+    nowRef.value = 2000
+    await router.route(
+      inbound({ authorId: 'bob', externalMessageId: 'bob-2', isBotMention: false, text: 'unrelated chatter' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    // then it stays observed — the grant followed the reply target, not the room
+    expect(sessions[0]!.prompts).toHaveLength(0)
+  })
+
   test('clearSticky drops the credit so a plain follow-up is no longer auto-engaged', async () => {
     // given a 2-human group where the bot just replied in alice's turn,
     // granting alice a sticky credit (mirrors the test above)
