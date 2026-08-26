@@ -304,6 +304,7 @@ export type WrapToolOptions = {
 export type BashSandboxBoundary = {
   ensureAvailable: () => Promise<void>
   buildCommand: typeof buildSandboxedCommand
+  resolveProcStrategy?: () => Promise<ProcStrategyResolution>
   resolveRuntime?: typeof resolvePrivilegedSandboxRuntime
   verifyRuntime?: typeof verifyPrivilegedSandboxRuntime
   cleanupRuntime?: typeof cleanupPrivilegedSandboxRuntime
@@ -992,7 +993,7 @@ async function applyBashSandbox(
     const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
       writableDirSet.has(op.target),
     )
-    const { strategy: proc, degradeReason } = await resolveProcStrategy()
+    const { strategy: proc, degradeReason } = await (boundary.resolveProcStrategy ?? resolveProcStrategy)()
     if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
       throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
     }

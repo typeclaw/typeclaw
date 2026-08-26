@@ -71,6 +71,7 @@ type PinnedOutputTarget = PinnedToolFiles & {
 // scheduler. Production never passes hooks.
 export type EnforceAndPinToolFilesHooks = {
   afterBudgetAcquire?(): void | Promise<void>
+  pinnedSnapshotBudgetForTests?: ReturnType<typeof createPinnedSnapshotBudgetForTests>
 }
 
 export async function enforceAndPinToolFiles(
@@ -142,7 +143,11 @@ export async function enforceAndPinToolFiles(
       verified.push({ target, original, resolved, dev: inspected.dev, ino: inspected.ino, size: inspected.size, kind })
     }
 
-    lease = await pinnedSnapshotBudget.acquire(declaredBytes, verified.length, options.signal)
+    lease = await (hooks.pinnedSnapshotBudgetForTests ?? pinnedSnapshotBudget).acquire(
+      declaredBytes,
+      verified.length,
+      options.signal,
+    )
     await hooks.afterBudgetAcquire?.()
     const openedIdentityVerifier = createPrivateSurfaceReadIdentityVerifier(identityOptions)
 
@@ -1256,16 +1261,26 @@ class PinnedSnapshotBudget {
   private count = 0
   private readonly queue: BudgetRequest[] = []
 
+  constructor(
+    private readonly limits: { maxBytes: number; maxCount: number; maxWaiters: number },
+    private readonly onWait?: () => void,
+  ) {}
+
   async acquire(bytes: number, count: number, signal?: AbortSignal): Promise<BudgetLease> {
-    if (bytes > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES || count > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT) {
+    if (bytes > this.limits.maxBytes || count > this.limits.maxCount) {
       throw new Error('tool inputs exceed the process-wide pinned snapshot budget')
     }
     if (signal?.aborted === true) throw abortError(signal)
-    if (this.queue.length >= PINNED_SNAPSHOT_MAX_WAITERS) {
-      throw new Error(`pinned snapshot waiter queue is full (${PINNED_SNAPSHOT_MAX_WAITERS} waiters)`)
+    if (this.queue.length >= this.limits.maxWaiters) {
+      throw new Error(`pinned snapshot waiter queue is full (${this.limits.maxWaiters} waiters)`)
     }
     return await new Promise<BudgetLease>((resolve, reject) => {
       const request: BudgetRequest = { bytes, count, signal, resolve, reject }
+      const waits =
+        this.queue.length > 0 ||
+        this.bytes + request.bytes > this.limits.maxBytes ||
+        this.count + request.count > this.limits.maxCount
+      if (waits) this.onWait?.()
       if (signal !== undefined) {
         request.onAbort = () => {
           const index = this.queue.indexOf(request)
@@ -1284,10 +1299,7 @@ class PinnedSnapshotBudget {
   private drain(): void {
     while (this.queue.length > 0) {
       const next = this.queue[0] as BudgetRequest
-      if (
-        this.bytes + next.bytes > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES ||
-        this.count + next.count > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT
-      ) {
+      if (this.bytes + next.bytes > this.limits.maxBytes || this.count + next.count > this.limits.maxCount) {
         return
       }
       this.queue.shift()
@@ -1302,10 +1314,7 @@ class PinnedSnapshotBudget {
           if (released) return false
           const byteDelta = bytes - leasedBytes
           const countDelta = count - leasedCount
-          if (
-            this.bytes + byteDelta > PINNED_SNAPSHOT_GLOBAL_MAX_BYTES ||
-            this.count + countDelta > PINNED_SNAPSHOT_GLOBAL_MAX_COUNT
-          ) {
+          if (this.bytes + byteDelta > this.limits.maxBytes || this.count + countDelta > this.limits.maxCount) {
             return false
           }
           this.bytes += byteDelta
@@ -1327,7 +1336,21 @@ class PinnedSnapshotBudget {
   }
 }
 
-const pinnedSnapshotBudget = new PinnedSnapshotBudget()
+export function createPinnedSnapshotBudgetForTests(options: {
+  maxBytes: number
+  maxCount: number
+  maxWaiters: number
+  onWait?: () => void
+}) {
+  const { onWait, ...limits } = options
+  return new PinnedSnapshotBudget(limits, onWait)
+}
+
+const pinnedSnapshotBudget = new PinnedSnapshotBudget({
+  maxBytes: PINNED_SNAPSHOT_GLOBAL_MAX_BYTES,
+  maxCount: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT,
+  maxWaiters: PINNED_SNAPSHOT_MAX_WAITERS,
+})
 
 function abortError(signal: AbortSignal): Error {
   const reason = signal.reason

@@ -36,8 +36,6 @@ import { emptyRegistry } from '@/plugin/registry'
 import {
   buildSandboxedCommand,
   canWriteAgentRootInSandbox,
-  _resetBwrapAvailabilityCacheForTests,
-  _resetRealProcProbeCacheForTests,
   resolveProtectedZones,
   resolveHiddenPaths,
   SandboxDegradedProcError,
@@ -66,9 +64,8 @@ import {
 } from './plugin-tools'
 import type { SessionOrigin } from './session-origin'
 import {
+  createPinnedSnapshotBudgetForTests,
   enforceAndPinToolFiles,
-  PINNED_SNAPSHOT_GLOBAL_MAX_COUNT,
-  PINNED_SNAPSHOT_MAX_WAITERS,
   TOOL_INPUT_MAX_BYTES,
   TOOL_INPUT_MAX_COUNT,
   writeToolOutputNoFollow,
@@ -2109,22 +2106,28 @@ describe('wrapSystemTool', () => {
 
   test('direct snapshots reject a file hardlinked to .env after initial authorization but before open', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-direct-hardlink-race-'))
-    const holderFiles = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT }, (_, i) =>
-      path.join(agentDir, `holder-${i}.txt`),
-    )
     const input = path.join(agentDir, 'input.txt')
     const env = path.join(agentDir, '.env')
-    await Promise.all(holderFiles.map(async (file) => await writeFile(file, 'x')))
     await writeFile(input, 'safe before hardlink')
-    let holder: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
+    let acquiredResolve!: () => void
+    const acquired = new Promise<void>((resolve) => {
+      acquiredResolve = resolve
+    })
+    let openResolve!: () => void
+    const allowOpen = new Promise<void>((resolve) => {
+      openResolve = resolve
+    })
     try {
-      holder = await enforceAndPinToolFiles({
-        tool: 'channel_send',
-        args: { attachments: holderFiles.map((file) => ({ path: file })) },
-        agentDir,
-      })
       let dispatched = false
-      const waiting = enforceAndPinToolFiles({ tool: 'read', args: { path: input }, agentDir }).then(
+      const waiting = enforceAndPinToolFiles(
+        { tool: 'read', args: { path: input }, agentDir },
+        {
+          async afterBudgetAcquire() {
+            acquiredResolve()
+            await allowOpen
+          },
+        },
+      ).then(
         async (pinned) => {
           dispatched = true
           await pinned.cleanup()
@@ -2132,10 +2135,9 @@ describe('wrapSystemTool', () => {
         },
         (error: unknown) => error,
       )
-      await Bun.sleep(10)
+      await acquired
       await link(input, env)
-      await holder.cleanup()
-      holder = undefined
+      openResolve()
 
       const failure = await waiting
       expect(failure).toBeInstanceOf(Error)
@@ -2144,7 +2146,7 @@ describe('wrapSystemTool', () => {
       )
       expect(dispatched).toBeFalse()
     } finally {
-      await holder?.cleanup()
+      openResolve()
       await rm(agentDir, { recursive: true, force: true })
     }
   })
@@ -2170,35 +2172,50 @@ describe('wrapSystemTool', () => {
 
   test('holds the process-wide pinned-count reservation through cleanup', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-global-snapshot-budget-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
-      path.join(agentDir, `${i}.png`),
-    )
+    const files = Array.from({ length: 3 }, (_, i) => path.join(agentDir, `${i}.png`))
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
+    let waitingResolve!: () => void
+    const waitingForCapacity = new Promise<void>((resolve) => {
+      waitingResolve = resolve
+    })
+    const budget = createPinnedSnapshotBudgetForTests({
+      maxBytes: 3,
+      maxCount: 2,
+      maxWaiters: 1,
+      onWait: waitingResolve,
+    })
     const make = (slice: string[]) =>
-      enforceAndPinToolFiles({
-        tool: 'look_at',
-        args: { images: slice.map((file) => ({ path: file })) },
-        agentDir,
-      })
+      enforceAndPinToolFiles(
+        {
+          tool: 'look_at',
+          args: { images: slice.map((file) => ({ path: file })) },
+          agentDir,
+        },
+        { pinnedSnapshotBudgetForTests: budget },
+      )
     let first: Awaited<ReturnType<typeof make>> | undefined
     let second: Awaited<ReturnType<typeof make>> | undefined
     let third: Awaited<ReturnType<typeof make>> | undefined
+    let waiting: ReturnType<typeof make> | undefined
     try {
-      first = await make(files.slice(0, TOOL_INPUT_MAX_COUNT.look_at))
-      second = await make(files.slice(TOOL_INPUT_MAX_COUNT.look_at, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT))
+      first = await make([files[0] as string])
+      second = await make([files[1] as string])
       let settled = false
-      const waiting = make([files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string]).then((value) => {
+      waiting = make([files[2] as string]).then((value) => {
         settled = true
         return value
       })
-      await Bun.sleep(10)
+      await waitingForCapacity
       expect(settled).toBeFalse()
       await first.cleanup()
       first = undefined
       third = await waiting
+      waiting = undefined
       expect(settled).toBeTrue()
     } finally {
       await first?.cleanup()
+      const pending = await waiting
+      await pending?.cleanup()
       await second?.cleanup()
       await third?.cleanup()
       await rm(agentDir, { recursive: true, force: true })
@@ -2207,33 +2224,38 @@ describe('wrapSystemTool', () => {
 
   test('aborting a queued snapshot waiter removes it without consuming capacity', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-aborted-snapshot-waiter-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
-      path.join(agentDir, `${i}.bin`),
-    )
+    const files = Array.from({ length: 2 }, (_, i) => path.join(agentDir, `${i}.bin`))
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
+    let waitingResolve!: () => void
+    const waitingForCapacity = new Promise<void>((resolve) => {
+      waitingResolve = resolve
+    })
+    const budget = createPinnedSnapshotBudgetForTests({
+      maxBytes: 2,
+      maxCount: 1,
+      maxWaiters: 1,
+      onWait: waitingResolve,
+    })
     let holder: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
     try {
-      holder = await enforceAndPinToolFiles({
-        tool: 'channel_send',
-        args: { attachments: files.slice(0, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT).map((file) => ({ path: file })) },
-        agentDir,
-      })
+      holder = await enforceAndPinToolFiles(
+        { tool: 'channel_send', args: { attachments: [{ path: files[0] as string }] }, agentDir },
+        { pinnedSnapshotBudgetForTests: budget },
+      )
       const controller = new AbortController()
-      const waiting = enforceAndPinToolFiles({
-        tool: 'read',
-        args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
-        agentDir,
-        signal: controller.signal,
-      })
+      const waiting = enforceAndPinToolFiles(
+        { tool: 'read', args: { path: files[1] as string }, agentDir, signal: controller.signal },
+        { pinnedSnapshotBudgetForTests: budget },
+      )
+      await waitingForCapacity
       controller.abort('cancelled test waiter')
       await expect(waiting).rejects.toThrow(/abort|cancel/i)
       await holder.cleanup()
       holder = undefined
-      const next = await enforceAndPinToolFiles({
-        tool: 'read',
-        args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
-        agentDir,
-      })
+      const next = await enforceAndPinToolFiles(
+        { tool: 'read', args: { path: files[1] as string }, agentDir },
+        { pinnedSnapshotBudgetForTests: budget },
+      )
       await next.cleanup()
     } finally {
       await holder?.cleanup()
@@ -2243,29 +2265,25 @@ describe('wrapSystemTool', () => {
 
   test('rejects excess queued snapshot waiters with a deterministic bound', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-bounded-snapshot-waiters-'))
-    const files = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT + 1 }, (_, i) =>
-      path.join(agentDir, `${i}.bin`),
-    )
+    const files = Array.from({ length: 2 }, (_, i) => path.join(agentDir, `${i}.bin`))
     await Promise.all(files.map(async (file) => await writeFile(file, 'x')))
+    const budget = createPinnedSnapshotBudgetForTests({ maxBytes: 2, maxCount: 1, maxWaiters: 2 })
     const controllers: AbortController[] = []
     type WaiterOutcome = { error: unknown } | { pinned: Awaited<ReturnType<typeof enforceAndPinToolFiles>> }
     let waiters: Array<Promise<WaiterOutcome>> = []
     let holder: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
     try {
-      holder = await enforceAndPinToolFiles({
-        tool: 'channel_send',
-        args: { attachments: files.slice(0, PINNED_SNAPSHOT_GLOBAL_MAX_COUNT).map((file) => ({ path: file })) },
-        agentDir,
-      })
-      waiters = Array.from({ length: PINNED_SNAPSHOT_MAX_WAITERS + 1 }, () => {
+      holder = await enforceAndPinToolFiles(
+        { tool: 'channel_send', args: { attachments: [{ path: files[0] as string }] }, agentDir },
+        { pinnedSnapshotBudgetForTests: budget },
+      )
+      waiters = Array.from({ length: 3 }, () => {
         const controller = new AbortController()
         controllers.push(controller)
-        return enforceAndPinToolFiles({
-          tool: 'read',
-          args: { path: files[PINNED_SNAPSHOT_GLOBAL_MAX_COUNT] as string },
-          agentDir,
-          signal: controller.signal,
-        }).then<WaiterOutcome, WaiterOutcome>(
+        return enforceAndPinToolFiles(
+          { tool: 'read', args: { path: files[1] as string }, agentDir, signal: controller.signal },
+          { pinnedSnapshotBudgetForTests: budget },
+        ).then<WaiterOutcome, WaiterOutcome>(
           (pinned) => ({ pinned }),
           (error: unknown) => ({ error }),
         )
@@ -3426,11 +3444,6 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
 })
 
 describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', () => {
-  beforeEach(() => {
-    _resetBwrapAvailabilityCacheForTests()
-    _resetRealProcProbeCacheForTests()
-  })
-
   function fakeBash(record: { command?: string }) {
     return {
       name: 'bash',
@@ -3464,6 +3477,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     await writeFile(path.join(agentDir, '.env'), `NODE_OPTIONS=${plantedSecret}\nVISIBLE_NAME=visible-value\n`)
     const boundary = {
       ensureAvailable: async () => {},
+      resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
       resolveRuntime: async () => ({ env: {}, mounts: [] }),
       buildCommand(command: string, options: SandboxPolicy | undefined) {
         return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -3538,6 +3552,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         buildCommand(command, options) {
           return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -3585,6 +3600,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         buildCommand(command, options) {
           return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -3839,6 +3855,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           resolveRuntime: (options) => resolvePrivilegedSandboxRuntime({ ...options, homeDir }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options were not provided')
@@ -3887,6 +3904,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         buildCommand(command, options) {
           inherited = options?.env?.inherit
@@ -3932,6 +3950,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         buildCommand(command, options) {
           const built = buildSandboxedCommand(command, options)
@@ -3979,6 +3998,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         buildCommand(command, options) {
           return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -4008,6 +4028,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options were not provided')
             sandboxEnv = options.env?.set
@@ -4048,6 +4069,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         cleanupRuntime: async () => {
@@ -4185,6 +4207,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
         resolveRuntime: async () => ({ env: {}, mounts: [] }),
         cleanupRuntime: async () => {
@@ -4228,6 +4251,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4281,6 +4305,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       incidentLedger,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4324,6 +4349,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: registry,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4361,6 +4387,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       realProcDependencyCheck: () => true,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4398,6 +4425,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: registry,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4449,6 +4477,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       incidentLedger,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4483,6 +4512,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       realProcDependencyCheck: () => true,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4523,6 +4553,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       realProcDependencyCheck: () => true,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4556,6 +4587,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: new RemediationRegistry(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4588,6 +4620,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       incidentLedger,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4625,6 +4658,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: registry,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4671,6 +4705,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       incidentLedger,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand: buildSandboxedCommand,
       },
     })
@@ -4747,6 +4782,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           resolveRuntime: async () => ({ env: {}, mounts: [] }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options were not provided')
@@ -4918,6 +4954,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options missing')
             capturedPolicy = options
@@ -4979,6 +5016,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       permissions: createPermissionService(),
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand() {
           throw new Error('synthetic sandbox build failure')
         },
@@ -5042,6 +5080,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: registry,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand(command, options) {
           if (options === undefined) throw new Error('sandbox options missing')
           return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -5106,6 +5145,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       remediations: registry,
       bashSandboxBoundary: {
         ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
         buildCommand(command, options) {
           if (options === undefined) throw new Error('sandbox options missing')
           return { ...buildSandboxedCommand(command, options), commandString: command }
@@ -5221,6 +5261,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options were not provided')
             expect(options.env?.inherit ?? []).not.toContain(name)
@@ -5270,6 +5311,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         permissions: createPermissionService(),
         bashSandboxBoundary: {
           ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
           buildCommand(command, options) {
             if (options === undefined) throw new Error('sandbox options were not provided')
             expect(options.env?.inherit).toContain(name)
