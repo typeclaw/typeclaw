@@ -1161,6 +1161,40 @@ describe('ChannelRouter session lifecycle', () => {
     expect(router.liveCount()).toBe(1)
   })
 
+  test('stop logs teardown abort details when a prompt is in flight', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    let releasePrompt: () => void = () => {}
+    const promptHeld = new Promise<void>((resolve) => {
+      releasePrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1' }))
+    sessions[0]!.onPrompt = async () => {
+      await promptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.stop()
+    releasePrompt()
+    await drainPromise
+
+    expect(logs).toContain('warn:[channels] discord-bot:g1:c1: abort site=teardown session=ses_fake_1 reason=teardown')
+  })
+
+  test('stop does not log a teardown abort for an idle session', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs })
+    await router.route(inbound({ externalMessageId: 'm1' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    await router.stop()
+
+    expect(logs.filter((line) => line.includes('abort site=teardown'))).toEqual([])
+  })
+
   // Reviewer follow-up (#1174): observe-only messages (buffered to contextBuffer
   // with no queued prompt) that arrive during the held prompt must be carried to
   // the successor, not dropped — and must NOT themselves trigger a turn on the
@@ -4933,6 +4967,34 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('aborting turn') && m.includes('policy-denied'))).toBe(true)
   })
 
+  test('policy-denial abort log identifies the session id, reason, and firing site for operator diagnosis', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: Array<{ text: string }> = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push({ text: msg.text ?? '' })
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'just FYI' }))
+    sessions[0]!.onPrompt = async () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
+      let i = 0
+      while (!sessions[0]!.agent.signal.aborted && i < 100) {
+        await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: `attempt ${i}` })
+        i++
+      }
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.agent.signal.aborted).toBe(true)
+    const abortLog = logs.find((m) => m.includes('site=policy_denied_send_cap'))
+    expect(abortLog).toBeDefined()
+    expect(abortLog).toContain('session=ses_fake_1')
+    expect(abortLog).toContain('reason=policy_denied:skip-locked')
+  })
+
   test('policy-denial loop: counter resets per turn (denials below the ceiling do not throw, next turn replies)', async () => {
     const dir = await tempDir()
     const sent: Array<{ text: string }> = []
@@ -8172,6 +8234,31 @@ describe('ChannelRouter commands', () => {
     expect(sessions[0]!.aborted).toBe(1)
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sessions[0]!.prompts[0]).toContain('long task')
+  })
+
+  test('/stop logs a diagnostic abort line identifying the session, reason, and site', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    let releasePrompt: (() => void) | undefined
+
+    await router.route(inbound({ text: 'long task' }))
+    sessions[0]!.onPrompt = async () => {
+      await new Promise<void>((resolve) => {
+        releasePrompt = resolve
+      })
+    }
+    const draining = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length === 1)
+
+    await router.route(inbound({ text: '/stop', externalMessageId: 'm-stop' }))
+    releasePrompt!()
+    await draining
+
+    const abortLog = logs.find((m) => m.includes('site=user_stop'))
+    expect(abortLog).toBeDefined()
+    expect(abortLog).toContain('session=ses_fake_1')
+    expect(abortLog).toContain('reason=user_stop')
   })
 
   test('/stop supersedes terminal-reply provenance before the aborted outcome is captured', async () => {
@@ -14165,6 +14252,23 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     expect(agent.signal.aborted).toBe(false)
   })
 
+  test('logs a diagnostic line identifying the session, reason, and site when channel_reply ends the turn', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const agent = sessions[0]!.agent
+
+    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+
+    expect(agent.signal.aborted).toBe(true)
+    const abortLog = logs.find((m) => m.includes('site=terminal_after_channel_reply'))
+    expect(abortLog).toBeDefined()
+    expect(abortLog).toContain('session=ses_fake_1')
+    expect(abortLog).toContain('reason=terminal_after_channel_reply')
+  })
+
   test('does NOT abort when channel_reply was rejected (details.ok === false)', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
     await agent.afterToolCall!(afterToolContext('channel_reply', { ok: false }, false))
@@ -16640,7 +16744,8 @@ describe('markRestartAbortForAllLive (graceful host restart)', () => {
   test('aborts every live session and marks its scope so resume auto-continues', async () => {
     // given a live channel session with an in-flight-capable turn
     const dir = await tempDir()
-    const { router, sessions } = makeRouter(dir)
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
     expect(sessions).toHaveLength(1)
@@ -16660,6 +16765,9 @@ describe('markRestartAbortForAllLive (graceful host restart)', () => {
       participants: [],
     })!
     expect((await readContinuationState(dir, scope)).restartAbortPending).toBe(true)
+    expect(logs).toContain(
+      'warn:[channels] discord-bot:g1:c1: abort site=graceful_restart session=ses_fake_1 reason=graceful_restart',
+    )
   })
 
   test('is a no-op with no live sessions', async () => {
