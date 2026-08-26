@@ -100,12 +100,12 @@ export async function loadChannelSessions(
   if (version === FILE_VERSION) {
     const file = parsed as FileV7
     if (!Array.isArray(file.sessions)) return []
-    return dedupe(file.sessions.filter(isValidRecord))
+    return dedupe(file.sessions.filter(isValidRecord).map(normalizeGithubReviewRound))
   }
   if (version === 5) {
     const file = parsed as FileV5
     if (!Array.isArray(file.sessions)) return []
-    return dedupe(file.sessions.filter(isValidRecord))
+    return dedupe(file.sessions.filter(isValidRecord).map(normalizeGithubReviewRound))
   }
   if (version === 6) {
     const file = parsed as FileV6
@@ -198,6 +198,19 @@ function dropLegacyGithubReviewRound(record: ChannelSessionRecord): ChannelSessi
   return rest
 }
 
+function normalizeGithubReviewRound(record: ChannelSessionRecord): ChannelSessionRecord {
+  const round = record.githubReviewRound
+  if (round === undefined || (round.kind !== undefined && round.roundId !== undefined)) return record
+  return {
+    ...record,
+    githubReviewRound: {
+      ...round,
+      kind: 'push',
+      roundId: `legacy:${round.workspace}#${round.prNumber}#${round.headSha}`,
+    },
+  }
+}
+
 function recordKey(record: ChannelSessionRecord): string {
   return `${record.adapter}:${record.workspace}:${record.chat}:${record.thread ?? ''}`
 }
@@ -246,6 +259,9 @@ function isValidV6Record(v: unknown): v is ChannelSessionRecord {
 
 function isValidGithubReviewRound(value: unknown, record: Record<string, unknown>): boolean {
   if (!isObject(value)) return false
+  const hasLegacyIdentity = value.kind === undefined && value.roundId === undefined
+  const hasCurrentIdentity =
+    (value.kind === 'push' || value.kind === 'reply') && typeof value.roundId === 'string' && value.roundId.length > 0
   return (
     (value.status === 'pending' || value.status === 'completed') &&
     record.adapter === 'github' &&
@@ -265,6 +281,7 @@ function isValidGithubReviewRound(value: unknown, record: Record<string, unknown
     value.attemptedCarriers.length > 0 &&
     value.attemptedCarriers.every((thread) => thread === null || typeof thread === 'string') &&
     value.attemptedCarriers.some((thread) => thread === value.carrierThread) &&
+    (hasLegacyIdentity || hasCurrentIdentity) &&
     (value.dismissalAttempted === undefined || value.dismissalAttempted === true) &&
     (value.requestChangesAttempted === undefined || value.requestChangesAttempted === true)
   )

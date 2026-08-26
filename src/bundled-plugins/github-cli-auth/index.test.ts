@@ -2645,6 +2645,8 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
         chat: 'pr:5',
         thread,
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'test-round',
           workspace: 'acme/widgets',
           prNumber: 5,
           headSha: 'sha-5',

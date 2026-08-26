@@ -47,6 +47,8 @@ export type InboundAttachment = {
 }
 
 export type GithubReviewFollowupRound = {
+  kind: 'push' | 'reply'
+  roundId: string
   workspace: string
   prNumber: number
   headSha: string
@@ -554,7 +556,13 @@ export type ReviewStateRequest = {
 // treated like a live block, so the bot never claims close-out when the runtime
 // could not confirm the platform-side verdict.
 export type ReviewStateResult =
-  | { ok: true; selfBlocking: boolean; approve: boolean; reviewDecision?: GithubReviewDecision }
+  | {
+      ok: true
+      selfBlocking: boolean
+      selfBlockingReviewId: number | null
+      approve: boolean
+      reviewDecision?: GithubReviewDecision
+    }
   | { ok: false; error: string; code?: 'unsupported' | 'not-found' | 'permission-denied' | 'transient' }
 
 export type GithubReviewDecision = 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED'

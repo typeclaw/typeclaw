@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test'
 
 import { createGithubReviewStateResolver } from './review-state'
 
-type ReviewFixture = { id: number; login: string; state: string; isBot?: boolean }
+type ReviewFixture = { id?: number; login: string; state: string; isBot?: boolean }
 
 type Page = { reviews: ReviewFixture[]; hasNextPage: boolean }
 
@@ -60,7 +60,13 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true, reviewDecision: 'REVIEW_REQUIRED' })
+    expect(result).toEqual({
+      ok: true,
+      selfBlocking: false,
+      selfBlockingReviewId: null,
+      approve: true,
+      reviewDecision: 'REVIEW_REQUIRED',
+    })
   })
 
   it('reports selfBlocking when the bot’s latest formal review is CHANGES_REQUESTED', async () => {
@@ -70,7 +76,22 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: true, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: true, selfBlockingReviewId: 1, approve: true })
+  })
+
+  it('keeps a successful blocking lookup when the decisive review id is absent', async () => {
+    const resolve = resolverFor(
+      fakeRest({
+        pages: [{ reviews: [{ login: 'bot', state: 'CHANGES_REQUESTED', isBot: true }], hasNextPage: false }],
+      }),
+    )
+
+    expect(await resolve(req())).toEqual({
+      ok: true,
+      selfBlocking: true,
+      selfBlockingReviewId: null,
+      approve: true,
+    })
   })
 
   it('does NOT treat a later COMMENTED review as clearing a CHANGES_REQUESTED block', async () => {
@@ -88,7 +109,7 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: true, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: true, selfBlockingReviewId: 1, approve: true })
   })
 
   it('clears the block when a later APPROVED review follows the CHANGES_REQUESTED', async () => {
@@ -106,7 +127,7 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })
   })
 
   it('clears the block when the bot’s prior review was DISMISSED', async () => {
@@ -124,7 +145,7 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })
   })
 
   it('ignores another reviewer’s CHANGES_REQUESTED', async () => {
@@ -134,7 +155,7 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })
   })
 
   it('normalizes the bot login across REST slug[bot] and GraphQL bare-slug forms', async () => {
@@ -159,7 +180,7 @@ describe('github review-state resolver', () => {
       { selfLogin: 'bot[bot]' },
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })
   })
 
   it('paginates until the bot’s latest review is found', async () => {
@@ -174,7 +195,7 @@ describe('github review-state resolver', () => {
       }),
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: false, approve: true })
+    expect(result).toEqual({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })
     expect(seen.urls.some((url) => url.includes('/pulls/644/reviews'))).toBe(true)
     expect(seen.urls).toContain('https://api.github.com/next')
   })
@@ -187,7 +208,7 @@ describe('github review-state resolver', () => {
       { approve: false },
     )
     const result = await resolve(req())
-    expect(result).toEqual({ ok: true, selfBlocking: true, approve: false })
+    expect(result).toEqual({ ok: true, selfBlocking: true, selfBlockingReviewId: 1, approve: false })
   })
 
   it('fails closed (ok:false) when the reviews API errors', async () => {

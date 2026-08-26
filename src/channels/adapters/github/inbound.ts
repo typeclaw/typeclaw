@@ -1,5 +1,6 @@
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
+import { registerOrJoinReplyReviewRound } from '@/channels/github-review-verdict-coordinator'
 import type { GithubReviewOn } from '@/channels/schema'
 import type { GithubReviewFollowupRound, InboundMessage } from '@/channels/types'
 
@@ -50,6 +51,7 @@ export type GithubWebhookHandlerOptions = {
   scheduleBackgroundTask?: (task: () => Promise<void>) => void
   sleepImpl?: (ms: number) => Promise<void>
   fetchImpl?: typeof fetch
+  generateReviewRoundId?: () => string
 }
 
 export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions): (req: Request) => Promise<Response> {
@@ -131,6 +133,7 @@ export async function processVerifiedGithubDelivery(
 
   const teamIsBotMember = await resolveTeamMembership(event, payload, options)
   const reviewCommentParent = await resolveReviewCommentParent(event, payload, selfId, selfLogin, options)
+  const replyReviewRound = await resolveReplyReviewRound(event, payload, selfLogin, reviewCommentParent, options)
   const classified = classifyGithubInbound(event, payload, selfLogin, {
     teamIsBotMember,
     authType: options.authType?.() ?? 'pat',
@@ -139,7 +142,12 @@ export async function processVerifiedGithubDelivery(
   })
   if (classified === null) return
 
-  options.route(withApprovalPolicy(classified, options.allowApprove?.() ?? true))
+  options.route(
+    withApprovalPolicy(
+      replyReviewRound === null ? classified : { ...classified, githubReviewRound: replyReviewRound },
+      options.allowApprove?.() ?? true,
+    ),
+  )
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -297,6 +305,7 @@ function scheduleReviewFollowup(input: {
   const fetchImpl = options.fetchImpl ?? fetch
   const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
   const sleepImpl = options.sleepImpl ?? defaultSleep
+  const generateReviewRoundId = options.generateReviewRoundId ?? randomUUID
   const target = `${repository.owner}/${repository.name}#${pullNumber}`
 
   const runFollowupAttempt = async (): Promise<'completed' | 'retry'> => {
@@ -340,7 +349,7 @@ function scheduleReviewFollowup(input: {
 
       if (threads.threads.length === 0) {
         if (selfBlocking) {
-          const round = buildReviewRound(repository, pullNumber, headSha, null)
+          const round = buildReviewRound(repository, pullNumber, headSha, null, generateReviewRoundId)
           options.route(
             withApprovalPolicy(
               buildReviewFollowupInbound({
@@ -361,7 +370,13 @@ function scheduleReviewFollowup(input: {
       }
 
       const round = selfBlocking
-        ? buildReviewRound(repository, pullNumber, headSha, String(threads.threads[0]!.rootCommentId))
+        ? buildReviewRound(
+            repository,
+            pullNumber,
+            headSha,
+            String(threads.threads[0]!.rootCommentId),
+            generateReviewRoundId,
+          )
         : undefined
       for (const [index, thread] of threads.threads.entries()) {
         // Deliver the PR-level blocking obligation through exactly one sibling
@@ -453,8 +468,11 @@ function buildReviewRound(
   prNumber: number,
   headSha: string,
   carrierThread: string | null,
+  generateRoundId: () => string,
 ): GithubReviewFollowupRound {
   return {
+    kind: 'push',
+    roundId: generateRoundId(),
     workspace: `${repository.owner}/${repository.name}`,
     prNumber,
     headSha,
@@ -1104,6 +1122,54 @@ async function resolveReviewCommentParent(
     if (user === null) return null
     return { parentId, isSelf: isSelfAuthor(user, selfId, selfLogin) }
   } catch {
+    return null
+  }
+}
+
+async function resolveReplyReviewRound(
+  event: string,
+  payload: Record<string, unknown>,
+  selfLogin: string | null,
+  parent: ReviewCommentParent | null,
+  options: GithubWebhookHandlerOptions,
+): Promise<GithubReviewFollowupRound | null> {
+  if (event !== 'pull_request_review_comment' || parent?.isSelf !== true || selfLogin === null) return null
+  const comment = readRecord(payload.comment)
+  const parentId = readNumber(comment, 'in_reply_to_id')
+  if (parentId === null || parent.parentId !== parentId) return null
+  const repository = readRepository(payload)
+  const pr = readRecord(payload.pull_request)
+  const prNumber = readNumber(pr, 'number')
+  const headSha = readString(readRecord(pr?.head), 'sha')
+  const authToken = options.authToken
+  if (repository === null || prNumber === null || headSha === null || authToken === undefined) return null
+
+  const target = `${repository.owner}/${repository.name}#${prNumber}`
+  try {
+    const token = await authToken({ repoSlug: `${repository.owner}/${repository.name}` })
+    const blocking = await fetchSelfReviewBlocking({
+      token,
+      selfLogin,
+      owner: repository.owner,
+      repo: repository.name,
+      prNumber,
+      fetchImpl: options.fetchImpl ?? fetch,
+    })
+    if (!blocking.ok) {
+      options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${blocking.error}`)
+      return null
+    }
+    if (!blocking.selfBlocking || blocking.selfBlockingReviewId === null) return null
+    return registerOrJoinReplyReviewRound({
+      workspace: `${repository.owner}/${repository.name}`,
+      prNumber,
+      headSha,
+      blockingReviewId: blocking.selfBlockingReviewId,
+      thread: String(parentId),
+      generateRoundId: options.generateReviewRoundId ?? randomUUID,
+    })
+  } catch (err) {
+    options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${describeError(err)}`)
     return null
   }
 }

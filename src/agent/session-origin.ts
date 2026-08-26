@@ -389,6 +389,7 @@ function renderChannelOrigin(
     chat: string
     chatName?: string
     thread: string | null
+    githubReviewRound?: GithubReviewFollowupRound
     reactionRef?: ReactionRef
     participants?: readonly ChannelParticipant[]
     membership?: MembershipCount
@@ -446,6 +447,16 @@ function renderChannelOrigin(
       'The GitHub adapter cannot send file attachments.',
       'GitHub has no typing indicator.',
     )
+
+    if (/^pr:\d+$/.test(origin.chat) && origin.githubReviewRound !== undefined) {
+      const isCarrier = origin.thread === origin.githubReviewRound.carrierThread
+      lines.push(
+        '',
+        isCarrier
+          ? '**This session is the review-round carrier.** Perform one whole-PR re-review and post the verdict.'
+          : "**This session is not the review-round carrier.** Do not spawn a reviewer, review, or publish findings; when the carrier's verdict lands, close out only this thread.",
+      )
+    }
 
     // Models reliably address review-comment feedback and then end the turn
     // WITHOUT resolving the thread — leaving a wall of "open" threads on the PR.

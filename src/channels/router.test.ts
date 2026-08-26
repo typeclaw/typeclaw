@@ -6261,7 +6261,12 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: true,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -6287,7 +6292,12 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push({ text: msg.text ?? '' })
       return { ok: true }
     })
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: false, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: false,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
 
     await router.route(inbound({ adapter: 'github', workspace: 'acme/repo', chat: 'pr:672' }))
     sessions[0]!.onPrompt = () => {
@@ -16911,6 +16921,8 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_persisted',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'persisted-round',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-old',
@@ -16947,6 +16959,8 @@ describe('GitHub review follow-up round composition', () => {
         sessionId: 'ses_expired',
         participants: [],
         githubReviewRound: {
+          kind: 'push',
+          roundId: 'expired-round',
           workspace: 'acme/widgets',
           prNumber: 7,
           headSha: 'sha-round',
@@ -16983,7 +16997,14 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => 'sha-round',
     })
     const { router } = makeRouter(dir)
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     await router.route(inbound({ ...firstKey, externalMessageId: 'round-101', githubReviewRound: round }))
@@ -17016,7 +17037,12 @@ describe('GitHub review follow-up round composition', () => {
     expect(await completed.promise).toEqual({ kind: 'completed' })
 
     const order: string[] = []
-    router.registerReviewStateResolver('github', async () => ({ ok: true, selfBlocking: true, approve: true }))
+    router.registerReviewStateResolver('github', async () => ({
+      ok: true,
+      selfBlocking: true,
+      selfBlockingReviewId: null,
+      approve: true,
+    }))
     router.registerReviewThreadResolver('github', async ({ rootCommentId }) => {
       order.push(`resolve:${rootCommentId}`)
       return { ok: true }
@@ -17055,7 +17081,14 @@ describe('GitHub review follow-up round composition', () => {
     })
     const logs: string[] = []
     const { router } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
     expect(
@@ -17106,7 +17139,14 @@ describe('GitHub review follow-up round composition', () => {
       },
     })
     const { router } = makeRouter(dir)
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
 
@@ -17149,7 +17189,14 @@ describe('GitHub review follow-up round composition', () => {
     })
     const logs: string[] = []
     const { router } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'round-101', githubReviewRound: round }))
     expect(
@@ -17203,7 +17250,14 @@ describe('GitHub review follow-up round composition', () => {
         saved.push(structuredClone(records))
       },
     })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     const firstInbound = inbound({
@@ -17354,7 +17408,14 @@ describe('GitHub review follow-up round composition', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     await router.route(inbound({ ...key, externalMessageId: 'no-waiter', githubReviewRound: round }))
     sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
@@ -17373,7 +17434,14 @@ describe('GitHub review follow-up round composition', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, { logs })
-    const round = { workspace: 'acme/widgets', prNumber: 7, headSha: 'sha-round', carrierThread: '101' } as const
+    const round = {
+      kind: 'push',
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
     const firstKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
     const secondKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '202' }
     await router.route(inbound({ ...firstKey, externalMessageId: 'exhaust-101', githubReviewRound: round }))
@@ -17399,6 +17467,8 @@ describe('GitHub review follow-up round composition', () => {
     })
     const { router, sessions } = makeRouter(dir)
     const round = {
+      kind: 'push',
+      roundId: 'test-round',
       workspace: 'acme/widgets',
       prNumber: 7,
       headSha: 'sha-dismissed',
@@ -17473,6 +17543,8 @@ describe('GitHub review follow-up round composition', () => {
     })
     const { router, sessions } = makeRouter(dir)
     const round = {
+      kind: 'push',
+      roundId: 'test-round',
       workspace: 'acme/widgets',
       prNumber: 7,
       headSha: 'sha-pending',

@@ -284,7 +284,7 @@ export default definePlugin({
       let leaseClaimed = false
       let dismissalLeaseClaimed = false
       const blockAfterLease = async (block: HookResult & { block: true }): Promise<HookResult> => {
-        if (leaseClaimed) await verdictGuard.release({ callId: event.callId, succeeded: false })
+        if (leaseClaimed) await verdictGuard.release({ callId: event.callId, outcome: 'failed' })
         if (dismissalLeaseClaimed) releaseGithubReviewRoundDismissal(event.callId, false)
         pendingDismissals.delete(event.callId)
         return block
@@ -628,7 +628,7 @@ export default definePlugin({
             callId: event.callId,
             result: event.result,
           })
-          await verdictGuard.release({ callId: event.callId, succeeded: review.committed })
+          await verdictGuard.release({ callId: event.callId, outcome: review.committed ? 'formal-landed' : 'failed' })
           // A backstop-recovered verdict had no guard() reservation, so release()
           // could not arm the lag shield — do it explicitly here so the next
           // same-commit submission is deduped.

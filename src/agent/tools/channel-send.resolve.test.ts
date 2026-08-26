@@ -66,7 +66,9 @@ function fakeRouter(handlers: {
     resolveReviewThread: async (req) => handlers.onResolve?.(req) ?? { ok: true },
     registerReviewStateResolver: () => {},
     unregisterReviewStateResolver: () => {},
-    getReviewState: handlers.getReviewState ?? (async () => ({ ok: true, selfBlocking: false, approve: true })),
+    getReviewState:
+      handlers.getReviewState ??
+      (async () => ({ ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true })),
     registerReviewSubmitter: () => {},
     unregisterReviewSubmitter: () => {},
     submitReview: async () => ({ ok: true, reviewId: 1, state: 'COMMENTED' }),
@@ -333,7 +335,7 @@ describe('channel_send re-review stranding guard', () => {
           resolved += 1
           return { ok: true }
         },
-        getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
+        getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }),
       }),
       sessionId: SESSION,
     })
@@ -355,7 +357,7 @@ describe('channel_send re-review stranding guard', () => {
   test('honors the dismissal branch when approval is disabled', async () => {
     const tool = createChannelSendTool({
       router: fakeRouter({
-        getReviewState: async () => ({ ok: true, selfBlocking: true, approve: false }),
+        getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: false }),
       }),
       sessionId: SESSION,
     })
@@ -381,7 +383,7 @@ describe('channel_send re-review stranding guard', () => {
           sent += 1
           return { ok: true }
         },
-        getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
+        getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }),
       }),
       sessionId: SESSION,
     })
@@ -408,7 +410,7 @@ describe('channel_send re-review stranding guard', () => {
         },
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: true, approve: true }
+          return { ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }
         },
       }),
       sessionId: SESSION,
@@ -437,6 +439,7 @@ describe('channel_send re-review stranding guard', () => {
         getReviewState: async () => ({
           ok: true,
           selfBlocking: false,
+          selfBlockingReviewId: null,
           approve: true,
           reviewDecision: 'REVIEW_REQUIRED',
         }),

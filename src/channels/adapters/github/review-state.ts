@@ -39,10 +39,12 @@ export function createGithubReviewStateResolver(deps: {
     if (!reviews.ok) return { ok: false, error: reviews.error, code: reviews.code }
     if (!reviewDecision.ok) return { ok: false, error: reviewDecision.error, code: reviewDecision.code }
 
-    const lastDecisive = reviews.states.filter(isDecisive).at(-1) ?? null
+    const lastDecisive = reviews.reviews.filter((review) => isDecisive(review.state)).at(-1) ?? null
+    const selfBlocking = lastDecisive?.state === 'CHANGES_REQUESTED'
     return {
       ok: true,
-      selfBlocking: lastDecisive === 'CHANGES_REQUESTED',
+      selfBlocking,
+      selfBlockingReviewId: selfBlocking ? lastDecisive.id : null,
       approve,
       ...(reviewDecision.reviewDecision !== null ? { reviewDecision: reviewDecision.reviewDecision } : {}),
     }
@@ -50,7 +52,7 @@ export function createGithubReviewStateResolver(deps: {
 }
 
 export type SelfReviewBlockingResult =
-  | { ok: true; selfBlocking: boolean }
+  | { ok: true; selfBlocking: boolean; selfBlockingReviewId: number | null }
   | { ok: false; error: string; code: 'not-found' | 'permission-denied' | 'transient' }
 
 // Last DECISIVE self review == CHANGES_REQUESTED? (COMMENTED/PENDING ignored, as
@@ -72,8 +74,9 @@ export async function fetchSelfReviewBlocking(deps: {
     deps.selfLogin,
   )
   if (!reviews.ok) return { ok: false, error: reviews.error, code: reviews.code }
-  const lastDecisive = reviews.states.filter(isDecisive).at(-1) ?? null
-  return { ok: true, selfBlocking: lastDecisive === 'CHANGES_REQUESTED' }
+  const lastDecisive = reviews.reviews.filter((review) => isDecisive(review.state)).at(-1) ?? null
+  const selfBlocking = lastDecisive?.state === 'CHANGES_REQUESTED'
+  return { ok: true, selfBlocking, selfBlockingReviewId: selfBlocking ? lastDecisive.id : null }
 }
 
 type Target = { owner: string; repo: string; prNumber: number }
@@ -89,7 +92,7 @@ function parseTarget(workspace: string, chat: string): Target | null {
 }
 
 type SelfReviewsResult =
-  | { ok: true; states: string[] }
+  | { ok: true; reviews: Array<{ state: string; id: number | null }> }
   | { ok: false; error: string; code: 'not-found' | 'permission-denied' | 'transient' }
 
 type ReviewDecision = 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED'
@@ -104,7 +107,7 @@ async function fetchSelfReviews(
   target: Target,
   selfLogin: string,
 ): Promise<SelfReviewsResult> {
-  const states: string[] = []
+  const reviews: Array<{ state: string; id: number | null }> = []
   let url: string | null =
     `${GITHUB_API_BASE}/repos/${target.owner}/${target.repo}/pulls/${target.prNumber}/reviews?per_page=100`
   while (url !== null) {
@@ -130,11 +133,12 @@ async function fetchSelfReviews(
       if (login === null) continue
       const isBot = row.user?.type === 'Bot'
       if (!isSelfReviewer(login, isBot, selfLogin)) continue
-      states.push(row.state)
+      const id = typeof row.id === 'number' && Number.isSafeInteger(row.id) && row.id > 0 ? row.id : null
+      reviews.push({ state: row.state, id })
     }
     url = nextLink(response.headers.get('link'))
   }
-  return { ok: true, states }
+  return { ok: true, reviews }
 }
 
 async function fetchReviewDecision(

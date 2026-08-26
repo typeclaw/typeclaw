@@ -3,7 +3,14 @@ import { afterEach, describe, expect, it } from 'bun:test'
 import { evaluateRereviewGuard, type RereviewGuardInput } from './github-rereview-guard'
 import { __resetReviewVerdictGuardForTest, registerGithubReviewRound } from './github-review-verdict-coordinator'
 
-const ROUND = { workspace: 'acme/widgets', prNumber: 644, headSha: 'sha-round', carrierThread: '12345' } as const
+const ROUND = {
+  kind: 'push',
+  roundId: 'test-round',
+  workspace: 'acme/widgets',
+  prNumber: 644,
+  headSha: 'sha-round',
+  carrierThread: '12345',
+} as const
 
 function input(overrides: Partial<RereviewGuardInput> = {}): RereviewGuardInput {
   return {
@@ -14,7 +21,7 @@ function input(overrides: Partial<RereviewGuardInput> = {}): RereviewGuardInput 
     wantsResolve: true,
     moreWorkThisTurn: false,
     workspace: 'acme/widgets',
-    getReviewState: async () => ({ ok: true, selfBlocking: true, approve: true }),
+    getReviewState: async () => ({ ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }),
     ...overrides,
   }
 }
@@ -25,7 +32,13 @@ const stateOk =
     approve = true,
     reviewDecision?: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED',
   ): RereviewGuardInput['getReviewState'] =>
-  async () => ({ ok: true, selfBlocking, approve, ...(reviewDecision !== undefined ? { reviewDecision } : {}) })
+  async () => ({
+    ok: true,
+    selfBlocking,
+    selfBlockingReviewId: null,
+    approve,
+    ...(reviewDecision !== undefined ? { reviewDecision } : {}),
+  })
 
 describe('re-review stranding guard', () => {
   afterEach(() => __resetReviewVerdictGuardForTest())
@@ -50,7 +63,7 @@ describe('re-review stranding guard', () => {
         round: ROUND,
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: false, approve: true }
+          return { ok: true, selfBlocking: false, selfBlockingReviewId: null, approve: true }
         },
       }),
     )
@@ -129,7 +142,7 @@ describe('re-review stranding guard', () => {
         text: 'Thanks for the context, I think this approach makes sense.',
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: true, approve: true }
+          return { ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }
         },
       }),
     )
@@ -212,7 +225,13 @@ describe('re-review stranding guard', () => {
         text: 'Thanks for the context — that makes sense.',
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: false, approve: true, reviewDecision: 'REVIEW_REQUIRED' }
+          return {
+            ok: true,
+            selfBlocking: false,
+            selfBlockingReviewId: null,
+            approve: true,
+            reviewDecision: 'REVIEW_REQUIRED',
+          }
         },
       }),
     )
@@ -243,7 +262,7 @@ describe('re-review stranding guard', () => {
         text: 'Looks good so far — spawning the reviewer now, back shortly.',
         getReviewState: async () => {
           queried = true
-          return { ok: true, selfBlocking: true, approve: true }
+          return { ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }
         },
       }),
     )
@@ -278,7 +297,7 @@ describe('re-review stranding guard', () => {
           text,
           getReviewState: async () => {
             queried = true
-            return { ok: true, selfBlocking: true, approve: true }
+            return { ok: true, selfBlocking: true, selfBlockingReviewId: null, approve: true }
           },
         }),
       )

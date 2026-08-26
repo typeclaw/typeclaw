@@ -146,6 +146,21 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       if (!hasPermissionForSubagent(permissions, origin, params.subagent_type, subagent)) {
         return errorResult('subagent.spawn denied: insufficient permissions')
       }
+      // Ordered AFTER the permission check on purpose: this message reports which
+      // sibling session holds the round, so an unauthorized caller must be turned
+      // away as unauthorized rather than told anything about the PR's round state.
+      if (
+        params.subagent_type === 'reviewer' &&
+        origin?.kind === 'channel' &&
+        origin.adapter === 'github' &&
+        /^pr:\d+$/.test(origin.chat) &&
+        origin.githubReviewRound !== undefined &&
+        origin.thread !== origin.githubReviewRound.carrierThread
+      ) {
+        return errorResult(
+          "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review; close out only this session's thread.",
+        )
+      }
       // Fail closed past the chain-length ceiling. The tool is present on
       // subagent sessions (operator/reviewer can delegate), but a session
       // already at MAX_SUBAGENT_DEPTH cannot spawn a deeper one — this is the
