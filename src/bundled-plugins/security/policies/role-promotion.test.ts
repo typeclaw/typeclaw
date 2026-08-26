@@ -3,7 +3,8 @@ import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { ACKNOWLEDGE_GUARDS } from '../policy'
+import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/policy'
+
 import { GUARD_ROLE_PROMOTION, checkRolePromotionGuard, diffRoles, sanitizeForReason } from './role-promotion'
 
 async function makeAgentDir(): Promise<string> {
