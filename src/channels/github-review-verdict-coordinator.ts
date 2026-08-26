@@ -462,6 +462,7 @@ export function createApproveIdempotencyGuard(deps: {
   return {
     async guard(args): Promise<ApproveBlock | null> {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
+      expireRecentLanded(now)
       const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver, now)
       if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
@@ -708,6 +709,20 @@ function activeReviewRoundState(key: string, now: () => number = Date.now): Revi
 
 function expireReviewRounds(now: () => number = Date.now): void {
   for (const key of reviewRounds.keys()) activeReviewRoundState(key, now)
+}
+
+// `recentlyLandedSame` only reports a miss on an expired record, so a PR that is
+// reviewed once leaves an entry nothing ever reads or drops again — one dead record
+// per PR for the life of the process. Sweeping on each guard bounds the map to PRs
+// still inside the window, and only a process that keeps reviewing can grow it.
+function expireRecentLanded(now: () => number): void {
+  for (const [key, landed] of recentLandedByPr) {
+    if (now() - landed.landedAt >= RECENT_LANDED_TTL_MS) recentLandedByPr.delete(key)
+  }
+}
+
+export function __recentLandedRecordCountForTest(): number {
+  return recentLandedByPr.size
 }
 
 // Test-only: clear the process-wide lease state between cases.

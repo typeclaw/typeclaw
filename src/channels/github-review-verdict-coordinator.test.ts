@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 
 import {
+  __recentLandedRecordCountForTest,
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
   completeGithubReviewRound,
@@ -546,6 +547,26 @@ describe('review verdict idempotency guard', () => {
     await guardFallback(g, 'a1', 71)
     await g.release({ callId: 'a1', outcome: 'failed' })
     expect(await guardFallback(g, 'a2', 71)).toMatchObject({ duplicateSource: 'standing', leaseRetained: true })
+  })
+
+  test('drops expired landed records instead of retaining one per reviewed pull request', async () => {
+    // given: two PRs each landed a verdict, so each holds a record
+    let clock = 1_000
+    const g = makeStandingGuard(
+      () => 'sha-abc',
+      () => clock,
+    )
+    await guardFallback(g, 'a1', 76)
+    await g.release({ callId: 'a1', outcome: 'fallback-landed' })
+    await guardFallback(g, 'a2', 77)
+    await g.release({ callId: 'a2', outcome: 'fallback-landed' })
+    expect(__recentLandedRecordCountForTest()).toBe(2)
+    // when: both fall out of the window and any later guard runs
+    clock += LAG_WINDOW_MS + 1
+    await guardFallback(g, 'a3', 78)
+    await g.release({ callId: 'a3', outcome: 'failed' })
+    // then: only records still inside the window survive
+    expect(__recentLandedRecordCountForTest()).toBe(0)
   })
 
   test('expires the landed-fallback cooldown so a later deliberate re-publication is not stranded', async () => {
