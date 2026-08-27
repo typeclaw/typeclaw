@@ -22,6 +22,7 @@ import { defineTool as definePiTool } from '@mariozechner/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
+import guardPlugin from '@/bundled-plugins/guard'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
@@ -43,6 +44,8 @@ import {
 import type { SandboxPolicy } from '@/sandbox'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 
+import type { InternalGuard } from './guard-types'
+import { buildInternalGuards } from './guards'
 import { URL_FETCH_MAX_BYTES } from './multimodal/looker'
 import {
   __resetSharedLoopGuardForTests,
@@ -79,6 +82,31 @@ const lacksInodeAnchoring = process.platform !== 'linux'
 function textOfFirstContent(result: { content: { type: string; text?: string }[] }): string | undefined {
   const first = result.content[0]
   return first?.type === 'text' ? first.text : undefined
+}
+
+async function registerGuardPlugin(
+  hooks: ReturnType<typeof createHookBus>,
+  agentDir: string,
+): Promise<readonly InternalGuard[]> {
+  const exports = await guardPlugin.plugin({
+    name: 'guard',
+    version: undefined,
+    agentDir,
+    config: undefined,
+    logger: noopLogger,
+    permissions: createPermissionService(),
+    github: {
+      resolveTokenForRepo: async () => ({ kind: 'unavailable', reason: 'test' }),
+      hasAppTokenResolver: () => false,
+    },
+    spawnSubagent: async () => {},
+  })
+  hooks.registerAll('guard', agentDir, noopLogger, exports.hooks ?? {})
+  return buildInternalGuards(agentDir).filter((guard) => guard.owner === 'guard')
+}
+
+function bundledAcknowledgementGuards(agentDir: string): readonly InternalGuard[] {
+  return buildInternalGuards(agentDir)
 }
 
 describe('zodToToolParameters', () => {
@@ -129,8 +157,8 @@ describe('zodToToolParameters', () => {
 })
 
 describe('wrapPluginTool', () => {
-  test('exposes the reserved acknowledgement envelope to hooks but not plugin execution', async () => {
-    const hookArgs: Record<string, unknown>[] = []
+  test('composes declaration through namespaced schema and execution without exposing acknowledgements to checks', async () => {
+    const checkArgs: Record<string, unknown>[] = []
     const executionArgs: Record<string, unknown>[] = []
     const tool = defineTool({
       description: '',
@@ -141,11 +169,18 @@ describe('wrapPluginTool', () => {
       },
     })
     const hooks = createHookBus()
-    hooks.registerAll('guard', '/agent', noopLogger, {
-      'tool.before': (event) => {
-        hookArgs.push(structuredClone(event.args))
+    hooks.registerAll('guard', '/agent', noopLogger, {})
+    const guards: InternalGuard[] = [
+      {
+        owner: 'guard',
+        key: 'nonWorkspaceWrite',
+        tools: new Set(['write']),
+        check: (event) => {
+          checkArgs.push(structuredClone(event.args))
+          return { kind: 'acknowledgement-required', reason: 'confirm write' }
+        },
       },
-    })
+    ]
     const wrapped = wrapPluginTool(tool, {
       pluginName: 'fixture',
       toolName: 'write',
@@ -153,24 +188,28 @@ describe('wrapPluginTool', () => {
       sessionId: 's',
       logger: noopLogger,
       hooks,
+      guards,
     })
 
     const parameters = wrapped.parameters as {
       properties?: Record<string, { properties?: Record<string, unknown>; additionalProperties?: boolean }>
     }
-    expect(Object.keys(parameters.properties?.acknowledgeGuards?.properties ?? {})).toEqual(['nonWorkspaceWrite'])
+    const guardSchema = parameters.properties?.acknowledgeGuards?.properties?.guard as {
+      properties?: Record<string, unknown>
+    }
+    expect(Object.keys(guardSchema.properties ?? {})).toEqual(['nonWorkspaceWrite'])
     expect(parameters.properties?.acknowledgeGuards?.additionalProperties).toBe(false)
 
     const result = await wrapped.execute(
       'c',
-      { value: 'ok', acknowledgeGuards: { nonWorkspaceWrite: true } },
+      { value: 'ok', acknowledgeGuards: { guard: { nonWorkspaceWrite: true } } },
       undefined,
       undefined,
       {} as never,
     )
 
     expect(textOfFirstContent(result)).toBe('ok')
-    expect(hookArgs).toEqual([{ value: 'ok', acknowledgeGuards: { nonWorkspaceWrite: true } }])
+    expect(checkArgs).toEqual([{ value: 'ok' }])
     expect(executionArgs).toEqual([{ value: 'ok' }])
   })
 
@@ -183,6 +222,14 @@ describe('wrapPluginTool', () => {
         hookRan = true
       },
     })
+    const guards: InternalGuard[] = [
+      {
+        owner: 'guard',
+        key: 'nonWorkspaceWrite',
+        tools: new Set(['write']),
+        check: () => undefined,
+      },
+    ]
     const wrapped = wrapPluginTool(
       defineTool({
         description: '',
@@ -199,12 +246,13 @@ describe('wrapPluginTool', () => {
         sessionId: 's',
         logger: noopLogger,
         hooks,
+        guards,
       },
     )
 
     const result = await wrapped.execute(
       'c',
-      { value: 'no', acknowledgeGuards: { otherAck: true } },
+      { value: 'no', acknowledgeGuards: { guard: { otherAck: true } } },
       undefined,
       undefined,
       {} as never,
@@ -1093,14 +1141,16 @@ describe('wrapSystemTool', () => {
       const hooks = createHookBus()
       hooks.registerAll('p1', agentDir, noopLogger, {
         'tool.before': (event) => {
-          expect(event.args.acknowledgeGuards).toEqual({ nonWorkspaceWrite: true })
+          expect(event.args).not.toHaveProperty('acknowledgeGuards')
         },
       })
+      const guards = await registerGuardPlugin(hooks, agentDir)
 
       const wrapped = wrapSystemTool(tool, {
         agentDir,
         sessionId: 's',
         hooks,
+        guards,
       })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
@@ -1108,7 +1158,7 @@ describe('wrapSystemTool', () => {
       try {
         const result = await wrapped.execute(
           'c',
-          { path: 'notes.md', content: '{}', acknowledgeGuards: { nonWorkspaceWrite: true } },
+          { path: 'notes.md', content: '{}', acknowledgeGuards: { guard: { nonWorkspaceWrite: true } } },
           undefined,
           undefined,
           {} as never,
@@ -1123,7 +1173,7 @@ describe('wrapSystemTool', () => {
     },
   )
 
-  test('write system tool runs a final guard after hook mutations', async () => {
+  test('write system tool runs the registered guard after an earlier hook mutation', async () => {
     const calls: number[] = []
     const tool = definePiTool({
       name: 'write',
@@ -1141,8 +1191,9 @@ describe('wrapSystemTool', () => {
         event.args.path = 'notes.md'
       },
     })
+    const guards = await registerGuardPlugin(hooks, '/agent')
 
-    const wrapped = wrapSystemTool(tool, { agentDir: '/agent', sessionId: 's', hooks })
+    const wrapped = wrapSystemTool(tool, { agentDir: '/agent', sessionId: 's', hooks, guards })
 
     await expect(
       wrapped.execute('c', { path: 'workspace/file.txt', content: 'x' }, undefined, undefined, {} as never),
@@ -1150,7 +1201,51 @@ describe('wrapSystemTool', () => {
     expect(calls).toEqual([])
   })
 
-  test('write system tool runs final skill guard after hook mutations', async () => {
+  test('a throwing guard blocks later hooks and the underlying system tool', async () => {
+    const calls: string[] = []
+    const errors: string[] = []
+    const tool = definePiTool({
+      name: 'look_at',
+      label: 'look_at',
+      description: '',
+      parameters: Type.Object({}),
+      async execute() {
+        calls.push('tool')
+        return { content: [], details: undefined }
+      },
+    })
+    const hooks = createHookBus()
+    hooks.registerAll(
+      'guard',
+      '/agent',
+      { info: () => {}, warn: () => {}, error: (message) => errors.push(message) },
+      {},
+    )
+    hooks.registerAll('later', '/agent', noopLogger, {
+      'tool.before': () => {
+        calls.push('later-hook')
+      },
+    })
+    const guards: InternalGuard[] = [
+      {
+        owner: 'guard',
+        key: 'brokenCheck',
+        tools: new Set(['look_at']),
+        check: () => {
+          throw new Error('unexpected failure')
+        },
+      },
+    ]
+    const wrapped = wrapSystemTool(tool, { agentDir: '/agent', sessionId: 's', hooks, guards })
+
+    await expect(wrapped.execute('c', {}, undefined, undefined, {} as never)).rejects.toThrow(
+      'blocked: guard brokenCheck failed closed after its check threw',
+    )
+    expect(calls).toEqual([])
+    expect(errors).toEqual(['guard brokenCheck threw: unexpected failure'])
+  })
+
+  test('write system tool runs the registered skill guard after an earlier hook mutation', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-plugin-tools-'))
     await mkdir(path.join(agentDir, 'memory', 'skills'), { recursive: true })
     const calls: number[] = []
@@ -1171,8 +1266,9 @@ describe('wrapSystemTool', () => {
         event.args.content = 'not a skill file'
       },
     })
+    const guards = await registerGuardPlugin(hooks, agentDir)
 
-    const wrapped = wrapSystemTool(tool, { agentDir, sessionId: 's', hooks })
+    const wrapped = wrapSystemTool(tool, { agentDir, sessionId: 's', hooks, guards })
 
     await expect(
       wrapped.execute('c', { path: 'workspace/file.txt', content: 'x' }, undefined, undefined, {} as never),
@@ -1180,7 +1276,7 @@ describe('wrapSystemTool', () => {
     expect(calls).toEqual([])
   })
 
-  test('write system tool runs final managed-config guard after hook mutations', async () => {
+  test('write system tool runs the registered managed-config guard after an earlier hook mutation', async () => {
     const calls: number[] = []
     const tool = definePiTool({
       name: 'write',
@@ -1199,8 +1295,9 @@ describe('wrapSystemTool', () => {
         event.args.content = '{ not valid json'
       },
     })
+    const guards = await registerGuardPlugin(hooks, '/agent')
 
-    const wrapped = wrapSystemTool(tool, { agentDir: '/agent', sessionId: 's', hooks })
+    const wrapped = wrapSystemTool(tool, { agentDir: '/agent', sessionId: 's', hooks, guards })
 
     await expect(
       wrapped.execute('c', { path: 'workspace/file.txt', content: 'x' }, undefined, undefined, {} as never),
@@ -3041,7 +3138,7 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
           params: {
             path: string
             edits: { oldText: string; newText: string }[]
-            acknowledgeGuards?: { nonWorkspaceWrite?: boolean }
+            acknowledgeGuards?: { guard?: { nonWorkspaceWrite?: boolean } }
           },
         ) {
           seen.push({ ...params, path: 'notes.md' })
@@ -3053,14 +3150,16 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
       const hooks = createHookBus()
       hooks.registerAll('p1', agentDir, noopLogger, {
         'tool.before': (event) => {
-          expect(event.args.acknowledgeGuards).toEqual({ nonWorkspaceWrite: true })
+          expect(event.args).not.toHaveProperty('acknowledgeGuards')
         },
       })
+      const guards = await registerGuardPlugin(hooks, agentDir)
 
       const wrapped = wrapBuiltinToolDefinition(tool, {
         agentDir,
         sessionId: 's',
         hooks,
+        guards,
       })
 
       const parameters = wrapped.parameters as { properties?: Record<string, unknown> }
@@ -3068,7 +3167,7 @@ describe('wrapBuiltinToolDefinition (hook + guard pipeline)', () => {
       const params = {
         path: 'notes.md',
         edits: [{ oldText: 'x', newText: 'y' }],
-        acknowledgeGuards: { nonWorkspaceWrite: true },
+        acknowledgeGuards: { guard: { nonWorkspaceWrite: true } },
       } as unknown as Parameters<typeof wrapped.execute>[1]
       try {
         const result = await wrapped.execute('c', params, undefined, undefined, {} as never)
@@ -3331,8 +3430,9 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     }
     const hooks = createHookBus()
     hooks.registerAll('p1', dir, noopLogger, {})
+    const guards = await registerGuardPlugin(hooks, dir)
 
-    const wrapped = wrapBuiltinToolDefinition(tool, { agentDir: dir, sessionId: 's', hooks })
+    const wrapped = wrapBuiltinToolDefinition(tool, { agentDir: dir, sessionId: 's', hooks, guards })
 
     await expect(
       wrapped.execute(
@@ -3379,11 +3479,13 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
     expect(overrides.map((t) => t.name)).toEqual(['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'])
   })
 
-  test('publishes the exact advisory acknowledgement schema owned by each tool', () => {
+  test('publishes the exact plugin-nested acknowledgement schema owned by each tool', async () => {
+    const guards = bundledAcknowledgementGuards('/agent')
     const overrides = buildBuiltinPiToolOverrides({
       agentDir: '/agent',
       sessionId: 's',
       hooks: createHookBus(),
+      guards,
     })
     const schemas = Object.fromEntries(
       overrides.map((tool) => {
@@ -3395,18 +3497,26 @@ describe('wrapBuiltinToolDefinition (pi customTools override path)', () => {
           tool.name,
           envelope === undefined
             ? undefined
-            : { keys: Object.keys(envelope.properties ?? {}), additionalProperties: envelope.additionalProperties },
+            : {
+                plugins: Object.fromEntries(
+                  Object.entries(envelope.properties ?? {}).map(([plugin, value]) => [
+                    plugin,
+                    Object.keys((value as { properties?: Record<string, unknown> }).properties ?? {}),
+                  ]),
+                ),
+                additionalProperties: envelope.additionalProperties,
+              },
         ]
       }),
     )
     expect(schemas).toEqual({
-      read: { keys: ['imageReadRedirect'], additionalProperties: false },
+      read: { plugins: { guard: ['imageReadRedirect'] }, additionalProperties: false },
       bash: {
-        keys: ['globalInstall', 'nonBunPackageManager', 'nonBunPackageRunner'],
+        plugins: { 'bun-hygiene': ['globalInstall', 'nonBunPackageManager', 'nonBunPackageRunner'] },
         additionalProperties: false,
       },
-      edit: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
-      write: { keys: ['nonWorkspaceWrite'], additionalProperties: false },
+      edit: { plugins: { guard: ['nonWorkspaceWrite'] }, additionalProperties: false },
+      write: { plugins: { guard: ['nonWorkspaceWrite'] }, additionalProperties: false },
       grep: undefined,
       find: undefined,
       ls: undefined,
@@ -3705,10 +3815,13 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
           return { content: [{ type: 'text' as const, text: 'mutated' }], details: undefined }
         },
       })
+      const hooks = createHookBus()
+      const guards = await registerGuardPlugin(hooks, agentDir)
       const wrapped = wrapBuiltinToolDefinition(tool, {
         agentDir,
         sessionId: `git-control-${toolName}`,
-        hooks: createHookBus(),
+        hooks,
+        guards,
       })
 
       try {
@@ -3717,7 +3830,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
             'c',
             {
               path: path.join(agentDir, '.git', 'config'),
-              acknowledgeGuards: { nonWorkspaceWrite: true, rolePromotion: true, cronPromotion: true },
+              acknowledgeGuards: { guard: { nonWorkspaceWrite: true } },
             },
             undefined,
             undefined,
@@ -5180,6 +5293,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         }
       },
     })
+    const guards = await registerGuardPlugin(hooks, agentDir)
     const editTool = {
       name: 'edit',
       label: 'edit',
@@ -5192,7 +5306,12 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
         throw new Error('underlying edit should not run')
       },
     }
-    const wrapped = wrapBuiltinToolDefinition(editTool, { agentDir, sessionId: 'deferred-final', hooks })
+    const wrapped = wrapBuiltinToolDefinition(editTool, {
+      agentDir,
+      sessionId: 'deferred-final',
+      hooks,
+      guards,
+    })
 
     try {
       await expect(
