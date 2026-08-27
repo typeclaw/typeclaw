@@ -1,11 +1,11 @@
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
 
+import type { InternalGuardResult } from '@/agent/guard-types'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
 
 import { GUARD_NON_WORKSPACE_WRITE } from '../keys'
-import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '../policy'
 import { isMemoryTopicsWriteAllowed } from './memory-topics-write'
 import { isSkillAuthoringAllowed } from './skill-authoring'
 
@@ -34,7 +34,7 @@ export async function checkNonWorkspaceWriteGuard(options: {
   args: Record<string, unknown>
   agentDir: string
   origin?: SessionOrigin
-}): Promise<GuardBlock | undefined> {
+}): Promise<InternalGuardResult> {
   const { tool, args, agentDir, origin } = options
   if (tool !== 'write' && tool !== 'edit') return undefined
 
@@ -51,7 +51,7 @@ export async function checkNonWorkspaceWriteGuard(options: {
   ])
   if (await isOperatorOwnedPackageManifest(agentDir, targetPath, realTargetPath)) {
     return {
-      block: true,
+      kind: 'block',
       reason: `Guard \`${GUARD_NON_WORKSPACE_WRITE}\` blocked a model write to operator-owned package manifest ${targetPath}.`,
     }
   }
@@ -69,14 +69,12 @@ export async function checkNonWorkspaceWriteGuard(options: {
   // and a `/tmp/link -> /agent/.env`) and must not land inside the agent dir
   // (a container/test agent dir can itself sit under /tmp).
   if (isTmpScratchWrite(rawPath, realTargetPath, realAgentDir, realTmpRoot)) return undefined
-  if (isGuardAcknowledged(args, GUARD_NON_WORKSPACE_WRITE)) return undefined
-
   return {
-    block: true,
+    kind: 'acknowledgement-required',
     reason: [
       `Guard \`${GUARD_NON_WORKSPACE_WRITE}\` blocked ${tool} outside the workspace: ${targetPath}.`,
       `The free-write zone is ${workspacePath}.`,
-      `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_WORKSPACE_WRITE}: true\` only if this write is intentional.`,
+      `Retry with \`acknowledgeGuards.guard.${GUARD_NON_WORKSPACE_WRITE}: true\` only if this write is intentional.`,
     ].join(' '),
   }
 }

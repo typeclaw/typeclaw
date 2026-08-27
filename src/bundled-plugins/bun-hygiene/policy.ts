@@ -1,5 +1,6 @@
+import type { InternalGuardResult } from '@/agent/guard-types'
+
 import { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, GUARD_NON_BUN_PACKAGE_RUNNER } from '../guard/keys'
-import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '../guard/policy'
 
 export { GUARD_GLOBAL_INSTALL, GUARD_NON_BUN_PACKAGE_MANAGER, GUARD_NON_BUN_PACKAGE_RUNNER } from '../guard/keys'
 
@@ -18,24 +19,54 @@ const NON_BUN_MANAGERS = new Set(['npm', 'pnpm', 'yarn'])
 const NON_BUN_RUNNERS = new Set(['npx', 'pnpx'])
 const INSTALL_SUBCOMMANDS = new Set(['install', 'i', 'add'])
 
-export function checkBunHygieneGuard(options: { tool: string; args: Record<string, unknown> }): GuardBlock | undefined {
+export function checkBunHygieneGuard(options: {
+  tool: string
+  args: Readonly<Record<string, unknown>>
+}): InternalGuardResult {
   const { tool, args } = options
   if (tool !== 'bash') return undefined
 
   const command = args.command
   if (typeof command !== 'string') return undefined
 
-  for (const verdict of classify(command)) {
-    const block = blockFor(verdict, args)
-    if (block !== undefined) return block
-  }
-  return undefined
+  const verdict = classify(command)[0]
+  return verdict === undefined ? undefined : blockFor(verdict)
 }
 
-function blockFor(verdict: Verdict, args: Record<string, unknown>): GuardBlock | undefined {
-  if (verdict.kind === 'global-install') return blockGlobalInstall(verdict.label, args)
-  if (verdict.kind === 'non-bun') return blockNonBunManager(verdict.manager, args)
-  return blockNonBunRunner(verdict.runner, args)
+export function checkGlobalInstallGuard(options: {
+  tool: string
+  args: Readonly<Record<string, unknown>>
+}): InternalGuardResult {
+  return checkVerdict(options, 'global-install')
+}
+
+export function checkNonBunPackageManagerGuard(options: {
+  tool: string
+  args: Readonly<Record<string, unknown>>
+}): InternalGuardResult {
+  return checkVerdict(options, 'non-bun')
+}
+
+export function checkNonBunPackageRunnerGuard(options: {
+  tool: string
+  args: Readonly<Record<string, unknown>>
+}): InternalGuardResult {
+  return checkVerdict(options, 'non-bun-runner')
+}
+
+function checkVerdict(
+  options: { tool: string; args: Readonly<Record<string, unknown>> },
+  kind: Verdict['kind'],
+): InternalGuardResult {
+  if (options.tool !== 'bash' || typeof options.args.command !== 'string') return undefined
+  const verdict = classify(options.args.command).find((candidate) => candidate.kind === kind)
+  return verdict === undefined ? undefined : blockFor(verdict)
+}
+
+function blockFor(verdict: Verdict): Exclude<InternalGuardResult, undefined> {
+  if (verdict.kind === 'global-install') return blockGlobalInstall(verdict.label)
+  if (verdict.kind === 'non-bun') return blockNonBunManager(verdict.manager)
+  return blockNonBunRunner(verdict.runner)
 }
 
 type Verdict =
@@ -332,43 +363,37 @@ function isGlobalFlag(word: string): boolean {
   return /^-[A-Za-z]*g[A-Za-z]*$/.test(word)
 }
 
-function blockGlobalInstall(label: string, args: Record<string, unknown>): GuardBlock | undefined {
-  if (isGuardAcknowledged(args, GUARD_GLOBAL_INSTALL)) return undefined
-
+function blockGlobalInstall(label: string): Exclude<InternalGuardResult, undefined> {
   return {
-    block: true,
+    kind: 'acknowledgement-required',
     reason: [
       `Guard \`${GUARD_GLOBAL_INSTALL}\` blocked a global install: ${label}.`,
       'Global installs live outside the bind-mounted /agent folder and are wiped on every container restart, so they never persist.',
       'Use `bun add <pkg>` to add a dependency that survives restarts (it writes package.json), or `bunx <pkg>` to run a tool once without installing.',
-      `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_GLOBAL_INSTALL}: true\` only if a throwaway global install is genuinely what you want.`,
+      `Retry with \`acknowledgeGuards.bun-hygiene.${GUARD_GLOBAL_INSTALL}: true\` only if a throwaway global install is genuinely what you want.`,
     ].join(' '),
   }
 }
 
-function blockNonBunManager(manager: string, args: Record<string, unknown>): GuardBlock | undefined {
-  if (isGuardAcknowledged(args, GUARD_NON_BUN_PACKAGE_MANAGER)) return undefined
-
+function blockNonBunManager(manager: string): Exclude<InternalGuardResult, undefined> {
   return {
-    block: true,
+    kind: 'acknowledgement-required',
     reason: [
       `Guard \`${GUARD_NON_BUN_PACKAGE_MANAGER}\` blocked \`${manager}\`. This container standardizes on bun for dependency management.`,
       'Use `bun install` / `bun add <pkg>` instead of npm/pnpm/yarn, and use `bunx <pkg>` for one-off tool execution.',
-      `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_MANAGER}: true\` if this package manager is genuinely required (e.g. a project pinned to a different lockfile).`,
+      `Retry with \`acknowledgeGuards.bun-hygiene.${GUARD_NON_BUN_PACKAGE_MANAGER}: true\` if this package manager is genuinely required (e.g. a project pinned to a different lockfile).`,
     ].join(' '),
   }
 }
 
-function blockNonBunRunner(runner: string, args: Record<string, unknown>): GuardBlock | undefined {
-  if (isGuardAcknowledged(args, GUARD_NON_BUN_PACKAGE_RUNNER)) return undefined
-
+function blockNonBunRunner(runner: string): Exclude<InternalGuardResult, undefined> {
   return {
-    block: true,
+    kind: 'acknowledgement-required',
     reason: [
       `Guard \`${GUARD_NON_BUN_PACKAGE_RUNNER}\` blocked \`${runner}\`.`,
       'This container standardizes on bun for package execution: `bunx` is the Bun-native equivalent and the package runner the image actually ships. `npx`/`pnpx` are absent from the default image, and where a custom image supplies them they carry npm/pnpm semantics rather than bun ones.',
       'Use `bunx <pkg>` for one-off package binaries.',
-      `Retry with \`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_RUNNER}: true\` only if this non-bun runner is genuinely required.`,
+      `Retry with \`acknowledgeGuards.bun-hygiene.${GUARD_NON_BUN_PACKAGE_RUNNER}: true\` only if this non-bun runner is genuinely required.`,
     ].join(' '),
   }
 }
