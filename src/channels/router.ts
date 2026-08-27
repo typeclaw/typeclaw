@@ -888,6 +888,7 @@ type LiveSession = {
   historyTimedAttachments: readonly TimedAttachment[]
   historyAttachments: InboundAttachment[]
   draining: boolean
+  drainPromise: Promise<void> | null
   debounceTimer: ReturnType<typeof setTimeout> | null
   typingTimer: ReturnType<typeof setInterval> | null
   typingStartedAt: number
@@ -2448,6 +2449,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         historyTimedAttachments: [],
         historyAttachments: [],
         draining: false,
+        drainPromise: null,
         debounceTimer: null,
         typingTimer: null,
         typingStartedAt: 0,
@@ -3464,7 +3466,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.qualifyingWorkThisLogicalTurn = false
   }
 
-  const drain = async (live: LiveSession): Promise<void> => {
+  const runDrain = async (live: LiveSession): Promise<void> => {
     if (live.draining || live.destroyed) return
     live.draining = true
     try {
@@ -3837,6 +3839,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       await tearDownLive(live)
       await handOffToSuccessor(live.key, carriedInbounds, carriedObserved, carriedReminders)
     }
+  }
+
+  const drain = (live: LiveSession): Promise<void> => {
+    if (live.draining || live.destroyed) return Promise.resolve()
+    const promise = runDrain(live)
+    live.drainPromise = promise
+    void promise.catch(() => {})
+    void promise
+      .finally(() => {
+        if (live.drainPromise === promise) live.drainPromise = null
+      })
+      .catch(() => {})
+    return promise
   }
 
   // Rebuild a live session for a channel key after a reload tore its predecessor
@@ -6886,6 +6901,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         live.firstUnprocessedAt = 0
         await drain(live)
+        await live.drainPromise
         // Settle the fire-and-forget `void persist()` from scheduleDebouncedDrain
         // (the lastInboundAt write). Draining alone doesn't await that promise, so
         // a test reading sessions.json right after would race the disk write — the
