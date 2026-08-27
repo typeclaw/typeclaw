@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import type { InternalGuard } from '@/agent/guard-types'
+
 import { createHookBus } from './hooks'
 
 const noopLogger = { info: () => {}, warn: () => {}, error: () => {} }
@@ -43,6 +45,86 @@ describe('HookBus session.prompt', () => {
 })
 
 describe('HookBus tool.before', () => {
+  test('block is unconditional while acknowledgement-required honors only the matching plugin and key', async () => {
+    const bus = createHookBus()
+    bus.registerAll('alpha', '/agent', noopLogger, {})
+    bus.registerAll('beta', '/agent', noopLogger, {})
+    const guards: InternalGuard[] = [
+      {
+        owner: 'alpha',
+        key: 'sameKey',
+        tools: new Set(['bash']),
+        check: () => ({ kind: 'acknowledgement-required', reason: 'alpha' }),
+      },
+      {
+        owner: 'beta',
+        key: 'sameKey',
+        tools: new Set(['bash']),
+        check: () => ({ kind: 'block', reason: 'beta hard block' }),
+      },
+    ]
+    const event = { tool: 'bash', sessionId: 's', callId: 'c', args: {} }
+
+    expect(await bus.runToolBefore(event, guards)).toEqual({ block: true, reason: 'alpha' })
+    expect(await bus.runToolBefore(event, guards, { alpha: { sameKey: true } })).toEqual({
+      block: true,
+      reason: 'beta hard block',
+    })
+    expect(await bus.runToolBefore(event, guards, { alpha: { sameKey: true }, beta: { sameKey: true } })).toEqual({
+      block: true,
+      reason: 'beta hard block',
+    })
+  })
+
+  test('acknowledging one guard does not suppress a later independent guard', async () => {
+    const bus = createHookBus()
+    bus.registerAll('hygiene', '/agent', noopLogger, {})
+    const guards: InternalGuard[] = ['globalInstall', 'nonBunPackageRunner'].map((key) => ({
+      owner: 'hygiene',
+      key,
+      tools: new Set(['bash']),
+      check: () => ({ kind: 'acknowledgement-required' as const, reason: key }),
+    }))
+
+    const result = await bus.runToolBefore({ tool: 'bash', sessionId: 's', callId: 'c', args: {} }, guards, {
+      hygiene: { globalInstall: true },
+    })
+    expect(result).toEqual({ block: true, reason: 'nonBunPackageRunner' })
+  })
+
+  test('a plugin guard runs immediately before its own hook, preserving security precedence', async () => {
+    const calls: string[] = []
+    const bus = createHookBus()
+    bus.registerAll('security', '/agent', noopLogger, {
+      'tool.before': () => {
+        calls.push('security')
+        return { block: true, reason: 'security first' }
+      },
+    })
+    bus.registerAll('guard', '/agent', noopLogger, {
+      'tool.before': () => {
+        calls.push('guard-hook')
+      },
+    })
+    const guards: InternalGuard[] = [
+      {
+        owner: 'guard',
+        key: 'soft',
+        tools: new Set(['write']),
+        check: () => {
+          calls.push('guard-check')
+          return { kind: 'acknowledgement-required', reason: 'soft' }
+        },
+      },
+    ]
+
+    const result = await bus.runToolBefore({ tool: 'write', sessionId: 's', callId: 'c', args: {} }, guards, {
+      guard: { soft: true },
+    })
+    expect(result).toEqual({ block: true, reason: 'security first' })
+    expect(calls).toEqual(['security'])
+  })
+
   test('mutations to event.args compose; first { block } short-circuits', async () => {
     const bus = createHookBus()
     const seen: Record<string, unknown>[] = []
