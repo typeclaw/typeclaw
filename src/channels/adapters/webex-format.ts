@@ -1,5 +1,7 @@
 import type { WebexMessage } from 'agent-messenger/webex'
 
+import type { InboundAttachment } from '@/channels/types'
+
 // Webex's E2E (internal conversation) path renders agent markdown as an HTML
 // `content` field that some clients display verbatim, so messages sent with
 // `markdown: true` leak literal `<br/>` and `&apos;`. typeclaw sends plain text
@@ -13,6 +15,40 @@ export function resolveWebexBodyText(msg: Pick<WebexMessage, 'text' | 'markdown'
   if (msg.markdown !== undefined && msg.markdown !== '') return msg.markdown
   if (msg.html !== undefined && msg.html !== '') return normalizeWebexHtmlFallbackText(msg.html)
   return ''
+}
+
+// Shared by both Webex classifiers and both Webex history mappers so a file
+// carries the same `#N` in every surface the agent can read. History used to
+// emit a single un-numbered `[Webex attachment]` regardless of file count,
+// which registered refs the agent could never name in
+// look_at_channel_attachment.
+export function splitWebexFiles(text: string, files: readonly string[] | undefined): SplitWebexFiles {
+  const attachments = (files ?? []).map(describeWebexFile)
+  if (attachments.length === 0) return { text, attachments: [] }
+  const summary = attachments.map(renderPlaceholder).join('\n')
+  return { text: text === '' ? summary : `${text}\n${summary}`, attachments }
+}
+
+type SplitWebexFiles = { text: string; attachments: InboundAttachment[] }
+
+function describeWebexFile(ref: string, index: number): InboundAttachment {
+  return { id: index + 1, kind: 'file', ref, filename: filenameFromUrl(ref) ?? `webex-file-${index + 1}` }
+}
+
+function filenameFromUrl(ref: string): string | null {
+  try {
+    const url = new URL(ref)
+    const name = url.pathname.split('/').filter(Boolean).pop()
+    return name === undefined || name === '' ? null : name
+  } catch {
+    return null
+  }
+}
+
+function renderPlaceholder(attachment: InboundAttachment): string {
+  const parts: string[] = [`Webex attachment #${attachment.id}: ${attachment.kind}`]
+  if (attachment.filename !== undefined) parts.push(`name=${attachment.filename}`)
+  return `[${parts.join(' ')}]`
 }
 
 export function normalizeWebexHtmlFallbackText(value: string): string {
