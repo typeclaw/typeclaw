@@ -4,11 +4,12 @@ import path from 'node:path'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
 
+import { GUARD_NON_WORKSPACE_WRITE } from '../keys'
 import { ACKNOWLEDGE_GUARDS, type GuardBlock, isGuardAcknowledged } from '../policy'
 import { isMemoryTopicsWriteAllowed } from './memory-topics-write'
 import { isSkillAuthoringAllowed } from './skill-authoring'
 
-export const GUARD_NON_WORKSPACE_WRITE = 'nonWorkspaceWrite'
+export { GUARD_NON_WORKSPACE_WRITE } from '../keys'
 
 const AGENT_ROOT_WRITE_ALLOWLIST = new Set([
   'AGENTS.md',

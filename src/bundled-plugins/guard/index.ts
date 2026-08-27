@@ -1,7 +1,6 @@
 import { definePlugin } from '@/plugin'
 
 import {
-  GUARD_NON_WORKSPACE_WRITE,
   checkManagedConfigGuard,
   checkMemoryTopicsDeleteGuard,
   checkNonWorkspaceWriteGuard,
@@ -10,7 +9,6 @@ import {
 } from './policy'
 
 export default definePlugin({
-  guardAcknowledgements: [{ key: GUARD_NON_WORKSPACE_WRITE, tools: ['write', 'edit'] }],
   plugin: async () => ({
     hooks: {
       'tool.before': async (event, ctx) => {

@@ -3,7 +3,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { ACKNOWLEDGE_GUARDS } from '../policy'
+import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/policy'
+
 import { checkPluginAdditionGuard, diffPlugins, GUARD_PLUGIN_ADDITION } from './plugin-addition'
 
 async function makeAgentDir(config: unknown): Promise<string> {

@@ -296,9 +296,6 @@ async function registerOnePlugin(args: RegisterOnePluginArgs): Promise<void> {
       logger,
       exports,
       ...(resolved.defined.commands !== undefined ? { commands: resolved.defined.commands } : {}),
-      ...(resolved.defined.guardAcknowledgements !== undefined
-        ? { guardAcknowledgements: resolved.defined.guardAcknowledgements }
-        : {}),
       registry,
       hooks,
       agentDir: args.agentDir,
