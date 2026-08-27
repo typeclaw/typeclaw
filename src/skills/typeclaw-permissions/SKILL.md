@@ -101,7 +101,7 @@ The security plugin classifies each guard on a two-axis policy:
 - **high — direct audience-leak.** Bypass sends data to a third-party audience outside the operator's control loop with NO operator-visible intermediate step. Inhabitants: `outboundSecret`, `systemPromptLeak`, `gitRemoteTainted`. **`owner` bypasses by default; `trusted`, `member`, `guest` do not.** The canonical case is **owner-in-public-channel**: an owner-permissioned operator asking the agent to "post deploy status to #general" can silently leak a `Bearer ghp_…` line. The defense lives in `roles.owner.match[]` discipline — the default is TUI-only, where a human is present. Configs that widen owner to a channel author should narrow the match or strip `security.bypass.high` (and the wildcard sentinel) from `roles.owner.permissions[]` for those origins.
 - **medium — silent-attack OR operator-reviewable state.** Two sub-shapes share this tier because they share a defense story (operator review catches it before the privileged effect escapes). (a) _silent-attack_: `secretExfilBash`, `secretExfilRead`, `ssrf`, and `sessionSearchSecrets` are heuristic/plugin defenses for non-canonical surfaces; bypassing them still cannot expose canonical credential stores or reusable child auth. For `ssrf`, a bypass skips only the heuristic plugin pre-check—the safe `web_fetch`/URL-backed `look_at` transport still enforces its independent policy below. (b) _operator-reviewable state_: bypass writes to a file the operator force-commits and reviews before the privileged effect takes hold — `gitExfil` (push to a clean operator-configured remote; the retarget-and-push path stays blocked by `gitRemoteTainted` at high), `rolePromotion` (`roles` is restart-required so the operator has wall-clock time), `cronPromotion` (deferred execution gives wall-clock time to revert). **`owner` and `trusted` bypass these plugin guards; `member`, `guest` do not.**
 
-  **Important:** `cronPromotion`, `rolePromotion`, and `pluginAddition` no longer honor `acknowledgeGuards`. For these three guards the bypass is **permission-only** — an actor bypasses them automatically by holding `security.bypass.medium` (owner and trusted have it by default) or the per-guard `security.bypass.<guard>` string. No per-call ack is accepted or possible. Additionally, `cronPromotion` is **caller-role-aware**: it only blocks changes that schedule deferred work above the caller's own resolved role (see `typeclaw-cron` for the full model). The `gitExfil` guard and all other guards still accept `acknowledgeGuards` per-call acks at the plugin layer, but an `ssrf` acknowledgement never bypasses the safe HTTP transport.
+  **Important:** security guards do not honor `acknowledgeGuards`. Their bypass is **permission-only**: an actor bypasses one by holding its tier permission or the per-guard `security.bypass.<guard>` string. Additionally, `cronPromotion` is caller-role-aware: it only blocks changes that schedule deferred work above the caller's resolved role.
 
 - **low — noisy, immediately recoverable.** No inhabitants today. Forward-compat for future guards. **`owner`, `trusted`, `member` all carry `bypass.low`; `guest` does not.**
 
@@ -111,7 +111,7 @@ At `tool.before` time, an actor bypasses a guard if they hold **either** the tie
 
 ### SSRF has a non-bypassable transport layer
 
-`security.bypass.ssrf`, `security.bypass.medium`, `owner`, `trusted`, and `acknowledgeGuards.ssrf` can skip the heuristic `tool.before` warning only. They cannot make the safe transports behind `web_fetch` and URL-backed `look_at` connect to a destination that transport policy rejects.
+`security.bypass.ssrf`, `security.bypass.medium`, `owner`, and `trusted` can skip the heuristic `tool.before` warning only. They cannot make the safe transports behind `web_fetch` and URL-backed `look_at` connect to a destination that transport policy rejects.
 
 Intentional internal access is operator-configured in raw-masked `.env`, not in `roles` or tool arguments:
 
@@ -148,31 +148,20 @@ See `typeclaw-plugins` for the authoring side of this — declaring and gating o
 
 ## When a tool is blocked
 
-The security plugin's `tool.before` hook produces block messages. For most guards the message is:
+The security plugin's `tool.before` hook produces block messages:
 
 ```
-Guard `<guardName>` blocked <what>. If this is genuinely intentional and the user
-explicitly asked for it, retry with `acknowledgeGuards.<guardName>: true` in the
-<tool> arguments. Or run as a role carrying `<per-guard-permission>` (...role hint...)
-or the tier permission `security.bypass.<low|medium|high>`; see the
-`typeclaw-permissions` skill.
+Guard `<guardName>` blocked <what>. Run as a role carrying `<per-guard-permission>`
+or the tier permission `security.bypass.<low|medium|high>`.
 ```
 
-For `cronPromotion`, `rolePromotion`, and `pluginAddition` the message omits the ack path entirely, because those guards no longer accept acks:
+Security-guard bypasses are permission-based. If the block concerns a canonical credential path, reusable authentication, or the safe HTTP transport's SSRF floor, there is no role escape hatch; direct the operator to the appropriate host-side workflow instead.
 
-```
-Guard `<guardName>` blocked <what>. To proceed, make this change from a session that
-already resolves to a role carrying `<per-guard-permission>` or
-`security.bypass.medium` — the TUI is always `owner`, or claim the role out-of-band
-via `typeclaw role claim` from the host CLI.
-```
+1. **Run as a role with the per-guard bypass permission.** Add the exact `security.bypass.<guardName>` string when the operator wants only that capability.
+2. **Run as a role with the tier bypass permission.** Granting `security.bypass.low|medium|high` opens every security guard in that tier.
+3. **Use a session that already resolves to a role with the bypass.** The TUI is always `owner`; role claims happen out-of-band through the host CLI.
 
-Four escape hatches for **bypassable plugin guards**, ordered from least to most invasive. If the block concerns a canonical credential path, reusable authentication, or the safe HTTP transport's SSRF floor, there is no role/ack escape hatch; direct the operator to the appropriate host-side workflow instead.
-
-1. **`acknowledgeGuards.<guardName>: true`** in the tool args. This is a per-call, in-session bypass for guards that support acknowledgements. Never use it without explicit user confirmation. It cannot authorize canonical secret access, credential handling, or a safe-HTTP destination rejected by transport policy. **Exception: this escape hatch also does NOT apply to `cronPromotion`, `rolePromotion`, or `pluginAddition`.** Those three guards ignore the ack flag entirely — they are bypassed only by holding the appropriate permission (see options 2-4 below) or via `typeclaw role claim` from the host CLI.
-2. **Run as a role with the per-guard bypass permission**. If the user wants this pattern to keep working without an ack every time, they edit `roles.<role>.permissions[]` to include the specific `security.bypass.<guardName>` string the block message named. This is the most granular grant — it only opens up that one guard. Use this when the user wants exactly one capability and nothing else.
-3. **Run as a role with the tier bypass permission**. The block message also names the tier permission (`security.bypass.low` / `.medium` / `.high`). Granting the tier opens every bypassable plugin guard of that tier at once — never canonical secrets.
-4. **Run from a session that already resolves to a role with the bypass**. The TUI is always `owner`, so a bypassable plugin guard that blocks a `member` channel author may permit the TUI. Canonical credential denial and safe-HTTP transport validation remain identical in both places. For `cronPromotion`, `rolePromotion`, and `pluginAddition` specifically, use a session carrying `security.bypass.medium` or claim the role out-of-band via `typeclaw role claim` from the host CLI.
+Separate advisory plugins may expose per-call acknowledgements. Those use plugin-nested JSON, for example `acknowledgeGuards: { "guard": { "nonWorkspaceWrite": true } }` or `{ "bun-hygiene": { "nonBunPackageManager": true } }`. The block reason names the exact tuple. These acknowledgements never apply to security guards.
 
 When you see a block, tell the user **which permission would skip it** (the block message now names both the per-guard and the tier options) and **which built-in roles have those permissions**. Do not just relay the guard reason — that loses the access-control framing entirely.
 
@@ -228,7 +217,7 @@ If you see a cron job mysteriously failing every fire with `denied by permission
 - **Do not promise that `typeclaw reload` applied a `roles` edit.** `roles` is restart-required. The reload tool will return success on the config file change, but the live `PermissionService` was built at boot and is not swapped on reload.
 - **Do not silently change a built-in role's permission list.** Setting `"permissions": []` on `member` is a wholesale replace, not a merge — you just took `channel.respond` away from every speaker who resolves to `member`. If the user said "give member just `channel.respond` and nothing else", that's fine (it's the same as the default), but say so explicitly: "this matches the default for `member`, no behavior change". If the user said "remove cron from `trusted`", make the change but warn that `trusted` no longer carries `cron.schedule` either.
 - **Do not write match rules using display names** (`#general`, `@user`, channel/user names). Match rules are platform IDs. Display names change; IDs don't. Always look up the ID before writing the rule.
-- **Do not edit `roles` to "fix" a security block** without explaining the alternative. For most guards, the right first move is `acknowledgeGuards.<X>: true` for the specific call. **Exceptions:** `cronPromotion`, `rolePromotion`, and `pluginAddition` do not accept acks; an `ssrf` ack only skips the heuristic plugin pre-check and never changes safe-HTTP transport policy. Intentional internal `web_fetch`/URL-backed `look_at` access is an operator boot-policy change, not a role edit. Editing `roles` to grant a permanent bypass is a heavier change with security implications — get explicit consent.
+- **Do not edit `roles` to "fix" a security block** without explaining the implications. Security guards are permission-only; advisory plugin acknowledgements do not apply. Intentional internal `web_fetch`/URL-backed `look_at` access is an operator boot-policy change, not a role edit.
 - **Do not interpret a missing `## Session origin` role line as "I have no role".** TUI sessions don't render the line because TUI is always `owner`. If you see no role line and you're not in TUI, something has gone wrong with the system prompt build — flag it, don't fabricate.
 
 ## What this skill does not cover
