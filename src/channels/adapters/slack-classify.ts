@@ -1,8 +1,8 @@
-import type { SlackRTMMessageEvent } from 'agent-messenger/slack'
+import type { SlackFile, SlackRTMMessageEvent } from 'agent-messenger/slack'
 
 import { matchesAnyAlias } from '@/channels/engagement'
 import type { ChannelAdapterConfig } from '@/channels/schema'
-import type { InboundMessage } from '@/channels/types'
+import type { InboundAttachment, InboundMessage } from '@/channels/types'
 
 import { slackTsToMillis } from './slack-bot-time'
 import { encodeSlackReactionRef } from './slack-reactions'
@@ -89,6 +89,38 @@ function classifyConversation(
 
 export function isRouteableSlackMessageSubtype(subtype: string | undefined): boolean {
   return subtype === undefined || subtype === 'me_message'
+}
+
+// The REST history fetch bypasses the inbound classifier, so files on
+// already-posted messages must be described here too. Registering the ref
+// without also baking a `#N` placeholder into the text is not enough: the
+// agent has no way to learn the id exists, so look_at_channel_attachment stays
+// unreachable in practice. Kept in the classifier module so the live inbound
+// path can adopt the same rendering.
+export function splitSlackFiles(text: string, files: readonly SlackFile[] | undefined): SplitSlackFiles {
+  const attachments = (files ?? []).map(describeSlackFile)
+  if (attachments.length === 0) return { text, attachments: [] }
+  const summary = attachments.map(renderPlaceholder).join('\n')
+  return { text: text === '' ? summary : `${text}\n${summary}`, attachments }
+}
+
+type SplitSlackFiles = { text: string; attachments: InboundAttachment[] }
+
+function describeSlackFile(file: SlackFile, index: number): InboundAttachment {
+  return {
+    id: index + 1,
+    kind: 'file',
+    ref: file.id,
+    filename: file.name,
+    mimetype: file.mimetype,
+  }
+}
+
+function renderPlaceholder(attachment: InboundAttachment): string {
+  const parts: string[] = [`Slack attachment #${attachment.id}: ${attachment.kind}`]
+  if (attachment.mimetype !== undefined) parts.push(attachment.mimetype)
+  if (attachment.filename !== undefined) parts.push(`name=${attachment.filename}`)
+  return `[${parts.join(' ')}]`
 }
 
 const MENTION_PATTERN = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
