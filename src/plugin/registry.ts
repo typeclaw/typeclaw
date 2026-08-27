@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs'
 
+import { z } from 'zod'
+
 import { BUILTIN_COMMAND_NAMES } from '@/cli/builtins'
 import type { CronJob, PromptJob } from '@/cron'
 
@@ -65,6 +67,7 @@ export type RegisterContributionsOptions = {
 }
 
 const COMMAND_NAME_REGEX = /^[a-z][a-z0-9-]*$/
+const ACKNOWLEDGE_GUARDS = 'acknowledgeGuards'
 
 // CLI subcommands plugins MUST NOT shadow. Derived from BUILTIN_COMMAND_NAMES
 // so cli/index.ts and registry.ts cannot drift apart.
@@ -80,6 +83,9 @@ export function registerContributions(opts: RegisterContributionsOptions): void 
   if (ex.tools) {
     for (const [toolName, tool] of Object.entries(ex.tools)) {
       assertNotEmpty('tool name', toolName, pluginName)
+      if (tool.parameters instanceof z.ZodObject && ACKNOWLEDGE_GUARDS in tool.parameters.shape) {
+        throw new Error(`plugin ${pluginName}: tool "${toolName}" declares reserved parameter "${ACKNOWLEDGE_GUARDS}"`)
+      }
       const conflict = registry.tools.find((t) => t.toolName === toolName)
       if (conflict) {
         throw new Error(`plugin ${pluginName}: tool "${toolName}" already registered by plugin ${conflict.pluginName}`)
@@ -138,9 +144,7 @@ export function registerContributions(opts: RegisterContributionsOptions): void 
     }
   }
 
-  if (ex.hooks) {
-    hooks.registerAll(pluginName, agentDir, logger, ex.hooks)
-  }
+  hooks.registerAll(pluginName, agentDir, logger, ex.hooks ?? {})
 
   if (ex.doctorChecks) {
     for (const [checkName, check] of Object.entries(ex.doctorChecks)) {
