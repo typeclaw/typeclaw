@@ -95,17 +95,29 @@ const GROUP_MENTION_PATTERN = /@(?:everyone|here)/
 type SplitInbound = { text: string; attachments: InboundAttachment[] }
 
 function splitInbound(event: DiscordInboundMessageEvent): SplitInbound {
-  const attachments = (event.attachments ?? []).map((attachment, index) => ({
+  return splitDiscordAttachments(event.content, event)
+}
+
+// Structural so the REST history shape and the gateway event shape share one
+// implementation. Exported because `discord.ts`'s history mapper bypasses the
+// classifier: without reusing this, an already-posted image renders with no
+// `#N` placeholder and registers no ref, so look_at_channel_attachment can
+// never resolve it. Same contract discord-bot/slack-bot already document.
+export type DiscordAttachmentCarrier = {
+  attachments?: readonly { url: string; filename: string; content_type?: string }[]
+}
+
+export function splitDiscordAttachments(text: string, carrier: DiscordAttachmentCarrier): SplitInbound {
+  const attachments = (carrier.attachments ?? []).map((attachment, index) => ({
     id: index + 1,
     kind: 'file' as const,
     ref: attachment.url,
     filename: attachment.filename,
     ...(attachment.content_type !== undefined ? { mimetype: attachment.content_type } : {}),
   }))
-  if (attachments.length === 0) return { text: event.content, attachments: [] }
+  if (attachments.length === 0) return { text, attachments: [] }
   const summary = attachments.map(renderPlaceholder).join('\n')
-  const text = event.content === '' ? summary : `${event.content}\n${summary}`
-  return { text, attachments }
+  return { text: text === '' ? summary : `${text}\n${summary}`, attachments }
 }
 
 function renderPlaceholder(attachment: InboundAttachment): string {
