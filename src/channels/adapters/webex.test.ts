@@ -424,6 +424,27 @@ describe('createWebexHistoryCallback reply attribution', () => {
     return res.messages
   }
 
+  test('numbers every history file so each is separately addressable', async () => {
+    const history = await historyOf(
+      [
+        message({
+          ref: 'm-1',
+          text: 'two files',
+          files: ['https://webexapis.com/v1/contents/AAA/photo.png', 'https://webexapis.com/v1/contents/BBB/doc.pdf'],
+        }),
+      ],
+      'bot-1',
+    )
+
+    expect(history[0]?.text).toBe(
+      'two files\n[Webex attachment #1: file name=photo.png]\n[Webex attachment #2: file name=doc.pdf]',
+    )
+    expect(history[0]?.attachments?.map((a) => [a.id, a.ref])).toEqual([
+      [1, 'https://webexapis.com/v1/contents/AAA/photo.png'],
+      [2, 'https://webexapis.com/v1/contents/BBB/doc.pdf'],
+    ])
+  })
+
   test('leaves replyToBotMessageId null when the threaded parent was authored by a human', async () => {
     const parent = message({ id: 'parent-blob', ref: 'parent-1', personId: 'human-blob-1', personRef: 'human-1' })
     const child = message({

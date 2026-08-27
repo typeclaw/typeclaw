@@ -43,7 +43,7 @@ import { describeError } from '../describe-error'
 import { createWebexChannelNameResolver } from './webex-channel-resolver'
 import { classifyInbound, type InboundDropReason, type WebexInboundMessage } from './webex-classify'
 import { createWebexEditMessageCallback } from './webex-edit'
-import { resolveWebexBodyText } from './webex-format'
+import { resolveWebexBodyText, splitWebexFiles } from './webex-format'
 import { createWebexPrefetchLimiter, isWebexRateLimitError, type WebexPrefetchLimiter } from './webex-prefetch-limiter'
 import { enrichWebexMessageReference } from './webex-reference'
 
@@ -534,9 +534,7 @@ function mapWebexHistoryMessage(
   botPersonId: string | null,
   authorById: ReadonlyMap<string, string>,
 ): ChannelHistoryMessage {
-  const attachments = (msg.files ?? []).map((ref, index) => ({ id: index + 1, kind: 'file' as const, ref }))
-  const body = resolveWebexBodyText(msg)
-  const text = attachments.length === 0 ? body : body === '' ? '[Webex attachment]' : `${body}\n[Webex attachment]`
+  const { text, attachments } = splitWebexFiles(resolveWebexBodyText(msg), msg.files)
   const ts = Date.parse(msg.created)
   return {
     externalMessageId: msg.ref,
