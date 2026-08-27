@@ -888,6 +888,12 @@ type LiveSession = {
   historyTimedAttachments: readonly TimedAttachment[]
   historyAttachments: InboundAttachment[]
   draining: boolean
+  // Every drain invocation still running, including the tail it executes after
+  // `draining` flips back to false. `drain()` deliberately no-ops while a drain
+  // owns the session, so a fire-and-forget `void drain(live)` is otherwise
+  // unobservable; this is the only handle a caller can await to know the turn
+  // actually landed. Entries remove themselves on settle.
+  activeDrains: Set<Promise<void>>
   debounceTimer: ReturnType<typeof setTimeout> | null
   typingTimer: ReturnType<typeof setInterval> | null
   typingStartedAt: number
@@ -2448,6 +2454,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         historyTimedAttachments: [],
         historyAttachments: [],
         draining: false,
+        activeDrains: new Set(),
         debounceTimer: null,
         typingTimer: null,
         typingStartedAt: 0,
@@ -3464,8 +3471,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.qualifyingWorkThisLogicalTurn = false
   }
 
-  const drain = async (live: LiveSession): Promise<void> => {
-    if (live.draining || live.destroyed) return
+  const runDrain = async (live: LiveSession): Promise<void> => {
     live.draining = true
     try {
       // `!live.pendingTeardown`: once a reload marks this draining session for
@@ -3836,6 +3842,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
       await handOffToSuccessor(live.key, carriedInbounds, carriedObserved, carriedReminders)
+    }
+  }
+
+  // No-op while a drain already owns the session: that loop re-checks both
+  // queues every iteration, so work landing behind it is picked up without a
+  // second concurrent drain. Registers the running invocation on `activeDrains`
+  // so `settleDrains` can await a turn started fire-and-forget.
+  const drain = (live: LiveSession): Promise<void> => {
+    if (live.draining || live.destroyed) return Promise.resolve()
+    const running = runDrain(live)
+    // Rejection is swallowed on the tracked copy only: settlement waiters must
+    // not re-surface a failure the starting caller already owns. `running` is
+    // what callers get back, so their rejection semantics are unchanged.
+    const settled = running.then(
+      () => undefined,
+      () => undefined,
+    )
+    live.activeDrains.add(settled)
+    void settled.then(() => live.activeDrains.delete(settled))
+    return running
+  }
+
+  // Resolves once no drain is running. Loops because a drain's post-`draining`
+  // tail can start a rival, and because work queued during one turn opens the
+  // next; a snapshot `Promise.all` would return with that successor in flight.
+  const settleDrains = async (live: LiveSession): Promise<void> => {
+    while (live.activeDrains.size > 0) {
+      await Promise.all(live.activeDrains)
     }
   }
 
@@ -6885,7 +6919,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.debounceTimer = null
         }
         live.firstUnprocessedAt = 0
+        // Settle a drain that is ALREADY in flight before starting our own, then
+        // again after. `drain()` no-ops while one owns the session, so a
+        // fire-and-forget `void drain(live)` raised elsewhere — the restart-resume
+        // lost-work notice, a promoted review carrier, a subagent-completion wake —
+        // would still be mid-turn when this returned, and the caller would assert
+        // on a prompt that has not landed. Same defect shape as the `persist()`
+        // race below: this seam has to mean "settled", not "started".
+        await settleDrains(live)
         await drain(live)
+        await settleDrains(live)
         // Settle the fire-and-forget `void persist()` from scheduleDebouncedDrain
         // (the lastInboundAt write). Draining alone doesn't await that promise, so
         // a test reading sessions.json right after would race the disk write — the

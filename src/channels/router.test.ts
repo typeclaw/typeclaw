@@ -16815,6 +16815,41 @@ describe('resumeRestartHandoff', () => {
     expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
   })
 
+  test('flushDebounce settles a drain already in flight, not merely one it starts', async () => {
+    // given: the same coalesced-restart shape as above, but the fire-and-forget
+    //   drain's FIRST turn parks on a macrotask. The racing inbound is queued
+    //   behind it, so its prompt can only land on a later iteration of that same
+    //   drain — which flushDebounce's own `drain()` call cannot reach, because
+    //   drain() no-ops while `live.draining` is set. The park makes that window
+    //   deterministic instead of contention-dependent: it is the oversubscribed-
+    //   CI flake reproduced on purpose.
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const { router, sessions } = makeRouter(dir, {
+      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
+      onSessionCreated: (fake) => {
+        fake.onPrompt = async () => {
+          if (fake.prompts.length > 1) return
+          await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        }
+      },
+    })
+    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
+    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: 'hi there' }))
+    await waitFor(() => reservation.sawInbound)
+
+    // when
+    await reservation.resume()
+    await inboundDone
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: both turns the in-flight drain owed had landed before the flush
+    // returned — no polling, because the seam settles rather than merely starts
+    const prompts = sessions[0]!.prompts
+    expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
+    expect(prompts.some((p) => p.includes('hi there'))).toBe(true)
+  })
+
   test('delivers the notice even when the racing inbound is observe-only (never engages)', async () => {
     // given: a handoff with interrupted names and a racing inbound that will NOT
     //   engage (not a mention, not a reply, mentions no one). sawInbound flips
