@@ -1,6 +1,6 @@
 # typeclaw-plugin-bun-hygiene
 
-The bundled bun-hygiene plugin. Registers a `tool.before` hook that blocks three classes of `bash` command:
+The bundled bun-hygiene policy contributes three runtime-internal guards for `bash` commands:
 
 1. **Global package installs** — `npm install -g`, `pnpm add -g`, `yarn global add`, `bun add -g`, and their `--global` / bundled-flag variants.
 2. **Non-bun install managers** — any `npm`, `pnpm`, or `yarn` invocation.
@@ -28,13 +28,13 @@ A global install (e.g. `npm install -g x`) trips **only** `globalInstall`, not b
 
 ## Bypass
 
-All three guards follow the repo-wide `acknowledgeGuards` convention (shared with the `security` and `guard` plugins). To run a blocked command intentionally, pass the matching flag in the `bash` tool arguments:
+All three guards follow the plugin-nested `acknowledgeGuards` convention. To run a blocked command intentionally, pass the matching flag in the `bash` tool arguments:
 
 ```jsonc
 // bash tool args
-{ "command": "npm install", "acknowledgeGuards": { "nonBunPackageManager": true } }
-{ "command": "npm install -g some-cli", "acknowledgeGuards": { "globalInstall": true } }
-{ "command": "npx tsc", "acknowledgeGuards": { "nonBunPackageRunner": true } }
+{ "command": "npm install", "acknowledgeGuards": { "bun-hygiene": { "nonBunPackageManager": true } } }
+{ "command": "npm install -g some-cli", "acknowledgeGuards": { "bun-hygiene": { "globalInstall": true } } }
+{ "command": "npx tsc", "acknowledgeGuards": { "bun-hygiene": { "nonBunPackageRunner": true } } }
 ```
 
 ## How it works
@@ -83,4 +83,4 @@ Registered after `guard` in `src/run/bundled-plugins.ts`. It guards a disjoint s
 ## Tests
 
 - `policy.test.ts` — pure-function unit tests for the detection logic: every global-install form, every non-bun install manager, `npx`/`pnpx` runner blocking (including behind preamble wrappers), the allowed-command set (`bunx`, `bun x`, substrings, paths, quoted text), all bypasses, guard precedence, escaped/quoted evasions, leading-assignment preambles, newline-as-separator scoping, falsy `--global=`, option placement, and subshell/substitution detection.
-- `index.test.ts` — composition tests: the plugin registers the `tool.before` hook and wires it to the policy (block on global install, `npm install`, and `npx`; allow `bunx`; honor the bypass).
+- `index.test.ts` — composition tests: the plugin registers guards and wires them to the policy (block on global install, `npm install`, and `npx`; allow `bunx`; honor the bypass).

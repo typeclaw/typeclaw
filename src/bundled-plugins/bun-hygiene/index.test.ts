@@ -1,28 +1,26 @@
 import { describe, expect, test } from 'bun:test'
 
-import { noopPermissionService } from '@/permissions'
-import type { HookContext, PluginContext, ToolBeforeEvent } from '@/plugin'
-
-import bunHygienePlugin from './index'
+import { buildInternalGuards } from '@/agent/guards'
+import { createHookBus, type ToolBeforeEvent } from '@/plugin'
 
 const noopLogger = { info: () => {}, warn: () => {}, error: () => {} }
 
-describe('bun-hygiene plugin', () => {
-  test('blocks global installs through the tool.before hook', async () => {
-    const hook = await toolBeforeHook()
+describe('bun-hygiene internal guards', () => {
+  test('blocks global installs through the internal registry', async () => {
+    const hook = await guardRunner()
 
-    const result = await hook(toolEvent('bash', { command: 'npm install -g typescript' }), hookContext())
+    const result = await hook(toolEvent('bash', { command: 'npm install -g typescript' }))
 
     expect(result?.block).toBe(true)
     expect(result?.reason).toContain('globalInstall')
   })
 
   test('blocks non-bun install managers and runners while allowing bunx through the hook', async () => {
-    const hook = await toolBeforeHook()
+    const hook = await guardRunner()
 
-    const blocked = await hook(toolEvent('bash', { command: 'npm install' }), hookContext())
-    const allowedBunx = await hook(toolEvent('bash', { command: 'bunx create-next-app' }), hookContext())
-    const blockedNpx = await hook(toolEvent('bash', { command: 'npx create-next-app' }), hookContext())
+    const blocked = await hook(toolEvent('bash', { command: 'npm install' }))
+    const allowedBunx = await hook(toolEvent('bash', { command: 'bunx create-next-app' }))
+    const blockedNpx = await hook(toolEvent('bash', { command: 'npx create-next-app' }))
 
     expect(blocked?.block).toBe(true)
     expect(blocked?.reason).toContain('nonBunPackageManager')
@@ -32,46 +30,31 @@ describe('bun-hygiene plugin', () => {
   })
 
   test('respects the acknowledgeGuards bypass', async () => {
-    const hook = await toolBeforeHook()
+    const hook = await guardRunner()
 
     const result = await hook(
-      toolEvent('bash', { command: 'npm install', acknowledgeGuards: { nonBunPackageManager: true } }),
-      hookContext(),
+      toolEvent('bash', {
+        command: 'npm install',
+        acknowledgeGuards: { 'bun-hygiene': { nonBunPackageManager: true } },
+      }),
     )
 
     expect(result).toBeUndefined()
   })
 })
 
-async function toolBeforeHook(): Promise<
-  NonNullable<NonNullable<Awaited<ReturnType<typeof bunHygienePlugin.plugin>>['hooks']>['tool.before']>
-> {
-  const exports = await bunHygienePlugin.plugin(pluginContext())
-  const hook = exports.hooks?.['tool.before']
-  if (!hook) throw new Error('bun-hygiene plugin did not register tool.before')
-  return hook
+async function guardRunner() {
+  const hooks = createHookBus()
+  hooks.registerAll('bun-hygiene', '/agent', noopLogger, {})
+  const guards = buildInternalGuards('/agent')
+  return async (event: ToolBeforeEvent) => {
+    const args = { ...event.args }
+    const acknowledgements = args.acknowledgeGuards as Record<string, Record<string, boolean>> | undefined
+    delete args.acknowledgeGuards
+    return hooks.runToolBefore({ ...event, args }, guards, acknowledgements)
+  }
 }
 
 function toolEvent(tool: string, args: Record<string, unknown>): ToolBeforeEvent {
   return { tool, sessionId: 's', callId: 'c', args }
-}
-
-function hookContext(): HookContext {
-  return { agentDir: '/agent', pluginName: 'bun-hygiene', logger: noopLogger }
-}
-
-function pluginContext(): PluginContext<undefined> {
-  return {
-    name: 'bun-hygiene',
-    version: undefined,
-    agentDir: '/agent',
-    config: undefined,
-    logger: noopLogger,
-    permissions: noopPermissionService,
-    github: {
-      resolveTokenForRepo: async () => ({ kind: 'unavailable', reason: 'test' }),
-      hasAppTokenResolver: () => false,
-    },
-    spawnSubagent: async () => {},
-  }
 }
