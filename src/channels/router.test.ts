@@ -20,6 +20,7 @@ import { readContinuationState } from '@/agent/todo/continuation-state'
 import { recordTurnOutcome } from '@/agent/todo/continuation-wiring'
 import { resolveTodoScope } from '@/agent/todo/scope'
 import { writeTodos } from '@/agent/todo/store'
+import { createChannelHistoryTool } from '@/agent/tools/channel-history'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
 import {
@@ -32,6 +33,7 @@ import type { PermissionService } from '@/permissions'
 import type { HookBus, SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
 
+import { createDiscordHistoryCallback } from './adapters/discord'
 import {
   __resetReviewVerdictGuardForTest,
   configureReviewVerdictCoordinator,
@@ -16362,6 +16364,62 @@ describe('ChannelRouter history attachment registry', () => {
     expect(resolved).not.toBeNull()
     expect(resolved!.ref).toBe(HIST_PHOTO.ref)
     expect(router.listInboundAttachmentIds(KEY)).toEqual([1])
+  })
+
+  // End-to-end guard for the production failure this registry exists to
+  // prevent: the agent was told by look_at_channel_attachment's own error text
+  // to "call channel_history first", did exactly that, and still could not
+  // resolve the image because the Discord user adapter's history mapper never
+  // carried the attachment. Wiring the REAL adapter callback and the REAL tool
+  // is the point — a fake history callback would have passed the whole time.
+  test('an id the agent reads in rendered channel_history output resolves to that ref', async () => {
+    const DISCORD_KEY: ChannelKey = { adapter: 'discord', workspace: 'g1', chat: 'c1', thread: null }
+    const { router } = makeRouter(await tempDir())
+    await router.route(inbound({ adapter: 'discord', text: 'open session' }))
+    await router.__testing!.flushDebounce(DISCORD_KEY)
+
+    router.registerHistory(
+      'discord',
+      createDiscordHistoryCallback({
+        client: {
+          getMessages: async () => [
+            {
+              id: 'm-image',
+              channel_id: 'c1',
+              author: { id: 'alice', username: 'alice' },
+              content: '',
+              timestamp: '2026-01-01T00:00:00.000Z',
+              attachments: [
+                {
+                  id: '1',
+                  filename: 'image.png',
+                  size: 10,
+                  url: 'https://cdn.discordapp.com/attachments/1/2/image.png',
+                  content_type: 'image/webp',
+                },
+              ],
+            },
+          ],
+        } as unknown as Parameters<typeof createDiscordHistoryCallback>[0]['client'],
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    )
+
+    const tool = createChannelHistoryTool({ router, origin: DISCORD_KEY })
+    const result = await tool.execute(
+      'call-1',
+      { scope: 'channel' },
+      undefined,
+      undefined,
+      {} as Parameters<typeof tool.execute>[4],
+    )
+
+    const rendered = result.content.map((part) => ('text' in part ? part.text : '')).join('\n')
+    const renderedId = /attachment #(\d+):/.exec(rendered)?.[1]
+    expect(renderedId).toBe('1')
+
+    const resolved = router.lookupInboundAttachment({ ...DISCORD_KEY, id: Number(renderedId) })
+    expect(resolved?.ref).toBe('https://cdn.discordapp.com/attachments/1/2/image.png')
   })
 
   test('a live current-turn #1 still wins over a registered history #1', async () => {
