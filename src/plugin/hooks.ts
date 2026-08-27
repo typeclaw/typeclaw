@@ -61,7 +61,21 @@ export type HookBus = {
   runSessionPrompt: (event: SessionPromptEvent) => Promise<void>
   runSessionTurnStart: (event: SessionTurnStartEvent) => Promise<void>
   runSessionTurnEnd: (event: SessionTurnEndEvent) => Promise<void>
-  runToolBefore: (event: ToolBeforeEvent) => Promise<{ block: true; reason: string } | undefined>
+  runToolBefore: (
+    event: ToolBeforeEvent,
+    guards?: readonly {
+      owner: string
+      key: string
+      tools: ReadonlySet<string>
+      check: (
+        event: Readonly<ToolBeforeEvent>,
+      ) =>
+        | undefined
+        | { readonly kind: 'block' | 'acknowledgement-required'; readonly reason: string }
+        | Promise<undefined | { readonly kind: 'block' | 'acknowledgement-required'; readonly reason: string }>
+    }[],
+    acknowledgements?: Readonly<Record<string, Readonly<Record<string, boolean>>>>,
+  ) => Promise<{ block: true; reason: string } | undefined>
   runToolAfter: (event: ToolAfterEvent) => Promise<void>
   count: (name: keyof Hooks) => number
 }
@@ -84,7 +98,7 @@ type Registries = {
   'session.prompt': RegisteredHook<'session.prompt'>[]
   'session.turn.start': RegisteredHook<'session.turn.start'>[]
   'session.turn.end': RegisteredHook<'session.turn.end'>[]
-  'tool.before': RegisteredHook<'tool.before'>[]
+  'tool.before': Array<RegisteredHook<'tool.before'> | { pluginName: string; guardOwner: true; logger: PluginLogger }>
   'tool.after': RegisteredHook<'tool.after'>[]
 }
 
@@ -110,6 +124,7 @@ export function createHookBus(options: CreateHookBusOptions = {}): HookBus {
   return {
     registerAll(pluginName, agentDir, logger, hooks) {
       const base = { pluginName, agentDir, logger }
+      r['tool.before'].push({ pluginName, guardOwner: true, logger })
       if (hooks['session.start']) r['session.start'].push({ ...base, handler: hooks['session.start'] })
       if (hooks['session.end']) r['session.end'].push({ ...base, handler: hooks['session.end'] })
       if (hooks['session.idle']) r['session.idle'].push({ ...base, handler: hooks['session.idle'] })
@@ -206,8 +221,26 @@ export function createHookBus(options: CreateHookBusOptions = {}): HookBus {
     // First plugin to return `{ block: true, reason }` short-circuits. Earlier
     // plugins' arg mutations remain visible to later plugins via the shared
     // event.args object.
-    async runToolBefore(event) {
+    async runToolBefore(event, guards = [], acknowledgements) {
       for (const reg of r['tool.before']) {
+        if ('guardOwner' in reg) {
+          for (const guard of guards) {
+            if (guard.owner !== reg.pluginName || !guard.tools.has(event.tool)) continue
+            let result
+            try {
+              result = await guard.check(event)
+            } catch (err) {
+              reg.logger.error(`guard ${guard.key} threw: ${err instanceof Error ? err.message : String(err)}`)
+              return { block: true, reason: `guard ${guard.key} failed closed after its check threw` }
+            }
+            if (result === undefined) continue
+            if (result.kind === 'block') return { block: true, reason: result.reason }
+            if (acknowledgements?.[guard.owner]?.[guard.key] !== true) {
+              return { block: true, reason: result.reason }
+            }
+          }
+          continue
+        }
         let result: ToolBeforeResult
         try {
           result = await reg.handler(event, ctx(reg))
@@ -234,6 +267,7 @@ export function createHookBus(options: CreateHookBusOptions = {}): HookBus {
     },
 
     count(name) {
+      if (name === 'tool.before') return r[name].filter((entry) => !('guardOwner' in entry)).length
       return r[name].length
     },
   }

@@ -283,7 +283,7 @@ These are two independent gates:
 
 Each variable is unset/empty or a comma-separated list of at most 64 entries; empty or malformed entries fail boot. They are parsed once at container startup, withheld from model bash, and protected by the raw live `.env` mask. A model must not read or edit them. Tell the operator to update `.env` out-of-band and run `typeclaw restart`; `reload` does not re-read them.
 
-The transport still performs DNS answer validation, socket pinning, mixed-answer fail-closed checks, and redirect revalidation. Neither hostname/CIDR exceptions, `acknowledgeGuards.ssrf`, nor any role—including `owner`—can permit known metadata/control-plane endpoints, their standardized compatible/mapped/translatable, well-known NAT64, and 6to4 IPv6 forms, or the ambiguous RFC 8215 `64:ff9b:1::/48` translator range. When `network.blockInternal` is on, an allowed private IPv4 HTTP target generally needs both the `.env` transport exception and a narrow `network.allow` firewall entry.
+The transport still performs DNS answer validation, socket pinning, mixed-answer fail-closed checks, and redirect revalidation. Neither hostname/CIDR exceptions nor any role—including `owner`—can permit known metadata/control-plane endpoints, their standardized compatible/mapped/translatable, well-known NAT64, and 6to4 IPv6 forms, or the ambiguous RFC 8215 `64:ff9b:1::/48` translator range. When `network.blockInternal` is on, an allowed private IPv4 HTTP target generally needs both the `.env` transport exception and a narrow `network.allow` firewall entry.
 
 ## Dockerfile
 

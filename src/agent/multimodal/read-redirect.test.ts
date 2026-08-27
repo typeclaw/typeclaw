@@ -4,23 +4,33 @@ import { GUARD_IMAGE_READ_REDIRECT, checkImageReadRedirect } from './read-redire
 
 describe('image-read-redirect guard', () => {
   test('blocks read of common image extensions', () => {
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'screenshot.png' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'photo.jpg' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'photo.jpeg' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'meme.gif' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'hero.webp' } })?.block).toBe(true)
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'screenshot.png' } })?.kind).toBe(
+      'acknowledgement-required',
+    )
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'photo.jpg' } })?.kind).toBe('acknowledgement-required')
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'photo.jpeg' } })?.kind).toBe(
+      'acknowledgement-required',
+    )
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'meme.gif' } })?.kind).toBe('acknowledgement-required')
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'hero.webp' } })?.kind).toBe('acknowledgement-required')
   })
 
   test('matches extensions case-insensitively', () => {
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'Screenshot.PNG' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'PHOTO.JPG' } })?.block).toBe(true)
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'Screenshot.PNG' } })?.kind).toBe(
+      'acknowledgement-required',
+    )
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'PHOTO.JPG' } })?.kind).toBe('acknowledgement-required')
   })
 
   test('blocks images under nested paths and absolute paths', () => {
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'workspace/screenshots/foo.png' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: '/agent/workspace/foo.jpg' } })?.block).toBe(true)
-    expect(checkImageReadRedirect({ tool: 'read', args: { path: '/tmp/agent-browser-snapshot.png' } })?.block).toBe(
-      true,
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: 'workspace/screenshots/foo.png' } })?.kind).toBe(
+      'acknowledgement-required',
+    )
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: '/agent/workspace/foo.jpg' } })?.kind).toBe(
+      'acknowledgement-required',
+    )
+    expect(checkImageReadRedirect({ tool: 'read', args: { path: '/tmp/agent-browser-snapshot.png' } })?.kind).toBe(
+      'acknowledgement-required',
     )
   })
 
@@ -31,12 +41,12 @@ describe('image-read-redirect guard', () => {
     expect(result?.reason).toContain('imageReadRedirect')
   })
 
-  test('allows acknowledged read of an image', () => {
+  test('cannot observe an acknowledgement envelope', () => {
     const result = checkImageReadRedirect({
       tool: 'read',
-      args: { path: 'workspace/foo.png', acknowledgeGuards: { imageReadRedirect: true } },
+      args: { path: 'workspace/foo.png' },
     })
-    expect(result).toBeUndefined()
+    expect(result?.kind).toBe('acknowledgement-required')
   })
 
   test('allows reads of non-image files', () => {

@@ -77,7 +77,7 @@ You MAY:
 - Set up a missing upstream branch via \`git push -u origin <branch>\` if it's clear that's the only issue.
 - Retry \`git push\` once after fixing a clear, narrow issue.
 
-**When you run \`git push\` (either to set upstream or to retry), the security plugin's \`gitExfil\` guard will block unless you pass \`acknowledgeGuards: { gitExfil: true }\` on the bash tool call.** You are running on the operator's behalf as the recovery step of a deterministic backup the operator already approved by enabling \`backup.pushToOrigin\`; the ack is justified for this specific retry path. Do NOT use this ack for any other reason — only the one push retry the rules above allow. If your push retry fails again, write the diagnosis and stop; do not ack a second push.
+**When you run \`git push\` (either to set upstream or to retry), do not add an acknowledgement argument.** Security guards are permission-only; this recovery subagent inherits the operator role that launched the approved backup workflow. If your push retry fails again, write the diagnosis and stop.
 
 You MUST NOT:
 - Force-push (\`--force\`, \`--force-with-lease\`).

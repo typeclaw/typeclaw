@@ -17,12 +17,7 @@ import type { Static, TSchema } from 'typebox'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
-import {
-  ACKNOWLEDGE_GUARDS,
-  checkManagedConfigGuard,
-  checkNonWorkspaceWriteGuard,
-  checkSkillAuthoringGuard,
-} from '@/bundled-plugins/guard/policy'
+import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/keys'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
 import { readEnvFile } from '@/init/env-file'
 import {
@@ -47,6 +42,7 @@ import type {
   ToolFileOperands,
   ToolResult,
 } from '@/plugin'
+import { PI_BUILTIN_TOOL_NAMES, type PiBuiltinToolName } from '@/plugin/core-tool-names'
 import {
   buildSandboxedCommand,
   canWriteAgentRootInSandbox,
@@ -81,9 +77,8 @@ import {
 } from '@/sandbox'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 
-import { GUARD_ACKNOWLEDGEMENTS } from './guard-acknowledgements'
+import type { InternalGuard } from './guard-types'
 import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-guard'
-import { checkImageReadRedirect } from './multimodal/read-redirect'
 import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-bash-policy'
 import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
@@ -203,10 +198,7 @@ export function sanitizeBashSpawnEnvironment(
 // guard + sandbox pipeline, and the call site routes them through `customTools`
 // while narrowing via `tools:` names. There is no longer an `AgentTool` vs
 // `ToolDefinition` split.
-type PiBuiltinToolName = 'read' | 'bash' | 'edit' | 'write' | 'grep' | 'find' | 'ls'
 type TypeclawToolName = 'web_search' | 'web_fetch'
-
-const PI_BUILTIN_TOOL_NAMES: readonly PiBuiltinToolName[] = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls']
 
 // pi builtins resolve relative paths (and, for trusted/owner bash, the spawn
 // cwd) against the cwd baked in at factory time, so the definitions are built
@@ -273,6 +265,7 @@ export type WrapToolOptions = {
   sessionId: string
   logger: PluginLogger
   hooks: HookBus
+  guards?: readonly InternalGuard[]
   // Called at tool-execute time (not at wrap time) so channel sessions whose
   // origin mutates per turn surface the current-turn `lastInboundAuthorId`
   // to `tool.before`. Sessions with a fixed origin can pass `() => origin`.
@@ -303,6 +296,7 @@ export type WrapSystemToolOptions = {
   agentDir: string
   sessionId: string
   hooks: HookBus
+  guards?: readonly InternalGuard[]
   getOrigin?: () => SessionOrigin | undefined
   getAbort?: () => ((reason?: string) => void) | undefined
   getLoopGuardTurn?: () => number | undefined
@@ -353,11 +347,7 @@ export function zodToToolParameters(schema: z.ZodType<unknown>): TSchema {
 }
 
 export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefinition {
-  const parameters = withGuardAcknowledgements(
-    opts.toolName,
-    zodToToolParameters(tool.parameters),
-    GUARD_ACKNOWLEDGEMENTS,
-  )
+  const parameters = withGuardAcknowledgements(opts.toolName, zodToToolParameters(tool.parameters), opts.guards ?? [])
 
   return piDefineTool({
     name: opts.toolName,
@@ -365,7 +355,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
     description: tool.description,
     parameters,
     async execute(toolCallId, params, signal) {
-      const envelope = extractGuardAcknowledgements(params, opts.toolName, GUARD_ACKNOWLEDGEMENTS)
+      const envelope = extractGuardAcknowledgements(params, opts.toolName, opts.guards ?? [])
       if (!envelope.ok) return errorResult(`invalid arguments: ${envelope.error}`)
 
       const validated = tool.parameters.safeParse(envelope.pluginArgs)
@@ -374,9 +364,6 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
       }
 
       const mutableArgs = validated.data as Record<string, unknown>
-      if (envelope.acknowledgements !== undefined) {
-        mutableArgs[ACKNOWLEDGE_GUARDS] = envelope.acknowledgements
-      }
       const liveOrigin = opts.getOrigin?.()
       const before: ToolBeforeEvent = {
         tool: opts.toolName,
@@ -388,11 +375,10 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
         ...(tool.fileOperands !== undefined ? { fileOperands: tool.fileOperands } : {}),
       }
-      const blockResult = await opts.hooks.runToolBefore(before)
+      const blockResult = await opts.hooks.runToolBefore(before, opts.guards, envelope.acknowledgements)
       if (blockResult !== undefined) {
         return errorResult(`blocked: ${blockResult.reason}`)
       }
-      stripGuardAcknowledgements(mutableArgs)
 
       const loopGate = gateLoopGuard(
         opts.sessionId,
@@ -475,43 +461,41 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(tool.name, tool.parameters, GUARD_ACKNOWLEDGEMENTS),
+    parameters: withGuardAcknowledgements(tool.name, tool.parameters, opts.guards ?? []),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const mutableArgs = params as Record<string, unknown>
+      const envelope = extractGuardAcknowledgements(params, tool.name, opts.guards ?? [])
+      if (!envelope.ok) throw new Error(`invalid arguments: ${envelope.error}`)
+      const mutableArgs = envelope.pluginArgs as Record<string, unknown>
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
       const liveOrigin = opts.getOrigin?.()
       const preflightFileOperands = opts.resolvePreflightFileOperands?.(tool.name, mutableArgs)
-      const blockResult = await opts.hooks.runToolBefore({
-        tool: tool.name,
-        sessionId: opts.sessionId,
-        callId: toolCallId,
-        args: mutableArgs,
-        toolProvenance: 'first-party',
-        ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
-        ...(preflightFileOperands !== undefined ? { fileOperands: preflightFileOperands } : {}),
-      })
+      const blockResult = await opts.hooks.runToolBefore(
+        {
+          tool: tool.name,
+          sessionId: opts.sessionId,
+          callId: toolCallId,
+          args: mutableArgs,
+          toolProvenance: 'first-party',
+          ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+          ...(preflightFileOperands !== undefined ? { fileOperands: preflightFileOperands } : {}),
+        },
+        opts.guards,
+        envelope.acknowledgements,
+      )
       if (blockResult !== undefined) {
         throw new Error(`blocked: ${blockResult.reason}`)
       }
+      const gitControlResult = await checkGitControlWriteGuard({
+        tool: tool.name,
+        args: mutableArgs,
+        agentDir: opts.agentDir,
+      })
+      if (gitControlResult !== undefined) throw new Error(`blocked: ${gitControlResult.reason}`)
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
         throw new Error(loopGate.message)
       }
-      const guardResult = await runFinalWriteGuards({
-        tool: tool.name,
-        args: mutableArgs,
-        agentDir: opts.agentDir,
-      })
-      if (guardResult !== undefined) {
-        throw new Error(`blocked: ${guardResult.reason}`)
-      }
-      const readGuardResult = runFinalReadGuards({ tool: tool.name, args: mutableArgs })
-      if (readGuardResult !== undefined) {
-        throw new Error(`blocked: ${readGuardResult.reason}`)
-      }
-      stripGuardAcknowledgements(mutableArgs)
-
       // `preflightFileOperands` is deliberately NOT forwarded: this boundary's
       // canonical credential denial must stay unconditional, so a target-declared
       // nonFile operand can never exempt `secrets.json`/`.env`/`~/.ssh` from it.
@@ -582,9 +566,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
 ): ToolDefinition<TParams, TDetails, TState> {
   return piDefineTool({
     ...tool,
-    parameters: withGuardAcknowledgements(tool.name, tool.parameters, GUARD_ACKNOWLEDGEMENTS),
+    parameters: withGuardAcknowledgements(tool.name, tool.parameters, opts.guards ?? []),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const mutableArgs = params as Record<string, unknown>
+      const envelope = extractGuardAcknowledgements(params, tool.name, opts.guards ?? [])
+      if (!envelope.ok) throw new Error(`invalid arguments: ${envelope.error}`)
+      const mutableArgs = envelope.pluginArgs as Record<string, unknown>
       const originalBashCommand =
         tool.name === 'bash' && typeof mutableArgs.command === 'string' ? mutableArgs.command : undefined
       normalizeDefaultTreeRoot(tool.name, mutableArgs)
@@ -594,17 +580,27 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
-      const blockResult = await opts.hooks.runToolBefore({
-        tool: tool.name,
-        sessionId: opts.sessionId,
-        callId: toolCallId,
-        args: mutableArgs,
-        toolProvenance: 'first-party',
-        ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
-      })
+      const blockResult = await opts.hooks.runToolBefore(
+        {
+          tool: tool.name,
+          sessionId: opts.sessionId,
+          callId: toolCallId,
+          args: mutableArgs,
+          toolProvenance: 'first-party',
+          ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+        },
+        opts.guards,
+        envelope.acknowledgements,
+      )
       if (blockResult !== undefined) {
         throw new Error(`blocked: ${blockResult.reason}`)
       }
+      const gitControlResult = await checkGitControlWriteGuard({
+        tool: tool.name,
+        args: mutableArgs,
+        agentDir: opts.agentDir,
+      })
+      if (gitControlResult !== undefined) throw new Error(`blocked: ${gitControlResult.reason}`)
       // Extract and delete before the loop guard serializes args and before
       // the bash tool destructures them, so the overlay never reaches logs,
       // loop-detection state, or pi's execute.
@@ -619,20 +615,6 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
         throw new Error(loopGate.message)
       }
-      const guardResult = await runFinalWriteGuards({
-        tool: tool.name,
-        args: mutableArgs,
-        agentDir: opts.agentDir,
-      })
-      if (guardResult !== undefined) {
-        throw new Error(`blocked: ${guardResult.reason}`)
-      }
-      const readGuardResult = runFinalReadGuards({ tool: tool.name, args: mutableArgs })
-      if (readGuardResult !== undefined) {
-        throw new Error(`blocked: ${readGuardResult.reason}`)
-      }
-      stripGuardAcknowledgements(mutableArgs)
-
       // Per-subagent capability fence: runs BEFORE the role-derived sandbox so
       // a read-only subagent's bash stays read-only even for a trusted/owner
       // caller whose sandbox otherwise preserves full agent-root writes. Throws
@@ -1448,15 +1430,6 @@ function errorResult(message: string) {
   }
 }
 
-async function runFinalWriteGuards(options: { tool: string; args: Record<string, unknown>; agentDir: string }) {
-  return (
-    (await checkGitControlWriteGuard(options)) ??
-    (await checkManagedConfigGuard(options)) ??
-    (await checkSkillAuthoringGuard(options)) ??
-    checkNonWorkspaceWriteGuard(options)
-  )
-}
-
 async function checkGitControlWriteGuard(options: {
   tool: string
   args: Record<string, unknown>
@@ -1472,17 +1445,13 @@ async function checkGitControlWriteGuard(options: {
   }
 }
 
-function runFinalReadGuards(options: { tool: string; args: Record<string, unknown> }) {
-  return checkImageReadRedirect(options)
-}
-
 function withGuardAcknowledgements<TParams extends TSchema>(
   toolName: string,
   parameters: TParams,
-  registry: ReadonlyMap<string, ReadonlySet<string>>,
+  guards: readonly InternalGuard[],
 ): TParams {
-  const allowedKeys = registry.get(toolName)
-  if (allowedKeys === undefined || allowedKeys.size === 0) return parameters
+  const matching = guards.filter((guard) => guard.tools.has(toolName))
+  if (matching.length === 0) return parameters
 
   const schema = parameters as Record<string, unknown>
   const properties = schema.properties
@@ -1492,7 +1461,15 @@ function withGuardAcknowledgements<TParams extends TSchema>(
   }
 
   const acknowledgementProperties: Record<string, TSchema> = {}
-  for (const key of allowedKeys) acknowledgementProperties[key] = Type.Optional(Type.Boolean())
+  for (const guard of matching) {
+    const plugin = acknowledgementProperties[guard.owner] as { properties?: Record<string, TSchema> } | undefined
+    acknowledgementProperties[guard.owner] = Type.Optional(
+      Type.Object(
+        { ...plugin?.properties, [guard.key]: Type.Optional(Type.Boolean()) },
+        { additionalProperties: false },
+      ),
+    )
+  }
 
   return {
     ...schema,
@@ -1506,13 +1483,19 @@ function withGuardAcknowledgements<TParams extends TSchema>(
 function extractGuardAcknowledgements(
   params: unknown,
   toolName: string,
-  registry: ReadonlyMap<string, ReadonlySet<string>>,
-): { ok: true; pluginArgs: unknown; acknowledgements?: Record<string, boolean> } | { ok: false; error: string } {
+  guards: readonly InternalGuard[],
+):
+  | {
+      ok: true
+      pluginArgs: unknown
+      acknowledgements?: Record<string, Record<string, boolean>>
+    }
+  | { ok: false; error: string } {
   if (params === null || typeof params !== 'object' || Array.isArray(params)) {
     return { ok: true, pluginArgs: params }
   }
 
-  const pluginArgs = { ...(params as Record<string, unknown>) }
+  const pluginArgs = params as Record<string, unknown>
   if (!Object.hasOwn(pluginArgs, ACKNOWLEDGE_GUARDS)) return { ok: true, pluginArgs }
 
   const rawAcknowledgements = pluginArgs[ACKNOWLEDGE_GUARDS]
@@ -1521,21 +1504,35 @@ function extractGuardAcknowledgements(
     return { ok: false, error: `${ACKNOWLEDGE_GUARDS} must be an object` }
   }
 
-  const allowedKeys = registry.get(toolName)
-  const acknowledgements: Record<string, boolean> = {}
-  for (const [key, value] of Object.entries(rawAcknowledgements as Record<string, unknown>)) {
-    if (allowedKeys?.has(key) !== true) {
-      return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${key} is not allowed for tool "${toolName}"` }
+  const acknowledgements: Record<string, Record<string, boolean>> = {}
+  for (const [pluginName, rawPluginAcknowledgements] of Object.entries(
+    rawAcknowledgements as Record<string, unknown>,
+  )) {
+    if (
+      rawPluginAcknowledgements === null ||
+      typeof rawPluginAcknowledgements !== 'object' ||
+      Array.isArray(rawPluginAcknowledgements)
+    ) {
+      return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${pluginName} must be an object` }
     }
-    if (typeof value !== 'boolean') {
-      return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${key} must be a boolean` }
+    const pluginAcknowledgements: Record<string, boolean> = {}
+    for (const [key, value] of Object.entries(rawPluginAcknowledgements as Record<string, unknown>)) {
+      const allowed = guards.some(
+        (guard) => guard.owner === pluginName && guard.key === key && guard.tools.has(toolName),
+      )
+      if (!allowed) {
+        return {
+          ok: false,
+          error: `${ACKNOWLEDGE_GUARDS}.${pluginName}.${key} is not allowed for tool "${toolName}"`,
+        }
+      }
+      if (typeof value !== 'boolean') {
+        return { ok: false, error: `${ACKNOWLEDGE_GUARDS}.${pluginName}.${key} must be a boolean` }
+      }
+      pluginAcknowledgements[key] = value
     }
-    acknowledgements[key] = value
+    acknowledgements[pluginName] = pluginAcknowledgements
   }
 
   return { ok: true, pluginArgs, acknowledgements }
-}
-
-function stripGuardAcknowledgements(args: Record<string, unknown>): void {
-  delete args[ACKNOWLEDGE_GUARDS]
 }

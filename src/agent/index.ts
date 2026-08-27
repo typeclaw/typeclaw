@@ -34,6 +34,7 @@ import type {
   Tool as PluginTool,
 } from '@/plugin'
 import { createHookBus, materializeSkills } from '@/plugin'
+import { CORE_SYSTEM_TOOL_NAMES } from '@/plugin/core-tool-names'
 import type { ReloadRegistry } from '@/reload'
 import { resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
@@ -42,6 +43,8 @@ import { applyAdaptiveThinkingCompat } from './adaptive-thinking-compat'
 import { getAuthFor } from './auth'
 import { createCompactionSettingsManager } from './compaction'
 import { renderGitNudge } from './git-nudge'
+import type { InternalGuard } from './guard-types'
+import { buildInternalGuards } from './guards'
 import type { LiveSubagentRegistry } from './live-subagents'
 import { sanitizeMessagesForLlmReplay } from './llm-replay-sanitizer'
 import { applyModelRuntimeOverrides } from './model-overrides'
@@ -316,6 +319,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   const getAbort: () => ((reason?: string) => void) | undefined = () => abortHolder.abort
   let loopGuardTurnId = 0
   const getLoopGuardTurn = () => loopGuardTurnId
+  const guards = buildInternalGuards(options.plugins?.agentDir ?? process.cwd())
 
   // Subagent built-in tool refs resolve to `ToolDefinition`s (see
   // plugin-tools.ts). Their NAMES narrow the session via `tools:`; their wrapped
@@ -406,9 +410,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
             }),
           ]
         : [
-            webSearchTool,
-            webFetchTool,
-            createLookAtTool(options.permissions),
+            ...buildCoreSystemTools(options.permissions),
             ...(options.mcpManager
               ? buildMcpDispatcherToolDefinitions(options.mcpManager, {
                   permissions: options.permissions,
@@ -468,6 +470,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     agentDir: options.plugins?.agentDir ?? process.cwd(),
     sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
     hooks: options.plugins?.hooks ?? createHookBus(),
+    guards,
     getOrigin,
     getAbort,
     getLoopGuardTurn,
@@ -478,6 +481,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     agentDir: options.plugins?.agentDir ?? process.cwd(),
     sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
     hooks: options.plugins?.hooks ?? createHookBus(),
+    guards,
     getOrigin,
     getAbort,
     getLoopGuardTurn,
@@ -924,6 +928,19 @@ export function buildTodoTools(
   return createTodoTools({ agentDir, getOrigin })
 }
 
+function buildCoreSystemTools(permissions: PermissionService | undefined): ToolDefinition[] {
+  const definitions = [webSearchTool, webFetchTool, createLookAtTool(permissions)]
+  const byName = new Map(definitions.map((tool) => [tool.name, tool]))
+  if (byName.size !== definitions.length || byName.size !== CORE_SYSTEM_TOOL_NAMES.length) {
+    throw new Error('core system tool catalog does not match its registered definitions')
+  }
+  return CORE_SYSTEM_TOOL_NAMES.map((name) => {
+    const tool = byName.get(name)
+    if (tool === undefined) throw new Error(`core system tool "${name}" has no registered definition`)
+    return tool
+  })
+}
+
 function wrapRegistryTools(
   plugins: PluginSessionWiring | undefined,
   getOrigin: () => SessionOrigin | undefined,
@@ -940,6 +957,7 @@ function wrapRegistryTools(
       sessionId: plugins.sessionId,
       logger: t.logger,
       hooks: plugins.hooks,
+      guards: buildInternalGuards(plugins.agentDir),
       getOrigin,
       getAbort,
       getLoopGuardTurn,
@@ -954,6 +972,7 @@ export function wrapSystemTools(
     agentDir: string
     sessionId: string
     hooks: HookBus
+    guards?: readonly InternalGuard[]
     getOrigin: () => SessionOrigin | undefined
     getAbort: () => ((reason?: string) => void) | undefined
     getLoopGuardTurn?: () => number | undefined
@@ -971,6 +990,7 @@ export function wrapSystemTools(
       agentDir: options.agentDir,
       sessionId: options.sessionId,
       hooks: options.hooks,
+      guards: options.guards,
       getOrigin: options.getOrigin,
       getAbort: options.getAbort,
       getLoopGuardTurn: options.getLoopGuardTurn,
@@ -997,6 +1017,7 @@ export function wrapSubagentCustomTools(
       sessionId: plugins.sessionId,
       logger,
       hooks: plugins.hooks,
+      guards: buildInternalGuards(plugins.agentDir),
       getOrigin,
       getAbort,
       getLoopGuardTurn,

@@ -54,7 +54,7 @@ describe('non-workspace-write guard policy', () => {
       origin: { kind: 'tui', sessionId: 's1' },
     })
 
-    expect(result?.block).toBe(true)
+    expect(result?.kind).toBe('acknowledgement-required')
   })
 
   test('still blocks a /tmp-rooted agent dir from writing its own memory/ via the /tmp allowance', async () => {
@@ -71,7 +71,7 @@ describe('non-workspace-write guard policy', () => {
     })
 
     expect(result).toEqual({
-      block: true,
+      kind: 'acknowledgement-required',
       reason: expect.stringContaining('nonWorkspaceWrite'),
     })
   })
@@ -87,7 +87,7 @@ describe('non-workspace-write guard policy', () => {
     })
 
     expect(result).toEqual({
-      block: true,
+      kind: 'acknowledgement-required',
       reason: expect.stringContaining('nonWorkspaceWrite'),
     })
   })

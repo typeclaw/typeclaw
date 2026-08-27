@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 
-import { ACKNOWLEDGE_GUARDS } from '../guard/policy'
 import {
   GUARD_GLOBAL_INSTALL,
   GUARD_NON_BUN_PACKAGE_MANAGER,
   GUARD_NON_BUN_PACKAGE_RUNNER,
   checkBunHygieneGuard,
+  checkGlobalInstallGuard,
+  checkNonBunPackageManagerGuard,
+  checkNonBunPackageRunnerGuard,
 } from './policy'
 
 function bash(command: string, extra: Record<string, unknown> = {}) {
@@ -29,7 +31,7 @@ describe('checkBunHygieneGuard — global installs', () => {
     'env FOO=bar npm install -g typescript',
   ])('blocks %p', (command) => {
     const result = bash(command)
-    expect(result?.block).toBe(true)
+    expect(result?.kind).toBe('acknowledgement-required')
     expect(result?.reason).toContain(GUARD_GLOBAL_INSTALL)
   })
 
@@ -39,11 +41,8 @@ describe('checkBunHygieneGuard — global installs', () => {
     expect(result?.reason).toContain('bunx')
   })
 
-  test('acknowledging globalInstall lets it through', () => {
-    const result = bash('npm install -g typescript', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
-    })
-    expect(result).toBeUndefined()
+  test('reports globalInstall without reading acknowledgement arguments', () => {
+    expect(bash('npm install -g typescript')?.kind).toBe('acknowledgement-required')
   })
 })
 
@@ -58,7 +57,7 @@ describe('checkBunHygieneGuard — non-bun package managers', () => {
     'echo done; npm run build',
   ])('blocks %p', (command) => {
     const result = bash(command)
-    expect(result?.block).toBe(true)
+    expect(result?.kind).toBe('acknowledgement-required')
     expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
   })
 
@@ -66,26 +65,22 @@ describe('checkBunHygieneGuard — non-bun package managers', () => {
     'blocks non-bun runner %p',
     (command) => {
       const result = bash(command)
-      expect(result?.block).toBe(true)
+      expect(result?.kind).toBe('acknowledgement-required')
       expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
     },
   )
 
-  test('acknowledging nonBunPackageManager lets it through', () => {
-    const result = bash('npm install', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_NON_BUN_PACKAGE_MANAGER]: true },
-    })
-    expect(result).toBeUndefined()
+  test('reports nonBunPackageManager without reading acknowledgement arguments', () => {
+    expect(bash('npm install')?.kind).toBe('acknowledgement-required')
   })
 
   // A global install is the more specific violation: acknowledging it must not
   // also require acknowledging nonBunPackageManager for the same command.
   test('global install takes precedence over the non-bun guard', () => {
     expect(bash('npm install -g typescript')?.reason).toContain(GUARD_GLOBAL_INSTALL)
-    const acknowledged = bash('npm install -g typescript', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
-    })
-    expect(acknowledged).toBeUndefined()
+    expect(
+      checkNonBunPackageManagerGuard({ tool: 'bash', args: { command: 'npm install -g typescript' } }),
+    ).toBeUndefined()
   })
 
   // The global-install verdict subsumes the manager verdict only within its own
@@ -95,33 +90,29 @@ describe('checkBunHygieneGuard — non-bun package managers', () => {
   test('acknowledging a compound command global install still surfaces its runner violation', () => {
     expect(bash('bun add -g foo && npx tsc')?.reason).toContain(GUARD_GLOBAL_INSTALL)
 
-    const globalAcknowledged = bash('bun add -g foo && npx tsc', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
-    })
-    expect(globalAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
-
-    const bothAcknowledged = bash('bun add -g foo && npx tsc', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true, [GUARD_NON_BUN_PACKAGE_RUNNER]: true },
-    })
-    expect(bothAcknowledged).toBeUndefined()
+    expect(checkGlobalInstallGuard({ tool: 'bash', args: { command: 'bun add -g foo && npx tsc' } })?.reason).toContain(
+      GUARD_GLOBAL_INSTALL,
+    )
+    expect(
+      checkNonBunPackageRunnerGuard({ tool: 'bash', args: { command: 'bun add -g foo && npx tsc' } })?.reason,
+    ).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
   })
 
   // Same scoping rule for a manager in a different segment: the global install
   // clears its own segment, not the separate `pnpm install`.
   test('acknowledging a global install still surfaces a manager violation elsewhere', () => {
-    const globalAcknowledged = bash('npm install -g typescript && pnpm install', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_GLOBAL_INSTALL]: true },
-    })
-    expect(globalAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
+    expect(
+      checkNonBunPackageManagerGuard({ tool: 'bash', args: { command: 'npm install -g typescript && pnpm install' } })
+        ?.reason,
+    ).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
   })
 
   test('non-bun manager takes precedence over a non-bun runner', () => {
     expect(bash('npm install && npx tsc')?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
 
-    const managerAcknowledged = bash('npm install && npx tsc', {
-      [ACKNOWLEDGE_GUARDS]: { [GUARD_NON_BUN_PACKAGE_MANAGER]: true },
-    })
-    expect(managerAcknowledged?.reason).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
+    expect(
+      checkNonBunPackageRunnerGuard({ tool: 'bash', args: { command: 'npm install && npx tsc' } })?.reason,
+    ).toContain(GUARD_NON_BUN_PACKAGE_RUNNER)
   })
 })
 
@@ -132,15 +123,11 @@ describe('checkBunHygieneGuard — non-bun package runners', () => {
     expect(result?.reason).toContain('Bun-native equivalent')
     expect(result?.reason).toContain('absent from the default image')
     expect(result?.reason).toContain('`bunx <pkg>`')
-    expect(result?.reason).toContain(`${ACKNOWLEDGE_GUARDS}.${GUARD_NON_BUN_PACKAGE_RUNNER}: true`)
+    expect(result?.reason).toContain(`acknowledgeGuards.bun-hygiene.${GUARD_NON_BUN_PACKAGE_RUNNER}: true`)
   })
 
-  test('acknowledging nonBunPackageRunner lets it through', () => {
-    expect(
-      bash('npx tsc', {
-        [ACKNOWLEDGE_GUARDS]: { [GUARD_NON_BUN_PACKAGE_RUNNER]: true },
-      }),
-    ).toBeUndefined()
+  test('reports nonBunPackageRunner without reading acknowledgement arguments', () => {
+    expect(bash('npx tsc')?.kind).toBe('acknowledgement-required')
   })
 
   test.each(['\\npx tsc', '"npx" tsc', 'FOO=bar npx tsc', 'sudo npx tsc'])('blocks obfuscated runner %p', (command) => {
@@ -155,7 +142,7 @@ describe('checkBunHygieneGuard — escaped/quoted evasion', () => {
     'blocks obfuscated non-bun manager %p',
     (command) => {
       const result = bash(command)
-      expect(result?.block).toBe(true)
+      expect(result?.kind).toBe('acknowledgement-required')
       expect(result?.reason).toContain(GUARD_NON_BUN_PACKAGE_MANAGER)
     },
   )
@@ -167,7 +154,7 @@ describe('checkBunHygieneGuard — escaped/quoted evasion', () => {
     "'pnpm' add --global typescript",
   ])('blocks obfuscated global install %p', (command) => {
     const result = bash(command)
-    expect(result?.block).toBe(true)
+    expect(result?.kind).toBe('acknowledgement-required')
     expect(result?.reason).toContain(GUARD_GLOBAL_INSTALL)
   })
 })
@@ -184,7 +171,7 @@ describe('checkBunHygieneGuard — option placement in global installs', () => {
     'pnpm add --reporter silent -g foo',
   ])('attributes %p to globalInstall', (command) => {
     const result = bash(command)
-    expect(result?.block).toBe(true)
+    expect(result?.kind).toBe('acknowledgement-required')
     expect(result?.reason).toContain(GUARD_GLOBAL_INSTALL)
   })
 })

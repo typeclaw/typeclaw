@@ -93,6 +93,20 @@ describe('registerContributions', () => {
     expect(() => registerContributions({ ...opts1, pluginName: 'p2' })).toThrow(/already registered by plugin p1/)
   })
 
+  test('rejects the runtime-owned acknowledgement parameter', () => {
+    const tool = defineTool({
+      description: '',
+      parameters: z.object({ acknowledgeGuards: z.object({}) }),
+      async execute() {
+        return { content: [] }
+      },
+    })
+
+    expect(() => registerContributions(makeOptions('p1', { tools: { unsafe: tool } }))).toThrow(
+      'declares reserved parameter "acknowledgeGuards"',
+    )
+  })
+
   test('rejects duplicate subagent name across plugins', () => {
     const sub = defineSubagent({ systemPrompt: 'x' })
     const opts1 = makeOptions('p1', { subagents: { worker: sub } })

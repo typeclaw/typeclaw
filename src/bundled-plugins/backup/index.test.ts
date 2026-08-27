@@ -208,11 +208,12 @@ describe('backup plugin', () => {
     expect(spawnCalls.length).toBe(1)
   })
 
-  test('diagnose subagent prompt instructs the model to ack gitExfil on its push retry (regression for PR #255 audience-leak policy)', async () => {
+  test('diagnose subagent prompt forbids acknowledgement bypasses on its push retry', async () => {
     const { DIAGNOSE_FAILURE_SYSTEM_PROMPT } = await import('./subagents')
-    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('acknowledgeGuards')
-    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('gitExfil')
-    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toMatch(/only the one push retry|only.*one.*retry/i)
+    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('permission-only')
+    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('do not add an acknowledgement argument')
+    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toContain('inherits the operator role')
+    expect(DIAGNOSE_FAILURE_SYSTEM_PROMPT).toMatch(/push retry fails again.*stop/i)
   })
 })
 
