@@ -1,29 +1,11 @@
 import { definePlugin } from '@/plugin'
 
-import {
-  checkManagedConfigGuard,
-  checkMemoryTopicsDeleteGuard,
-  checkNonWorkspaceWriteGuard,
-  checkSkillAuthoringGuard,
-  checkUncommittedChangesAdvice,
-} from './policy'
+import { checkMemoryTopicsDeleteGuard, checkUncommittedChangesAdvice } from './policy'
 
 export default definePlugin({
   plugin: async () => ({
     hooks: {
       'tool.before': async (event, ctx) => {
-        const managedConfigResult = await checkManagedConfigGuard({
-          tool: event.tool,
-          args: event.args,
-          agentDir: ctx.agentDir,
-        })
-        if (managedConfigResult) return managedConfigResult
-        const skillResult = await checkSkillAuthoringGuard({
-          tool: event.tool,
-          args: event.args,
-          agentDir: ctx.agentDir,
-        })
-        if (skillResult) return skillResult
         const memoryTopicsDeleteResult = checkMemoryTopicsDeleteGuard({
           tool: event.tool,
           args: event.args,
@@ -31,12 +13,7 @@ export default definePlugin({
           origin: event.origin,
         })
         if (memoryTopicsDeleteResult) return memoryTopicsDeleteResult
-        return checkNonWorkspaceWriteGuard({
-          tool: event.tool,
-          args: event.args,
-          agentDir: ctx.agentDir,
-          origin: event.origin,
-        })
+        return undefined
       },
       'tool.after': async (event, ctx) => {
         await checkUncommittedChangesAdvice({

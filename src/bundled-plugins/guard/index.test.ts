@@ -3,7 +3,9 @@ import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { buildInternalGuards } from '@/agent/guards'
 import { noopPermissionService } from '@/permissions'
+import { createHookBus } from '@/plugin'
 import type { ContentPart, HookContext, PluginContext, ToolAfterEvent, ToolBeforeEvent, ToolResult } from '@/plugin'
 
 import guardPlugin from './index'
@@ -19,7 +21,7 @@ describe('guard plugin', () => {
       toolEvent('write', {
         path: 'notes.md',
         content: '{}',
-        acknowledgeGuards: { nonWorkspaceWrite: true },
+        acknowledgeGuards: { guard: { nonWorkspaceWrite: true } },
       }),
       hookContext('/agent'),
     )
@@ -27,7 +29,7 @@ describe('guard plugin', () => {
     expect(blocked).toEqual({
       block: true,
       reason: expect.stringMatching(
-        /Guard `nonWorkspaceWrite` blocked write outside the workspace: (?:[A-Z]:)?[\\/]agent[\\/]notes\.md\. The free-write zone is (?:[A-Z]:)?[\\/]agent[\\/]workspace\. Retry with `acknowledgeGuards\.nonWorkspaceWrite: true` only if this write is intentional\./,
+        /Guard `nonWorkspaceWrite` blocked write outside the workspace: (?:[A-Z]:)?[\\/]agent[\\/]notes\.md\. The free-write zone is (?:[A-Z]:)?[\\/]agent[\\/]workspace\. Retry with `acknowledgeGuards\.guard\.nonWorkspaceWrite: true` only if this write is intentional\./,
       ),
     })
     expect(acknowledged).toBeUndefined()
@@ -91,7 +93,7 @@ describe('guard plugin', () => {
       toolEvent('write', {
         path: 'package.json',
         content: '{}',
-        acknowledgeGuards: { nonWorkspaceWrite: true },
+        acknowledgeGuards: { guard: { nonWorkspaceWrite: true } },
       }),
       hookContext('/agent'),
     )
@@ -428,13 +430,16 @@ async function runGit(cwd: string, args: string[]): Promise<void> {
   }
 }
 
-async function toolBeforeHook(): Promise<
-  NonNullable<NonNullable<Awaited<ReturnType<typeof guardPlugin.plugin>>['hooks']>['tool.before']>
-> {
-  const exports = await guardPlugin.plugin(pluginContext('/agent'))
-  const hook = exports.hooks?.['tool.before']
-  if (!hook) throw new Error('guard plugin did not register tool.before')
-  return hook
+async function toolBeforeHook() {
+  return async (event: ToolBeforeEvent, ctx: HookContext) => {
+    const exports = await guardPlugin.plugin(pluginContext(ctx.agentDir))
+    const hooks = createHookBus()
+    hooks.registerAll('guard', ctx.agentDir, ctx.logger, exports.hooks ?? {})
+    const args = { ...event.args }
+    const acknowledgements = args.acknowledgeGuards as Record<string, Record<string, boolean>> | undefined
+    delete args.acknowledgeGuards
+    return hooks.runToolBefore({ ...event, args }, buildInternalGuards(ctx.agentDir), acknowledgements)
+  }
 }
 
 function toolEvent(tool: string, args: Record<string, unknown>, origin?: ToolBeforeEvent['origin']): ToolBeforeEvent {
