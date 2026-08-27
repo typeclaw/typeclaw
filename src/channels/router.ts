@@ -3852,12 +3852,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const drain = (live: LiveSession): Promise<void> => {
     if (live.draining || live.destroyed) return Promise.resolve()
     const running = runDrain(live)
-    // Rejection is swallowed on the tracked copy only: settlement waiters must
-    // not re-surface a failure the starting caller already owns. `running` is
-    // what callers get back, so their rejection semantics are unchanged.
+    // Attaching this handler marks `running` handled, so a drain-tail throw can
+    // no longer reach the runtime's unhandled-rejection reporter — every
+    // production call site is `void drain(live)` and catches nothing. Log it
+    // here so the failure stays visible rather than disappearing into the
+    // tracking. The settlement copy must still RESOLVE: `settleDrains` waits on
+    // unrelated turns too, and one failed drain must not reject a waiter that
+    // has nothing to do with it. Callers keep `running`, so an awaiting caller
+    // still sees the original rejection.
     const settled = running.then(
       () => undefined,
-      () => undefined,
+      (err: unknown) => {
+        logger.error(`[channels] ${live.keyId}: drain failed: ${describeError(err)}`)
+      },
     )
     live.activeDrains.add(settled)
     void settled.then(() => live.activeDrains.delete(settled))
@@ -6912,7 +6919,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
       pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
       flushDebounce: async (key: ChannelKey) => {
-        const live = liveSessions.get(channelKeyId(key))
+        const keyId = channelKeyId(key)
+        let live = liveSessions.get(keyId)
         if (!live) return
         if (live.debounceTimer) {
           clearTimeout(live.debounceTimer)
@@ -6926,9 +6934,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // would still be mid-turn when this returned, and the caller would assert
         // on a prompt that has not landed. Same defect shape as the `persist()`
         // race below: this seam has to mean "settled", not "started".
-        await settleDrains(live)
-        await drain(live)
-        await settleDrains(live)
+        //
+        // Re-resolved by key each round because settling is not a property of one
+        // object: a deferred reload teardown drops this session mid-drain and
+        // `handOffToSuccessor` replays the carried work onto a REPLACEMENT live
+        // session with its own `activeDrains`. Watching only the session captured
+        // at entry would return with the successor's prompt still in flight.
+        for (;;) {
+          await settleDrains(live)
+          await drain(live)
+          await settleDrains(live)
+          const current = liveSessions.get(keyId)
+          if (current === undefined || current === live) break
+          live = current
+        }
         // Settle the fire-and-forget `void persist()` from scheduleDebouncedDrain
         // (the lastInboundAt write). Draining alone doesn't await that promise, so
         // a test reading sessions.json right after would race the disk write — the
