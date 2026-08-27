@@ -89,6 +89,14 @@ This closes the laundering attack: a `guest` who asks the agent to schedule a cr
 7. **Plugin `ctx.spawnSubagent`**: hook callers pass `{ parentSessionId, spawnedByOrigin: event.origin }`. The runtime resolves `spawnedByRole` from the origin via PermissionService — callers can't forge a role.
 8. **Channel router (`channel.respond` gate)**: every inbound is gated BEFORE `ensureLive`. Denial logs `[channels] <key>: denied by permissions (channel.respond) author=<id> id=<msg>` and returns. The `channels.<adapter>.allow[]` field is no longer supported — it is silently ignored on parse and NOT translated to `roles.member.match[]`. Define `roles.member.match[]` directly.
 
+## Internal acknowledgement guards
+
+The five acknowledgement guards are runtime-owned policy, not plugin API. `src/agent/guards.ts` holds their single internal table of `{ owner, key, tools, check }`; plugin factories cannot add guards. Both tool-schema generation and runtime enforcement consume that table, and boot-time construction rejects duplicate or malformed keys and targets absent from the shared core-tool catalog.
+
+The model-facing acknowledgement envelope remains plugin-nested for stable attribution: `acknowledgeGuards: { "bun-hygiene": { nonBunPackageManager: true } }`. The runtime removes the entire envelope before constructing the check event, so checks receive only clean tool arguments and cannot inspect acknowledgements. It then interprets results centrally: `block` is unconditional, while `acknowledgement-required` proceeds only when the exact `(owner, key)` tuple is `true`.
+
+Internal owner markers share the `tool.before` registration sequence. Each owner's guards run immediately before that bundled plugin's own hook, preserving precedence (`security` hook → `guard` checks/hook → `bun-hygiene` checks → `github-cli-auth` hook). Security guards remain ordinary, non-acknowledgeable `tool.before` checks.
+
 ## Rules of thumb
 
 - **Plugins declare `permissions: [...]` on `definePlugin(...)`, not on `PluginExports`.** Read before the factory runs; owner-wildcard expansion is deterministic.

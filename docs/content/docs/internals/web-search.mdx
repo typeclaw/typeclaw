@@ -47,7 +47,7 @@ there is no model-triggered reload path. It is applied again to every manual red
 hostname does not skip DNS resolution or socket pinning, and mixed answer sets
 still fail when any blocked answer is outside the exception. Cloud metadata
 hostnames and known metadata IPs are checked first and cannot be overridden by
-host entries, CIDRs, `acknowledgeGuards.ssrf`, or role-level guard bypasses. The
+host entries, CIDRs, or role-level guard bypasses. The
 same floor recognizes metadata IPv4 carried by standardized compatible, mapped,
 translatable, well-known NAT64, and 6to4 IPv6 forms. It blocks the full RFC 8215
 local-use `64:ff9b:1::/48` range because the technology-agnostic standard does not
