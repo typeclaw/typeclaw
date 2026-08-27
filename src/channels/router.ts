@@ -230,12 +230,7 @@ export function disengageReactionEmojiFor(adapter: AdapterId): string {
   return DISENGAGE_REACTION_EMOJI_OVERRIDES[adapter] ?? DISENGAGE_REACTION_EMOJI
 }
 
-type SilentAckReason =
-  | 'skip_response'
-  | 'no_reply'
-  | 'skip_response_text_leak'
-  | 'github_review_output'
-  | 'awaiting_background_child'
+type SilentAckReason = 'github_review_output' | 'awaiting_background_child'
 
 // Wake nudge pushed into a resumed channel session at boot so drain() has a
 // non-empty batch and fires a turn. The substantive instruction the model acts
@@ -929,14 +924,13 @@ type LiveSession = {
   // `currentTurnReactionRef` points at — last item of the drained batch) was
   // EXPLICITLY addressed to the bot: a DM, an @-mention/alias (`isBotMention`
   // folds plain-name matching in at the adapter classify layer), or a reply to
-  // the bot's own message. Gates the PERSISTENT silent-ack :eyes: (see
-  // `armSilentTurnAck`): a deliberate silence on a message aimed AT us earns a
-  // courteous "seen, nothing to add" 👀, but staying quiet during ambient
-  // human-to-human chatter (sticky observation, solo-human fallback) must leave
-  // NO mark — otherwise a busy room accumulates stale 👀 on messages the bot
-  // was never part of. Computed from the SAME message the reaction targets so
-  // eligibility and target can never disagree. Reset with `currentTurnReactionRef`
-  // in the drain finally; preserved across reminder-only iterations exactly like it.
+  // the bot's own message. Gates the PERSISTENT :eyes: for deferred background
+  // work (see `armSilentTurnAck`): an addressed request may retain a progress
+  // marker while a child runs, but ambient human-to-human chatter must leave no
+  // mark. Explicit NO_REPLY and skip_response turns never use this flag to add a
+  // reaction. Computed from the SAME message the reaction targets so eligibility
+  // and target cannot disagree. Reset with `currentTurnReactionRef` in the drain
+  // finally; preserved across reminder-only iterations exactly like it.
   currentTurnExplicitlyAddressed: boolean
   // Typing-status anchor of the inbound that triggered THIS turn (last item in
   // the drained batch, mirroring `currentTurnReactionRef`). Adapter-opaque ts
@@ -962,16 +956,12 @@ type LiveSession = {
   // discarded on silence (skip_response / empty / errored turns) so the bot never
   // leaves a reaction on a message it merely looked at (e.g. cron lookaround).
   pendingTurnReactions: ReactionRequest[]
-  // Armed by `validateChannelTurn` on a DELIBERATE silent turn (skip_response or
-  // an explicit NO_REPLY), stamped with `turnSeq` so a stale flag from a crashed
-  // turn cannot leak into the next one. Read in drain's per-turn finally — AFTER
-  // the transient engage :eyes: is dropped — to leave a PERSISTENT :eyes: on the
-  // triggering message: "I saw this and intentionally chose not to reply." Null
-  // on every non-deliberate outcome (a real reply, a model malfunction, a
-  // plumbing leak, a retry, a synthetic turn). Firing after the engage-drop is
-  // load-bearing: adapters that collapse a same-actor same-emoji reaction into
-  // one toggle would otherwise have the engage-drop remove the only visible
-  // :eyes:. See `reactOnSilentAck`.
+  // Armed when output landed outside the channel (a GitHub review) or was
+  // deliberately deferred to a background child. Explicit NO_REPLY and
+  // skip_response turns do not arm it: opting out must leave no reaction behind.
+  // Stamped with `turnSeq` so a stale flag from a crashed turn cannot leak into
+  // the next one. Fired after the transient engage :eyes: is dropped because
+  // adapters may collapse a same-actor same-emoji reaction into one toggle.
   silentAckTurn: { turnSeq: number; reason: SilentAckReason } | null
   // One silent-ack-:eyes:-add promise per PERSISTENT ack `reactOnSilentAck` has
   // planted on a trigger message, each resolving to its removable ref (or null).
@@ -980,16 +970,15 @@ type LiveSession = {
   // sees every in-flight add and awaits it before removing — storing only the
   // resolved ref raced (cleanup could snapshot an empty array, then a slow add
   // append its ref afterward, stranding the :eyes:). Cross-turn state on purpose:
-  // a silent turn means "seen, not replying FOR NOW", and once the same sticky
-  // conversation gets a genuine reply those marks read as stale/contradictory —
-  // so they are retired on the next replied turn (see dropSilentAckReactions).
+  // the mark means output is external or deferred, and once the same sticky
+  // conversation gets a genuine reply it reads as stale — so it is retired on
+  // the next replied turn (see dropSilentAckReactions).
   // Conversation-scoped, NOT per-trigger-message: coalescing means the silent
   // turn's trigger (message N) and the eventual reply's trigger (message N+1)
   // routinely differ, so exact-message scoping would strand the mark. NOT reset
   // in drain's outer per-turn finally. On teardown the entries are dropped
-  // WITHOUT removing the reactions: a session that ends without ever replying
-  // legitimately keeps its "seen, not replying" ack, unlike the transient
-  // engage :eyes: which teardown must strip.
+  // WITHOUT removing the reactions, unlike the transient engage :eyes: which
+  // teardown must strip.
   activeSilentAckReactions: Array<Promise<ReactionRef | null>>
   // One add promise per willingness status posted by the agent, resolving to
   // the removable reaction-instance ref. Cross-turn state on purpose: the
@@ -3749,15 +3738,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // (observe-after-engage). Leaving it only on the reply path stranded the
           // ack permanently on messages the agent looked at but never answered.
           const dropDone = dropEngageReactions(live, engageAddPromises)
-          // A DELIBERATE silent turn (skip_response / NO_REPLY) leaves a
-          // PERSISTENT :eyes: acking "seen, intentionally not replying". On a
-          // typing-less adapter it reuses the same message/emoji/actor as the
-          // transient engage :eyes:, and adapters that collapse that into one
-          // toggle would let a still-in-flight engage removal strip the ack — so
-          // the silent path AWAITS every engage removal reaching the adapter
-          // before adding the persistent one. Only silent turns pay that wait:
-          // normal/reply turns keep the engage drop fire-and-forget (`void`), so
-          // turn-end never blocks on the reaction API off the silent path.
+          // A turn whose output landed outside the channel or was deferred to a
+          // background child leaves a persistent :eyes:. On a typing-less adapter
+          // it reuses the transient engage reaction's message/emoji/actor, so wait
+          // for that removal to reach the adapter before adding the persistent one.
           if (live.silentAckTurn?.turnSeq === live.turnSeq) await dropDone
           else void dropDone
           reactOnSilentAck(live)
@@ -5232,6 +5216,45 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.pendingSystemReminders.push(retryReminder(WILLINGNESS_NUDGE))
   }
 
+  const armRetainedOutputAckIfEligible = (
+    live: LiveSession,
+    successfulSendsBeforePrompt: number,
+    explicitlySkipped: boolean,
+  ): boolean => {
+    // A formal GitHub review is user-facing output delivered outside the channel.
+    // Preserve its acknowledgement even when the model closes the turn through
+    // skip_response after publishing the review.
+    if (
+      live.githubReviewOutputTurn === live.turnSeq &&
+      live.successfulChannelSends === successfulSendsBeforePrompt &&
+      live.currentTurnAuthorId !== null
+    ) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=github_review_output_this_turn`)
+      armSilentTurnAck(live, 'github_review_output')
+      return true
+    }
+
+    // An active child means delivery is deferred rather than dropped. Normally a
+    // completed prose leaf still goes through reply recovery, but skip_response is
+    // authoritative: its prose is intentionally discarded, while the progress
+    // acknowledgement must remain until the child reports back.
+    const awaitLeaf = recoverableAssistantText(live.session)
+    const awaitLeafIsUnfinishedToolUse = awaitLeaf?.source === 'mid-turn' || awaitLeaf?.source === 'pre-tool'
+    if (
+      live.currentTurnAuthorId !== null &&
+      (explicitlySkipped ||
+        awaitLeaf === null ||
+        awaitLeafIsUnfinishedToolUse ||
+        endsWithNoReplySignal(awaitLeaf.text)) &&
+      isAwaitingBackgroundChild(live, 'empty_turn_recovery')
+    ) {
+      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
+      armSilentTurnAck(live, 'awaiting_background_child')
+      return true
+    }
+    return false
+  }
+
   const validateChannelTurn = async (live: LiveSession, successfulSendsBeforePrompt: number): Promise<void> => {
     // `skip_response` short-circuit. Honoring it bypasses recovery entirely.
     // Stale-flag protection: only honor when stamped on the just-completed
@@ -5249,8 +5272,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.skippedTurn !== null && live.skippedTurn.turnSeq === live.turnSeq && !skipContested) {
       const { reason } = live.skippedTurn
       live.skippedTurn = null
+      armRetainedOutputAckIfEligible(live, successfulSendsBeforePrompt, true)
       logger.info(`[channels] ${live.keyId} skipped_by_tool reason=${JSON.stringify(reason)}`)
-      armSilentTurnAck(live, 'skip_response')
       void dropContinuationReactions(live)
       return
     }
@@ -5264,52 +5287,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.stagedFallbackCause = { cause, sendCountAtStage: live.successfulChannelSends }
     }
 
-    // A formal GitHub review already landed this logical turn (APPROVE /
-    // REQUEST_CHANGES / COMMENT, stamped via noteGithubReviewOutput). That review IS
-    // the turn's user-facing output — it just went through the GitHub review API, not
-    // channel_reply/channel_send, so `successfulChannelSends` never moved. An empty
-    // completion afterward is the agent legitimately having nothing more to say, NOT
-    // a dead turn: skip the empty-turn retries AND the "I got stuck" fallback and
-    // treat it as silent completion. Gated on no channel send this turn so a turn
-    // that ALSO replied in-channel still runs the normal reply-recovery below.
-    if (
-      live.githubReviewOutputTurn === live.turnSeq &&
-      live.successfulChannelSends === successfulSendsBeforePrompt &&
-      live.currentTurnAuthorId !== null
-    ) {
-      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=github_review_output_this_turn`)
-      armSilentTurnAck(live, 'github_review_output')
-      return
-    }
-
-    // A background child spawned by this session is still running, and the turn
-    // produced no user-facing output. That is `spawn_subagent`'s contract being
-    // honored ("you will receive a system-reminder when it completes"), not the
-    // empty-completion degeneration every branch below exists to repair — so the
-    // recovery ladder must not manufacture the status prose the model
-    // deliberately withheld. Each nudge re-enters with the child STILL running,
-    // so the budgets stack (MAX_EMPTY_TURN_RETRIES + MAX_WILLINGNESS_NUDGES) into
-    // several "still working…" messages for one request; on GitHub, where a
-    // channel reply IS a public PR comment, that shipped as duplicate review
-    // acknowledgements. The completion reminder re-wakes this session with the
-    // real result, so silence here is delivery deferred, not delivery dropped.
-    // Bounded by the same stuck-child backstop as GC/rollover: a wedged child
-    // stops pinning and the normal ladder resumes. A completed `stop` leaf
-    // carrying real text is deliberately NOT covered — recovering an answer the
-    // model already wrote is still correct while a child runs. Unfinished
-    // toolUse narration is covered because it is no longer publishable as an
-    // answer on any path.
     const awaitLeaf = recoverableAssistantText(live.session)
-    const awaitLeafIsUnfinishedToolUse = awaitLeaf?.source === 'mid-turn' || awaitLeaf?.source === 'pre-tool'
-    if (
-      live.currentTurnAuthorId !== null &&
-      (awaitLeaf === null || awaitLeafIsUnfinishedToolUse || endsWithNoReplySignal(awaitLeaf.text)) &&
-      isAwaitingBackgroundChild(live, 'empty_turn_recovery')
-    ) {
-      logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
-      armSilentTurnAck(live, 'awaiting_background_child')
-      return
-    }
+    if (armRetainedOutputAckIfEligible(live, successfulSendsBeforePrompt, false)) return
 
     // Suppress a leaked tool call (never post the plumbing) and, while budget
     // remains, push a self-correction reminder so the same logical turn
@@ -5691,7 +5670,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
       logger.info(`[channels] ${live.keyId} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
-      armSilentTurnAck(live, 'no_reply')
       void dropContinuationReactions(live)
       return
     }
@@ -5737,7 +5715,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.warn(
         `[channels] ${live.keyId}: suppressed plain_text_tool_call_leak (silent) text_len=${assistantText.length}`,
       )
-      armSilentTurnAck(live, 'skip_response_text_leak')
       return
     }
     if (plainTextToolCallKind === 'suppress-warn') {
@@ -6687,11 +6664,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const armSilentTurnAck = (live: LiveSession, reason: SilentAckReason): void => {
-    // A GitHub review IS its own emoji-shaped output, so it always earns the
-    // 👀; every other deliberate silence earns one ONLY when the triggering
-    // message was addressed to the bot. Staying quiet in ambient chatter leaves
-    // no mark, so a busy room never accumulates stale 👀 on messages the bot
-    // was never part of.
+    // A GitHub review is user-facing output, so it always earns the 👀; deferred
+    // background work earns one only when the triggering message addressed the
+    // bot. Ambient chatter stays unmarked.
     const eligible =
       reason === 'github_review_output' ? live.key.adapter === 'github' : live.currentTurnExplicitlyAddressed
     if (!eligible) return
@@ -6731,8 +6706,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // Retire every persistent silent-ack :eyes: outstanding in this live session
-  // once the agent posts a genuine reply — the "seen, not replying" mark is now
-  // contradicted. Snapshot-and-clear the promise array BEFORE awaiting, so a
+  // once the agent posts a genuine reply. Snapshot-and-clear the promise array
+  // BEFORE awaiting, so a
   // concurrent later silent turn appending a fresh add is never swept by this
   // in-flight cleanup. Each entry is AWAITED to its resolved ref before removal,
   // so an add still in flight when the reply lands is still retired. Failures are

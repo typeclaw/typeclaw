@@ -3142,11 +3142,10 @@ describe('disengageReactionEmojiFor', () => {
   })
 })
 
-describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
+describe('ChannelRouter reaction cleanup on deliberate silence', () => {
   const REACTION_REF: ReactionRef = { adapter: 'discord-bot', value: 'msg-ref' }
 
-  // discord-bot is typing-capable, so route() adds no eager engage :eyes: — every
-  // captured reaction is the silent-ack, keeping these assertions unambiguous.
+  // discord-bot is typing-capable, so route() adds no eager engage :eyes:.
   const setupSilentTurn = async (
     dir: string,
   ): Promise<{
@@ -3166,7 +3165,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     return { router, sessions, captured }
   }
 
-  test('skip_response leaves an :eyes: on the triggering message', async () => {
+  test('skip_response leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3175,11 +3174,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ adapter: 'discord-bot', chat: 'c1', emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('an explicit NO_REPLY leaves an :eyes: on the triggering message', async () => {
+  test('an explicit NO_REPLY leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3187,11 +3185,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('(NO_REPLY) with parens leaves an :eyes:', async () => {
+  test('(NO_REPLY) with parens leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3199,11 +3196,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('a plain-text skip_response(...) leak leaves an :eyes: (deliberate silence)', async () => {
+  test('a plain-text skip_response(...) leak leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
     sessions[0]!.onPrompt = () => {
@@ -3211,8 +3207,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
   test('does not react when the silent turn carries no triggering reactionRef', async () => {
@@ -3276,13 +3271,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('on a typing-less adapter, the silent-ack :eyes: is added AFTER the transient engage :eyes: is removed', async () => {
-    // given a typing-less adapter (engage :eyes: IS added on route, then removed
-    // at turn end) whose engage add resolves to a removable instance ref. Both
-    // the engage add and the silent-ack add target the SAME triggering message /
-    // emoji, so the guard is the ORDER: the final event must be the silent-ack
-    // add, never a removal. Pre-fix (fire-and-forget drop) the order raced to
-    // add,add,remove — the trailing remove would strip the ack on toggle adapters.
+  test('on a typing-less adapter, NO_REPLY removes the transient engage :eyes:', async () => {
     const dir = await tempDir()
     const engageInstanceRef: ReactionRef = { adapter: 'discord-bot', value: 'engage-instance' }
     const events: string[] = []
@@ -3303,8 +3292,8 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => events.length === 3)
-    expect(events).toEqual(['add-eyes', 'remove-eyes', 'add-eyes'])
+    await waitFor(() => events.length === 2)
+    expect(events).toEqual(['add-eyes', 'remove-eyes'])
   })
 
   test('an ambient (unaddressed) NO_REPLY leaves NO :eyes:', async () => {
@@ -3351,7 +3340,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('a DM NO_REPLY still leaves an :eyes: (explicitly addressed)', async () => {
+  test('a DM NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await (async () => {
       const { router, sessions } = makeRouter(dir)
@@ -3370,11 +3359,10 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
-  test('a reply-to-bot NO_REPLY still leaves an :eyes: (explicitly addressed)', async () => {
+  test('a reply-to-bot NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -3391,8 +3379,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: REACTION_REF })
+    expect(captured).toHaveLength(0)
   })
 
   const ADDRESSED_REF: ReactionRef = { adapter: 'discord-bot', value: 'addressed-msg' }
@@ -3425,9 +3412,7 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     expect(called).toBe(false)
   })
 
-  test('ambient then addressed coalesced: the :eyes: lands on the final addressed message', async () => {
-    // given an ambient message and a later addressed one coalescing into ONE turn.
-    // batch[last] is the addressed tail, so the ack must fire AND target its ref.
+  test('ambient then addressed coalesced: NO_REPLY leaves no :eyes:', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -3446,181 +3431,193 @@ describe('ChannelRouter silent-ack :eyes: on deliberate silence', () => {
     }
     await router.__testing!.flushDebounce(KEY)
 
-    // then the ack fires on the final addressed message's ref, not the ambient one
-    await waitFor(() => captured.length > 0)
-    expect(captured[0]).toMatchObject({ emoji: 'eyes', reactionRef: ADDRESSED_REF })
+    expect(captured).toHaveLength(0)
   })
 })
 
-describe('ChannelRouter retires the persistent silent-ack :eyes: on a later reply', () => {
-  const REF_A: ReactionRef = { adapter: 'discord-bot', value: 'msg-a' }
-  const REF_B: ReactionRef = { adapter: 'discord-bot', value: 'msg-b' }
-  const SILENT_ACK_INSTANCE: ReactionRef = { adapter: 'discord-bot', value: 'silent-ack-instance' }
-
-  // discord-bot is typing-capable, so route() adds no eager engage :eyes: — every
-  // add is the silent-ack, and the add resolves to a removable instance ref so a
-  // later reply can retire it. Removals are captured to assert cleanup.
-  const setup = (
-    dir: string,
-  ): {
-    router: ReturnType<typeof makeRouter>['router']
-    sessions: ReturnType<typeof makeRouter>['sessions']
-    added: ReactionRequest[]
-    removed: ReactionRef[]
-  } => {
+describe('ChannelRouter persistent output acknowledgements', () => {
+  test('keeps a GitHub review acknowledgement until a later channel reply', async () => {
+    const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.setTypingCapability('discord-bot', true)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const triggerRef: ReactionRef = { adapter: 'github', value: 'review-request' }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
     const added: ReactionRequest[] = []
     const removed: ReactionRef[] = []
-    router.registerReaction('discord-bot', async (req) => {
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async (req) => {
       added.push(req)
-      return { ok: true, reactionRef: SILENT_ACK_INSTANCE }
+      return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('github', async (req) => {
       removed.push(req.reactionRef)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
-    return { router, sessions, added, removed }
-  }
+    router.registerOutbound('github', async () => ({ ok: true }))
 
-  test('a silent turn plants an :eyes: that a later reply removes', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given a first turn that deliberately stays silent
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.some((r) => r.emoji === 'eyes'))
-
-    // when a later turn in the same conversation replies for real
-    sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'here you go' })
-      sessions[0]!.setAssistantText('here you go')
+    await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'review already published' })
+      sessions[0]!.setAssistantText('')
     }
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
+    await router.__testing!.flushDebounce(key)
 
-    // then the stale silent-ack :eyes: is retired
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
-  })
+    await waitFor(() => added.length === 1)
+    expect(added[0]).toMatchObject({ emoji: 'eyes', reactionRef: triggerRef })
 
-  test('a reply retires ALL outstanding silent-ack :eyes: in the conversation', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given two separate silent turns, each planting its own :eyes:
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 1)
-
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 2)
-
-    // when a third turn finally replies
     sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'done' })
-      sessions[0]!.setAssistantText('done')
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
     }
-    await router.route(inbound({ externalMessageId: 'm3', reactionRef: REF_A }))
-    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ ...key, externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(key)
 
-    // then both silent-ack markers are removed, not just the latest
-    await waitFor(() => removed.length === 2)
-    expect(removed).toEqual([SILENT_ACK_INSTANCE, SILENT_ACK_INSTANCE])
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([acknowledgementRef])
   })
 
-  test('a later silent turn does NOT remove the earlier silent-ack :eyes:', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 1)
-
-    // when a second turn is ALSO silent
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.filter((r) => r.emoji === 'eyes').length === 2)
-
-    // then nothing is removed — silence never contradicts a prior "seen" ack
-    expect(removed).toHaveLength(0)
-  })
-
-  test('a Korean silent turn then a reply retires the :eyes: (language-agnostic)', async () => {
-    const dir = await tempDir()
-    const { router, sessions, added, removed } = setup(dir)
-
-    // given a Korean inbound the agent silently acks
-    await router.route(inbound({ text: '확인만 해주세요', reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
-    await waitFor(() => added.some((r) => r.emoji === 'eyes'))
-
-    // when a later Korean turn replies
-    sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '네, 처리했어요' })
-      sessions[0]!.setAssistantText('네, 처리했어요')
-    }
-    await router.route(inbound({ externalMessageId: 'm2', text: '고마워요', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
-
-    // then the marker is retired regardless of message language
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
-  })
-
-  test('a reply removes the :eyes: even when the silent-ack add resolves AFTER cleanup starts', async () => {
-    // Regression for the race: reactOnSilentAck stores the add PROMISE (not its
-    // resolved ref), so a reply that runs cleanup before a slow add resolves
-    // still awaits it and removes the mark. Here the add is held open until the
-    // reply turn has already drained, forcing cleanup to see an unresolved entry.
+  test('adds a persistent acknowledgement after removing a typing-less engage reaction', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
-    router.setTypingCapability('discord-bot', true)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const triggerRef: ReactionRef = { adapter: 'github', value: 'review-request' }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
+    const events: string[] = []
+    router.registerReaction('github', async (req) => {
+      events.push(`add-${req.emoji}`)
+      return { ok: true, reactionRef: acknowledgementRef }
+    })
+    router.registerRemoveReaction('github', async () => {
+      events.push('remove-eyes')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ ...key, isBotMention: true, reactionRef: triggerRef }))
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => events.length === 3)
+    expect(events).toEqual(['add-eyes', 'remove-eyes', 'add-eyes'])
+  })
+
+  test('removes a slow persistent acknowledgement when a later reply races its add', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const acknowledgementRef: ReactionRef = { adapter: 'github', value: 'review-ack' }
     const removed: ReactionRef[] = []
-    let releaseSilentAckAdd: (() => void) | null = null
-    const silentAckAddGate = new Promise<void>((resolve) => {
-      releaseSilentAckAdd = resolve
+    let releaseAdd: (() => void) | null = null
+    const addGate = new Promise<void>((resolve) => {
+      releaseAdd = resolve
     })
     let addCount = 0
-    router.registerReaction('discord-bot', async () => {
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async () => {
       addCount++
-      await silentAckAddGate
-      return { ok: true, reactionRef: SILENT_ACK_INSTANCE }
+      await addGate
+      return { ok: true, reactionRef: acknowledgementRef }
     })
-    router.registerRemoveReaction('discord-bot', async (req) => {
+    router.registerRemoveReaction('github', async (req) => {
       removed.push(req.reactionRef)
       return { ok: true }
     })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerOutbound('github', async () => ({ ok: true }))
 
-    // given a silent turn whose :eyes: add is still in flight (gated)
-    await router.route(inbound({ reactionRef: REF_A }))
-    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
-    await router.__testing!.flushDebounce(KEY)
+    await router.route(
+      inbound({ ...key, isBotMention: true, reactionRef: { adapter: 'github', value: 'review-request' } }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.noteGithubReviewOutput({
+        sessionId: 'ses_fake_1',
+        workspace: 'acme/repo',
+        prNumber: 672,
+        state: 'APPROVE',
+      })
+      sessions[0]!.setAssistantText('')
+    }
+    await router.__testing!.flushDebounce(key)
     await waitFor(() => addCount === 1)
 
-    // when a later turn replies while the add is STILL unresolved
     sessions[0]!.onPrompt = async () => {
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'done' })
-      sessions[0]!.setAssistantText('done')
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
     }
-    await router.route(inbound({ externalMessageId: 'm2', reactionRef: REF_B }))
-    await router.__testing!.flushDebounce(KEY)
-    // let the gated add resolve only now — after cleanup has already begun
-    releaseSilentAckAdd!()
+    await router.route(inbound({ ...key, externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(key)
+    releaseAdd!()
 
-    // then cleanup still awaits the add and retires the mark (no strand)
-    await waitFor(() => removed.length > 0)
-    expect(removed).toContainEqual(SILENT_ACK_INSTANCE)
+    await waitFor(() => removed.length === 1)
+    expect(removed).toEqual([acknowledgementRef])
+  })
+
+  test('a later reply removes all outstanding persistent acknowledgements', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const acknowledgementRefs: ReactionRef[] = [
+      { adapter: 'github', value: 'review-ack-1' },
+      { adapter: 'github', value: 'review-ack-2' },
+    ]
+    const removed: ReactionRef[] = []
+    let addCount = 0
+    router.setTypingCapability('github', true)
+    router.registerReaction('github', async () => {
+      const reactionRef = acknowledgementRefs[addCount]
+      if (!reactionRef) throw new Error('unexpected persistent acknowledgement')
+      addCount++
+      return { ok: true, reactionRef }
+    })
+    router.registerRemoveReaction('github', async (req) => {
+      removed.push(req.reactionRef)
+      return { ok: true }
+    })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    for (let index = 0; index < 2; index++) {
+      await router.route(
+        inbound({
+          ...key,
+          externalMessageId: `m${index + 1}`,
+          isBotMention: true,
+          reactionRef: { adapter: 'github', value: `review-request-${index + 1}` },
+        }),
+      )
+      sessions[0]!.onPrompt = () => {
+        router.noteGithubReviewOutput({
+          sessionId: 'ses_fake_1',
+          workspace: 'acme/repo',
+          prNumber: 672,
+          state: 'APPROVE',
+        })
+        sessions[0]!.setAssistantText('')
+      }
+      await router.__testing!.flushDebounce(key)
+      await waitFor(() => addCount === index + 1)
+    }
+
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ ...key, text: 'Review complete.' })
+      sessions[0]!.setAssistantText('Review complete.')
+    }
+    await router.route(inbound({ ...key, externalMessageId: 'm3' }))
+    await router.__testing!.flushDebounce(key)
+
+    await waitFor(() => removed.length === 2)
+    expect(removed).toEqual(acknowledgementRefs)
   })
 })
 
@@ -3661,8 +3658,7 @@ describe('ChannelRouter model react only when replying', () => {
 
   test('drops a queued channel_react reaction when the turn stays silent', async () => {
     // given a typing-capable adapter (no eager engage :eyes:) whose model queues
-    // a reaction but sends no reply. The queued reaction uses a DISTINCT emoji so
-    // it is separable from the silent-ack :eyes: a NO_REPLY turn now leaves.
+    // a reaction but sends no reply.
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
     router.setTypingCapability('discord-bot', true)
@@ -17712,15 +17708,25 @@ describe('ChannelRouter background-child await suppression', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
+    const reactions: ReactionRequest[] = []
     const { router, sessions } = makeRouter(dir, { logs, newestRunningChildSubagentStartedAt: runningChild })
+    router.setTypingCapability('discord-bot', true)
+    router.registerReaction('discord-bot', async (req) => {
+      reactions.push(req)
+      return { ok: true }
+    })
     router.registerOutbound('discord-bot', async (msg) => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
 
     // given: the model does tool work (spawning a background child), then ends the turn empty
-    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
-    sessions[0]!.onPrompt = () => strandOnUnansweredToolUse(sessions[0]!, 'background-child')
+    const reactionRef: ReactionRef = { adapter: 'discord-bot', value: 'review-request' }
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘', reactionRef }))
+    sessions[0]!.onPrompt = () => {
+      strandOnUnansweredToolUse(sessions[0]!, 'background-child')
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for background child' })
+    }
     await router.__testing!.flushDebounce(KEY)
 
     // then: the recovery ladder does not manufacture a status message
@@ -17729,6 +17735,8 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(logs.some((m) => m.includes('empty_turn_retry'))).toBe(false)
     expect(logs.some((m) => m.includes('empty_turn_fallback'))).toBe(false)
     expect(logs.some((m) => m.includes('empty_turn_suppressed cause=awaiting_background_child'))).toBe(true)
+    await waitFor(() => reactions.length === 1)
+    expect(reactions[0]).toMatchObject({ emoji: 'eyes', reactionRef })
   })
 
   test('a more_work_this_turn ack is not re-nudged into a second status post while the child runs', async () => {
