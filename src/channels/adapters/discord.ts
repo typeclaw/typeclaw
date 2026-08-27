@@ -36,7 +36,12 @@ import type { DiscordAccountRecord } from '@/secrets/schema'
 import { describeError } from '../describe-error'
 import { createDiscordAuthorResolver } from './discord-author-resolver'
 import { createDiscordChannelResolver } from './discord-channel-resolver'
-import { classifyInbound, type InboundDropReason } from './discord-classify'
+import {
+  classifyInbound,
+  type DiscordAttachmentCarrier,
+  type InboundDropReason,
+  splitDiscordAttachments,
+} from './discord-classify'
 import { createDiscordUserEditMessageCallback } from './discord-edit'
 import { createDiscordReactionCallback, createDiscordRemoveReactionCallback } from './discord-reactions'
 
@@ -437,23 +442,30 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   }
 }
 
-// WORKAROUND: the SDK's `DiscordMessage` type omits `author.bot`, but the REST
-// API returns it and the client passes the body through unchanged, so it's
-// present at runtime. `=== true` fails closed to human if absent. This flag
-// feeds history-derived membership (deriveMembershipFromHistory), which
-// otherwise miscounts peer bots as humans and inflates effectiveHumans.
-type RawDiscordMessage = DiscordMessage & { author: { bot?: boolean } }
+// WORKAROUND: the SDK's `DiscordMessage` type omits `author.bot` and
+// `attachments`, but the REST API returns both and the client passes the body
+// through unchanged, so they are present at runtime. `=== true` fails closed to
+// human if absent. That flag feeds history-derived membership
+// (deriveMembershipFromHistory), which otherwise miscounts peer bots as humans
+// and inflates effectiveHumans.
+type RawDiscordMessage = DiscordMessage & DiscordAttachmentCarrier & { author: { bot?: boolean } }
 
 function mapDiscordHistoryMessage(msg: DiscordMessage): ChannelHistoryMessage {
   const raw = msg as RawDiscordMessage
+  // The REST history fetch bypasses the inbound classifier, so attachments on
+  // already-posted messages must be mapped here too — otherwise they are
+  // silently dropped and look_at_channel_attachment can never resolve them,
+  // even though its error text tells the agent channel_history is the fix.
+  const { text, attachments } = splitDiscordAttachments(msg.content, raw)
   return {
     externalMessageId: msg.id,
     authorId: msg.author.id,
     authorName: msg.author.username,
-    text: msg.content,
+    text,
     ts: parseDiscordTimestamp(msg.timestamp),
     isBot: raw.author.bot === true,
     replyToBotMessageId: null,
+    ...(attachments.length > 0 ? { attachments } : {}),
   }
 }
 

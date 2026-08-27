@@ -7,7 +7,7 @@ import { channelsSchema } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { DiscordAccountRecord } from '@/secrets/schema'
 
-import { createDiscordAdapter, type DiscordAdapterLogger } from './discord'
+import { createDiscordAdapter, createDiscordHistoryCallback, type DiscordAdapterLogger } from './discord'
 
 const config = channelsSchema.parse({ discord: {} }).discord!
 
@@ -447,6 +447,98 @@ describe('createDiscordAdapter', () => {
     expect(listener.stopped).toBe(true)
     expect(r.unregistered).toContain('outbound:discord')
     expect(r.unregistered).toContain('remove-reaction:discord')
+  })
+})
+
+describe('createDiscordHistoryCallback', () => {
+  function historyMessage(overrides: Record<string, unknown> = {}) {
+    return {
+      id: '400000000000000004',
+      channel_id: '300000000000000003',
+      author: { id: '500000000000000005', username: 'alice' },
+      content: 'hello',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    }
+  }
+
+  async function fetchHistory(messages: unknown[]) {
+    const callback = createDiscordHistoryCallback({
+      client: { getMessages: async () => messages } as unknown as Parameters<
+        typeof createDiscordHistoryCallback
+      >[0]['client'],
+      logger: logger(),
+    })
+    return await callback({ chat: '300000000000000003', thread: null, limit: 10 })
+  }
+
+  test('a captionless image in history is addressable and carries its CDN ref', async () => {
+    const result = await fetchHistory([
+      historyMessage({
+        content: '',
+        attachments: [
+          {
+            id: '1',
+            filename: 'image.png',
+            size: 1024,
+            url: 'https://cdn.discordapp.com/attachments/1/2/image.png',
+            content_type: 'image/webp',
+          },
+        ],
+      }),
+    ])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const [message] = result.messages
+    expect(message?.text).toBe('[Discord attachment #1: file image/webp name=image.png]')
+    expect(message?.attachments).toEqual([
+      {
+        id: 1,
+        kind: 'file',
+        ref: 'https://cdn.discordapp.com/attachments/1/2/image.png',
+        filename: 'image.png',
+        mimetype: 'image/webp',
+      },
+    ])
+  })
+
+  test('placeholder ids line up one-to-one with the structured refs', async () => {
+    const result = await fetchHistory([
+      historyMessage({
+        content: 'two files',
+        attachments: [
+          { id: '1', filename: 'a.png', size: 1, url: 'https://cdn.discordapp.com/attachments/1/2/a.png' },
+          {
+            id: '2',
+            filename: 'b.pdf',
+            size: 1,
+            url: 'https://cdn.discordapp.com/attachments/1/3/b.pdf',
+            content_type: 'application/pdf',
+          },
+        ],
+      }),
+    ])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    const message = result.messages[0]
+    expect(message?.text).toBe(
+      'two files\n[Discord attachment #1: file name=a.png]\n[Discord attachment #2: file application/pdf name=b.pdf]',
+    )
+    expect(message?.attachments?.map((a) => [a.id, a.ref])).toEqual([
+      [1, 'https://cdn.discordapp.com/attachments/1/2/a.png'],
+      [2, 'https://cdn.discordapp.com/attachments/1/3/b.pdf'],
+    ])
+  })
+
+  test('text-only history messages are untouched and carry no attachments key', async () => {
+    const result = await fetchHistory([historyMessage()])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.messages[0]?.text).toBe('hello')
+    expect(result.messages[0]?.attachments).toBeUndefined()
   })
 })
 
