@@ -80,6 +80,23 @@ describe('discord-bot recovery store', () => {
     expect(store.listReplayCursors()).toEqual([])
     expect(store.disconnectedAt()).toBeNull()
   })
+
+  test('merges fresh channel cursors into retained replay anchors on a later disconnect', async () => {
+    const store = await loadDiscordBotRecoveryStore(agentDir)
+    await store.markProcessed({ channelId: 'channel-1', workspace: 'guild-1', messageId: '101', processedAt: 1 })
+    await store.markProcessed({ channelId: 'channel-2', workspace: 'guild-1', messageId: '102', processedAt: 2 })
+    await store.markDisconnected(3)
+    await store.completeReplay('channel-2')
+    await store.markProcessed({ channelId: 'channel-2', workspace: 'guild-1', messageId: '103', processedAt: 4 })
+
+    await store.markDisconnected(5)
+
+    expect(store.listReplayCursors()).toEqual([
+      { channelId: 'channel-1', workspace: 'guild-1', messageId: '101', processedAt: 1 },
+      { channelId: 'channel-2', workspace: 'guild-1', messageId: '103', processedAt: 4 },
+    ])
+    expect(store.disconnectedAt()).toBe(3)
+  })
 })
 
 describe('discord-bot bounded backfill', () => {

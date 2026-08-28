@@ -176,11 +176,18 @@ function createRecoveryStore(
     },
     markDisconnected: async (at) => {
       await mutate(() => {
-        if (disconnectedAt !== null) return false
-        disconnectedAt = at
-        replayCursors.clear()
-        for (const [channelId, cursor] of cursors) replayCursors.set(channelId, cursor)
-        return true
+        let changed = false
+        if (disconnectedAt === null) {
+          disconnectedAt = at
+          replayCursors.clear()
+          changed = true
+        }
+        for (const [channelId, cursor] of cursors) {
+          if (replayCursors.has(channelId)) continue
+          replayCursors.set(channelId, cursor)
+          changed = true
+        }
+        return changed
       })
     },
     completeReplay: async (channelId) => {
