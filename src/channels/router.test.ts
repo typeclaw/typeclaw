@@ -420,11 +420,16 @@ function makeRouter(
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
     onSessionCreated?: (session: FakeSession) => void
+    beforeSessionCreation?: (attempt: number) => Promise<void> | void
+    failSessionCreationAt?: readonly number[]
+    handoffRetryRetentionMs?: number
+    handoffRetryItemLimit?: number
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
   const origins: SessionOrigin[] = options.origins ?? []
   const nowRef = options.nowRef ?? { value: 1000 }
+  let creationAttempts = 0
   const router = createChannelRouter({
     agentDir,
     configForAdapter: () => options.config ?? baseConfig,
@@ -445,6 +450,10 @@ function makeRouter(
       : {}),
     ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
     ...(options.recordTurnOutcome !== undefined ? { recordTurnOutcome: options.recordTurnOutcome } : {}),
+    ...(options.handoffRetryRetentionMs !== undefined
+      ? { handoffRetryRetentionMs: options.handoffRetryRetentionMs }
+      : {}),
+    ...(options.handoffRetryItemLimit !== undefined ? { handoffRetryItemLimit: options.handoffRetryItemLimit } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -453,12 +462,17 @@ function makeRouter(
       error: (m) => options.logs?.push(`error:${m}`),
     },
     createSessionForChannel: async ({ origin, originRef, existingSessionId, existingSessionFile }) => {
+      creationAttempts++
       options.factoryCalls?.push({
         ...(existingSessionId !== undefined ? { existingSessionId } : {}),
         ...(existingSessionFile !== undefined ? { existingSessionFile } : {}),
       })
       origins.push(origin)
       options.originRefs?.push(originRef)
+      await options.beforeSessionCreation?.(creationAttempts)
+      if (options.failSessionCreationAt?.includes(creationAttempts)) {
+        throw new Error(`session creation failed at attempt ${creationAttempts}`)
+      }
       const fake = new FakeSession()
       options.onSessionCreated?.(fake)
       sessions.push(fake)
@@ -1165,6 +1179,197 @@ describe('ChannelRouter session lifecycle', () => {
     expect(sessions[0]!.prompts.length).toBe(1)
     expect(sessions[1]!.prompts.some((p) => p.includes('after reload'))).toBe(true)
     expect(router.liveCount()).toBe(1)
+  })
+
+  test('failed reload handoff retains queued inbounds for the next successful session in order', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { factoryCalls, failSessionCreationAt: [2], logs })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
+    await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
+
+    releaseFirstPrompt()
+    await drainPromise
+    expect(factoryCalls).toHaveLength(2)
+    expect(router.liveCount()).toBe(0)
+    expect(
+      logs.some((line) => line.includes('successor recreate after reload failed') && line.includes('retained')),
+    ).toBe(true)
+
+    await router.route(inbound({ externalMessageId: 'm4', text: 'new trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(factoryCalls).toHaveLength(3)
+    expect(sessions).toHaveLength(2)
+    const replayed = sessions[1]!.prompts.join('\n')
+    expect(replayed.indexOf('queued first')).toBeLessThan(replayed.indexOf('queued second'))
+    expect(replayed.indexOf('queued second')).toBeLessThan(replayed.indexOf('new trigger'))
+    expect(replayed.match(/queued first/g)).toHaveLength(1)
+    expect(replayed.match(/queued second/g)).toHaveLength(1)
+  })
+
+  test('a timed-out reload successor cannot replace the retry that replayed its retained work', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    let releaseLateSuccessor: () => void = () => {}
+    const lateSuccessorBlocked = new Promise<void>((resolve) => {
+      releaseLateSuccessor = resolve
+    })
+    let markLateSuccessorEntered: () => void = () => {}
+    const lateSuccessorEntered = new Promise<void>((resolve) => {
+      markLateSuccessorEntered = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      ensureLiveTimeoutMs: 1_000,
+      factoryCalls,
+      beforeSessionCreation: async (attempt) => {
+        if (attempt !== 2) return
+        markLateSuccessorEntered()
+        await lateSuccessorBlocked
+      },
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'retained once' }))
+    releaseFirstPrompt()
+    await lateSuccessorEntered
+    await drainPromise
+
+    await router.route(inbound({ externalMessageId: 'm3', text: 'retry trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.join('\n').match(/retained once/g)).toHaveLength(1)
+
+    releaseLateSuccessor()
+    await waitFor(() => sessions.length === 3 && sessions[2]!.disposed === 1)
+
+    await router.route(inbound({ externalMessageId: 'm4', text: 'still on retry' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(factoryCalls).toHaveLength(3)
+    expect(router.liveCount()).toBe(1)
+    expect(sessions[1]!.prompts.join('\n')).toContain('still on retry')
+    expect(sessions[1]!.prompts.join('\n').match(/retained once/g)).toHaveLength(1)
+  })
+
+  test('successful reload handoff delivers its queued inbound exactly once', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued once' }))
+    releaseFirstPrompt()
+    await drainPromise
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.join('\n').match(/queued once/g)).toHaveLength(1)
+  })
+
+  test('expired reload handoff reports the loss and recovery path to the channel and operator log', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const logs: string[] = []
+    const nowRef = { value: 1000 }
+    const notices: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      factoryCalls,
+      failSessionCreationAt: [2],
+      handoffRetryRetentionMs: 100,
+      logs,
+      nowRef,
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      notices.push(message.text ?? '')
+      return { ok: true }
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'retained until expiry' }))
+    releaseFirstPrompt()
+    await drainPromise
+
+    nowRef.value += 100
+    await router.__testing!.runIdleGc()
+
+    expect(logs.some((line) => line.includes('reload handoff retention policy discarded'))).toBe(true)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!).toContain('could not replay 1 queued item(s)')
+    expect(notices[0]!).toContain("reload({ scope: 'providers' })")
+  })
+
+  test('oversized reload handoff reports the whole rejected batch instead of silently trimming it', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const notices: string[] = []
+    const { router, sessions } = makeRouter(dir, { handoffRetryItemLimit: 1, logs })
+    router.registerOutbound('discord-bot', async (message) => {
+      notices.push(message.text ?? '')
+      return { ok: true }
+    })
+    let releaseFirstPrompt: () => void = () => {}
+    const firstPromptHeld = new Promise<void>((resolve) => {
+      releaseFirstPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm1', text: 'before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await firstPromptHeld
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length > 0)
+    await router.tearDownAllLive()
+    await router.route(inbound({ externalMessageId: 'm2', text: 'queued first' }))
+    await router.route(inbound({ externalMessageId: 'm3', text: 'queued second' }))
+
+    releaseFirstPrompt()
+    await drainPromise
+
+    expect(sessions).toHaveLength(1)
+    expect(router.liveCount()).toBe(0)
+    expect(logs.some((line) => line.includes('per-key item limit 1 exceeded'))).toBe(true)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!).toContain('could not replay 2 queued item(s)')
+    expect(notices[0]!).toContain('per-key item limit 1 exceeded')
   })
 
   test('stop logs teardown abort details when a prompt is in flight', async () => {

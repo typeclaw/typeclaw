@@ -642,6 +642,10 @@ function defaultMeasureTranscriptBytes(path: string): number {
 // instead of awaiting the same dead promise forever.
 export const ENSURE_LIVE_TIMEOUT_MS = 30_000
 
+const RELOAD_HANDOFF_RETENTION_MS = 15 * 60_000
+const MAX_PENDING_RELOAD_HANDOFF_KEYS = 100
+const MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY = 1_000
+
 // Thrown by ensureLive() when a teardown (roles reload or shutdown) raced
 // ahead of an in-flight creation. route() has no special handling — it
 // propagates to the adapter's outer catch, dropping this one inbound. The
@@ -820,6 +824,14 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
 type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup'; githubReviewRoundKey?: string }
+
+type PendingReloadHandoff = {
+  key: ChannelKey
+  inbounds: QueuedInbound[]
+  observed: ObservedInbound[]
+  reminders: PendingSystemReminder[]
+  retainedAt: number
+}
 
 const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
 
@@ -1711,6 +1723,12 @@ export type CreateChannelRouterOptions = {
   // Test seam: override the ensureLive watchdog ceiling so the timeout path
   // is exercisable in <100ms instead of the 30s production default.
   ensureLiveTimeoutMs?: number
+  // Test seam for expiring a failed reload handoff without waiting for the
+  // production retention window.
+  handoffRetryRetentionMs?: number
+  // Test seam for exercising the per-key retry-buffer capacity without
+  // manufacturing a production-sized batch.
+  handoffRetryItemLimit?: number
   // Test seam: per-callback ceiling for channel name resolvers; mirrors the
   // ensureLive seam so timeout paths can be exercised quickly in tests.
   resolveChannelNamesTimeoutMs?: number
@@ -1828,6 +1846,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const now = options.now ?? Date.now
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
+  const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
+  const handoffRetryItemLimit = options.handoffRetryItemLimit ?? MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY
   const resolveChannelNamesTimeoutMs = options.resolveChannelNamesTimeoutMs ?? RESOLVE_CHANNEL_NAMES_TIMEOUT_MS
   const fetchHistoryTimeoutMs = options.fetchHistoryTimeoutMs ?? FETCH_HISTORY_TIMEOUT_MS
   const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS
@@ -1839,6 +1859,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
   const liveSessions = new Map<string, LiveSession>()
   const creating = new Map<string, Promise<LiveSession>>()
+  // Unlike `creating`, this marker survives the watchdog cleanup. A timed-out
+  // attempt can keep running after a retry claims the key, so only the latest
+  // monotonic token may persist, install, or adopt queued handoff work.
+  const latestCreationTokens = new Map<string, number>()
+  // A deferred reload splices post-reload work off the stale session before it
+  // recreates the successor. If that recreation times out, returning from the
+  // handoff used to discard the only copy and produce the production symptom
+  // "the agent stopped responding." Keep one ordered batch per channel key so
+  // the next successful ensureLive adopts it before any newer inbound. Entries
+  // expire and the key count is capped; crossing either bound reports the loss
+  // to both logs and the channel instead of silently trimming user work.
+  const pendingReloadHandoffs = new Map<string, PendingReloadHandoff>()
   // Restart-resume reservations, keyed by channelKeyId. Installed by
   // reserveRestartHandoff BEFORE channel adapters start receiving, so an
   // inbound that races the boot resume coalesces onto the reservation (via the
@@ -2201,6 +2233,95 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return true
   }
 
+  const pendingReloadHandoffItemCount = (pending: PendingReloadHandoff): number =>
+    pending.inbounds.length + pending.observed.length + pending.reminders.length
+
+  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
+    const count = pendingReloadHandoffItemCount(pending)
+    const recovery =
+      "Re-send the affected messages. If provider credentials changed, run reload({ scope: 'providers' }); " +
+      'otherwise check the channel logs and retry after session creation is healthy.'
+    logger.error(
+      `[channels] ${channelKeyId(pending.key)}: reload handoff retention policy discarded ${count} queued item(s): ${reason}. ${recovery}`,
+    )
+    const result = await send(
+      {
+        adapter: pending.key.adapter,
+        workspace: pending.key.workspace,
+        chat: pending.key.chat,
+        thread: pending.key.thread,
+        text: `⚠️ TypeClaw could not replay ${count} queued item(s) after reload: ${reason}. ${recovery}`,
+      },
+      { source: 'system', outputKind: 'meta' },
+    ).catch((err) => {
+      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice threw: ${describeError(err)}`)
+      return null
+    })
+    if (result !== null && !result.ok) {
+      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice failed: ${result.error}`)
+    }
+  }
+
+  const expirePendingReloadHandoffs = async (): Promise<void> => {
+    for (const [keyId, pending] of pendingReloadHandoffs) {
+      const ageMs = now() - pending.retainedAt
+      if (ageMs < handoffRetryRetentionMs) continue
+      pendingReloadHandoffs.delete(keyId)
+      void reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+    }
+  }
+
+  const retainReloadHandoff = (
+    key: ChannelKey,
+    inbounds: QueuedInbound[],
+    observed: ObservedInbound[],
+    reminders: PendingSystemReminder[],
+  ): boolean => {
+    void expirePendingReloadHandoffs()
+    const keyId = channelKeyId(key)
+    const existing = pendingReloadHandoffs.get(keyId)
+    if (existing !== undefined) {
+      const incoming: PendingReloadHandoff = { key, inbounds, observed, reminders, retainedAt: now() }
+      if (pendingReloadHandoffItemCount(existing) + pendingReloadHandoffItemCount(incoming) > handoffRetryItemLimit) {
+        void reportDiscardedReloadHandoff(incoming, `per-key item limit ${handoffRetryItemLimit} would be exceeded`)
+        return false
+      }
+      existing.inbounds.push(...inbounds)
+      existing.observed.push(...observed)
+      existing.reminders.push(...reminders)
+      return true
+    }
+    const pending: PendingReloadHandoff = { key, inbounds, observed, reminders, retainedAt: now() }
+    if (pendingReloadHandoffItemCount(pending) > handoffRetryItemLimit) {
+      void reportDiscardedReloadHandoff(pending, `per-key item limit ${handoffRetryItemLimit} exceeded`)
+      return false
+    }
+    if (pendingReloadHandoffs.size >= MAX_PENDING_RELOAD_HANDOFF_KEYS) {
+      void reportDiscardedReloadHandoff(pending, `key limit ${MAX_PENDING_RELOAD_HANDOFF_KEYS} reached`)
+      return false
+    }
+    pendingReloadHandoffs.set(keyId, pending)
+    return true
+  }
+
+  const adoptPendingReloadHandoff = (live: LiveSession): void => {
+    const pending = pendingReloadHandoffs.get(live.keyId)
+    if (pending === undefined) return
+    const ageMs = now() - pending.retainedAt
+    if (ageMs >= handoffRetryRetentionMs) {
+      pendingReloadHandoffs.delete(live.keyId)
+      void reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+      return
+    }
+    // Delete before enqueueing: once ownership moves to the live queues, a
+    // second ensureLive must not replay the same batch and double-deliver it.
+    pendingReloadHandoffs.delete(live.keyId)
+    live.promptQueue.push(...pending.inbounds)
+    live.contextBuffer.push(...pending.observed)
+    live.pendingSystemReminders.push(...pending.reminders)
+    if ((pending.inbounds.length > 0 || pending.reminders.length > 0) && !live.draining) void drain(live)
+  }
+
   const ensureLive = async (
     key: ChannelKey,
     triggeringMessageId?: string,
@@ -2222,7 +2343,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (existing && !existing.destroyed) {
       // A resume that finds the key already live is a no-op for reopening: the
       // session is up, so just hand it back and let the caller enqueue the wake.
-      if (resumeTarget !== undefined) return existing
+      if (resumeTarget !== undefined) {
+        adoptPendingReloadHandoff(existing)
+        return existing
+      }
       // Rollover decision (soft TTL → cost-aware grace → hard cap) lives in
       // shouldRolloverLive, which also skips draining sessions so a mid-prompt
       // turn is never aborted by a follow-up's idle check (PR #359 incident).
@@ -2252,6 +2376,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
         }
       } else {
+        adoptPendingReloadHandoff(existing)
         return existing
       }
     }
@@ -2260,8 +2385,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (inFlight) return inFlight
 
     const generation = liveGeneration
+    const creationToken = (latestCreationTokens.get(keyId) ?? 0) + 1
+    latestCreationTokens.set(keyId, creationToken)
+    const isLatestCreation = (): boolean => latestCreationTokens.get(keyId) === creationToken
 
-    const promise = (async () => {
+    let promise!: Promise<LiveSession>
+    promise = (async () => {
       await ensureLoaded()
       const record = mappings ? findRecord(mappings, key) : undefined
       let resolvedRecord = record
@@ -2389,6 +2518,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         originRef,
       })
       logger.info(`[channels] ${keyId}: ensureLive session-created sessionId=${created.sessionId}`)
+
+      // A watchdog timeout only releases callers; it cannot cancel the factory.
+      // Check the durable per-key token before this late attempt can overwrite
+      // the retry's mapping. The `creating` entry is intentionally insufficient:
+      // both attempts may have removed their transient entries by now.
+      if (!isLatestCreation()) {
+        await created.dispose()
+        throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+      }
 
       const transcriptPath = created.getTranscriptPath?.()
       const persistedRecord: ChannelSessionRecord = {
@@ -2588,6 +2726,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (isColdStart) {
         // Install before the slow prefetch so a concurrent teardown/shutdown can
         // see and dispose this session during the network fetch.
+        if (!isLatestCreation()) {
+          await tearDownLive(live)
+          throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+        }
         liveSessions.set(keyId, live)
         const adapterConfig = options.configForAdapter(key.adapter)
         // Overlap the disk mapping-write with the network history prefetch —
@@ -2611,6 +2753,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // before installing — a failed persist must fail ensureLive without
         // leaving a warm session behind for later inbounds to reuse.
         await persistPromise
+        if (!isLatestCreation()) {
+          await tearDownLive(live)
+          throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+        }
         liveSessions.set(keyId, live)
       }
 
@@ -2623,6 +2769,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.baseContextBytes = measureTranscriptBytes(transcriptPathForBase)
       }
 
+      if (!isLatestCreation()) {
+        await unwindInstalledLive(keyId, live)
+        throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
+      }
+      adoptPendingReloadHandoff(live)
       logger.info(`[channels] ${keyId}: ensureLive done (${phase})`)
       return live
     })()
@@ -2631,21 +2782,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     try {
       return await raceWithTimeout(promise, ensureLiveTimeoutMs, `[channels] ${keyId} ensureLive`)
     } catch (err) {
-      // The orphaned `promise` may still settle eventually; that's OK because
-      // the only side effect it produces post-timeout is a `liveSessions.set`,
-      // which the next inbound's existence-check short-circuit at the top of
-      // ensureLive will treat as a usable warm session — strictly better than
-      // a permanent silent drop. The caller (route() in this file, ultimately
-      // the adapter's outer catch) sees the timeout error and logs it.
+      // A timed-out creation may still settle, but the durable creation token
+      // discards it if a later creation has claimed ownership of this key.
       logger.error(`[channels] ${keyId}: ensureLive failed: ${describeError(err)}`)
       throw err
     } finally {
-      // Owner-checked delete: only clear the in-flight marker if it still points
-      // at THIS promise. A watchdog timeout can orphan a slow creation whose
-      // `finally` runs while a later inbound has already installed its own
-      // `creating` entry for the same key; an unconditional delete would drop
-      // that newer entry and let a third inbound cold-start a duplicate session
-      // (observed: 3 concurrent sessions approving the same PR).
       if (creating.get(keyId) === promise) creating.delete(keyId)
     }
   }
@@ -3839,9 +3980,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const carriedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
       const carriedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
       const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+      const hasCarriedWork = carriedInbounds.length > 0 || carriedObserved.length > 0 || carriedReminders.length > 0
+      const retained =
+        hasCarriedWork && retainReloadHandoff(live.key, carriedInbounds, carriedObserved, carriedReminders)
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
-      await handOffToSuccessor(live.key, carriedInbounds, carriedObserved, carriedReminders)
+      if (retained) await handOffToSuccessor(live.key)
     }
   }
 
@@ -3886,33 +4030,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // were enqueued while draining), so they are transplanted straight onto the
   // fresh session's queues rather than re-routed through route() — re-routing
   // would re-run the claim/command/permission gates and re-derive engagement
-  // from a lossy QueuedInbound projection. Best-effort: a recreate failure logs
-  // and drops the batch rather than throwing out of the predecessor's drain.
-  const handOffToSuccessor = async (
-    key: ChannelKey,
-    inbounds: QueuedInbound[],
-    observed: ObservedInbound[],
-    reminders: PendingSystemReminder[],
-  ): Promise<void> => {
-    // Observed context alone is carried too: observe() can buffer post-reload
-    // messages onto contextBuffer with no queued prompt, and dropping them would
-    // lose the successor's "recent context". Only skip when nothing at all was
-    // carried.
-    if (inbounds.length === 0 && reminders.length === 0 && observed.length === 0) return
-    let successor: LiveSession
+  // from a lossy QueuedInbound projection. The batch is retained BEFORE the
+  // recreate attempt so a timeout leaves it available to the next successful
+  // ensureLive rather than dropping the user's messages at the handoff seam.
+  const handOffToSuccessor = async (key: ChannelKey): Promise<void> => {
     try {
-      successor = await ensureLive(key)
+      await ensureLive(key)
     } catch (err) {
-      logger.warn(`[channels] ${channelKeyId(key)}: successor recreate after reload failed: ${describeError(err)}`)
-      return
+      logger.warn(
+        `[channels] ${channelKeyId(key)}: successor recreate after reload failed; queued work retained for the next successful session: ${describeError(err)}`,
+      )
     }
-    if (successor.destroyed) return
-    successor.promptQueue.push(...inbounds)
-    successor.contextBuffer.push(...observed)
-    successor.pendingSystemReminders.push(...reminders)
-    // Observed-only context is NOT a turn trigger — it waits on contextBuffer for
-    // a real inbound. Drain only when there is actual work (a prompt or reminder).
-    if ((inbounds.length > 0 || reminders.length > 0) && !successor.draining) void drain(successor)
   }
 
   const scheduleDebouncedDrain = (live: LiveSession): void => {
@@ -5975,6 +6103,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const runIdleGc = async (): Promise<void> => {
+    await expirePendingReloadHandoffs()
     const t = now()
     const victims: LiveSession[] = []
     for (const live of liveSessions.values()) {
@@ -6009,6 +6138,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
     liveGeneration++
+    const pendingHandoffs = Array.from(pendingReloadHandoffs.values())
+    pendingReloadHandoffs.clear()
+    for (const pending of pendingHandoffs) {
+      void reportDiscardedReloadHandoff(pending, 'router stopped before replay could complete')
+    }
     const all = Array.from(liveSessions.values())
     liveSessions.clear()
     for (const live of all) {
