@@ -1152,10 +1152,14 @@ describe('ChannelRouter session lifecycle', () => {
     // Release the held prompt: the stale session tears down (finishing only the
     // in-flight prompt), and a fresh successor is created that processes the
     // post-reload message exactly once.
+    // Asserted synchronously off the flush promise, with no polling: the
+    // successor is created inside the predecessor's own drain tail, so
+    // flushDebounce must follow the handoff to the replacement session and
+    // settle ITS drain too before returning.
     releaseFirstPrompt()
     await drainPromise
-    await waitFor(() => sessions.length === 2)
-    await waitFor(() => sessions[1]!.prompts.length > 0)
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.length).toBeGreaterThan(0)
     expect(sessions[0]!.prompts.length).toBe(1)
     expect(sessions[1]!.prompts.some((p) => p.includes('after reload'))).toBe(true)
     expect(router.liveCount()).toBe(1)
@@ -13327,6 +13331,53 @@ describe('ChannelRouter role-claim bypass', () => {
 })
 
 describe('ChannelRouter injectSubagentCompletionReminder', () => {
+  test('a rejected fire-and-forget drain is reported, and does not wedge or reject the settle seam', async () => {
+    // given: a live session, plus a permission service that can be armed to
+    //   throw from the per-turn role resolution `drain()` performs OUTSIDE the
+    //   prompt-level catch — so the whole drain rejects rather than being
+    //   absorbed as a prompt error
+    const dir = await tempDir()
+    const logs: string[] = []
+    let failRoleDescribe = false
+    const permissions: PermissionService = {
+      ...grantAllPermissions,
+      describe: () => {
+        if (failRoleDescribe) throw new Error('role describe boom')
+        return { role: 'owner', permissions: ['channel.respond'] }
+      },
+    }
+    const { router, sessions } = makeRouter(dir, { logs, permissions })
+    await router.route(inbound())
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(KEY)
+
+    // when: a completion wake starts a fire-and-forget `void drain(live)` that
+    // rejects. Nothing awaits that promise, so this is the only path on which
+    // the failure can still be seen.
+    failRoleDescribe = true
+    expect(
+      router.injectSubagentCompletionReminder({
+        parentSessionId: 'ses_fake_1',
+        subagent: 'explorer',
+        taskId: 'bg_drain_boom',
+        ok: true,
+        durationMs: 100,
+      }).kind,
+    ).toBe('delivered')
+
+    // then: the failure is reported rather than swallowed by the tracking, and
+    // settling resolves — one failed drain must not reject an unrelated waiter
+    await expect(router.__testing!.flushDebounce(KEY)).resolves.toBeUndefined()
+    expect(
+      logs.some((l) => l.startsWith('error:') && l.includes('drain failed') && l.includes('role describe boom')),
+    ).toBe(true)
+
+    // and: the settled entry did not leak into the tracking set, so a later
+    // flush still returns instead of waiting forever on a dead promise
+    failRoleDescribe = false
+    await expect(router.__testing!.flushDebounce(KEY)).resolves.toBeUndefined()
+  })
+
   test('matching parentSessionId wakes the channel session with a <system-reminder> turn even when no user inbound is queued', async () => {
     // given a live channel session whose sessionId is the factory-stamped `ses_fake_1`
     const dir = await tempDir()
@@ -16813,6 +16864,41 @@ describe('resumeRestartHandoff', () => {
     const prompts = sessions[0]!.prompts
     expect(prompts.some((p) => p.includes('container just restarted'))).toBe(false)
     expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
+  })
+
+  test('flushDebounce settles a drain already in flight, not merely one it starts', async () => {
+    // given: the same coalesced-restart shape as above, but the fire-and-forget
+    //   drain's FIRST turn parks on a macrotask. The racing inbound is queued
+    //   behind it, so its prompt can only land on a later iteration of that same
+    //   drain — which flushDebounce's own `drain()` call cannot reach, because
+    //   drain() no-ops while `live.draining` is set. The park makes that window
+    //   deterministic instead of contention-dependent: it is the oversubscribed-
+    //   CI flake reproduced on purpose.
+    const dir = await tempDir()
+    await seedMapping(dir, 'ses_origin', '2026-05-02T16-56-52-380Z_ses_origin.jsonl')
+    const { router, sessions } = makeRouter(dir, {
+      transcriptPathFor: (sessionId) => `/tmp/fake/2026-05-02T16-56-52-380Z_${sessionId}.jsonl`,
+      onSessionCreated: (fake) => {
+        fake.onPrompt = async () => {
+          if (fake.prompts.length > 1) return
+          await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        }
+      },
+    })
+    const reservation = router.reserveRestartHandoff(channelHandoff({ interruptedSubagents: ['researcher'] }))!
+    const inboundDone = router.route(inbound({ authorId: 'alice', authorName: 'alice', text: 'hi there' }))
+    await waitFor(() => reservation.sawInbound)
+
+    // when
+    await reservation.resume()
+    await inboundDone
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: both turns the in-flight drain owed had landed before the flush
+    // returned — no polling, because the seam settles rather than merely starts
+    const prompts = sessions[0]!.prompts
+    expect(prompts.some((p) => p.includes('researcher') && p.includes('lost when the container'))).toBe(true)
+    expect(prompts.some((p) => p.includes('hi there'))).toBe(true)
   })
 
   test('delivers the notice even when the racing inbound is observe-only (never engages)', async () => {

@@ -888,6 +888,12 @@ type LiveSession = {
   historyTimedAttachments: readonly TimedAttachment[]
   historyAttachments: InboundAttachment[]
   draining: boolean
+  // Every drain invocation still running, including the tail it executes after
+  // `draining` flips back to false. `drain()` deliberately no-ops while a drain
+  // owns the session, so a fire-and-forget `void drain(live)` is otherwise
+  // unobservable; this is the only handle a caller can await to know the turn
+  // actually landed. Entries remove themselves on settle.
+  activeDrains: Set<Promise<void>>
   debounceTimer: ReturnType<typeof setTimeout> | null
   typingTimer: ReturnType<typeof setInterval> | null
   typingStartedAt: number
@@ -2448,6 +2454,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         historyTimedAttachments: [],
         historyAttachments: [],
         draining: false,
+        activeDrains: new Set(),
         debounceTimer: null,
         typingTimer: null,
         typingStartedAt: 0,
@@ -3464,8 +3471,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.qualifyingWorkThisLogicalTurn = false
   }
 
-  const drain = async (live: LiveSession): Promise<void> => {
-    if (live.draining || live.destroyed) return
+  const runDrain = async (live: LiveSession): Promise<void> => {
     live.draining = true
     try {
       // `!live.pendingTeardown`: once a reload marks this draining session for
@@ -3836,6 +3842,41 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
       await handOffToSuccessor(live.key, carriedInbounds, carriedObserved, carriedReminders)
+    }
+  }
+
+  // No-op while a drain already owns the session: that loop re-checks both
+  // queues every iteration, so work landing behind it is picked up without a
+  // second concurrent drain. Registers the running invocation on `activeDrains`
+  // so `settleDrains` can await a turn started fire-and-forget.
+  const drain = (live: LiveSession): Promise<void> => {
+    if (live.draining || live.destroyed) return Promise.resolve()
+    const running = runDrain(live)
+    // Attaching this handler marks `running` handled, so a drain-tail throw can
+    // no longer reach the runtime's unhandled-rejection reporter — every
+    // production call site is `void drain(live)` and catches nothing. Log it
+    // here so the failure stays visible rather than disappearing into the
+    // tracking. The settlement copy must still RESOLVE: `settleDrains` waits on
+    // unrelated turns too, and one failed drain must not reject a waiter that
+    // has nothing to do with it. Callers keep `running`, so an awaiting caller
+    // still sees the original rejection.
+    const settled = running.then(
+      () => undefined,
+      (err: unknown) => {
+        logger.error(`[channels] ${live.keyId}: drain failed: ${describeError(err)}`)
+      },
+    )
+    live.activeDrains.add(settled)
+    void settled.then(() => live.activeDrains.delete(settled))
+    return running
+  }
+
+  // Resolves once no drain is running. Loops because a drain's post-`draining`
+  // tail can start a rival, and because work queued during one turn opens the
+  // next; a snapshot `Promise.all` would return with that successor in flight.
+  const settleDrains = async (live: LiveSession): Promise<void> => {
+    while (live.activeDrains.size > 0) {
+      await Promise.all(live.activeDrains)
     }
   }
 
@@ -6878,14 +6919,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
       pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
       flushDebounce: async (key: ChannelKey) => {
-        const live = liveSessions.get(channelKeyId(key))
+        const keyId = channelKeyId(key)
+        let live = liveSessions.get(keyId)
         if (!live) return
         if (live.debounceTimer) {
           clearTimeout(live.debounceTimer)
           live.debounceTimer = null
         }
         live.firstUnprocessedAt = 0
-        await drain(live)
+        // Settle a drain that is ALREADY in flight before starting our own, then
+        // again after. `drain()` no-ops while one owns the session, so a
+        // fire-and-forget `void drain(live)` raised elsewhere — the restart-resume
+        // lost-work notice, a promoted review carrier, a subagent-completion wake —
+        // would still be mid-turn when this returned, and the caller would assert
+        // on a prompt that has not landed. Same defect shape as the `persist()`
+        // race below: this seam has to mean "settled", not "started".
+        //
+        // Re-resolved by key each round because settling is not a property of one
+        // object: a deferred reload teardown drops this session mid-drain and
+        // `handOffToSuccessor` replays the carried work onto a REPLACEMENT live
+        // session with its own `activeDrains`. Watching only the session captured
+        // at entry would return with the successor's prompt still in flight.
+        for (;;) {
+          await settleDrains(live)
+          await drain(live)
+          await settleDrains(live)
+          const current = liveSessions.get(keyId)
+          if (current === undefined || current === live) break
+          live = current
+        }
         // Settle the fire-and-forget `void persist()` from scheduleDebouncedDrain
         // (the lastInboundAt write). Draining alone doesn't await that promise, so
         // a test reading sessions.json right after would race the disk write — the
