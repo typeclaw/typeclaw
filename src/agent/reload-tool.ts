@@ -16,9 +16,11 @@ export function createReloadTool({ registry }: CreateReloadToolOptions) {
       'all-or-nothing: invalid input leaves its live state unchanged and the failure reason is ' +
       "reported in that scope's result. Boot-only config fields (port, mounts, memory.idleMs) " +
       'are reported as restart-required. Safe to call any time. ' +
-      'Without a scope arg, runs every registered reloadable in registration order so later ' +
-      'scopes observe earlier swaps (e.g. cron sees a freshly-loaded plugins registry). ' +
-      'With a scope arg, runs only that one reloadable.',
+      'Without a scope arg, runs every non-destructive registered reloadable in registration ' +
+      'order so later scopes observe earlier swaps (e.g. cron sees a freshly-loaded plugins ' +
+      'registry). Provider credential invalidation recreates every live channel session, so it ' +
+      'runs only with an explicit scope="providers" after credentials change. With a scope arg, ' +
+      'runs only that one reloadable.',
     parameters: Type.Object({
       scope: Type.Optional(
         Type.String({
@@ -26,7 +28,8 @@ export function createReloadTool({ registry }: CreateReloadToolOptions) {
             'Optional reload scope name. Common scopes: "config" (typeclaw.json), ' +
             '"plugins" (re-resolve and re-run plugin factories), "skills" (read-only diagnostic ' +
             'reporting which skills are visible to a new session), "cron" (cron.json). ' +
-            'Omit to reload all scopes.',
+            'Use "providers" only after provider credentials change. Omit to reload all ' +
+            'non-destructive scopes.',
         }),
       ),
     }),
@@ -48,7 +51,11 @@ export function createReloadTool({ registry }: CreateReloadToolOptions) {
         }
       }
 
-      const { results } = await registry.reloadAll()
+      const results: ReloadResult[] = []
+      for (const item of items) {
+        if (item.scope === 'providers') continue
+        results.push(await registry.reloadOne(item.scope))
+      }
       return {
         content: [{ type: 'text', text: formatResults(results) }],
         details: { results },
