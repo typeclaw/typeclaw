@@ -58,6 +58,31 @@ describe('detectContinuationWillingness — positive (self-directed future inten
     '바로 티켓 AC 업데이트하겠습니다 🙏',
     '설정 값 수정하겠습니다.',
     '업데이트할게요',
+    // Open X하다 class reached by the -(으)ㄹ게 morpheme pass, not by any table entry.
+    // Enumeration could never cover these: every new action verb a user invents
+    // ("머지", "롤백", "재시작") composes with 하다 and inherits 할게 for free.
+    '바로 배포할게요',
+    '이 브랜치 롤백할게',
+    '충돌만 정리하고 머지할게요',
+    '컨테이너 재시작할게요.',
+    '그 파일 삭제할게',
+    // The remaining -겠 stems in their -(으)ㄹ게 form: 두 → 둘게, 놓 → 놓을게.
+    '크론 타이밍 반영해둘게요',
+    '설정 값 미리 맞춰놓을게',
+    // Playful -용 politeness particle, and banmal mid-sentence continuation.
+    '배포할게용',
+    '배포할게 지금 바로',
+    // 드리 humble auxiliary, the one -(으)ㄹ게 stem outside the -겠 set.
+    '알려드릴게요',
+    '나머지는 제가 정리해서 알려드릴게',
+    // 안 that opens or closes an unrelated word must not read as negation. 안내/안전
+    // start one, 방안/제안 end one; all four carry a genuine promise.
+    '안내해드릴게요',
+    '안전하게 배포할게요',
+    '방안 확인할게요',
+    '제안 확인할게요',
+    // A negator binds only its own verb — the promise in the following clause stands.
+    '배포는 안 하고 확인만 할게요',
   ]
 
   for (const text of willing) {
@@ -238,6 +263,46 @@ describe('detectContinuationWillingness — negative (final / descriptive / othe
     '잘 모르겠어.',
     // Descriptive casual past — an already-done report, not a promise to act.
     '이미 확인했어, 문제 없어.',
+    // -게 forms that are NOT the volitional ending. These are why the ㄹ게 pattern is
+    // anchored to the 하/보/두/놓 stems instead of matching any ㄹ-batchim syllable:
+    // the adverbial -게 sits on a bare adjective stem (힘들게/길게/멀게), 별게 is a noun
+    // + 이, and -게 되다/만들다 is a change-of-state auxiliary. All are clause-medial,
+    // so a sentence-final lookahead would NOT have excluded them — the space after 게
+    // is one character wide and a lookahead cannot see past it.
+    '힘들게 찾았지만 결국 됐어요.',
+    '로그가 길게 나와서 잘라서 봤어요.',
+    '그건 별게 아니에요.',
+    '이제야 원인을 알게 되었습니다.',
+    '멀게 느껴지실 수 있어요.',
+    // 것이 contraction — 할 게 is two tokens ("things to do"), not the 할게 ending.
+    '아직 할 게 많이 남았습니다.',
+    // Genuine first-person -(으)ㄹ게 volitionals that promise the OPPOSITE of
+    // continuation, or no work at all. They are excluded by the stem anchor: 마치/쉬/
+    // 기다리 are not 하/보/두/놓.
+    '그럼 여기서 마칠게요.',
+    '답변 기다릴게요.',
+    // Permission-seeking question — awaits the user rather than committing to act,
+    // mirroring the Japanese 〜ますか guard.
+    '그럼 제가 배포할게요?',
+    // Reported speech — the promise belongs to someone else, not the agent.
+    '리뷰어가 "배포할게요"라고 했습니다.',
+    // Short negation 안/못 inverts the promise. These must stay false for enumerated
+    // verbs too, which is why no -게 form remains in the phrase table: a table hit
+    // returns before the negation strip and the guards ever run.
+    '네, 배포 안 할게요',
+    '그건 안 볼게요',
+    '지금은 안 해볼게요',
+    '안 업데이트할게요',
+    '그 브랜치는 안할게',
+    // Long negation -지 않을게요 — excluded structurally, 않을게 is not a stem.
+    '배포하지 않을게요',
+    // The negated -겠 sibling, same inversion.
+    '배포 안 하겠습니다',
+    // Question and quotative forms of verbs that used to sit in the phrase table and
+    // therefore short-circuited both guards.
+    '제가 처리할게요?',
+    '리뷰어가 "확인할게요"라고 했습니다.',
+    '알려드릴게요?',
     '',
     '...',
   ]

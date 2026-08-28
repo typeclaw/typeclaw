@@ -104,47 +104,33 @@ const EN_PHRASES: readonly string[] = [
   'gimme a sec',
 ]
 
-// Korean: the -겠습니다/-겠어요 and -ㄹ게(요) verb endings are first-person
+// Korean: the -겠습니다/-겠어요 and -(으)ㄹ게(요) verb endings are first-person
 // volitional — they cannot address the listener, so they are safe self-direction
-// anchors. The -겠습니다/-겠어요 form is matched by MORPHEME_PATTERNS below (it
-// generalizes across all action verbs), so only the -ㄹ게 forms and stall idioms
-// are enumerated here. Each entry is the CASUAL (banmal) -게 base; the polite -게요
-// / -게여 forms match too because the substring pass tests `includes` (볼게 ⊂
-// 볼게요). Enumerating the casual base is deliberate over a broad `[ㄹ-final]게`
-// morpheme regex: that would also fire on the adverbial -게 of adjective stems
-// (힘들게 "hard-ly", 멀게 "far-ly", 길게 "long-ly"), violating the file's
-// prefer-false-negatives bias. Bare adverb+noun fragments ("바로 확인", "계속 확인")
-// are still excluded: without the -게 volitional they match other-directed requests
+// anchors. BOTH are matched by MORPHEME_PATTERNS below, stem-anchored to the same
+// action/auxiliary stems, so they generalize across every verb built on them. No
+// -게 form is enumerated here at all: an entry in this table would SHORT-CIRCUIT
+// the morpheme pass, because the substring pass returns before it runs, and the
+// negation / question / quotative guards that make the morpheme pass safe would
+// never execute. A table entry 처리할게 is what made 제가 처리할게요? report
+// willingness despite the question guard. Only the stall idioms — which have no
+// verb to negate or question — remain.
+//
+// The stem anchor is what keeps this narrow. A broad `[ㄹ-final]게` regex was
+// rejected: it fires on the adverbial -게 of adjective stems (힘들게 "hard-ly",
+// 멀게 "far-ly", 길게 "long-ly"), on the noun 별게 ("별게 아니에요" = "it's nothing"),
+// and on the -게 되다/만들다 construction (알게 되었습니다 = "I came to know") — none
+// of which promise work. Requiring the -게 be sentence-final does NOT rescue it,
+// because every one of those confusables is followed by a SPACE, so a lookahead
+// cannot see past it. Worse, an open-class rule also admits genuine volitionals
+// that mean the OPPOSITE of continuation (여기서 마칠게요 "I'll stop here", 이제
+// 쉴게요 "I'll rest now"), violating the file's prefer-false-negatives bias.
+//
+// Bare adverb+noun fragments ("바로 확인", "계속 확인") are still excluded: without
+// the -게 volitional they match other-directed requests
 // ("바로 확인 부탁드려요" = "please check") and descriptive progressives ("계속 확인
 // 중입니다" = "I'm still checking"). The persona speaking banmal ("확인해볼게!") was
 // the production miss that closed a Discord turn in silence.
-const KO_PHRASES: readonly string[] = [
-  '확인해볼게',
-  '확인해 볼게',
-  '확인할게',
-  '계속 진행할게',
-  '계속할게',
-  '살펴볼게',
-  '볼게',
-  '검토할게',
-  '검토해볼게',
-  '조회해볼게',
-  '찾아볼게',
-  '알아볼게',
-  '처리할게',
-  '알려드릴게',
-  // Action/config verb -게 forms (the -겠습니다 siblings are covered by the
-  // morpheme regex; these are the casual/casual-polite variants chat models emit).
-  '업데이트할게',
-  '수정할게',
-  '설정할게',
-  '반영할게',
-  '적용할게',
-  '추가할게',
-  '생성할게',
-  '잠시만요',
-  '잠깐만요',
-]
+const KO_PHRASES: readonly string[] = ['잠시만요', '잠깐만요']
 
 // The remaining languages mirror the precision-first selection above: every
 // entry pairs a FIRST-PERSON future/volitional anchor with a work verb
@@ -697,6 +683,25 @@ const MORPHEME_PATTERNS: readonly RegExp[] = [
   // Listener-directed conjecture takes the honorific 시 (피곤하시겠어요 → 시겠, not
   // 하겠), so it is excluded too.
   /(?:하|보|두|놓)겠(?:습니다|어요)/,
+  // Korean first-person volitional -(으)ㄹ게(요): the same stems as -겠 above plus the
+  // humble auxiliary 드리 (알려드릴게요), carrying the ㄹ that marks the ending
+  // (하 → 할게, 보 → 볼게, 두 → 둘게, 놓 → 놓을게, 드리 → 드릴게; consonant-final 놓 takes
+  // the -을게 allomorph). This is what generalizes across the
+  // open X하다 class the tables cannot enumerate — 배포할게요/롤백할게요/머지할게요 all
+  // reduce to 할게. The ㄹ is load-bearing for precision, not just morphology: the
+  // adverbial -게 attaches to a BARE stem (착하게 "kindly", never 착할게), so 할게/볼게
+  // have no adjective reading at all, and the 여기서 마칠게요 ("I'll stop here") class of
+  // non-work volitionals never reaches these stems. The (?![?？]) lookahead drops the
+  // permission-seeking question form (제가 처리할게요? "shall I handle it?"), mirroring
+  // the Japanese question guard below; a question awaits the user rather than
+  // committing to act. The quotative lookahead drops reported speech
+  // ("확인할게요"라고 했습니다 = "they said they'd check"), where the promise is someone
+  // else's — an optional closing quote may sit between the ending and 라고.
+  // The (?![요여용]) is load-bearing: without it the optional particle group
+  // backtracks to empty and the guards below inspect the 요 instead of what follows
+  // it, so 배포할게요? would slip through. Forcing the particle to be consumed when
+  // present is JS's substitute for a possessive quantifier.
+  /(?:할|볼|둘|놓을|드릴)게(?:요|여|용)?(?![요여용])(?![?？])(?!["'”』]?\s*라(?:고|며|는|던))/,
   // Turkish first-person-singular future "-acağım/-eceğim" ("I will VERB").
   // Vowel harmony yields exactly these two suffixes; the y-buffer
   // ("bekleyeceğim") leaves the suffix intact.
@@ -720,6 +725,25 @@ const MORPHEME_PATTERNS: readonly RegExp[] = [
 const JA_VOLITIONAL_IDIOMS = /お願い(?:いた)?します|失礼します/g
 const JA_VOLITIONAL = /します(?![か？?])|してみます(?![か？?])/
 
+// Korean short negation 안/못 inverts the promise: 배포 안 할게요 is a commitment NOT
+// to deploy. Both Korean morpheme families are affected (안 할게요 and 안 하겠습니다),
+// so negated spans are stripped before the morpheme pass rather than guarded inside
+// each pattern — the same strip-then-test shape JA_VOLITIONAL_IDIOMS uses above.
+//
+// The negator must be its OWN token. Two lookbehind/shape constraints enforce that,
+// and both are load-bearing in opposite directions: (?<![가-힣]) rejects a 안 that ends
+// a word (방안/제안 확인할게요 = "I'll check the plan/proposal"), while requiring a space
+// before the {0,6} verb window rejects a 안 that merely STARTS one (안내해드릴게요 =
+// "I'll guide you", 안전하게 배포할게요 = "I'll deploy safely"). Without the space the
+// window swallows 내해 and suppresses a real promise. The no-space branch stays for the
+// attached spelling 안할게요.
+//
+// The {0,6} window spans the verb the negator scopes over, which may be several
+// syllables (안 업데이트할게요), but cannot cross a space, so a negator in an earlier
+// clause never reaches a later promise (배포는 안 하고 확인만 할게요 stays willing).
+// Long negation -지 않을게요 needs no entry: 않을게 is not one of the stems.
+const KO_NEGATED_VOLITIONAL = /(?<![가-힣])(?:안|못)(?:\s+[가-힣]{0,6})?(?:(?:할|볼|둘|놓을|드릴)게|(?:하|보|두|놓)겠)/g
+
 // Reply texts shorter than this are almost always a complete final answer
 // ("네", "ok", "done") where a partial match would be noise. The shortest
 // legitimate intent phrases ("on it now", "확인할게요") clear this floor.
@@ -730,6 +754,7 @@ export function detectContinuationWillingness(text: string): boolean {
   const normalized = normalize(text)
   if (normalized.length < MIN_LENGTH) return false
   if (ALL_PHRASES.some((phrase) => normalized.includes(phrase))) return true
-  if (MORPHEME_PATTERNS.some((pattern) => pattern.test(normalized))) return true
-  return JA_VOLITIONAL.test(normalized.replace(JA_VOLITIONAL_IDIOMS, ''))
+  const affirmed = normalized.replace(KO_NEGATED_VOLITIONAL, ' ')
+  if (MORPHEME_PATTERNS.some((pattern) => pattern.test(affirmed))) return true
+  return JA_VOLITIONAL.test(affirmed.replace(JA_VOLITIONAL_IDIOMS, ''))
 }
