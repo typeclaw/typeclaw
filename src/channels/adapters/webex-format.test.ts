@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { normalizeWebexHtmlFallbackText, resolveWebexBodyText } from './webex-format'
+import { normalizeWebexHtmlFallbackText, resolveWebexBodyText, splitWebexFiles } from './webex-format'
 
 describe('normalizeWebexHtmlFallbackText', () => {
   test('decodes named and numeric entities', () => {
@@ -47,5 +47,39 @@ describe('resolveWebexBodyText', () => {
   test('returns empty string when no body present', () => {
     expect(resolveWebexBodyText({ text: undefined, markdown: undefined, html: undefined })).toBe('')
     expect(resolveWebexBodyText({ text: '', markdown: '', html: '' })).toBe('')
+  })
+})
+
+describe('splitWebexFiles', () => {
+  test('numbers every file so each one is separately addressable', () => {
+    const { text, attachments } = splitWebexFiles('two files', [
+      'https://webexapis.com/v1/contents/AAA/photo.png',
+      'https://webexapis.com/v1/contents/BBB/report.pdf',
+    ])
+
+    expect(text).toBe(
+      'two files\n[Webex attachment #1: file name=photo.png]\n[Webex attachment #2: file name=report.pdf]',
+    )
+    expect(attachments.map((a) => [a.id, a.ref])).toEqual([
+      [1, 'https://webexapis.com/v1/contents/AAA/photo.png'],
+      [2, 'https://webexapis.com/v1/contents/BBB/report.pdf'],
+    ])
+  })
+
+  test('a captionless file becomes the whole body', () => {
+    expect(splitWebexFiles('', ['https://webexapis.com/v1/contents/AAA/photo.png']).text).toBe(
+      '[Webex attachment #1: file name=photo.png]',
+    )
+  })
+
+  test('falls back to a positional filename when the ref has no usable path', () => {
+    expect(splitWebexFiles('', ['not-a-url']).attachments).toEqual([
+      { id: 1, kind: 'file', ref: 'not-a-url', filename: 'webex-file-1' },
+    ])
+  })
+
+  test('leaves text untouched when there are no files', () => {
+    expect(splitWebexFiles('hello', undefined)).toEqual({ text: 'hello', attachments: [] })
+    expect(splitWebexFiles('hello', [])).toEqual({ text: 'hello', attachments: [] })
   })
 })

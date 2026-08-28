@@ -38,7 +38,7 @@ import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-atta
 import { createSlackAuthorResolver } from './slack-author-resolver'
 import { slackTsToMillis } from './slack-bot-time'
 import { createSlackChannelResolver } from './slack-channel-resolver'
-import { classifyInbound, type InboundDropReason, type SlackConversationType } from './slack-classify'
+import { classifyInbound, type InboundDropReason, type SlackConversationType, splitSlackFiles } from './slack-classify'
 import { createSlackUserEditMessageCallback } from './slack-edit'
 import { createSlackReactionCallback, createSlackRemoveReactionCallback } from './slack-reactions'
 
@@ -461,18 +461,12 @@ async function defaultReadFile(path: string): Promise<Buffer> {
 }
 
 function mapSlackHistoryMessage(msg: SlackMessage): ChannelHistoryMessage {
-  const attachments = (msg.files ?? []).map((file, index) => ({
-    id: index + 1,
-    kind: 'file' as const,
-    ref: file.id,
-    filename: file.name,
-    mimetype: file.mimetype,
-  }))
+  const { text, attachments } = splitSlackFiles(msg.text, msg.files)
   return {
     externalMessageId: msg.ts,
     authorId: msg.user ?? msg.username ?? 'unknown',
     authorName: msg.username ?? msg.user ?? 'unknown',
-    text: msg.text,
+    text,
     ts: slackTsToMillis(msg.ts),
     isBot: false,
     replyToBotMessageId: null,

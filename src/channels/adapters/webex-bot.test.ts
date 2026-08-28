@@ -241,6 +241,35 @@ describe('webex history and membership', () => {
     expect(result.nextCursor).toBeUndefined()
   })
 
+  test('numbers every history file so each is separately addressable', async () => {
+    const cb = createWebexHistoryCallback({
+      client: {
+        listMessages: async () => [
+          webexMessage({
+            id: 'files-blob',
+            ref: 'files',
+            text: 'two files',
+            files: ['https://webexapis.com/v1/contents/AAA/photo.png', 'https://webexapis.com/v1/contents/BBB/doc.pdf'],
+          }),
+        ],
+      },
+      logger: logger(),
+      botPersonIdRef: () => 'bot-1',
+    })
+
+    const result = await cb({ chat: 'room-1', thread: null, limit: 10 })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected ok')
+    expect(result.messages[0]?.text).toBe(
+      'two files\n[Webex attachment #1: file name=photo.png]\n[Webex attachment #2: file name=doc.pdf]',
+    )
+    expect(result.messages[0]?.attachments?.map((a) => [a.id, a.ref])).toEqual([
+      [1, 'https://webexapis.com/v1/contents/AAA/photo.png'],
+      [2, 'https://webexapis.com/v1/contents/BBB/doc.pdf'],
+    ])
+  })
+
   test('returns ok false on history failure', async () => {
     const cb = createWebexHistoryCallback({
       client: { listMessages: async () => Promise.reject(new Error('down')) },
@@ -751,6 +780,7 @@ function webexMessageShape() {
     personRef: 'user-1',
     personEmail: 'user@example.com',
     created: '2026-01-01T00:00:00Z',
+    files: [] as string[],
   }
 }
 

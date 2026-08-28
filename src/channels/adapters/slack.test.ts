@@ -8,7 +8,7 @@ import { channelsSchema } from '@/channels/schema'
 import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
-import { createSlackAdapter, type SlackAdapterLogger } from './slack'
+import { createSlackAdapter, createSlackHistoryCallback, type SlackAdapterLogger } from './slack'
 
 const config = channelsSchema.parse({ slack: {} }).slack!
 
@@ -351,6 +351,73 @@ describe('createSlackAdapter', () => {
     expect(r.unregistered).toContain('outbound:slack')
     expect(log.lines).toContain('error:[slack] listener error: invalid_auth')
     expect(log.lines.some((line) => line.includes('[object'))).toBe(false)
+  })
+})
+
+describe('createSlackHistoryCallback', () => {
+  function file(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'F0001',
+      name: 'image.png',
+      title: 'image.png',
+      mimetype: 'image/png',
+      size: 1024,
+      url_private: 'https://files.slack.com/files-pri/T1-F0001/image.png',
+      created: 1,
+      user: 'U123',
+      ...overrides,
+    }
+  }
+
+  async function fetchHistory(messages: unknown[]) {
+    const callback = createSlackHistoryCallback({
+      client: { getMessages: async () => messages } as unknown as Parameters<
+        typeof createSlackHistoryCallback
+      >[0]['client'],
+      logger: logger(),
+    })
+    return await callback({ chat: 'C123', thread: null, limit: 10 })
+  }
+
+  test('a captionless file in history is addressable by the id it renders', async () => {
+    const result = await fetchHistory([{ ts: '1700000000.000100', text: '', type: 'message', files: [file()] }])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.messages[0]?.text).toBe('[Slack attachment #1: file image/png name=image.png]')
+    expect(result.messages[0]?.attachments).toEqual([
+      { id: 1, kind: 'file', ref: 'F0001', filename: 'image.png', mimetype: 'image/png' },
+    ])
+  })
+
+  test('placeholder ids line up one-to-one with the structured refs', async () => {
+    const result = await fetchHistory([
+      {
+        ts: '1700000000.000100',
+        text: 'two files',
+        type: 'message',
+        files: [file(), file({ id: 'F0002', name: 'b.pdf', mimetype: 'application/pdf' })],
+      },
+    ])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.messages[0]?.text).toBe(
+      'two files\n[Slack attachment #1: file image/png name=image.png]\n[Slack attachment #2: file application/pdf name=b.pdf]',
+    )
+    expect(result.messages[0]?.attachments?.map((a) => [a.id, a.ref])).toEqual([
+      [1, 'F0001'],
+      [2, 'F0002'],
+    ])
+  })
+
+  test('text-only history messages are untouched and carry no attachments key', async () => {
+    const result = await fetchHistory([{ ts: '1700000000.000100', text: 'hello', type: 'message' }])
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.messages[0]?.text).toBe('hello')
+    expect(result.messages[0]?.attachments).toBeUndefined()
   })
 })
 
