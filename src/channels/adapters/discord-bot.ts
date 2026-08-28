@@ -65,6 +65,13 @@ import {
   createDiscordRemoveReactionCallback,
   encodeDiscordReactionRef,
 } from './discord-bot-reactions'
+import {
+  createInMemoryDiscordBotRecoveryStore,
+  fetchDiscordBackfill,
+  loadDiscordBotRecoveryStore,
+  type DiscordBackfillMessage,
+  type DiscordBotRecoveryStore,
+} from './discord-bot-recovery'
 import { enrichDiscordMessageReferences } from './discord-bot-reference'
 import {
   ackInteraction,
@@ -93,6 +100,10 @@ const STOP_REPLY_FAILED = 'Could not stop the current turn (internal error).'
 const STOP_REPLY_PERMISSION_DENIED = 'You do not have permission to stop the current turn in this channel.'
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10'
+const DISCORD_BACKFILL_MAX_CHANNELS = 20
+const DISCORD_BACKFILL_MAX_TOTAL_MESSAGES = 100
+const DISCORD_BACKFILL_MAX_DURATION_MS = 20_000
+const DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS = 5_000
 
 function formatLabel(name: string | undefined, id: string, prefix = ''): string {
   if (name === undefined || name === '' || name === id) return id
@@ -139,6 +150,9 @@ export type DiscordBotAdapterOptions = {
   createClient?: () => DiscordBotClient
   createListener?: (client: DiscordBotClient, options: DiscordBotListenerOptions) => DiscordBotListener
   enrichHistoricalProvenance?: typeof enrichHistoricalProvenance
+  recoveryStore?: DiscordBotRecoveryStore
+  now?: () => number
+  recoveryMaxDurationMs?: number
 }
 
 export type DiscordBotAdapter = {
@@ -1051,7 +1065,13 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
   let connected = false
   let started = false
   let inflightInbounds = 0
+  const inflightOperations = new Set<Promise<void>>()
   let stopWaiters: Array<() => void> = []
+  let recoveryStore = options.recoveryStore ?? null
+  let recoveryBarrier = Promise.resolve()
+  const channelBarriers = new Map<string, Promise<void>>()
+  const now = options.now ?? Date.now
+  const recoveryMaxDurationMs = options.recoveryMaxDurationMs ?? DISCORD_BACKFILL_MAX_DURATION_MS
 
   const channelResolver = createDiscordChannelResolver({ token: options.token, fetchImpl })
   const threadRoomResolver = createDiscordThreadRoomResolver({ token: options.token, fetchImpl })
@@ -1130,76 +1150,263 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     }
   }
 
-  const handleMessageCreate = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
-    inflightInbounds++
-    try {
-      // One log line per gateway event is non-negotiable: it's the only way to
-      // tell from logs whether the gateway is delivering at all. content_len=0
-      // is the smoking gun for a missing MessageContent privileged intent.
-      const inboundWorkspace = event.guild_id ?? '@dm'
-      const inboundTag = await formatChannelTag(inboundWorkspace, event.channel_id)
-      logger.info(
-        `[discord-bot] inbound id=${event.id} author=${formatLabel(event.author.username, event.author.id)} ${inboundTag} content_len=${event.content.length}`,
-      )
+  const processMessageCreate = async (event: DiscordGatewayMessageCreateEvent): Promise<void> => {
+    // One log line per gateway event is non-negotiable: it's the only way to
+    // tell from logs whether the gateway is delivering at all. content_len=0
+    // is the smoking gun for a missing MessageContent privileged intent.
+    const inboundWorkspace = event.guild_id ?? '@dm'
+    const inboundTag = await formatChannelTag(inboundWorkspace, event.channel_id)
+    logger.info(
+      `[discord-bot] inbound id=${event.id} author=${formatLabel(event.author.username, event.author.id)} ${inboundTag} content_len=${event.content.length}`,
+    )
 
-      const verdict = classifyInbound(event, options.configRef(), botUserId)
-      if (verdict.kind === 'drop') {
-        logger.info(`[discord-bot] dropped id=${event.id} reason=${verdict.reason}${dropHint(verdict.reason)}`)
+    const verdict = classifyInbound(event, options.configRef(), botUserId)
+    if (verdict.kind === 'drop') {
+      logger.info(`[discord-bot] dropped id=${event.id} reason=${verdict.reason}${dropHint(verdict.reason)}`)
+      return
+    }
+
+    const hintedText = addDiscordMentionHints(verdict.payload.text, mentionUserMap(event.mentions), { botUserId })
+    const replyMessageId = event.message_reference?.message_id
+    const referenceResult = await enrichDiscordMessageReferences({
+      text: hintedText,
+      ...(replyMessageId !== undefined
+        ? { reply: { channelId: event.message_reference?.channel_id ?? event.channel_id, messageId: replyMessageId } }
+        : {}),
+      fetchMessage: async (channelId, messageId) => {
+        const message: { author: { id: string; username: string; global_name?: string | null }; content: string } =
+          await client.getMessage(channelId, messageId)
+        return {
+          authorId: message.author.id,
+          authorName: message.author.global_name ?? message.author.username,
+          text: message.content,
+        }
+      },
+    })
+    // Discord threads are their own channels (`chat = thread id`, `thread`
+    // stays null), so the engagement gate cannot see "this is a thread" from
+    // the payload alone. Resolve the channel's type/parent and stamp the
+    // structural `room` signal for guild inbounds; DMs are never thread rooms.
+    let room = event.guild_id !== undefined ? await threadRoomResolver(event.channel_id) : undefined
+    if (room?.parentChat !== undefined && event.guild_id !== undefined) {
+      const parentNames = await channelResolver({
+        adapter: 'discord-bot',
+        workspace: event.guild_id,
+        chat: room.parentChat,
+        thread: null,
+      })
+      if (parentNames.chatName !== undefined) room = { ...room, parentChatName: parentNames.chatName }
+    }
+    const basePayload =
+      referenceResult.referenceContext === undefined
+        ? { ...verdict.payload, text: hintedText }
+        : { ...verdict.payload, text: hintedText, referenceContext: referenceResult.referenceContext }
+    const payload = room !== undefined ? { ...basePayload, room } : basePayload
+
+    const routedTag = await formatChannelTag(payload.workspace, payload.chat)
+    logger.info(
+      `[discord-bot] routed id=${event.id} ${routedTag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
+    )
+    await options.router.route(payload)
+  }
+
+  const trackInbound = (operation: Promise<void>): Promise<void> => {
+    inflightInbounds++
+    inflightOperations.add(operation)
+    return operation.finally(() => {
+      inflightOperations.delete(operation)
+      inflightInbounds--
+      if (inflightInbounds !== 0 || stopWaiters.length === 0) return
+      const waiters = stopWaiters
+      stopWaiters = []
+      for (const waiter of waiters) waiter()
+    })
+  }
+
+  const enqueueChannelOperation = <T>(channelId: string, operation: () => Promise<T>): Promise<T> => {
+    const previous = channelBarriers.get(channelId) ?? Promise.resolve()
+    const queued = previous.then(operation)
+    const barrier = queued.then(
+      () => undefined,
+      () => undefined,
+    )
+    channelBarriers.set(channelId, barrier)
+    void barrier.finally(() => {
+      if (channelBarriers.get(channelId) === barrier) channelBarriers.delete(channelId)
+    })
+    return queued
+  }
+
+  const enqueueChannelInbound = (channelId: string, operation: () => Promise<void>): Promise<void> => {
+    const recoveryGate = recoveryBarrier
+    return trackInbound(recoveryGate.then(() => enqueueChannelOperation(channelId, operation)))
+  }
+
+  const enqueueRecovery = (operation: () => Promise<void>): Promise<void> => {
+    const queued = recoveryBarrier.then(operation)
+    recoveryBarrier = queued.catch(() => {})
+    return trackInbound(queued)
+  }
+
+  const handleMessageCreate = (event: DiscordGatewayMessageCreateEvent): Promise<void> =>
+    enqueueChannelInbound(event.channel_id, async () => {
+      if (recoveryStore?.isProcessed(event.channel_id, event.id) === true) {
+        logger.info(`[discord-bot] deduplicated id=${event.id} channel=${event.channel_id}`)
         return
       }
-
-      const hintedText = addDiscordMentionHints(verdict.payload.text, mentionUserMap(event.mentions), { botUserId })
-      const replyMessageId = event.message_reference?.message_id
-      const referenceResult = await enrichDiscordMessageReferences({
-        text: hintedText,
-        ...(replyMessageId !== undefined
-          ? { reply: { channelId: event.message_reference?.channel_id ?? event.channel_id, messageId: replyMessageId } }
-          : {}),
-        fetchMessage: async (channelId, messageId) => {
-          const message: { author: { id: string; username: string; global_name?: string | null }; content: string } =
-            await client.getMessage(channelId, messageId)
-          return {
-            authorId: message.author.id,
-            authorName: message.author.global_name ?? message.author.username,
-            text: message.content,
-          }
-        },
-      })
-      // Discord threads are their own channels (`chat = thread id`, `thread`
-      // stays null), so the engagement gate cannot see "this is a thread" from
-      // the payload alone. Resolve the channel's type/parent and stamp the
-      // structural `room` signal for guild inbounds; DMs are never thread rooms.
-      let room = event.guild_id !== undefined ? await threadRoomResolver(event.channel_id) : undefined
-      if (room?.parentChat !== undefined && event.guild_id !== undefined) {
-        const parentNames = await channelResolver({
-          adapter: 'discord-bot',
-          workspace: event.guild_id,
-          chat: room.parentChat,
-          thread: null,
+      try {
+        await processMessageCreate(event)
+        await recoveryStore?.markProcessed({
+          channelId: event.channel_id,
+          workspace: event.guild_id ?? '@dm',
+          messageId: event.id,
+          processedAt: now(),
         })
-        if (parentNames.chatName !== undefined) room = { ...room, parentChatName: parentNames.chatName }
+      } catch (err) {
+        logger.error(`[discord-bot] handleInbound failed: ${describeError(err)}`)
       }
-      const basePayload =
-        referenceResult.referenceContext === undefined
-          ? { ...verdict.payload, text: hintedText }
-          : { ...verdict.payload, text: hintedText, referenceContext: referenceResult.referenceContext }
-      const payload = room !== undefined ? { ...basePayload, room } : basePayload
+    })
 
-      const routedTag = await formatChannelTag(payload.workspace, payload.chat)
-      logger.info(
-        `[discord-bot] routed id=${event.id} ${routedTag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
-      )
-      await options.router.route(payload)
-    } catch (err) {
-      logger.error(`[discord-bot] handleInbound failed: ${describeError(err)}`)
-    } finally {
-      inflightInbounds--
-      if (inflightInbounds === 0 && stopWaiters.length > 0) {
-        const waiters = stopWaiters
-        stopWaiters = []
-        for (const w of waiters) w()
+  const replayAfterReconnect = async (): Promise<void> => {
+    if (recoveryStore === null) return
+    const store = recoveryStore
+    const disconnectedAt = store.disconnectedAt()
+    if (disconnectedAt === null) return
+
+    const downtimeMs = Math.max(0, now() - disconnectedAt)
+    let replayed = 0
+    let skipped = 0
+    let cappedChannels = 0
+    let unavailableChannels = 0
+    const replayDeadline = performance.now() + recoveryMaxDurationMs
+    const replayCursors = store.listReplayCursors().sort((left, right) => right.processedAt - left.processedAt)
+    const selectedCursors = replayCursors.slice(0, DISCORD_BACKFILL_MAX_CHANNELS)
+    let skippedChannels = replayCursors.length - selectedCursors.length
+    let remainingMessages = DISCORD_BACKFILL_MAX_TOTAL_MESSAGES
+    let deadlineReached = false
+    cursorLoop: for (const [cursorIndex, cursor] of selectedCursors.entries()) {
+      const fetchBudgetMs = replayDeadline - performance.now()
+      if (remainingMessages === 0) {
+        skippedChannels++
+        continue
       }
+      if (fetchBudgetMs <= 0) {
+        deadlineReached = true
+        skippedChannels += selectedCursors.length - cursorIndex
+        break
+      }
+      const fetched = await settleWithin(
+        fetchDiscordBackfill({
+          channelId: cursor.channelId,
+          workspace: cursor.workspace,
+          after: cursor.messageId,
+          token: options.token,
+          fetchImpl,
+          now: now(),
+        }),
+        fetchBudgetMs,
+      )
+      if (fetched.kind === 'timed-out') {
+        deadlineReached = true
+        skippedChannels += selectedCursors.length - cursorIndex
+        break
+      }
+      if (fetched.kind === 'failed') {
+        unavailableChannels++
+        logger.warn(
+          `[discord-bot] replay downtime_ms=${downtimeMs} outcome=unavailable channel=${cursor.channelId} error=${describeError(fetched.error)}`,
+        )
+        continue
+      }
+      const result = fetched.value
+      if (!result.ok) {
+        unavailableChannels++
+        logger.warn(
+          `[discord-bot] replay downtime_ms=${downtimeMs} outcome=unavailable channel=${cursor.channelId} error=${result.error}`,
+        )
+        continue
+      }
+
+      let cursorCompleted = result.outcome === 'succeeded'
+      if (result.outcome === 'capped') {
+        cappedChannels++
+        skipped += result.skipped
+        logger.warn(
+          `[discord-bot] replay downtime_ms=${downtimeMs} outcome=capped channel=${cursor.channelId} skipped_age=${result.skippedByAge} skipped_count=${result.skippedByCount} more_may_exist=${String(result.moreMayExist)}`,
+        )
+      }
+      const aggregateOverflow = Math.max(0, result.messages.length - remainingMessages)
+      if (aggregateOverflow > 0) {
+        cursorCompleted = false
+        cappedChannels++
+        skipped += aggregateOverflow
+        logger.warn(
+          `[discord-bot] replay downtime_ms=${downtimeMs} outcome=capped channel=${cursor.channelId} skipped_aggregate=${aggregateOverflow}`,
+        )
+      }
+      const messages = result.messages.slice(-remainingMessages)
+      remainingMessages -= messages.length
+      for (const [messageIndex, message] of messages.entries()) {
+        if (performance.now() >= replayDeadline) {
+          cursorCompleted = false
+          deadlineReached = true
+          skipped += messages.length - messageIndex
+          skippedChannels += selectedCursors.length - cursorIndex - 1
+          break cursorLoop
+        }
+        const delivery = await enqueueChannelOperation(message.channel_id, async () => {
+          if (store.isReplayProcessed(message.channel_id, message.id)) return 'deduplicated' as const
+          if (performance.now() >= replayDeadline) return 'timed-out' as const
+          try {
+            await processMessageCreate(toGatewayMessage(message, cursor.workspace))
+            await store.markProcessed({
+              channelId: message.channel_id,
+              workspace: cursor.workspace,
+              messageId: message.id,
+              processedAt: now(),
+            })
+            return 'replayed' as const
+          } catch (err) {
+            logger.error(
+              `[discord-bot] replay downtime_ms=${downtimeMs} outcome=route_failed channel=${cursor.channelId} id=${message.id} error=${describeError(err)}`,
+            )
+            return 'failed' as const
+          }
+        })
+        if (delivery === 'replayed') {
+          replayed++
+        } else if (delivery === 'timed-out') {
+          cursorCompleted = false
+          deadlineReached = true
+          skipped += messages.length - messageIndex
+          skippedChannels += selectedCursors.length - cursorIndex - 1
+          break cursorLoop
+        } else if (delivery === 'failed') {
+          cursorCompleted = false
+          unavailableChannels++
+          break
+        }
+      }
+      if (cursorCompleted) await store.completeReplay(cursor.channelId)
     }
+
+    if (deadlineReached) {
+      cappedChannels++
+      logger.warn(
+        `[discord-bot] replay downtime_ms=${downtimeMs} outcome=capped reason=duration duration_limit_ms=${recoveryMaxDurationMs}`,
+      )
+    }
+    if (skippedChannels > 0) {
+      cappedChannels += skippedChannels
+      logger.warn(
+        `[discord-bot] replay downtime_ms=${downtimeMs} outcome=capped skipped_channels=${skippedChannels} channel_limit=${DISCORD_BACKFILL_MAX_CHANNELS} message_limit=${DISCORD_BACKFILL_MAX_TOTAL_MESSAGES} duration_limit_ms=${recoveryMaxDurationMs}`,
+      )
+    }
+    const outcome = unavailableChannels > 0 ? 'partial' : cappedChannels > 0 ? 'capped' : 'succeeded'
+    const log = unavailableChannels > 0 || cappedChannels > 0 ? logger.warn : logger.info
+    log(
+      `[discord-bot] replay downtime_ms=${downtimeMs} outcome=${outcome} replayed=${replayed} skipped_observed=${skipped} capped_channels=${cappedChannels} unavailable_channels=${unavailableChannels}`,
+    )
   }
 
   return {
@@ -1214,11 +1421,19 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         throw err
       }
 
+      recoveryStore ??=
+        options.agentDir === undefined
+          ? createInMemoryDiscordBotRecoveryStore()
+          : await loadDiscordBotRecoveryStore(options.agentDir, logger)
+
       listener = createListener(client, { intents: DISCORD_BOT_INTENTS })
       listener.on('connected', (info) => {
         connected = true
         botUserId = info.user.id
         logger.info(`[discord-bot] connected as ${info.user.username} (${info.user.id})`)
+        void enqueueRecovery(replayAfterReconnect).catch((err) => {
+          logger.error(`[discord-bot] replay failed: ${describeError(err)}`)
+        })
         // For bots, the gateway's user.id IS the application id — the same
         // value is required for both /me lookups and /applications/{id}/
         // commands. Fire-and-forget registration so a slow Discord API
@@ -1249,6 +1464,23 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       })
       listener.on('disconnected', () => {
         connected = false
+        if (started) {
+          const pendingChannels = Array.from(inflightOperations)
+          void enqueueRecovery(async () => {
+            const drain = await settleWithin(
+              Promise.all(pendingChannels).then(() => undefined),
+              DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS,
+            )
+            if (drain.kind === 'timed-out') {
+              logger.warn(
+                `[discord-bot] disconnect drain timed out after ${DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS}ms; snapshotting completed cursors`,
+              )
+            }
+            await recoveryStore?.markDisconnected(now())
+          }).catch((err) => {
+            logger.error(`[discord-bot] failed to persist disconnect: ${describeError(err)}`)
+          })
+        }
         logger.warn('[discord-bot] disconnected; SDK will reconnect with backoff')
       })
       listener.on('error', (err) => {
@@ -1256,7 +1488,26 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         // when a terminal Gateway close stops the listener. Match that
         // distinct SDK error contract without treating transient transport
         // errors as disconnects.
-        if (isTerminalGatewayClose(err)) connected = false
+        if (isTerminalGatewayClose(err)) {
+          connected = false
+          if (started) {
+            const pendingChannels = Array.from(inflightOperations)
+            void enqueueRecovery(async () => {
+              const drain = await settleWithin(
+                Promise.all(pendingChannels).then(() => undefined),
+                DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS,
+              )
+              if (drain.kind === 'timed-out') {
+                logger.warn(
+                  `[discord-bot] disconnect drain timed out after ${DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS}ms; snapshotting completed cursors`,
+                )
+              }
+              await recoveryStore?.markDisconnected(now())
+            }).catch((persistErr) => {
+              logger.error(`[discord-bot] failed to persist disconnect: ${describeError(persistErr)}`)
+            })
+          }
+        }
         logger.error(`[discord-bot] gateway error: ${describeError(err)}`)
       })
       listener.on('message_create', (event) => {
@@ -1353,6 +1604,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      listener?.stop()
       options.router.unregisterOutbound('discord-bot', outboundCallback)
       options.router.unregisterReaction('discord-bot', reactionCallback)
       options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
@@ -1371,7 +1623,6 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
           stopWaiters.push(resolve)
         })
       }
-      listener?.stop()
       listener = null
       connected = false
     },
@@ -1386,6 +1637,32 @@ const TERMINAL_GATEWAY_CLOSE_PATTERN = /^Discord gateway closed with non-recover
 
 function isTerminalGatewayClose(err: unknown): boolean {
   return err instanceof Error && TERMINAL_GATEWAY_CLOSE_PATTERN.test(err.message)
+}
+
+function toGatewayMessage(message: DiscordBackfillMessage, workspace: string): DiscordGatewayMessageCreateEvent {
+  return {
+    ...message,
+    guild_id: workspace === '@dm' ? undefined : workspace,
+    type: 'MESSAGE_CREATE',
+  }
+}
+
+type TimedSettlement<T> = { kind: 'completed'; value: T } | { kind: 'failed'; error: unknown } | { kind: 'timed-out' }
+
+function settleWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<TimedSettlement<T>> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve({ kind: 'timed-out' }), Math.max(0, timeoutMs))
+    void operation.then(
+      (value) => {
+        clearTimeout(timeout)
+        resolve({ kind: 'completed', value })
+      },
+      (error: unknown) => {
+        clearTimeout(timeout)
+        resolve({ kind: 'failed', error })
+      },
+    )
+  })
 }
 
 // Operator hints appended to drop logs. Kept short — full guidance lives in

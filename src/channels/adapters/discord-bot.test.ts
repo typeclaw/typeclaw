@@ -31,6 +31,7 @@ import {
   DISCORD_SLASH_COMMAND_NAMES,
 } from './discord-bot'
 import { encodeDiscordReactionRef } from './discord-bot-reactions'
+import { createInMemoryDiscordBotRecoveryStore } from './discord-bot-recovery'
 import { DISCORD_SLASH_COMMAND_TYPE_CHAT_INPUT } from './discord-bot-slash-commands'
 
 const provenanceConfig: ChannelAdapterConfig = {
@@ -93,6 +94,328 @@ describe('discord-bot lifecycle', () => {
     expect(adapter.isConnected()).toBe(false)
     expect(listener.stopped).toBe(true)
     expect(router.unregistered).toEqual(router.registered)
+  })
+
+  test('backfills a reconnect gap once in order before newer live delivery', async () => {
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const historyRequests: URL[] = []
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: discordRecoveryFetch(historyRequests, [
+        gatewayMessage('100000000000000003', 'third'),
+        gatewayMessage('100000000000000002', '<@bot-1> second'),
+      ]),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      now: () => Date.parse('2026-08-28T10:05:00.000Z'),
+    })
+
+    await adapter.start()
+    listener.emit('message_create', gatewayMessage('100000000000000001', 'first'))
+    listener.emit('disconnected', 'transport closed')
+    listener.emit('connected', connectedInfo())
+    listener.emit('message_create', gatewayMessage('100000000000000003', 'third'))
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual([
+      '100000000000000001',
+      '100000000000000002',
+      '100000000000000003',
+    ])
+    expect(router.routed[1]?.isBotMention).toBe(true)
+    expect(historyRequests).toHaveLength(1)
+    expect(historyRequests[0]?.searchParams.get('after')).toBe('100000000000000001')
+  })
+
+  test('serializes pre-connected gateway delivery with replay for the same message', async () => {
+    let releaseRoute: (() => void) | undefined
+    let targetRouteStarted: (() => void) | undefined
+    const routeStarted = new Promise<void>((resolve) => {
+      targetRouteStarted = resolve
+    })
+    const heldRoute = new Promise<void>((resolve) => {
+      releaseRoute = resolve
+    })
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter(async (message) => {
+      if (message.externalMessageId !== '100000000000000042') return
+      targetRouteStarted?.()
+      await heldRoute
+    })
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: discordRecoveryFetch([], [gatewayMessage('100000000000000042', 'missed')]),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    listener.emit('message_create', gatewayMessage('100000000000000041', 'before gap'))
+    await Bun.sleep(0)
+    listener.emit('disconnected', 'transport closed')
+    listener.emit('message_create', gatewayMessage('100000000000000042', 'missed'))
+    listener.emit('connected', connectedInfo())
+    await routeStarted
+    await Bun.sleep(5)
+    releaseRoute?.()
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual([
+      '100000000000000041',
+      '100000000000000042',
+    ])
+  })
+
+  test('does not backfill or duplicate delivery during normal operation', async () => {
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const historyRequests: URL[] = []
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: discordRecoveryFetch(historyRequests, []),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    expect(adapter.isConnected()).toBe(true)
+    listener.emit('message_create', gatewayMessage('100000000000000010', 'normal'))
+    listener.emit('message_create', gatewayMessage('100000000000000010', 'normal'))
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual(['100000000000000010'])
+    expect(historyRequests).toEqual([])
+  })
+
+  test('does not let a slow live channel block another channel', async () => {
+    let releaseSlowRoute: (() => void) | undefined
+    const slowRoute = new Promise<void>((resolve) => {
+      releaseSlowRoute = resolve
+    })
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter(async (message) => {
+      if (message.chat === '800000000000000001') await slowRoute
+    })
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: discordRecoveryFetch([], []),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    listener.emit('message_create', gatewayMessage('100000000000000020', 'slow'))
+    listener.emit('message_create', {
+      ...gatewayMessage('100000000000000021', 'independent'),
+      channel_id: '800000000000000002',
+    })
+    await Bun.sleep(5)
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual(['100000000000000021'])
+    releaseSlowRoute?.()
+    await adapter.stop()
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual([
+      '100000000000000021',
+      '100000000000000020',
+    ])
+  })
+
+  test('retains a failed replay anchor when newer live messages advance the cursor', async () => {
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    let historyAttempt = 0
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/v10/channels/800000000000000001') {
+        return Response.json({ id: '800000000000000001', guild_id: '700000000000000001' })
+      }
+      if (url.pathname.endsWith('/messages') && url.searchParams.has('after')) {
+        historyAttempt++
+        if (historyAttempt === 1) return new Response(null, { status: 503 })
+        return Response.json([
+          withoutDispatchType(gatewayMessage('100000000000000003', 'newer live')),
+          withoutDispatchType(gatewayMessage('100000000000000002', 'missed')),
+        ])
+      }
+      return Response.json({})
+    }) as typeof fetch
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      now: () => Date.parse('2026-08-28T10:05:00.000Z'),
+    })
+
+    await adapter.start()
+    listener.emit('message_create', gatewayMessage('100000000000000001', 'first'))
+    listener.emit('disconnected', 'transport closed')
+    listener.emit('connected', connectedInfo())
+    listener.emit('message_create', gatewayMessage('100000000000000003', 'newer live'))
+    listener.emit('disconnected', 'transport closed')
+    listener.emit('connected', connectedInfo())
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual([
+      '100000000000000001',
+      '100000000000000003',
+      '100000000000000002',
+    ])
+    expect(new Set(router.routed.map((message) => message.externalMessageId)).size).toBe(3)
+    expect(historyAttempt).toBe(2)
+  })
+
+  test('releases live delivery when reconnect recovery reaches its duration cap', async () => {
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const warnings: string[] = []
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.signal !== undefined && String(input).endsWith('/channels/800000000000000001')) {
+        return await new Promise<Response>(() => {})
+      }
+      const url = new URL(String(input))
+      if (url.pathname.startsWith('/api/v10/channels/')) {
+        return Response.json({ id: url.pathname.split('/').at(-1), guild_id: '700000000000000001' })
+      }
+      return Response.json({})
+    }) as typeof fetch
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: (message) => warnings.push(message), error: () => {} },
+      fetchImpl,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      recoveryMaxDurationMs: 5,
+    })
+
+    await adapter.start()
+    listener.emit('message_create', gatewayMessage('100000000000000030', 'before gap'))
+    listener.emit('disconnected', 'transport closed')
+    listener.emit('connected', connectedInfo())
+    listener.emit('message_create', gatewayMessage('100000000000000031', 'after timeout'))
+    await Bun.sleep(20)
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual([
+      '100000000000000030',
+      '100000000000000031',
+    ])
+    expect(warnings.some((message) => message.includes('outcome=capped reason=duration'))).toBe(true)
+  })
+
+  test('retries a duration-capped replay anchor on the next connection', async () => {
+    const recoveryStore = createInMemoryDiscordBotRecoveryStore()
+    await recoveryStore.markProcessed({
+      channelId: '800000000000000001',
+      workspace: '700000000000000001',
+      messageId: '100000000000000050',
+      processedAt: 1,
+    })
+    await recoveryStore.markDisconnected(2)
+    let channelLookupAttempt = 0
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      if (url.pathname === '/api/v10/channels/800000000000000001') {
+        channelLookupAttempt++
+        if (channelLookupAttempt === 1) return await new Promise<Response>(() => {})
+        return Response.json({ id: '800000000000000001', guild_id: '700000000000000001' })
+      }
+      if (url.pathname.endsWith('/messages')) {
+        return Response.json([withoutDispatchType(gatewayMessage('100000000000000051', 'missed'))])
+      }
+      return Response.json({})
+    }) as typeof fetch
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      recoveryStore,
+      recoveryMaxDurationMs: 5,
+      now: () => Date.parse('2026-08-28T10:05:00.000Z'),
+    })
+
+    await adapter.start()
+    await Bun.sleep(15)
+    expect(recoveryStore.listReplayCursors()).toHaveLength(1)
+    listener.emit('connected', connectedInfo())
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual(['100000000000000051'])
+    expect(channelLookupAttempt).toBeGreaterThanOrEqual(2)
+    expect(recoveryStore.listReplayCursors()).toEqual([])
+    expect(recoveryStore.disconnectedAt()).toBeNull()
+  })
+
+  test('retains channels beyond the replay pass limit for the next connection', async () => {
+    const recoveryStore = createInMemoryDiscordBotRecoveryStore()
+    for (let index = 1; index <= 21; index++) {
+      await recoveryStore.markProcessed({
+        channelId: String(800000000000000000n + BigInt(index)),
+        workspace: '700000000000000001',
+        messageId: String(100000000000000000n + BigInt(index)),
+        processedAt: index,
+      })
+    }
+    await recoveryStore.markDisconnected(22)
+    const historyChannels: string[] = []
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      const channelId = url.pathname.endsWith('/messages')
+        ? url.pathname.split('/').at(-2)
+        : url.pathname.split('/').at(-1)
+      if (url.pathname.endsWith('/messages')) {
+        historyChannels.push(channelId ?? '')
+        return Response.json([])
+      }
+      return Response.json({ id: channelId, guild_id: '700000000000000001' })
+    }) as typeof fetch
+    const listener = new FakeDiscordBotListener()
+    const adapter = createDiscordBotAdapter({
+      router: new FakeDiscordBotRouter().value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl,
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      recoveryStore,
+    })
+
+    await adapter.start()
+    await Bun.sleep(10)
+    expect(historyChannels).toHaveLength(20)
+    expect(recoveryStore.listReplayCursors()).toHaveLength(1)
+    listener.emit('connected', connectedInfo())
+    await adapter.stop()
+
+    expect(historyChannels).toHaveLength(21)
+    expect(new Set(historyChannels)).toHaveLength(21)
+    expect(recoveryStore.listReplayCursors()).toEqual([])
+    expect(recoveryStore.disconnectedAt()).toBeNull()
   })
 
   test('logs the nested reason of a gateway ErrorEvent, never [object ErrorEvent]', async () => {
@@ -2212,9 +2535,15 @@ class FakeDiscordBotListener {
 class FakeDiscordBotRouter {
   readonly registered: string[] = []
   readonly unregistered: string[] = []
+  readonly routed: InboundMessage[] = []
   selfIdentity: ((workspace: string) => { id: string; username?: string } | null) | null = null
+  constructor(private readonly routeHook?: (message: InboundMessage) => Promise<void>) {}
+
   readonly value = {
-    route: async () => {},
+    route: async (message: InboundMessage) => {
+      await this.routeHook?.(message)
+      this.routed.push(message)
+    },
     registerOutbound: () => this.registered.push('outbound'),
     unregisterOutbound: () => this.unregistered.push('outbound'),
     registerReaction: () => this.registered.push('reaction'),
@@ -2248,7 +2577,40 @@ class FakeDiscordBotRouter {
 }
 
 function connectedInfo() {
-  return { user: { id: 'bot-1', username: 'Typeey' }, sessionId: 'session-1' }
+  return { user: { id: 'bot-1', username: 'test-bot' }, sessionId: 'test-session' }
+}
+
+function gatewayMessage(id: string, content: string): DiscordGatewayMessageCreateEvent {
+  return {
+    type: 'MESSAGE_CREATE',
+    id,
+    channel_id: '800000000000000001',
+    guild_id: '700000000000000001',
+    author: { id: '600000000000000001', username: 'test-user', bot: false },
+    content,
+    timestamp: '2026-08-28T10:00:00.000Z',
+  }
+}
+
+function discordRecoveryFetch(historyRequests: URL[], history: DiscordGatewayMessageCreateEvent[]): typeof fetch {
+  return (async (input: string | URL | Request) => {
+    const url = new URL(String(input))
+    if (url.pathname.endsWith('/messages') && url.searchParams.has('after')) {
+      historyRequests.push(url)
+      return Response.json(history.map(({ type: _type, ...message }) => message))
+    }
+    if (url.pathname === '/api/v10/channels/800000000000000001') {
+      return Response.json({ id: '800000000000000001', guild_id: '700000000000000001' })
+    }
+    return Response.json({})
+  }) as typeof fetch
+}
+
+function withoutDispatchType(
+  message: DiscordGatewayMessageCreateEvent,
+): Omit<DiscordGatewayMessageCreateEvent, 'type'> {
+  const { type: _type, ...rest } = message
+  return rest
 }
 
 function lifecycleConfig(): ChannelAdapterConfig {
