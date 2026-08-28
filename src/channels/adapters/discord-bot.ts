@@ -1327,7 +1327,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         continue
       }
 
-      let cursorCompleted = result.outcome === 'succeeded'
+      let cursorCompleted = true
       if (result.outcome === 'capped') {
         cappedChannels++
         skipped += result.skipped

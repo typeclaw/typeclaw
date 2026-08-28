@@ -418,6 +418,49 @@ describe('discord-bot lifecycle', () => {
     expect(recoveryStore.disconnectedAt()).toBeNull()
   })
 
+  test('completes a count-capped replay after reporting and delivering the bounded subset', async () => {
+    const recoveryStore = createInMemoryDiscordBotRecoveryStore()
+    await recoveryStore.markProcessed({
+      channelId: '800000000000000001',
+      workspace: '700000000000000001',
+      messageId: '100000000000000000',
+      processedAt: 1,
+    })
+    await recoveryStore.markDisconnected(2)
+    const historyRequests: URL[] = []
+    const history = Array.from({ length: 51 }, (_, index) =>
+      gatewayMessage(String(100000000000000001n + BigInt(index)), `missed-${index + 1}`),
+    )
+    const warnings: string[] = []
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: (message) => warnings.push(message), error: () => {} },
+      fetchImpl: discordRecoveryFetch(historyRequests, history),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      recoveryStore,
+      now: () => Date.parse('2026-08-28T10:05:00.000Z'),
+    })
+
+    await adapter.start()
+    await Bun.sleep(10)
+    listener.emit('connected', connectedInfo())
+    await adapter.stop()
+
+    expect(router.routed).toHaveLength(50)
+    expect(new Set(router.routed.map((message) => message.externalMessageId))).toHaveLength(50)
+    expect(historyRequests).toHaveLength(1)
+    expect(warnings.some((message) => message.includes('outcome=capped') && message.includes('skipped_count=1'))).toBe(
+      true,
+    )
+    expect(recoveryStore.listReplayCursors()).toEqual([])
+    expect(recoveryStore.disconnectedAt()).toBeNull()
+  })
+
   test('logs the nested reason of a gateway ErrorEvent, never [object ErrorEvent]', async () => {
     // given: a ws 'error' fires with an ErrorEvent, which is not an Error
     const errors: string[] = []
