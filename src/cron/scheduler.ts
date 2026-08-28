@@ -203,6 +203,7 @@ function jobFingerprint(job: CronJob): string {
     count: job.count ?? null,
     enabled: job.enabled,
     timezone: job.timezone ?? null,
+    timeoutMs: job.timeoutMs ?? null,
     kind: job.kind,
     payload: jobPayload(job),
   })

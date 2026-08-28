@@ -75,6 +75,7 @@ type PromptOverrides = {
   prompt?: string
   subagent?: string
   payload?: unknown
+  timeoutMs?: number
 }
 type ExecOverrides = { enabled?: boolean; timezone?: string; command?: string[] }
 
@@ -87,6 +88,7 @@ const promptJob = (id: string, schedule: string, overrides: PromptOverrides = {}
   ...(overrides.timezone !== undefined && { timezone: overrides.timezone }),
   ...(overrides.subagent !== undefined && { subagent: overrides.subagent }),
   ...(overrides.payload !== undefined && { payload: overrides.payload }),
+  ...(overrides.timeoutMs !== undefined && { timeoutMs: overrides.timeoutMs }),
 })
 
 const execJob = (id: string, schedule: string, overrides: ExecOverrides = {}): CronJob => ({
@@ -390,6 +392,23 @@ describe('Scheduler.replaceJobs', () => {
     expect(diff.updated.map((j) => j.id).sort()).toEqual(['payload-change', 'plain-to-subagent', 'subagent-rename'])
     expect(diff.unchanged.map((j) => j.id)).toEqual(['untouched'])
 
+    scheduler.stop()
+  })
+
+  test('treats a per-job timeout change as an update', () => {
+    const clock = createFakeClock()
+    const recorder = createFireRecorder()
+    const scheduler = createScheduler({
+      jobs: [promptJob('bounded', '* * * * *', { timeoutMs: 60_000 })],
+      onFire: recorder.onFire,
+      clock,
+      logger: silentLogger,
+    })
+    scheduler.start()
+
+    const diff = scheduler.replaceJobs([promptJob('bounded', '* * * * *', { timeoutMs: 120_000 })])
+
+    expect(diff.updated.map((job) => job.id)).toEqual(['bounded'])
     scheduler.stop()
   })
 
