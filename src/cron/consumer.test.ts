@@ -7,7 +7,7 @@ import type { AgentSession } from '@/agent'
 import type { HookBus } from '@/plugin'
 import { createStream } from '@/stream'
 
-import { createCronConsumer, type CronConsumerLogger, type CronSession } from './consumer'
+import { createCronConsumer, type CronConsumerClock, type CronConsumerLogger, type CronSession } from './consumer'
 import type { CronJob, ExecJob, PromptJob } from './schema'
 
 async function waitForFile(path: string): Promise<string> {
@@ -34,6 +34,15 @@ async function waitForCondition(predicate: () => boolean): Promise<void> {
 
 async function waitForConsumerIdle(consumer: ReturnType<typeof createCronConsumer>): Promise<void> {
   await waitForCondition(() => consumer.inFlightCount() === 0)
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
 }
 
 // Minimal AgentSession stub satisfying the surface the model-fallback helper
@@ -82,12 +91,13 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true })
 })
 
-const promptJob = (id: string, prompt: string): PromptJob => ({
+const promptJob = (id: string, prompt: string, overrides: Partial<PromptJob> = {}): PromptJob => ({
   id,
   schedule: '* * * * *',
   enabled: true,
   kind: 'prompt',
   prompt,
+  ...overrides,
 })
 
 const execJob = (id: string, command: string[]): ExecJob => ({
@@ -100,6 +110,39 @@ const execJob = (id: string, command: string[]): ExecJob => ({
 
 function publishCron(stream: ReturnType<typeof createStream>, job: CronJob): string {
   return stream.publish({ target: { kind: 'cron', jobId: job.id }, payload: job })
+}
+
+function createFakeClock(start = 1_000): CronConsumerClock & { advance: (ms: number) => Promise<void> } {
+  let now = start
+  let nextHandle = 1
+  const timers = new Map<number, { at: number; callback: () => void }>()
+  return {
+    now: () => now,
+    setTimeout: (callback, ms) => {
+      const handle = nextHandle++
+      timers.set(handle, { at: now + ms, callback })
+      return handle
+    },
+    clearTimeout: (handle) => {
+      timers.delete(handle)
+    },
+    advance: async (ms) => {
+      const target = now + ms
+      for (;;) {
+        const due = [...timers.entries()]
+          .filter(([, timer]) => timer.at <= target)
+          .sort(([, a], [, b]) => a.at - b.at)[0]
+        if (due === undefined) break
+        const [handle, timer] = due
+        timers.delete(handle)
+        now = timer.at
+        timer.callback()
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+      now = target
+      await new Promise((resolve) => setImmediate(resolve))
+    },
+  }
 }
 
 function makeFakeSessionFactory(): {
@@ -282,6 +325,269 @@ describe('createCronConsumer', () => {
     expect(calls.length).toBeGreaterThanOrEqual(2)
     expect(calls.some((c) => c.startsWith('slow:') && c.includes('third'))).toBe(true)
 
+    consumer.stop()
+  })
+
+  test('bounds a hung occurrence and allows the next occurrence of that job to run', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    const infos: string[] = []
+    let calls = 0
+    let disposals = 0
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () => {
+        calls += 1
+        if (calls === 1) {
+          return {
+            prompt: async () => new Promise<void>(() => {}),
+            dispose: () => {
+              disposals += 1
+            },
+          }
+        }
+        return { prompt: async () => {} }
+      },
+      logger: { ...silentLogger, info: (message) => infos.push(message) },
+    })
+    consumer.start()
+    const job = promptJob('bounded', 'run', { timeoutMs: 100 })
+
+    publishCron(stream, job)
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(100)
+    expect(consumer.inFlightCount()).toBe(0)
+    expect(disposals).toBe(1)
+
+    publishCron(stream, job)
+    await waitForConsumerIdle(consumer)
+
+    expect(calls).toBe(2)
+    expect(infos.some((line) => /run-start fire_id=/.test(line))).toBe(true)
+    expect(infos.some((line) => /run-end .*elapsed_ms=100 outcome=timeout/.test(line))).toBe(true)
+    expect(infos.some((line) => /run-end .*outcome=success/.test(line))).toBe(true)
+    consumer.stop()
+  })
+
+  test('does not prompt a session whose creation finishes after the occurrence deadline', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    let finishCreation: ((session: CronSession) => void) | undefined
+    let prompts = 0
+    let disposals = 0
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () =>
+        new Promise<CronSession>((resolve) => {
+          finishCreation = resolve
+        }),
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, promptJob('slow-create', 'run', { timeoutMs: 100 }))
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(100)
+    finishCreation?.({
+      prompt: async () => {
+        prompts += 1
+      },
+      dispose: () => {
+        disposals += 1
+      },
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(prompts).toBe(0)
+    expect(disposals).toBe(1)
+    consumer.stop()
+  })
+
+  test('does not prompt after a turn-start hook finishes past the occurrence deadline', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    const hooks = fakeHooks([])
+    let finishTurnStart: (() => void) | undefined
+    let prompts = 0
+    let disposals = 0
+    hooks.runSessionTurnStart = async () =>
+      new Promise<void>((resolve) => {
+        finishTurnStart = resolve
+      })
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () => ({
+        prompt: async () => {
+          prompts += 1
+        },
+        hooks,
+        sessionId: 'slow-hook-session',
+        agentDir: root,
+        dispose: () => {
+          disposals += 1
+        },
+      }),
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, promptJob('slow-hook', 'run', { timeoutMs: 100 }))
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(100)
+    finishTurnStart?.()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(prompts).toBe(0)
+    expect(disposals).toBe(1)
+    consumer.stop()
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'kills a timed-out exec process group after the abort grace period',
+    async () => {
+      const stream = createStream()
+      const clock = createFakeClock()
+      const consumer = createCronConsumer({
+        stream,
+        cwd: root,
+        clock,
+        createSessionForCron: makeFakeSessionFactory().createSessionForCron,
+        logger: silentLogger,
+      })
+      consumer.start()
+      const script = [
+        'trap "" TERM',
+        'echo $$ > parent.pid',
+        `sh -c 'trap "" TERM; echo $$ > child.pid; while :; do sleep 1; done' &`,
+        'wait',
+      ].join('\n')
+
+      publishCron(stream, { ...execJob('stubborn-tree', ['sh', '-c', script]), timeoutMs: 100 })
+      const parentPid = Number((await waitForFile(join(root, 'parent.pid'))).trim())
+      const childPid = Number((await waitForFile(join(root, 'child.pid'))).trim())
+      await clock.advance(100)
+
+      expect(consumer.inFlightCount()).toBe(0)
+      expect(isProcessAlive(parentPid)).toBe(true)
+      expect(isProcessAlive(childPid)).toBe(true)
+
+      await clock.advance(5_000)
+      await waitForCondition(() => !isProcessAlive(parentPid) && !isProcessAlive(childPid))
+
+      consumer.stop()
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'keeps exec SIGKILL escalation when the parent exits but a resistant child survives',
+    async () => {
+      const stream = createStream()
+      const clock = createFakeClock()
+      const consumer = createCronConsumer({
+        stream,
+        cwd: root,
+        clock,
+        createSessionForCron: makeFakeSessionFactory().createSessionForCron,
+        logger: silentLogger,
+      })
+      consumer.start()
+      const script = [
+        `const child = Bun.spawn({ cmd: ['sh', '-c', 'trap "" TERM; while :; do sleep 1; done'], stdout: 'ignore', stderr: 'ignore' })`,
+        `await Bun.write('parent.pid', String(process.pid))`,
+        `await Bun.write('child.pid', String(child.pid))`,
+        `await child.exited`,
+      ].join('; ')
+
+      publishCron(stream, { ...execJob('exiting-parent', [process.execPath, '-e', script]), timeoutMs: 100 })
+      const parentPid = Number((await waitForFile(join(root, 'parent.pid'))).trim())
+      const childPid = Number((await waitForFile(join(root, 'child.pid'))).trim())
+      await clock.advance(100)
+      await waitForCondition(() => !isProcessAlive(parentPid))
+
+      expect(isProcessAlive(childPid)).toBe(true)
+
+      await clock.advance(5_000)
+      await waitForCondition(() => !isProcessAlive(childPid))
+
+      consumer.stop()
+    },
+  )
+
+  test('does not time out a long occurrence that finishes within its configured deadline', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    const infos: string[] = []
+    let release: (() => void) | undefined
+    let disposals = 0
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () => ({
+        prompt: async () =>
+          new Promise<void>((resolve) => {
+            release = resolve
+          }),
+        dispose: () => {
+          disposals += 1
+        },
+      }),
+      logger: { ...silentLogger, info: (message) => infos.push(message) },
+    })
+    consumer.start()
+
+    publishCron(stream, promptJob('long-valid', 'run', { timeoutMs: 1_000 }))
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(900)
+    expect(consumer.inFlightCount()).toBe(1)
+    expect(disposals).toBe(0)
+
+    release?.()
+    await waitForConsumerIdle(consumer)
+
+    expect(disposals).toBe(1)
+    expect(infos.some((line) => /run-end .*elapsed_ms=900 outcome=success/.test(line))).toBe(true)
+    expect(infos.some((line) => /outcome=timeout/.test(line))).toBe(false)
+    consumer.stop()
+  })
+
+  test('skip logs identify the blocking fire and how long it has been active', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    const warnings: string[] = []
+    let release: (() => void) | undefined
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () => ({
+        prompt: async () =>
+          new Promise<void>((resolve) => {
+            release = resolve
+          }),
+      }),
+      logger: { ...silentLogger, warn: (message) => warnings.push(message) },
+    })
+    consumer.start()
+    const job = promptJob('busy-observable', 'run')
+
+    publishCron(stream, job)
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(250)
+    publishCron(stream, job)
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(warnings).toEqual([
+      expect.stringMatching(/busy-observable: previous run fire_id=.* active_for_ms=250, skipping/),
+    ])
+    release?.()
+    await waitForConsumerIdle(consumer)
     consumer.stop()
   })
 
@@ -801,7 +1107,7 @@ describe('createCronConsumer', () => {
     await new Promise((r) => setImmediate(r))
 
     // then
-    expect(warns).toEqual([expect.stringContaining('busy: previous run still in progress, skipping')])
+    expect(warns).toEqual([expect.stringMatching(/busy: previous run fire_id=.* active_for_ms=\d+, skipping/)])
 
     for (const r of resolvers) r()
     consumer.stop()
@@ -880,6 +1186,7 @@ describe('createCronConsumer model fallback', () => {
     try {
       const stream = createStream()
       const errors: string[] = []
+      const infos: string[] = []
       const attempted: string[] = []
       const consumer = createCronConsumer({
         stream,
@@ -895,7 +1202,7 @@ describe('createCronConsumer model fallback', () => {
             }),
           }
         },
-        logger: { ...silentLogger, error: (m) => errors.push(m) },
+        logger: { ...silentLogger, info: (m) => infos.push(m), error: (m) => errors.push(m) },
       })
       consumer.start()
 
@@ -907,6 +1214,7 @@ describe('createCronConsumer model fallback', () => {
       expect(attempted).toEqual(['openai/gpt-5.4-nano', 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo'])
       expect(errors.some((e) => /all 2 model\(s\) failed/.test(e))).toBe(true)
       expect(errors.some((e) => /down: fireworks/.test(e))).toBe(true)
+      expect(infos.some((line) => /run-end .*outcome=failed/.test(line))).toBe(true)
 
       consumer.stop()
     } finally {

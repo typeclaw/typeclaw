@@ -684,12 +684,11 @@ async function startAgentRuntime(
       // the unreachable case where a fire somehow predates the holder.
       increment: (id, job, at) => cronCountStore?.increment(id, job, at) ?? Promise.resolve(false),
     },
-    invokeHandler: async (job) => {
+    invokeHandler: async (job, signal) => {
       const snap = pluginRuntime.get()
       const registered = snap.registry.cronJobs.find((j) => j.globalId === job.id)
       const pluginName = registered?.pluginName ?? '<unknown>'
       const logger = createPluginLogger(pluginName)
-      const abortController = new AbortController()
       const origin: SessionOrigin = {
         kind: 'cron',
         jobId: job.id,
@@ -702,7 +701,7 @@ async function startAgentRuntime(
         name: pluginName,
         agentDir: cwd,
         logger,
-        signal: abortController.signal,
+        signal,
         permissions: pluginsLoaded.permissions,
         origin,
         prompt: (text: string) =>
@@ -712,7 +711,7 @@ async function startAgentRuntime(
             runtime: pluginRuntime,
             agentDir: cwd,
             permissions: pluginsLoaded.permissions,
-            signal: abortController.signal,
+            signal,
             runtimeVersion: runtimeVersionOpt.runtimeVersion,
             containerName: containerNameOpt.containerName,
             sessionFactory,
@@ -724,7 +723,7 @@ async function startAgentRuntime(
             spawnedByOrigin: origin,
           }),
         exec: (strings: TemplateStringsArray, ...values: unknown[]) =>
-          runExecForCommand(strings, values, { cwd, signal: abortController.signal }),
+          runExecForCommand(strings, values, { cwd, signal }),
       }
       await job.handler(ctx)
     },
@@ -784,6 +783,7 @@ async function startAgentRuntime(
       })
       return {
         prompt: (text) => session.prompt(text),
+        abort: () => session.abort(),
         dispose: () => {
           liveSessionRegistry.unregister(sessionId)
           session.dispose()
