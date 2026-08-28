@@ -38,6 +38,7 @@ Lives at the agent folder root. Reloads live via `typeclaw reload`.
 | `scheduledByRole` | role name (string)    | yes      | role the firing session resolves as; required — rejected with an error if missing |
 | `enabled`         | `boolean`             | no       | defaults to `true`; set `false` to keep the entry but skip firing                 |
 | `timezone`        | IANA tz name (string) | no       | defaults to container `TZ` env (UTC if unset)                                     |
+| `timeoutMs`       | positive integer      | no       | per-occurrence deadline in milliseconds; defaults to 1 hour                       |
 
 ## `kind: "prompt"`
 
@@ -54,9 +55,9 @@ Lives at the agent folder root. Reloads live via `typeclaw reload`.
 
 ## Per-job coalescing
 
-If a job is still running when its next tick fires, the next tick is dropped for that specific job (and logged), not queued. Other jobs are unaffected.
+If a job is still running when its next tick fires, the next tick is dropped for that specific job (and logged), not queued. Other jobs are unaffected. Each occurrence has a one-hour deadline by default so a hung run cannot suppress that job forever; set `timeoutMs` on jobs that legitimately need longer.
 
-The scheduler is a pure clock — it just emits "this job's time has come" events. The consumer owns the per-`id` in-flight set.
+The scheduler is a pure clock — it just emits "this job's time has come" events. The consumer owns the per-`id` in-flight reservation.
 
 ## Limits
 
