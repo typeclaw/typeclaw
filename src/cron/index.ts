@@ -14,11 +14,13 @@ export { aggregateCronList, type CronListEntry, type CronListSource } from './li
 export {
   cronFileSchema,
   cronJobSchema,
+  cronRunTimeoutMsSchema,
   type CronFile,
   type CronJob,
   type CronParseWarning,
   type ExecJob,
   type HandlerJob,
+  MAX_CRON_RUN_TIMEOUT_MS,
   parseCronJson,
   type ParseCronMode,
   type ParseCronResult,

@@ -44,6 +44,36 @@ describe('cronFileSchema', () => {
     expect(parsed.jobs[0]?.enabled).toBe(false)
   })
 
+  test('accepts a positive per-job timeoutMs override', () => {
+    const parsed = cronFileSchema.parse({
+      jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', timeoutMs: 7_200_000 }],
+    })
+    expect(parsed.jobs[0]?.timeoutMs).toBe(7_200_000)
+  })
+
+  test('rejects a non-positive or fractional timeoutMs', () => {
+    expect(() =>
+      cronFileSchema.parse({ jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', timeoutMs: 0 }] }),
+    ).toThrow()
+    expect(() =>
+      cronFileSchema.parse({ jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', timeoutMs: 1.5 }] }),
+    ).toThrow()
+  })
+
+  test('accepts the largest safe timer delay and rejects an overflowing timeoutMs', () => {
+    const maximum = 2_147_483_647
+    expect(() =>
+      cronFileSchema.parse({
+        jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', timeoutMs: maximum }],
+      }),
+    ).not.toThrow()
+    expect(() =>
+      cronFileSchema.parse({
+        jobs: [{ id: 'j', schedule: '* * * * *', kind: 'prompt', prompt: 'x', timeoutMs: maximum + 1 }],
+      }),
+    ).toThrow(/timeoutMs must be at most 2147483647/)
+  })
+
   test('rejects missing id', () => {
     expect(() => cronFileSchema.parse({ jobs: [{ schedule: '* * * * *', kind: 'prompt', prompt: 'x' }] })).toThrow()
   })

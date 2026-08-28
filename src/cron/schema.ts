@@ -6,6 +6,12 @@ import { validateSubagentPayload } from '@/agent/subagents'
 import type { CronHandlerContext } from '@/plugin/types'
 
 const idPattern = /^[a-zA-Z0-9_-]+$/
+export const MAX_CRON_RUN_TIMEOUT_MS = 2_147_483_647
+export const cronRunTimeoutMsSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(MAX_CRON_RUN_TIMEOUT_MS, `timeoutMs must be at most ${MAX_CRON_RUN_TIMEOUT_MS}`)
 
 const baseJob = z.object({
   id: z.string().min(1).regex(idPattern, 'id must contain only letters, digits, hyphens, or underscores'),
@@ -23,6 +29,7 @@ const baseJob = z.object({
   count: z.number().int().positive().optional(),
   enabled: z.boolean().default(true),
   timezone: z.string().optional(),
+  timeoutMs: cronRunTimeoutMsSchema.optional(),
   scheduledByRole: z.string().optional(),
   // Audit snapshot of the SessionOrigin that scheduled this job. Persisted
   // as opaque z.unknown() because SessionOrigin is recursive (a cron origin

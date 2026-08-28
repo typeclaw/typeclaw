@@ -79,6 +79,7 @@ export type PluginPromptCronJob = {
   prompt: string
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number
   subagent?: string
   payload?: unknown
 }
@@ -89,6 +90,7 @@ export type PluginExecCronJob = {
   command: string[]
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number
 }
 
 // In-process handler. Invoked directly by the cron consumer; no shell-out, no
@@ -107,6 +109,7 @@ export type PluginHandlerCronJob = {
   handler: (ctx: CronHandlerContext) => Promise<void>
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number
 }
 
 export type PluginCronJob = PluginPromptCronJob | PluginExecCronJob | PluginHandlerCronJob
@@ -116,14 +119,10 @@ export type PluginCronJob = PluginPromptCronJob | PluginExecCronJob | PluginHand
 // CLI-shaped fields (stdin/stdout/stderr, args, exit code) because cron has
 // no caller to pipe to.
 //
-// `signal` is reserved for future cancellation and is currently never aborted
-// by the runtime — the consumer matches the existing prompt/exec cron jobs
-// which also let in-flight work finish on container shutdown. The signal IS
-// already threaded into `ctx.prompt` and `ctx.exec`, so the moment the
-// runtime starts aborting it (e.g. via a future graceful-shutdown path),
-// propagation works without handler-author changes. Handler authors who
-// want to respect future cancellation should still check `ctx.signal.aborted`
-// in long-running loops; nothing fires it today.
+// `signal` aborts when the occurrence reaches its per-job `timeoutMs` or the
+// runtime's default cron deadline. `ctx.prompt` and `ctx.exec` propagate it
+// automatically. Custom async work and long-running loops must cooperate by
+// checking the signal or passing it to abort-aware APIs.
 //
 // `origin` is a cron-shaped SessionOrigin so any session the handler spawns
 // via `ctx.prompt` carries the cron job's provenance — same role-inheritance

@@ -146,6 +146,34 @@ describe('registerContributions', () => {
     }
   })
 
+  test('preserves timeout overrides for every plugin cron job kind', () => {
+    const opts = makeOptions('bounded-work', {
+      cronJobs: {
+        prompt: { schedule: '* * * * *', kind: 'prompt', prompt: 'run', timeoutMs: 1_000 },
+        exec: { schedule: '* * * * *', kind: 'exec', command: ['run'], timeoutMs: 2_000 },
+        handler: { schedule: '* * * * *', kind: 'handler', handler: async () => {}, timeoutMs: 3_000 },
+      },
+    })
+    registerContributions(opts)
+
+    expect(opts.registry.cronJobs.map(({ job }) => [job.kind, job.timeoutMs])).toEqual([
+      ['prompt', 1_000],
+      ['exec', 2_000],
+      ['handler', 3_000],
+    ])
+  })
+
+  test('rejects invalid plugin cron timeout overrides', () => {
+    for (const timeoutMs of [0, 1.5, 2_147_483_648]) {
+      const opts = makeOptions('invalid-timeout', {
+        cronJobs: {
+          job: { schedule: '* * * * *', kind: 'prompt', prompt: 'run', timeoutMs },
+        },
+      })
+      expect(() => registerContributions(opts)).toThrow(/timeoutMs/)
+    }
+  })
+
   test('records plugin commands declared on DefinedPlugin', () => {
     const cmd = defineCommand({
       surface: 'host',

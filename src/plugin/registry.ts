@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { z } from 'zod'
 
 import { BUILTIN_COMMAND_NAMES } from '@/cli/builtins'
-import type { CronJob, PromptJob } from '@/cron'
+import { cronRunTimeoutMsSchema, type CronJob, type PromptJob } from '@/cron'
 
 import type { HookBus } from './hooks'
 import type {
@@ -244,6 +244,7 @@ function toCronJob(globalId: string, spec: PluginCronJob): CronJob {
   // would lose every security bypass. Hand-authored cron.json entries take
   // a different path and must declare scheduledByRole explicitly.
   const scheduledByRole: PromptJob['scheduledByRole'] = 'owner'
+  const timeoutMs = parsePluginCronTimeout(globalId, spec.timeoutMs)
   if (spec.kind === 'prompt') {
     const job: PromptJob = {
       id: globalId,
@@ -253,6 +254,7 @@ function toCronJob(globalId: string, spec: PluginCronJob): CronJob {
       prompt: spec.prompt,
       scheduledByRole,
       ...(spec.timezone !== undefined ? { timezone: spec.timezone } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
       ...(spec.subagent !== undefined ? { subagent: spec.subagent } : {}),
       ...(spec.payload !== undefined ? { payload: spec.payload } : {}),
     }
@@ -267,6 +269,7 @@ function toCronJob(globalId: string, spec: PluginCronJob): CronJob {
       command: spec.command,
       scheduledByRole,
       ...(spec.timezone !== undefined ? { timezone: spec.timezone } : {}),
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     }
   }
   return {
@@ -277,5 +280,15 @@ function toCronJob(globalId: string, spec: PluginCronJob): CronJob {
     handler: spec.handler,
     scheduledByRole,
     ...(spec.timezone !== undefined ? { timezone: spec.timezone } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
   }
+}
+
+function parsePluginCronTimeout(globalId: string, timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs === undefined) return undefined
+  const parsed = cronRunTimeoutMsSchema.safeParse(timeoutMs)
+  if (parsed.success) return parsed.data
+  throw new Error(
+    `plugin cron job "${globalId}" has invalid timeoutMs: ${parsed.error.issues[0]?.message ?? 'invalid value'}`,
+  )
 }
