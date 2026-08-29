@@ -64,7 +64,7 @@ import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistr
 import { createPluginLogger } from '@/plugin/context'
 import type { CronHandlerContext } from '@/plugin/types'
 import { createContainerBroker, publishForwardResult, subscribeForwardRequest } from '@/portbroker'
-import { formatChannelReloadSummary, ReloadRegistry, type ReloadAllResult } from '@/reload'
+import { formatChannelReloadSummary, ReloadRegistry, type ReloadAllResult, type ReloadContext } from '@/reload'
 import { createClaimController } from '@/role-claim'
 import {
   exportClaudeCredentialsFileForAgent,
@@ -205,11 +205,11 @@ async function startAgentRuntime(
 ): Promise<StartAgentResult> {
   const reloadRegistry = new ReloadRegistry()
 
-  const reloadAllNonDestructive = async (): Promise<ReloadAllResult> => {
+  const reloadAllNonDestructive = async (context?: ReloadContext): Promise<ReloadAllResult> => {
     const results = []
     for (const item of reloadRegistry.list()) {
       if (item.scope === 'providers') continue
-      results.push(await reloadRegistry.reloadOne(item.scope))
+      results.push(await reloadRegistry.reloadOne(item.scope, context))
     }
     return { results }
   }
