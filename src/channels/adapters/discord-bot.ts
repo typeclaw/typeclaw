@@ -104,6 +104,8 @@ const DISCORD_BACKFILL_MAX_CHANNELS = 20
 const DISCORD_BACKFILL_MAX_TOTAL_MESSAGES = 100
 const DISCORD_BACKFILL_MAX_DURATION_MS = 20_000
 const DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS = 5_000
+const DISCORD_GATEWAY_STALE_AFTER_MS = 90_000
+const DISCORD_GATEWAY_LIVENESS_CHECK_INTERVAL_MS = 30_000
 
 function formatLabel(name: string | undefined, id: string, prefix = ''): string {
   if (name === undefined || name === '' || name === id) return id
@@ -153,6 +155,12 @@ export type DiscordBotAdapterOptions = {
   recoveryStore?: DiscordBotRecoveryStore
   now?: () => number
   recoveryMaxDurationMs?: number
+  liveness?: {
+    staleAfterMs?: number
+    checkIntervalMs?: number
+    setInterval?: (fn: () => void, ms: number) => unknown
+    clearInterval?: (handle: unknown) => void
+  }
 }
 
 export type DiscordBotAdapter = {
@@ -1072,6 +1080,15 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
   const channelBarriers = new Map<string, Promise<void>>()
   const now = options.now ?? Date.now
   const recoveryMaxDurationMs = options.recoveryMaxDurationMs ?? DISCORD_BACKFILL_MAX_DURATION_MS
+  const staleAfterMs = options.liveness?.staleAfterMs ?? DISCORD_GATEWAY_STALE_AFTER_MS
+  const livenessCheckIntervalMs = options.liveness?.checkIntervalMs ?? DISCORD_GATEWAY_LIVENESS_CHECK_INTERVAL_MS
+  const setLivenessInterval = options.liveness?.setInterval ?? ((fn: () => void, ms: number) => setInterval(fn, ms))
+  const clearLivenessInterval =
+    options.liveness?.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>))
+  let lastGatewayEventAt = 0
+  let livenessTimer: unknown = null
+  let livenessProbeRunning = false
+  let livenessCursorIndex = 0
 
   const channelResolver = createDiscordChannelResolver({ token: options.token, fetchImpl })
   const threadRoomResolver = createDiscordThreadRoomResolver({ token: options.token, fetchImpl })
@@ -1409,6 +1426,71 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     )
   }
 
+  // The SDK already closes on a missing heartbeat ACK, but heartbeat state is
+  // private and cannot detect the production failure where the socket remains
+  // nominally alive while MESSAGE_CREATE dispatch stops. Inactivity alone is
+  // not evidence of failure (a guild may be quiet for hours), so a stale
+  // timestamp only permits this REST comparison. A newer channel message in
+  // REST than the newest gateway-processed snowflake is positive proof that
+  // delivery has a gap; only then do we report unhealthy to manager recovery.
+  const checkGatewayLiveness = async (): Promise<void> => {
+    if (!started || !connected || livenessProbeRunning) return
+    const checkedAt = now()
+    if (checkedAt - lastGatewayEventAt < staleAfterMs) return
+    const gatewayEventAtStart = lastGatewayEventAt
+    const store = recoveryStore
+    if (store === null) return
+    const cursors = store.listCursors().sort((left, right) => right.processedAt - left.processedAt)
+    if (cursors.length === 0) return
+    const cursor = cursors[livenessCursorIndex % cursors.length]
+    if (cursor === undefined) return
+    livenessCursorIndex = (livenessCursorIndex + 1) % cursors.length
+
+    livenessProbeRunning = true
+    try {
+      const result = await fetchDiscordBackfill({
+        channelId: cursor.channelId,
+        workspace: cursor.workspace,
+        after: cursor.messageId,
+        token: options.token,
+        fetchImpl,
+        now: checkedAt,
+      })
+      if (!result.ok) {
+        logger.warn(`[discord-bot] liveness probe unavailable: ${result.error}; gateway health unchanged`)
+        return
+      }
+      if (result.messages.length === 0 && result.skipped === 0 && !result.moreMayExist) return
+      // A dispatch that landed while REST was in flight proves the Gateway is
+      // delivering again; its per-channel operation may not have advanced the
+      // durable cursor yet, so the timestamp is the race-free authority here.
+      if (!started || !connected || lastGatewayEventAt !== gatewayEventAtStart) return
+
+      connected = false
+      await store.markDisconnected(checkedAt)
+      logger.warn(
+        `[discord-bot] gateway delivery gap detected channel=${cursor.channelId} stale_ms=${checkedAt - lastGatewayEventAt}; reporting unhealthy for recovery restart`,
+      )
+    } finally {
+      livenessProbeRunning = false
+    }
+  }
+
+  const startLivenessTimer = (): void => {
+    if (livenessTimer !== null) return
+    livenessTimer = setLivenessInterval(() => {
+      void checkGatewayLiveness().catch((err) => {
+        logger.error(`[discord-bot] liveness check failed: ${describeError(err)}`)
+      })
+    }, livenessCheckIntervalMs)
+  }
+
+  const stopLivenessTimer = (): void => {
+    if (livenessTimer === null) return
+    clearLivenessInterval(livenessTimer)
+    livenessTimer = null
+  }
+
   return {
     async start(): Promise<void> {
       if (started) return
@@ -1429,6 +1511,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       listener = createListener(client, { intents: DISCORD_BOT_INTENTS })
       listener.on('connected', (info) => {
         connected = true
+        lastGatewayEventAt = now()
         botUserId = info.user.id
         logger.info(`[discord-bot] connected as ${info.user.username} (${info.user.id})`)
         void enqueueRecovery(replayAfterReconnect).catch((err) => {
@@ -1465,6 +1548,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       listener.on('disconnected', () => {
         connected = false
         if (started) {
+          const disconnectedAt = now()
           const pendingChannels = Array.from(inflightOperations)
           void enqueueRecovery(async () => {
             const drain = await settleWithin(
@@ -1476,7 +1560,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
                 `[discord-bot] disconnect drain timed out after ${DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS}ms; snapshotting completed cursors`,
               )
             }
-            await recoveryStore?.markDisconnected(now())
+            await recoveryStore?.markDisconnected(disconnectedAt)
           }).catch((err) => {
             logger.error(`[discord-bot] failed to persist disconnect: ${describeError(err)}`)
           })
@@ -1491,6 +1575,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         if (isTerminalGatewayClose(err)) {
           connected = false
           if (started) {
+            const disconnectedAt = now()
             const pendingChannels = Array.from(inflightOperations)
             void enqueueRecovery(async () => {
               const drain = await settleWithin(
@@ -1502,7 +1587,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
                   `[discord-bot] disconnect drain timed out after ${DISCORD_DISCONNECT_DRAIN_TIMEOUT_MS}ms; snapshotting completed cursors`,
                 )
               }
-              await recoveryStore?.markDisconnected(now())
+              await recoveryStore?.markDisconnected(disconnectedAt)
             }).catch((persistErr) => {
               logger.error(`[discord-bot] failed to persist disconnect: ${describeError(persistErr)}`)
             })
@@ -1511,9 +1596,17 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         logger.error(`[discord-bot] gateway error: ${describeError(err)}`)
       })
       listener.on('message_create', (event) => {
+        lastGatewayEventAt = now()
+        if (!connected && recoveryStore !== null && recoveryStore.disconnectedAt() !== null) {
+          connected = true
+          void enqueueRecovery(replayAfterReconnect).catch((err) => {
+            logger.error(`[discord-bot] replay failed after gateway delivery resumed: ${describeError(err)}`)
+          })
+        }
         void handleMessageCreate(event)
       })
       listener.on('interaction_create', (event) => {
+        lastGatewayEventAt = now()
         void handleInteractionCreate(event)
       })
 
@@ -1533,6 +1626,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
 
       try {
         await listener.start()
+        startLivenessTimer()
       } catch (err) {
         // Listener failed after registration — roll back every callback so a
         // failed start leaves no router state behind (stop() returns early on
@@ -1554,6 +1648,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         listener = null
         botUserId = null
         connected = false
+        lastGatewayEventAt = 0
         started = false
         logger.error(`[discord-bot] listener start failed: ${describeError(err)}`)
         throw err
@@ -1604,6 +1699,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      stopLivenessTimer()
       listener?.stop()
       options.router.unregisterOutbound('discord-bot', outboundCallback)
       options.router.unregisterReaction('discord-bot', reactionCallback)
@@ -1625,6 +1721,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       }
       listener = null
       connected = false
+      lastGatewayEventAt = 0
     },
 
     isConnected(): boolean {

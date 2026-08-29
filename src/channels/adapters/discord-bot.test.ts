@@ -197,6 +197,117 @@ describe('discord-bot lifecycle', () => {
     expect(historyRequests).toEqual([])
   })
 
+  test('detects a silent gateway delivery gap and backfills it exactly once after recovery', async () => {
+    const recoveryStore = createInMemoryDiscordBotRecoveryStore()
+    await recoveryStore.markProcessed({
+      channelId: '800000000000000001',
+      workspace: '700000000000000001',
+      messageId: '100000000000000001',
+      processedAt: 1_000,
+    })
+    const missed = gatewayMessage('100000000000000002', '<@bot-1> missed')
+    const historyRequests: URL[] = []
+    const logs: string[] = []
+    let currentTime = 1_000
+    let livenessTick: (() => void) | undefined
+    const listener = new FakeDiscordBotListener()
+    const router = new FakeDiscordBotRouter()
+    const adapter = createDiscordBotAdapter({
+      router: router.value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: {
+        info: (message) => logs.push(`info:${message}`),
+        warn: (message) => logs.push(`warn:${message}`),
+        error: (message) => logs.push(`error:${message}`),
+      },
+      fetchImpl: discordRecoveryFetch(historyRequests, [missed]),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => listener.value,
+      recoveryStore,
+      now: () => currentTime,
+      liveness: {
+        staleAfterMs: 100,
+        checkIntervalMs: 10,
+        setInterval: (fn) => {
+          livenessTick = fn
+          return 'liveness-timer'
+        },
+        clearInterval: () => {},
+      },
+    })
+
+    await adapter.start()
+    expect(historyRequests).toEqual([])
+    currentTime = 1_101
+    livenessTick?.()
+    await Bun.sleep(0)
+    await Bun.sleep(0)
+
+    expect(adapter.isConnected()).toBe(false)
+    expect(router.routed).toEqual([])
+    expect(recoveryStore.disconnectedAt()).toBe(1_101)
+    expect(logs.some((message) => message.includes('gateway delivery gap detected'))).toBe(true)
+
+    listener.emit('connected', connectedInfo())
+    listener.emit('message_create', missed)
+    await adapter.stop()
+
+    expect(router.routed.map((message) => message.externalMessageId)).toEqual(['100000000000000002'])
+    expect(historyRequests).toHaveLength(2)
+    expect(logs.some((message) => message.includes('downtime_ms=0') && message.includes('outcome=succeeded'))).toBe(
+      true,
+    )
+  })
+
+  test('keeps an idle but gap-free gateway healthy', async () => {
+    const recoveryStore = createInMemoryDiscordBotRecoveryStore()
+    await recoveryStore.markProcessed({
+      channelId: '800000000000000001',
+      workspace: '700000000000000001',
+      messageId: '100000000000000010',
+      processedAt: 1_000,
+    })
+    const historyRequests: URL[] = []
+    let currentTime = 1_000
+    let livenessTick: (() => void) | undefined
+    let livenessTimerCleared = false
+    const adapter = createDiscordBotAdapter({
+      router: new FakeDiscordBotRouter().value,
+      configRef: () => lifecycleConfig(),
+      token: 'test-token',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: discordRecoveryFetch(historyRequests, []),
+      createClient: () => fakeDiscordBotClient(),
+      createListener: () => new FakeDiscordBotListener().value,
+      recoveryStore,
+      now: () => currentTime,
+      liveness: {
+        staleAfterMs: 100,
+        checkIntervalMs: 10,
+        setInterval: (fn) => {
+          livenessTick = fn
+          return 'liveness-timer'
+        },
+        clearInterval: () => {
+          livenessTimerCleared = true
+        },
+      },
+    })
+
+    await adapter.start()
+    currentTime = 1_101
+    livenessTick?.()
+    await Bun.sleep(0)
+    await Bun.sleep(0)
+
+    expect(adapter.isConnected()).toBe(true)
+    expect(recoveryStore.disconnectedAt()).toBeNull()
+    expect(historyRequests).toHaveLength(1)
+    await adapter.stop()
+    expect(livenessTimerCleared).toBe(true)
+  })
+
   test('does not let a slow live channel block another channel', async () => {
     let releaseSlowRoute: (() => void) | undefined
     const slowRoute = new Promise<void>((resolve) => {
