@@ -89,6 +89,8 @@ An `exec` job runs a command instead of waking the agent:
 
 If a job is still running when its next scheduled time comes around, that next run is **skipped** for that one job — not queued up. A 25-minute job set to run every 15 minutes will run, skip, run, skip; it never piles up into a backlog. Other jobs keep firing on their own schedules independently.
 
+Each occurrence is also bounded by a one-hour deadline so a hung run cannot suppress that job forever. Set a larger positive `timeoutMs` on a job whose legitimate work needs more than an hour; when the deadline expires, that occurrence is aborted and the next scheduled occurrence can run.
+
 </Accordion>
 
 <Accordion title="Checking what's scheduled from the CLI">

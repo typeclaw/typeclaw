@@ -131,6 +131,7 @@ type PluginPromptCronJob = {
   prompt: string
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number // defaults to 1 hour
   subagent?: string // invoke a subagent instead of prompting
   payload?: unknown
 }
@@ -141,6 +142,7 @@ type PluginExecCronJob = {
   command: string[]
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number // defaults to 1 hour
 }
 
 type PluginHandlerCronJob = {
@@ -149,10 +151,11 @@ type PluginHandlerCronJob = {
   handler: (ctx: CronHandlerContext) => Promise<void>
   enabled?: boolean
   timezone?: string
+  timeoutMs?: number // defaults to 1 hour
 }
 ```
 
-`kind: 'handler'` is plugin-only — a TypeScript function reference, so it cannot appear in `cron.json` (the schema gate limits user files to `prompt` and `exec`). Use it when a job needs imperative control flow (probe → maybe prompt → write file) in the same plugin as the logic. `CronHandlerContext` mirrors a command's LLM-call surface (`prompt`, `subagent`, `exec`) plus `jobId`, `name`, `agentDir`, `logger`, `signal`, `permissions`, and a cron-shaped `origin` that stamps provenance on anything the handler spawns.
+`kind: 'handler'` is plugin-only — a TypeScript function reference, so it cannot appear in `cron.json` (the schema gate limits user files to `prompt` and `exec`). Use it when a job needs imperative control flow (probe → maybe prompt → write file) in the same plugin as the logic. `CronHandlerContext` mirrors a command's LLM-call surface (`prompt`, `subagent`, `exec`) plus `jobId`, `name`, `agentDir`, `logger`, `signal`, `permissions`, and a cron-shaped `origin` that stamps provenance on anything the handler spawns. The signal aborts when the occurrence reaches its deadline.
 
 ### Skills
 
