@@ -645,6 +645,8 @@ export const ENSURE_LIVE_TIMEOUT_MS = 30_000
 const RELOAD_HANDOFF_RETENTION_MS = 15 * 60_000
 const MAX_PENDING_RELOAD_HANDOFF_KEYS = 100
 const MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY = 1_000
+const MAX_PENDING_RELOAD_HANDOFF_BYTES_PER_KEY = 8 * 1024 * 1024
+const MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL = 64 * 1024 * 1024
 
 // Thrown by ensureLive() when a teardown (roles reload or shutdown) raced
 // ahead of an in-flight creation. route() has no special handling — it
@@ -831,6 +833,7 @@ type PendingReloadHandoff = {
   observed: ObservedInbound[]
   reminders: PendingSystemReminder[]
   retainedAt: number
+  estimatedBytes: number
 }
 
 const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
@@ -1641,6 +1644,7 @@ export type ChannelRouter = {
     typingHeartbeatIntervalFor: (adapter: ChannelKey['adapter']) => number
     githubReviewRoundFor: (key: ChannelKey) => GithubReviewFollowupRound | null | undefined
     pendingReminderCount: (key: ChannelKey) => number | undefined
+    creationTokenCount: () => number
     runIdleGc: () => Promise<void>
     // Returns the seeded author state on the live session matching
     // `key`, or undefined when no live session exists. Tests use this
@@ -1729,6 +1733,8 @@ export type CreateChannelRouterOptions = {
   // Test seam for exercising the per-key retry-buffer capacity without
   // manufacturing a production-sized batch.
   handoffRetryItemLimit?: number
+  // Test seam for the retained payload-size guard.
+  handoffRetryByteLimit?: number
   // Test seam: per-callback ceiling for channel name resolvers; mirrors the
   // ensureLive seam so timeout paths can be exercised quickly in tests.
   resolveChannelNamesTimeoutMs?: number
@@ -1848,6 +1854,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
   const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
   const handoffRetryItemLimit = options.handoffRetryItemLimit ?? MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY
+  const handoffRetryByteLimit = options.handoffRetryByteLimit ?? MAX_PENDING_RELOAD_HANDOFF_BYTES_PER_KEY
   const resolveChannelNamesTimeoutMs = options.resolveChannelNamesTimeoutMs ?? RESOLVE_CHANNEL_NAMES_TIMEOUT_MS
   const fetchHistoryTimeoutMs = options.fetchHistoryTimeoutMs ?? FETCH_HISTORY_TIMEOUT_MS
   const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS
@@ -1859,6 +1866,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
   const liveSessions = new Map<string, LiveSession>()
   const creating = new Map<string, Promise<LiveSession>>()
+  let nextCreationToken = 0
+  const activeCreationAttempts = new Map<string, number>()
   // Unlike `creating`, this marker survives the watchdog cleanup. A timed-out
   // attempt can keep running after a retry claims the key, so only the latest
   // monotonic token may persist, install, or adopt queued handoff work.
@@ -2236,6 +2245,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const pendingReloadHandoffItemCount = (pending: PendingReloadHandoff): number =>
     pending.inbounds.length + pending.observed.length + pending.reminders.length
 
+  const estimateReloadHandoffBytes = (
+    inbounds: QueuedInbound[],
+    observed: ObservedInbound[],
+    reminders: PendingSystemReminder[],
+  ): number => {
+    try {
+      const serializableInbounds = inbounds.map(({ engageReaction: _engageReaction, ...inbound }) => inbound)
+      return Buffer.byteLength(JSON.stringify({ inbounds: serializableInbounds, observed, reminders }), 'utf8')
+    } catch {
+      return Number.POSITIVE_INFINITY
+    }
+  }
+
+  const pendingReloadHandoffTotalBytes = (): number => {
+    let total = 0
+    for (const pending of pendingReloadHandoffs.values()) total += pending.estimatedBytes
+    return total
+  }
+
   const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
     const count = pendingReloadHandoffItemCount(pending)
     const recovery =
@@ -2244,6 +2272,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.error(
       `[channels] ${channelKeyId(pending.key)}: reload handoff retention policy discarded ${count} queued item(s): ${reason}. ${recovery}`,
     )
+    await dropPendingReloadHandoffEngageReactions(pending)
     const result = await send(
       {
         adapter: pending.key.adapter,
@@ -2263,12 +2292,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const expirePendingReloadHandoffs = async (): Promise<void> => {
+    const expired: Array<{ pending: PendingReloadHandoff; ageMs: number }> = []
     for (const [keyId, pending] of pendingReloadHandoffs) {
       const ageMs = now() - pending.retainedAt
       if (ageMs < handoffRetryRetentionMs) continue
       pendingReloadHandoffs.delete(keyId)
-      void reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`)
+      expired.push({ pending, ageMs })
     }
+    await Promise.all(
+      expired.map(({ pending, ageMs }) =>
+        reportDiscardedReloadHandoff(pending, `retention limit exceeded after ${ageMs}ms`),
+      ),
+    )
   }
 
   const retainReloadHandoff = (
@@ -2281,19 +2316,53 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const keyId = channelKeyId(key)
     const existing = pendingReloadHandoffs.get(keyId)
     if (existing !== undefined) {
-      const incoming: PendingReloadHandoff = { key, inbounds, observed, reminders, retainedAt: now() }
+      const incoming: PendingReloadHandoff = {
+        key,
+        inbounds,
+        observed,
+        reminders,
+        retainedAt: now(),
+        estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
+      }
       if (pendingReloadHandoffItemCount(existing) + pendingReloadHandoffItemCount(incoming) > handoffRetryItemLimit) {
         void reportDiscardedReloadHandoff(incoming, `per-key item limit ${handoffRetryItemLimit} would be exceeded`)
+        return false
+      }
+      if (existing.estimatedBytes + incoming.estimatedBytes > handoffRetryByteLimit) {
+        void reportDiscardedReloadHandoff(incoming, `per-key byte limit ${handoffRetryByteLimit} would be exceeded`)
+        return false
+      }
+      if (pendingReloadHandoffTotalBytes() + incoming.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
+        void reportDiscardedReloadHandoff(
+          incoming,
+          `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} would be exceeded`,
+        )
         return false
       }
       existing.inbounds.push(...inbounds)
       existing.observed.push(...observed)
       existing.reminders.push(...reminders)
+      existing.estimatedBytes += incoming.estimatedBytes
       return true
     }
-    const pending: PendingReloadHandoff = { key, inbounds, observed, reminders, retainedAt: now() }
+    const pending: PendingReloadHandoff = {
+      key,
+      inbounds,
+      observed,
+      reminders,
+      retainedAt: now(),
+      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders),
+    }
     if (pendingReloadHandoffItemCount(pending) > handoffRetryItemLimit) {
       void reportDiscardedReloadHandoff(pending, `per-key item limit ${handoffRetryItemLimit} exceeded`)
+      return false
+    }
+    if (pending.estimatedBytes > handoffRetryByteLimit) {
+      void reportDiscardedReloadHandoff(pending, `per-key byte limit ${handoffRetryByteLimit} exceeded`)
+      return false
+    }
+    if (pendingReloadHandoffTotalBytes() + pending.estimatedBytes > MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL) {
+      void reportDiscardedReloadHandoff(pending, `global byte limit ${MAX_PENDING_RELOAD_HANDOFF_BYTES_TOTAL} exceeded`)
       return false
     }
     if (pendingReloadHandoffs.size >= MAX_PENDING_RELOAD_HANDOFF_KEYS) {
@@ -2385,8 +2454,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (inFlight) return inFlight
 
     const generation = liveGeneration
-    const creationToken = (latestCreationTokens.get(keyId) ?? 0) + 1
+    const creationToken = ++nextCreationToken
     latestCreationTokens.set(keyId, creationToken)
+    activeCreationAttempts.set(keyId, (activeCreationAttempts.get(keyId) ?? 0) + 1)
     const isLatestCreation = (): boolean => latestCreationTokens.get(keyId) === creationToken
 
     let promise!: Promise<LiveSession>
@@ -2776,7 +2846,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       adoptPendingReloadHandoff(live)
       logger.info(`[channels] ${keyId}: ensureLive done (${phase})`)
       return live
-    })()
+    })().finally(() => {
+      const remaining = (activeCreationAttempts.get(keyId) ?? 1) - 1
+      if (remaining > 0) activeCreationAttempts.set(keyId, remaining)
+      else {
+        activeCreationAttempts.delete(keyId)
+        latestCreationTokens.delete(keyId)
+      }
+    })
 
     creating.set(keyId, promise)
     try {
@@ -4618,7 +4695,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // its persistent :eyes: is added strictly AFTER the transient one is removed
   // (see reactOnSilentAck). Fire-and-forget callers just `void` the result.
   const dropEngageReactions = (live: LiveSession, addPromises: Array<Promise<ReactionRef | null>>): Promise<void> => {
-    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(live, addPromise))).then(() => undefined)
+    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(live.key, addPromise))).then(
+      () => undefined,
+    )
   }
 
   // Only the LAST engaging inbound of a coalesced batch should carry the eager
@@ -4633,29 +4712,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     void dropEngageReactions(live, addPromises)
   }
 
-  const dropOneEngageReaction = (live: LiveSession, addPromise: Promise<ReactionRef | null>): Promise<void> => {
+  const dropPendingReloadHandoffEngageReactions = (pending: PendingReloadHandoff): Promise<void> => {
+    const addPromises = pending.inbounds.flatMap((item) =>
+      item.engageReaction !== undefined ? [item.engageReaction] : [],
+    )
+    for (const item of pending.inbounds) delete item.engageReaction
+    return Promise.all(addPromises.map((addPromise) => dropOneEngageReaction(pending.key, addPromise))).then(
+      () => undefined,
+    )
+  }
+
+  const dropOneEngageReaction = (key: ChannelKey, addPromise: Promise<ReactionRef | null>): Promise<void> => {
     return addPromise
       .then((reactionRef) => {
         if (reactionRef === null) return undefined
         return removeReaction({
-          adapter: live.key.adapter,
-          workspace: live.key.workspace,
-          chat: live.key.chat,
-          thread: live.key.thread,
+          adapter: key.adapter,
+          workspace: key.workspace,
+          chat: key.chat,
+          thread: key.thread,
           reactionRef,
         })
       })
       .then((result) => {
         if (result && !result.ok && result.code !== 'unsupported' && result.code !== 'not-found') {
-          logger.info(
-            `[channels] engage-unreact failed adapter=${live.key.adapter} chat=${live.key.chat}: ${result.error}`,
-          )
+          logger.info(`[channels] engage-unreact failed adapter=${key.adapter} chat=${key.chat}: ${result.error}`)
         }
       })
       .catch((err) => {
-        logger.info(
-          `[channels] engage-unreact threw adapter=${live.key.adapter} chat=${live.key.chat}: ${describeError(err)}`,
-        )
+        logger.info(`[channels] engage-unreact threw adapter=${key.adapter} chat=${key.chat}: ${describeError(err)}`)
       })
   }
 
@@ -6141,7 +6226,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const pendingHandoffs = Array.from(pendingReloadHandoffs.values())
     pendingReloadHandoffs.clear()
     for (const pending of pendingHandoffs) {
-      void reportDiscardedReloadHandoff(pending, 'router stopped before replay could complete')
+      await reportDiscardedReloadHandoff(pending, 'router stopped before replay could complete')
     }
     const all = Array.from(liveSessions.values())
     liveSessions.clear()
@@ -7052,6 +7137,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     __testing: {
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
       pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
+      creationTokenCount: () => latestCreationTokens.size,
       flushDebounce: async (key: ChannelKey) => {
         const keyId = channelKeyId(key)
         let live = liveSessions.get(keyId)

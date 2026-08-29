@@ -424,6 +424,7 @@ function makeRouter(
     failSessionCreationAt?: readonly number[]
     handoffRetryRetentionMs?: number
     handoffRetryItemLimit?: number
+    handoffRetryByteLimit?: number
   } = {},
 ): { router: ChannelRouter; sessions: FakeSession[]; origins: SessionOrigin[] } {
   const sessions: FakeSession[] = options.sessions ?? []
@@ -454,6 +455,7 @@ function makeRouter(
       ? { handoffRetryRetentionMs: options.handoffRetryRetentionMs }
       : {}),
     ...(options.handoffRetryItemLimit !== undefined ? { handoffRetryItemLimit: options.handoffRetryItemLimit } : {}),
+    ...(options.handoffRetryByteLimit !== undefined ? { handoffRetryByteLimit: options.handoffRetryByteLimit } : {}),
     permissions: options.permissions ?? grantAllPermissions,
     now: () => nowRef.value,
     logger: {
@@ -1303,6 +1305,7 @@ describe('ChannelRouter session lifecycle', () => {
     const logs: string[] = []
     const nowRef = { value: 1000 }
     const notices: string[] = []
+    const removed: RemoveReactionRequest[] = []
     const { router, sessions } = makeRouter(dir, {
       factoryCalls,
       failSessionCreationAt: [2],
@@ -1312,6 +1315,14 @@ describe('ChannelRouter session lifecycle', () => {
     })
     router.registerOutbound('discord-bot', async (message) => {
       notices.push(message.text ?? '')
+      return { ok: true }
+    })
+    router.registerReaction('discord-bot', async () => ({
+      ok: true,
+      reactionRef: { adapter: 'discord-bot', value: 'retained-reaction' },
+    }))
+    router.registerRemoveReaction('discord-bot', async (request) => {
+      removed.push(request)
       return { ok: true }
     })
     let releaseFirstPrompt: () => void = () => {}
@@ -1325,7 +1336,13 @@ describe('ChannelRouter session lifecycle', () => {
     const drainPromise = router.__testing!.flushDebounce(KEY)
     await waitFor(() => sessions[0]!.prompts.length > 0)
     await router.tearDownAllLive()
-    await router.route(inbound({ externalMessageId: 'm2', text: 'retained until expiry' }))
+    await router.route(
+      inbound({
+        externalMessageId: 'm2',
+        text: 'retained until expiry',
+        reactionRef: { adapter: 'discord-bot', value: 'queued-message' },
+      }),
+    )
     releaseFirstPrompt()
     await drainPromise
 
@@ -1336,6 +1353,44 @@ describe('ChannelRouter session lifecycle', () => {
     expect(notices).toHaveLength(1)
     expect(notices[0]!).toContain('could not replay 1 queued item(s)')
     expect(notices[0]!).toContain("reload({ scope: 'providers' })")
+    expect(removed).toHaveLength(1)
+    expect(removed[0]!.reactionRef).toEqual({ adapter: 'discord-bot', value: 'retained-reaction' })
+  })
+
+  test('failed reload handoff also retains observed context and system reminders', async () => {
+    const dir = await tempDir()
+    const factoryCalls: SessionFactoryArgs[] = []
+    const { router, sessions } = makeRouter(dir, { factoryCalls, failSessionCreationAt: [2] })
+    await router.route(
+      inbound({ isBotMention: true, authorId: 'carol', authorName: 'carol', text: 'prime group context' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+    let releaseHeldPrompt: () => void = () => {}
+    const heldPrompt = new Promise<void>((resolve) => {
+      releaseHeldPrompt = resolve
+    })
+    await router.route(inbound({ externalMessageId: 'm-hold', text: 'hold before reload' }))
+    sessions[0]!.onPrompt = async () => {
+      await heldPrompt
+    }
+    const drainPromise = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.some((prompt) => prompt.includes('hold before reload')))
+
+    await router.tearDownAllLive()
+    await router.route(
+      inbound({ isBotMention: false, externalMessageId: 'm-observed', text: 'retained ambient context' }),
+    )
+    router.__testing!.injectContinuationReminder(KEY, 'retained reminder marker')
+    releaseHeldPrompt()
+    await drainPromise
+    expect(router.liveCount()).toBe(0)
+
+    await router.route(inbound({ externalMessageId: 'm-next', text: 'new trigger after retry' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const replayed = sessions[1]!.prompts.join('\n')
+    expect(replayed.match(/retained ambient context/g)).toHaveLength(1)
+    expect(replayed.match(/retained reminder marker/g)).toHaveLength(1)
   })
 
   test('oversized reload handoff reports the whole rejected batch instead of silently trimming it', async () => {
@@ -1571,6 +1626,16 @@ describe('ChannelRouter session lifecycle', () => {
 })
 
 describe('ChannelRouter ensureLive watchdog', () => {
+  test('releases creation tokens after ordinary successful sessions settle', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(router.__testing!.creationTokenCount()).toBe(0)
+  })
+
   test('hung session factory rejects after the timeout instead of awaiting forever', async () => {
     // given a factory that never resolves (simulates a hung Discord REST chain
     // inside createForChannel — the production failure mode that bricked the
