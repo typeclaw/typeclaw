@@ -15,7 +15,7 @@ This is a **best-effort scheduler**. Concretely:
 
 - **Missed ticks are not replayed.** If the container was down at 23:30 and starts at 23:45, the 23:30 fire is lost forever.
 - **Overlapping fires are skipped, not queued.** If a job is still running when its next tick arrives, the new tick is dropped (logged) and the next attempt is the tick after that.
-- **There are no retries, no timeouts, no failure hooks.** A job that throws is logged and forgotten until its next scheduled fire.
+- **There are no retries or failure hooks.** Each occurrence has a one-hour deadline by default; a timeout aborts that occurrence and the next scheduled fire can run normally. Use `timeoutMs` for a known longer workload.
 
 Tell the user this if they ask about reliability. Do not invent guarantees the runtime does not give them.
 
@@ -25,15 +25,16 @@ Tell the user this if they ask about reliability. Do not invent guarantees the r
 
 ### Shared fields (all jobs)
 
-| Field      | Required     | Notes                                                                                                                                           |
-| ---------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`       | yes          | Unique. Letters, digits, hyphens, underscores. Used in logs and to coalesce.                                                                    |
-| `schedule` | one of these | Standard 5-field cron expression (`min hr dom mon dow`) or 6-field with seconds. Recurring. See "Schedule syntax" below.                        |
-| `at`       | one of these | One-shot ISO instant — fires **once** then retires. Mutually exclusive with `schedule`; set exactly one. See "One-shot reminders (`at`)" below. |
-| `until`    | no           | Recurring only. Absolute ISO instant; last allowed fire (inclusive). The job retires after this.                                                |
-| `count`    | no           | Recurring only. Stop after N accepted fires. Coexists with `until` — whichever boundary is reached first wins.                                  |
-| `enabled`  | no           | Defaults to `true`. Set to `false` to keep a job in the file but skip it.                                                                       |
-| `timezone` | no           | IANA name like `Asia/Seoul`. Recurring (`schedule`) only — NOT valid with `at`. Defaults to UTC (the container's timezone).                     |
+| Field       | Required     | Notes                                                                                                                                           |
+| ----------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`        | yes          | Unique. Letters, digits, hyphens, underscores. Used in logs and to coalesce.                                                                    |
+| `schedule`  | one of these | Standard 5-field cron expression (`min hr dom mon dow`) or 6-field with seconds. Recurring. See "Schedule syntax" below.                        |
+| `at`        | one of these | One-shot ISO instant — fires **once** then retires. Mutually exclusive with `schedule`; set exactly one. See "One-shot reminders (`at`)" below. |
+| `until`     | no           | Recurring only. Absolute ISO instant; last allowed fire (inclusive). The job retires after this.                                                |
+| `count`     | no           | Recurring only. Stop after N accepted fires. Coexists with `until` — whichever boundary is reached first wins.                                  |
+| `enabled`   | no           | Defaults to `true`. Set to `false` to keep a job in the file but skip it.                                                                       |
+| `timezone`  | no           | IANA name like `Asia/Seoul`. Recurring (`schedule`) only — NOT valid with `at`. Defaults to UTC (the container's timezone).                     |
+| `timeoutMs` | no           | Positive integer occurrence deadline in milliseconds. Defaults to 1 hour. Increase only for work that legitimately needs longer.                |
 
 **`schedule` XOR `at`:** every job has exactly one of `schedule` (recurring) or `at` (one-shot). Setting both, or neither, is rejected. `at` jobs may not set `until`, `timezone`, or `count` > 1 (the instant already pins the single fire).
 
@@ -409,7 +410,7 @@ If you finished an edit and the user only sees an in-flight job from the previou
 - **Do not edit `cron.json` from inside an `exec` job's `command`.** Exec jobs run without an LLM and have no way to call the `reload` tool, so the file mutation will not take effect until something else triggers a reload. If you genuinely need scheduled cron-management, write a `prompt` job whose prompt is "edit cron.json to ..." and let the prompt-fire's session call `reload` itself.
 - **Do not put secrets in `prompt` or `command`.** `cron.json` is committed to git. Reference env vars or files instead (`["sh", "-c", "curl -H \"Authorization: Bearer $TOKEN\" ..."]`).
 - **Do not promise sub-second precision or guaranteed execution.** This is best-effort — see "What cron actually does" above.
-- **Do not invent fields the schema doesn't support** (no `retry`, `timeout`, `onFailure`, `concurrency`, etc.). They will be silently ignored at best, or rejected at worst.
+- **Do not invent fields the schema doesn't support** (no `retry`, `timeout`, `onFailure`, `concurrency`, etc.). Use the supported `timeoutMs` field for an occurrence deadline.
 
 ## When the user says "every X" or "do X once"
 

@@ -330,7 +330,7 @@ type CronHandlerContext = {
   readonly name: string // plugin name that registered the job
   readonly agentDir: string // /agent in container
   readonly logger: PluginLogger
-  readonly signal: AbortSignal // reserved for future cancellation; currently inert
+  readonly signal: AbortSignal // aborts when this cron occurrence reaches its deadline
   readonly permissions: PermissionService // live service — has() gating, see "permissions: [...] — declaring and gating" in §5.7 below
   readonly origin: SessionOrigin // { kind: 'cron', jobKind: 'handler', ... }
   readonly prompt: (text: string) => Promise<string> // full agent session, slim system prompt mode
