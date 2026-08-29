@@ -557,6 +557,50 @@ describe('createCronConsumer', () => {
     consumer.stop()
   })
 
+  test('does not emit idle or retry when an aborted prompt settles after its deadline', async () => {
+    const stream = createStream()
+    const clock = createFakeClock()
+    const events: string[] = []
+    const hooks = fakeHooks(events)
+    let sessionsCreated = 0
+    let settlePrompt: (() => void) | undefined
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      clock,
+      createSessionForCron: async () => {
+        sessionsCreated += 1
+        return {
+          prompt: async () =>
+            new Promise<void>((resolve) => {
+              settlePrompt = resolve
+            }),
+          abort: async () => {
+            settlePrompt?.()
+          },
+          dispose: () => events.push('dispose'),
+          hooks,
+          sessionId: 'timed-out-session',
+          agentDir: root,
+        }
+      },
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    publishCron(stream, promptJob('late-settlement', 'run', { timeoutMs: 100 }))
+    await new Promise((resolve) => setImmediate(resolve))
+    await clock.advance(100)
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(sessionsCreated).toBe(1)
+    expect(events).toContain('end:timed-out-session')
+    expect(events).toContain('dispose')
+    expect(events.some((event) => event.startsWith('idle:'))).toBe(false)
+    expect(consumer.inFlightCount()).toBe(0)
+    consumer.stop()
+  })
+
   test('skip logs identify the blocking fire and how long it has been active', async () => {
     const stream = createStream()
     const clock = createFakeClock()

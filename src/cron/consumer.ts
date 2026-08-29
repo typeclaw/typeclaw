@@ -420,8 +420,14 @@ async function runPromptOnce(
       // regular method that reads `this._eventListeners`. Destructuring drops
       // the receiver.
       const sessionForHelper: AgentSession = {
-        prompt: (text: string) =>
-          created.prompt(retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text),
+        prompt: async (text: string) => {
+          await created.prompt(retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text)
+          // A deadline may win the race while abort is still unwinding the
+          // provider call. Never let that late settlement look successful:
+          // promptWithFallback would otherwise emit session.idle after this
+          // occurrence already emitted session.end and released its job slot.
+          if (control.signal.aborted) throw new Error('cron occurrence aborted after deadline')
+        },
         subscribe: created.session?.subscribe.bind(created.session) ?? (() => () => {}),
       } as unknown as AgentSession
       return {
@@ -453,6 +459,7 @@ async function runPromptOnce(
   // live session before tearing it down). Failed-chain disposal is already
   // handled by the helper's per-attempt dispose calls.
   if (result.success && lastSession !== null) {
+    if (control.signal.aborted) return
     const finalSession: CronSession = lastSession
     if (finalSession.hooks && finalSession.sessionId !== undefined) {
       try {
