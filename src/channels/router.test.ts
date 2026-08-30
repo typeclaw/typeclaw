@@ -308,10 +308,10 @@ function installPoisonWatchTrigger(router: ChannelRouter, session: FakeSession, 
     const priorLeaf = session.leafEntry
     const userEntry: SessionEntry = {
       type: 'message',
-      id: `${id}-retry-user-${promptCount}`,
+      id: `${id}-dead-user-${promptCount}`,
       parentId: priorLeaf?.id ?? null,
       timestamp: '2026-08-28T00:00:00.000Z',
-      message: { role: 'user', content: [{ type: 'text', text: 'retry' }], timestamp: 1000 },
+      message: { role: 'user', content: [{ type: 'text', text: 'unanswered' }], timestamp: 1000 },
     }
     session.entriesById.set(userEntry.id, userEntry)
     session.leafEntry = userEntry
@@ -7702,16 +7702,12 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('no recoverable assistant text in branch'))).toBe(true)
   })
 
-  test('rolls over after consecutive fast turns append no assistant entry and replays every affected inbound', async () => {
+  test('rolls over after consecutive fast turns append no assistant entry so a later message is answered', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
-    const originRefs: SessionOriginRef[] = []
-    const replayAuthors: Array<string | undefined> = []
-    let historyFetches = 0
     const { router, sessions } = makeRouter(dir, {
       logs,
-      originRefs,
       onSessionCreated: (session) => {
         if (sessions.length === 0) {
           let deadTurn = 0
@@ -7735,10 +7731,6 @@ describe('ChannelRouter channel-turn protocol', () => {
           }
         } else if (sessions.length === 1) {
           session.onPrompt = async () => {
-            const origin = originRefs[1]?.current
-            replayAuthors.push(
-              origin !== undefined && origin.kind === 'channel' ? origin.lastInboundAuthorId : undefined,
-            )
             await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'recovered' })
             session.setAssistantText('recovered')
           }
@@ -7749,67 +7741,42 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
-    router.registerHistory('discord-bot', async () => {
-      historyFetches++
-      return { ok: true, messages: [historyMessage({ externalMessageId: 'm1', text: 'missed-1' })] }
-    })
 
     await router.route(inbound({ text: 'start the work', externalMessageId: 'trigger' }))
     await router.__testing!.flushDebounce(KEY)
 
     for (let i = 1; i <= 3; i++) {
-      await router.route(
-        inbound({ text: `missed-${i}`, externalMessageId: `m${i}`, authorId: i === 2 ? 'owner' : 'guest' }),
-      )
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
       await router.__testing!.flushDebounce(KEY)
       if (i < 3) expect(sessions).toHaveLength(1)
     }
 
-    expect(sessions).toHaveLength(2)
+    expect(sessions).toHaveLength(1)
     expect(sessions[0]!.disposed).toBe(1)
-    expect(sessions[1]!.prompts).toHaveLength(3)
-    expect(sessions[1]!.prompts[0]).toContain('missed-1')
-    expect(sessions[1]!.prompts[1]).toContain('missed-2')
-    expect(sessions[1]!.prompts[2]).toContain('missed-3')
-    expect(replayAuthors).toEqual(['guest', 'owner', 'guest'])
+
+    await router.route(inbound({ text: 'after reset', externalMessageId: 'm4' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts).toHaveLength(1)
+    expect(sessions[1]!.prompts[0]).toContain('after reset')
     expect(sent).toContain(
-      '⚠️ This conversation session stopped responding. I’m resetting it and will retry the unanswered messages.',
+      '⚠️ This conversation session stopped responding, so I reset it. Please resend any unanswered request.',
     )
     expect(sent).toContain('recovered')
-    expect(historyFetches).toBe(1)
     expect(logs.some((m) => m.includes('poisoned-session-rollover'))).toBe(true)
   })
 
   test('/stop sees a suspected poisoned session and resets the escape hatch', async () => {
     const dir = await tempDir()
-    let promptCount = 0
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, {
       logs,
-      onSessionCreated: (session) => {
-        session.onPrompt = async () => {
-          promptCount++
-          if (promptCount === 1) {
-            await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'working' })
-            strandOnUnansweredToolUse(session, 'stop-trigger')
-          } else {
-            const priorLeaf = session.leafEntry
-            const userEntry: SessionEntry = {
-              type: 'message',
-              id: `stop-dead-user-${promptCount}`,
-              parentId: priorLeaf?.id ?? null,
-              timestamp: '2026-08-28T00:00:00.000Z',
-              message: { role: 'user', content: [{ type: 'text', text: 'unanswered' }], timestamp: 1000 },
-            }
-            session.entriesById.set(userEntry.id, userEntry)
-            session.leafEntry = userEntry
-          }
-        }
-      },
     })
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
     await router.route(inbound({ text: 'start the work', externalMessageId: 'trigger' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'stop-trigger')
     await router.__testing!.flushDebounce(KEY)
 
     await router.route(inbound({ text: 'first miss' }))
@@ -7823,224 +7790,6 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.route(inbound({ text: 'fresh turn', externalMessageId: 'm2' }))
     await router.__testing!.flushDebounce(KEY)
     expect(sessions).toHaveLength(2)
-  })
-
-  test('keeps affected inbounds queued when successor creation fails and retries them on the next message', async () => {
-    const dir = await tempDir()
-    const sent: string[] = []
-    let failedSuccessorOnce = false
-    const { router, sessions } = makeRouter(dir, {
-      onSessionCreated: (session) => {
-        if (sessions.length === 0) {
-          let promptCount = 0
-          session.onPrompt = async () => {
-            promptCount++
-            if (promptCount === 1) {
-              await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'working' })
-              strandOnUnansweredToolUse(session, 'recreate-failure-trigger')
-              return
-            }
-            const priorLeaf = session.leafEntry
-            const userEntry: SessionEntry = {
-              type: 'message',
-              id: `recreate-failure-user-${promptCount}`,
-              parentId: priorLeaf?.id ?? null,
-              timestamp: '2026-08-28T00:00:00.000Z',
-              message: { role: 'user', content: [{ type: 'text', text: 'unanswered' }], timestamp: 1000 },
-            }
-            session.entriesById.set(userEntry.id, userEntry)
-            session.leafEntry = userEntry
-          }
-          return
-        }
-        if (!failedSuccessorOnce) {
-          failedSuccessorOnce = true
-          throw new Error('synthetic successor failure')
-        }
-        session.onPrompt = async () => {
-          await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'recovered later' })
-          session.setAssistantText('recovered later')
-        }
-      },
-    })
-    router.registerOutbound('discord-bot', async (message) => {
-      sent.push(message.text ?? '')
-      return { ok: true }
-    })
-
-    await router.route(inbound({ text: 'start work', externalMessageId: 'm-start' }))
-    await router.__testing!.flushDebounce(KEY)
-    for (let i = 1; i <= 3; i++) {
-      await router.route(inbound({ text: `retained-${i}`, externalMessageId: `m${i}` }))
-      await router.__testing!.flushDebounce(KEY)
-    }
-
-    expect(sessions).toHaveLength(1)
-    expect(sent).toContain(
-      '⚠️ The stuck session was reset, but the replacement could not start. Your unanswered messages remain queued and will retry with the next message.',
-    )
-
-    await router.route(inbound({ text: 'retry now', externalMessageId: 'm-retry' }))
-    await router.__testing!.flushDebounce(KEY)
-
-    expect(sessions).toHaveLength(2)
-    for (let i = 1; i <= 3; i++) {
-      expect(sessions[1]!.prompts.filter((prompt) => prompt.includes(`retained-${i}`))).toHaveLength(1)
-    }
-    expect(sent).toContain('recovered later')
-  })
-
-  test('shutdown waits for poisoned-session pointer clearing to persist', async () => {
-    const dir = await tempDir()
-    let holdPointerClear = false
-    let releasePointerClear: (() => void) | undefined
-    let pointerClearStarted: (() => void) | undefined
-    const pointerClearStartedPromise = new Promise<void>((resolve) => {
-      pointerClearStarted = resolve
-    })
-    const snapshots: ChannelSessionRecord[][] = []
-    const { router, sessions } = makeRouter(dir, {
-      saveChannelSessions: async (_agentDir, records) => {
-        snapshots.push(records.map((record) => ({ ...record })))
-        if (holdPointerClear && records[0]?.sessionId === undefined) {
-          pointerClearStarted?.()
-          await new Promise<void>((resolve) => {
-            releasePointerClear = resolve
-          })
-        }
-      },
-    })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
-
-    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
-    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'shutdown-race')
-    await router.__testing!.flushDebounce(KEY)
-    for (let i = 1; i <= 2; i++) {
-      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
-      await router.__testing!.flushDebounce(KEY)
-    }
-
-    holdPointerClear = true
-    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
-    const rollover = router.__testing!.flushDebounce(KEY)
-    await pointerClearStartedPromise
-    let stopSettled = false
-    const stopping = router.stop().then(() => {
-      stopSettled = true
-    })
-    await Promise.resolve()
-    expect(stopSettled).toBe(false)
-
-    releasePointerClear?.()
-    await Promise.all([rollover, stopping])
-
-    expect(snapshots.some((records) => records[0]?.sessionId === undefined)).toBe(true)
-    expect(stopSettled).toBe(true)
-  })
-
-  test('shutdown retires a tripped poison before the drain registers retirement', async () => {
-    const dir = await tempDir()
-    let releaseNotice: (() => void) | undefined
-    let noticeStarted: (() => void) | undefined
-    const noticeStartedPromise = new Promise<void>((resolve) => {
-      noticeStarted = resolve
-    })
-    const snapshots: ChannelSessionRecord[][] = []
-    const { router, sessions } = makeRouter(dir, {
-      saveChannelSessions: async (_agentDir, records) => {
-        snapshots.push(records.map((record) => ({ ...record })))
-      },
-    })
-    router.registerOutbound('discord-bot', async (message) => {
-      if (message.text?.includes('conversation session stopped responding')) {
-        noticeStarted?.()
-        await new Promise<void>((resolve) => {
-          releaseNotice = resolve
-        })
-      }
-      return { ok: true }
-    })
-
-    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
-    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'shutdown-before-retire')
-    await router.__testing!.flushDebounce(KEY)
-    for (let i = 1; i <= 2; i++) {
-      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
-      await router.__testing!.flushDebounce(KEY)
-    }
-
-    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
-    const rollover = router.__testing!.flushDebounce(KEY)
-    await noticeStartedPromise
-    const stopping = router.stop()
-    releaseNotice?.()
-    await Promise.all([rollover, stopping])
-
-    expect(snapshots.some((records) => records[0]?.sessionId === undefined)).toBe(true)
-    expect(sessions[0]!.disposed).toBe(1)
-  })
-
-  test('reroutes an inbound that was awaiting membership while its poisoned live retires', async () => {
-    const dir = await tempDir()
-    let holdMembership = false
-    let releaseMembership: (() => void) | undefined
-    let membershipStarted: (() => void) | undefined
-    const membershipStartedPromise = new Promise<void>((resolve) => {
-      membershipStarted = resolve
-    })
-    const { router, sessions } = makeRouter(dir, {
-      onSessionCreated: (session) => {
-        if (sessions.length === 1) session.onPrompt = () => session.setAssistantText('recovered')
-      },
-    })
-    router.registerOutbound('discord-bot', async () => ({ ok: true }))
-    router.registerMembership('discord-bot', async () => {
-      if (holdMembership) {
-        membershipStarted?.()
-        await new Promise<void>((resolve) => {
-          releaseMembership = resolve
-        })
-      }
-      return { humans: 2, bots: 0, fetchedAt: Date.now(), truncated: false }
-    })
-
-    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
-    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'route-race')
-    await router.__testing!.flushDebounce(KEY)
-    for (let i = 1; i <= 2; i++) {
-      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
-      await router.__testing!.flushDebounce(KEY)
-    }
-
-    let racedRoute: Promise<void> | undefined
-    sessions[0]!.onPrompt = async () => {
-      const priorLeaf = sessions[0]!.leafEntry
-      const userEntry: SessionEntry = {
-        type: 'message',
-        id: 'route-race-third-user',
-        parentId: priorLeaf?.id ?? null,
-        timestamp: '2026-08-28T00:00:00.000Z',
-        message: { role: 'user', content: [{ type: 'text', text: 'missed-3' }], timestamp: 1000 },
-      }
-      sessions[0]!.entriesById.set(userEntry.id, userEntry)
-      sessions[0]!.leafEntry = userEntry
-      holdMembership = true
-      racedRoute = router.route(
-        inbound({ text: 'raced inbound', authorId: 'bob', authorName: 'bob', externalMessageId: 'raced' }),
-      )
-      await membershipStartedPromise
-    }
-    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
-    const rollover = router.__testing!.flushDebounce(KEY)
-    await waitFor(() => sessions[0]!.disposed === 1)
-    holdMembership = false
-    releaseMembership?.()
-    await rollover
-    await racedRoute
-    await router.__testing!.flushDebounce(KEY)
-
-    expect(sessions).toHaveLength(2)
-    expect(sessions[1]!.prompts.some((prompt) => prompt.includes('raced inbound'))).toBe(true)
   })
 
   test('does not roll over slow or tool-heavy turns that produce assistant progress', async () => {

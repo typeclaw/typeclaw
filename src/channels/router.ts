@@ -348,9 +348,7 @@ export const MAX_EMPTY_TURN_RETRIES = 2
 export const POISONED_SESSION_CONSECUTIVE_TURNS = 3
 export const POISONED_SESSION_FAST_TURN_MS = 1_000
 export const POISONED_SESSION_RESET_TEXT =
-  '⚠️ This conversation session stopped responding. I’m resetting it and will retry the unanswered messages.'
-const POISONED_SESSION_RECREATE_FAILED_TEXT =
-  '⚠️ The stuck session was reset, but the replacement could not start. Your unanswered messages remain queued and will retry with the next message.'
+  '⚠️ This conversation session stopped responding, so I reset it. Please resend any unanswered request.'
 
 // Separate, tiny budget for the tool-call-leak self-correction retry. Kept
 // apart from MAX_EMPTY_TURN_RETRIES so a persistently-leaking model cannot
@@ -1113,14 +1111,9 @@ type LiveSession = {
   // increments it before injecting EMPTY_TURN_RETRY_NUDGE and reads it to decide
   // retry-vs-fallback. See the candidate===null branch.
   emptyTurnRetries: number
-  // Consecutive 2026-08-28 poison fingerprints. The matching inbounds are
-  // retained so rollover replays the work instead of merely replacing one
-  // silent drop with another. NO_REPLY, skip_response, awaiting-background-child,
-  // slow provider calls, and tool-heavy turns all fail at least one discriminator
-  // and clear this state.
+  // Consecutive 2026-08-28 poison fingerprints. Deliberate silence, slow
+  // providers, and tool-heavy turns all fail at least one discriminator.
   rapidUnchangedEmptyTurns: number
-  rapidUnchangedEmptyBatches: Array<{ inbounds: QueuedInbound[]; observed: ObservedInbound[] }>
-  poisonedRolloverPending: boolean
   // Armed only by the stranded-toolUse-after-send recovery path that preceded
   // the 2026-08-28 collapse. Healthy empty turns outside that fingerprint can
   // never accumulate toward rollover; any later assistant progress disarms it.
@@ -1866,18 +1859,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
   const liveSessions = new Map<string, LiveSession>()
   const creating = new Map<string, Promise<LiveSession>>()
-  // Serializes pointer clearing + teardown against a racing ensureLive. Without
-  // this per-key barrier, an inbound can rehydrate the poisoned sessionId in the
-  // await gap and undo the reset.
-  const retiring = new Map<string, Promise<void>>()
-  const pendingPoisonReplays = new Map<
-    string,
-    {
-      turns: Array<{ inbounds: QueuedInbound[]; observed: ObservedInbound[] }>
-      reminders: PendingSystemReminder[]
-    }
-  >()
-  const activePoisonReplays = new Map<string, Promise<void>>()
   // Restart-resume reservations, keyed by channelKeyId. Installed by
   // reserveRestartHandoff BEFORE channel adapters start receiving, so an
   // inbound that races the boot resume coalesces onto the reservation (via the
@@ -1935,11 +1916,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // session before running this handler, so `live` is non-null here.
         const target = live!
         const resetPoisonedSession = target.rapidUnchangedEmptyTurns > 0
+        await stopCurrentChannelTurn(target)
         if (resetPoisonedSession) {
-          await retireLiveSession(target)
+          await retirePoisonedSession(target)
           return { reply: 'Reset the stuck conversation session.' }
         }
-        await stopCurrentChannelTurn(target)
         return { reply: 'Stopped the current turn.' }
       },
     },
@@ -2026,49 +2007,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await next
   }
 
-  const clearPersistedSessionPointer = async (live: LiveSession): Promise<void> => {
-    if (mappings === null) return
-    const idx = mappings.findIndex(
-      (record) =>
-        record.adapter === live.key.adapter &&
-        record.workspace === live.key.workspace &&
-        record.chat === live.key.chat &&
-        (record.thread ?? null) === (live.key.thread ?? null),
-    )
-    if (idx < 0) return
-    const previous = mappings[idx]!
-    mappings[idx] = {
-      adapter: previous.adapter,
-      workspace: previous.workspace,
-      chat: previous.chat,
-      thread: previous.thread,
-      participants: previous.participants,
-      lastInboundAt: 0,
-    }
-    await persist()
-  }
-
-  const retireLiveSession = async (live: LiveSession): Promise<void> => {
-    const existing = retiring.get(live.keyId)
-    if (existing !== undefined) return existing
-    const retirement = Promise.resolve().then(async () => {
-      let pointerClearError: unknown = null
-      try {
-        await clearPersistedSessionPointer(live)
-      } catch (err) {
-        logger.error(`[channels] ${live.keyId}: session pointer clear failed during reset: ${describeError(err)}`)
-        pointerClearError = err
+  const retirePoisonedSession = async (live: LiveSession): Promise<void> => {
+    if (mappings !== null) {
+      const idx = mappings.findIndex(
+        (record) =>
+          record.adapter === live.key.adapter &&
+          record.workspace === live.key.workspace &&
+          record.chat === live.key.chat &&
+          (record.thread ?? null) === (live.key.thread ?? null),
+      )
+      if (idx >= 0) {
+        const previous = mappings[idx]!
+        mappings[idx] = {
+          adapter: previous.adapter,
+          workspace: previous.workspace,
+          chat: previous.chat,
+          thread: previous.thread,
+          participants: previous.participants,
+          githubReviewRound: previous.githubReviewRound,
+          lastInboundAt: 0,
+        }
       }
-      liveSessions.delete(live.keyId)
-      await tearDownLive(live)
-      if (pointerClearError !== null) throw pointerClearError
-    })
-    retiring.set(live.keyId, retirement)
-    try {
-      await retirement
-    } finally {
-      if (retiring.get(live.keyId) === retirement) retiring.delete(live.keyId)
     }
+    liveSessions.delete(live.keyId)
+    await Promise.all([tearDownLive(live), persist()])
   }
 
   const persistGithubReviewRound = (live: LiveSession, round: GithubReviewFollowupRound | null): void => {
@@ -2306,17 +2268,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // parent-scoped from the first fetch (Discord threads resolve `chat` to the
     // thread id, so an unscoped warm would prime the cache against the thread).
     room?: InboundMessage['room'],
-    // Poison rollover replays all retained messages itself. Prefetch can exclude
-    // only one triggering id and would duplicate every earlier affected inbound.
-    skipColdStartPrefetch = false,
   ): Promise<LiveSession> => {
     const keyId = channelKeyId(key)
-    const retirement = retiring.get(keyId)
-    if (retirement !== undefined) {
-      await retirement
-      return ensureLive(key, triggeringMessageId, triggeringAuthorId, resumeTarget, room, skipColdStartPrefetch)
-    }
-    skipColdStartPrefetch ||= pendingPoisonReplays.has(keyId)
     const existing = liveSessions.get(keyId)
     if (existing && !existing.destroyed) {
       // A resume that finds the key already live is a no-op for reopening: the
@@ -2600,8 +2553,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         policyDeniedToolSendsThisTurn: new Map(),
         emptyTurnRetries: 0,
         rapidUnchangedEmptyTurns: 0,
-        rapidUnchangedEmptyBatches: [],
-        poisonedRolloverPending: false,
         poisonWatchArmed: false,
         toolLeakRetries: 0,
         emptyStopAfterToolWorkArmed: false,
@@ -2696,10 +2647,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // Overlap the disk mapping-write with the network history prefetch —
         // they are independent. allSettled lets a persist failure take priority
         // (and unwind the install) even if prefetch also rejects.
-        const prefetchPromise =
-          adapterConfig && !skipColdStartPrefetch
-            ? prefetchChannelContext(live, adapterConfig, triggeringMessageId)
-            : Promise.resolve()
+        const prefetchPromise = adapterConfig
+          ? prefetchChannelContext(live, adapterConfig, triggeringMessageId)
+          : Promise.resolve()
         const [persistResult, prefetchResult] = await Promise.allSettled([persistPromise, prefetchPromise])
         if (persistResult.status === 'rejected') {
           await unwindInstalledLive(keyId, live)
@@ -2709,7 +2659,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           await unwindInstalledLive(keyId, live)
           throw prefetchResult.reason
         }
-        if (adapterConfig && !skipColdStartPrefetch) logger.info(`[channels] ${keyId}: ensureLive prefetched-context`)
+        if (adapterConfig) logger.info(`[channels] ${keyId}: ensureLive prefetched-context`)
       } else {
         // Rehydrate has no prefetch to overlap, so settle the mapping write
         // before installing — a failed persist must fail ensureLive without
@@ -3591,7 +3541,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) &&
         !live.destroyed &&
         !live.pendingTeardown &&
-        !live.poisonedRolloverPending
+        live.rapidUnchangedEmptyTurns < POISONED_SESSION_CONSECUTIVE_TURNS
       ) {
         live.typingTimedOut = false
         // Each turn starts with no held reactions; the model re-requests them
@@ -3762,7 +3712,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
         try {
-          const leafEntryBeforePromptId = live.session.sessionManager.getLeafEntry()?.id ?? null
           const assistantEntryBeforePrompt = latestAssistantEntryId(live.session)
           const result = await promptPersistentTurnWithFallback({
             refs: resolveFallbackChain(getConfig().models, undefined),
@@ -3794,14 +3743,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           const poisonWatchArmedBeforePrompt = live.poisonWatchArmed
           await validateChannelTurn(live, successfulSendsBeforePrompt, {
             batch,
-            observed,
             elapsedMs: now() - promptStart,
-            leafEntryBeforePromptId,
             assistantEntryBeforePrompt,
           })
-          if (!live.poisonedRolloverPending && live.rapidUnchangedEmptyTurns === rapidUnchangedEmptyTurnsBeforePrompt) {
+          if (live.rapidUnchangedEmptyTurns === rapidUnchangedEmptyTurnsBeforePrompt) {
             live.rapidUnchangedEmptyTurns = 0
-            live.rapidUnchangedEmptyBatches = []
             if (
               live.poisonWatchArmed === poisonWatchArmedBeforePrompt &&
               (live.successfulChannelSends > successfulSendsBeforePrompt ||
@@ -3953,50 +3899,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       await stopTypingHeartbeat(live)
       live.currentTurnTypingThread = null
     }
-    if (live.poisonedRolloverPending && !live.destroyed) {
-      const turns = [...live.rapidUnchangedEmptyBatches]
-      const queuedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
-      const queuedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
-      if (queuedInbounds.length > 0) turns.push({ inbounds: queuedInbounds, observed: queuedObserved })
-      else if (queuedObserved.length > 0 && turns.length > 0) turns.at(-1)!.observed.push(...queuedObserved)
-      const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
-      const replayCount = turns.reduce((count, turn) => count + turn.inbounds.length, 0)
-      logger.warn(
-        `[channels] ${live.keyId}: poisoned-session-rollover replaying=${replayCount} session=${live.sessionId}`,
-      )
-      const trigger = turns.at(-1)?.inbounds.at(-1)
-      pendingPoisonReplays.set(live.keyId, { turns, reminders: carriedReminders })
-      let successor: LiveSession
-      try {
-        await retireLiveSession(live)
-        successor = await ensureLive(
-          live.key,
-          trigger?.externalMessageId,
-          trigger?.authorId,
-          undefined,
-          live.room,
-          true,
-        )
-      } catch (err) {
-        logger.error(`[channels] ${live.keyId}: poisoned-session recreate failed: ${describeError(err)}`)
-        const failureNotice = await send(
-          {
-            adapter: live.key.adapter,
-            workspace: live.key.workspace,
-            chat: live.key.chat,
-            thread: live.key.thread,
-            text: POISONED_SESSION_RECREATE_FAILED_TEXT,
-          },
-          { source: 'system', outputKind: 'meta' },
-        )
-        if (!failureNotice.ok) {
-          logger.warn(
-            `[channels] ${live.keyId}: poisoned-session recreate-failure notice failed: ${failureNotice.error}`,
-          )
-        }
-        return
-      }
-      await replayPendingPoisonTurns(successor)
+    if (live.rapidUnchangedEmptyTurns >= POISONED_SESSION_CONSECUTIVE_TURNS && !live.destroyed) {
+      logger.warn(`[channels] ${live.keyId}: poisoned-session-rollover session=${live.sessionId}`)
+      await retirePoisonedSession(live)
       return
     }
     // A reload deferred this session's teardown so its in-flight reply could
@@ -4044,35 +3949,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.activeDrains.add(settled)
     void settled.then(() => live.activeDrains.delete(settled))
     return running
-  }
-
-  // Replay each swallowed real-user turn separately. Collapsing them into one
-  // batch would authorize every earlier speaker as the final speaker, allowing a
-  // low-privilege request to inherit a later owner's tool permissions.
-  const replayPendingPoisonTurns = async (live: LiveSession): Promise<void> => {
-    const active = activePoisonReplays.get(live.keyId)
-    if (active !== undefined) return await active
-    const replay = (async () => {
-      const pending = pendingPoisonReplays.get(live.keyId)
-      if (pending === undefined) return
-      while (pending.turns.length > 0) {
-        const turn = pending.turns[0]!
-        live.contextBuffer.push(...turn.observed)
-        live.promptQueue.push(...turn.inbounds)
-        await drain(live)
-        pending.turns.shift()
-      }
-      live.pendingSystemReminders.push(...pending.reminders)
-      pending.reminders.length = 0
-      pendingPoisonReplays.delete(live.keyId)
-      if (live.pendingSystemReminders.length > 0) await drain(live)
-    })()
-    activePoisonReplays.set(live.keyId, replay)
-    try {
-      await replay
-    } finally {
-      if (activePoisonReplays.get(live.keyId) === replay) activePoisonReplays.delete(live.keyId)
-    }
   }
 
   // Resolves once no drain is running. Loops because a drain's post-`draining`
@@ -4322,12 +4198,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     const live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
     live.room = event.room
-    const pendingPoisonReplay = pendingPoisonReplays.get(live.keyId)
-    if (pendingPoisonReplay !== undefined) {
-      const replayCount = pendingPoisonReplay.turns.reduce((count, turn) => count + turn.inbounds.length, 0)
-      logger.warn(`[channels] ${live.keyId}: poisoned-session replay resumed count=${replayCount}`)
-      await replayPendingPoisonTurns(live)
-    }
 
     const isNewAuthor = !live.participants.some((p) => p.authorId === event.authorId)
     live.participants = updateParticipants(
@@ -4357,14 +4227,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
 
     const membership = await membershipForEngagement(live)
-    // A poisoned-session retirement can begin while this route awaits a slow
-    // membership lookup. Never enqueue onto the now-destroyed predecessor: run
-    // the full admission path again so ensureLive waits for the retirement
-    // barrier and targets the successor.
-    if (live.destroyed || liveSessions.get(live.keyId) !== live) {
-      logger.info(`[channels] ${live.keyId}: route retry after live-session replacement`)
-      return await route(event)
-    }
 
     const effectiveHumans = countEffectiveHumans(live.participants, membership, now())
     live.multiHumanGroup = isMultiHumanGroup(event.isDm, effectiveHumans)
@@ -5519,9 +5381,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     successfulSendsBeforePrompt: number,
     prompt: {
       batch: QueuedInbound[]
-      observed: ObservedInbound[]
       elapsedMs: number
-      leafEntryBeforePromptId: string | null
       assistantEntryBeforePrompt: string | null
     },
   ): Promise<void> => {
@@ -5840,13 +5700,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           prompt.elapsedMs <= POISONED_SESSION_FAST_TURN_MS &&
           branchLeaf?.type === 'message' &&
           branchLeaf.message.role === 'user' &&
-          prompt.leafEntryBeforePromptId !== branchLeaf.id &&
           prompt.assistantEntryBeforePrompt === latestAssistantEntryId(live.session) &&
           !isPinnedByRunningChild(live.sessionId, live.keyId, 'poisoned-session-rollover') &&
           live.successfulChannelSends === successfulSendsBeforePrompt
         if (rapidUnchangedRealUserTurn) {
           live.rapidUnchangedEmptyTurns++
-          live.rapidUnchangedEmptyBatches.push({ inbounds: [...prompt.batch], observed: [...prompt.observed] })
           logger.warn(
             `[channels] ${live.keyId}: rapid unchanged empty turn ` +
               `count=${live.rapidUnchangedEmptyTurns}/${POISONED_SESSION_CONSECUTIVE_TURNS} elapsed_ms=${prompt.elapsedMs}`,
@@ -5855,7 +5713,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // 2026-08-28 Discord fingerprint: after stranded_toolUse_after_send,
             // prompt() returned in 53-56ms for 14 real-user turns, appended no
             // assistant entry, and kept swallowing messages until idle rollover.
-            live.poisonedRolloverPending = true
             live.emptyTurnFallbackTurn = live.turnSeq
             const notice = await send(
               {
@@ -6276,16 +6133,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   gcTimer.unref?.()
 
   const stop = async (): Promise<void> => {
-    // Pointer clearing during poison retirement must reach disk before closing
-    // seals persist(). Otherwise shutdown can preserve the poisoned sessionId
-    // and rehydrate it on the next boot.
-    while (true) {
-      const trippedPoisoned = Array.from(liveSessions.values()).filter(
-        (live) => live.poisonedRolloverPending && !live.destroyed,
-      )
-      if (trippedPoisoned.length === 0 && retiring.size === 0) break
-      await Promise.all([...trippedPoisoned.map((live) => retireLiveSession(live)), ...retiring.values()])
-    }
     closing = true
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
