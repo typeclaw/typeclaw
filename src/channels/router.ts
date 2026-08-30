@@ -2052,13 +2052,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const existing = retiring.get(live.keyId)
     if (existing !== undefined) return existing
     const retirement = Promise.resolve().then(async () => {
+      let pointerClearError: unknown = null
       try {
         await clearPersistedSessionPointer(live)
       } catch (err) {
         logger.error(`[channels] ${live.keyId}: session pointer clear failed during reset: ${describeError(err)}`)
+        pointerClearError = err
       }
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
+      if (pointerClearError !== null) throw pointerClearError
     })
     retiring.set(live.keyId, retirement)
     try {
@@ -3963,9 +3966,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       const trigger = turns.at(-1)?.inbounds.at(-1)
       pendingPoisonReplays.set(live.keyId, { turns, reminders: carriedReminders })
-      await retireLiveSession(live)
       let successor: LiveSession
       try {
+        await retireLiveSession(live)
         successor = await ensureLive(
           live.key,
           trigger?.externalMessageId,
@@ -6276,11 +6279,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Pointer clearing during poison retirement must reach disk before closing
     // seals persist(). Otherwise shutdown can preserve the poisoned sessionId
     // and rehydrate it on the next boot.
-    const trippedPoisoned = Array.from(liveSessions.values()).filter(
-      (live) => live.poisonedRolloverPending && !live.destroyed,
-    )
-    for (const live of trippedPoisoned) await retireLiveSession(live)
-    while (retiring.size > 0) await Promise.all(retiring.values())
+    while (true) {
+      const trippedPoisoned = Array.from(liveSessions.values()).filter(
+        (live) => live.poisonedRolloverPending && !live.destroyed,
+      )
+      if (trippedPoisoned.length === 0 && retiring.size === 0) break
+      await Promise.all([...trippedPoisoned.map((live) => retireLiveSession(live)), ...retiring.values()])
+    }
     closing = true
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
