@@ -7890,6 +7890,117 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toContain('recovered later')
   })
 
+  test('shutdown waits for poisoned-session pointer clearing to persist', async () => {
+    const dir = await tempDir()
+    let holdPointerClear = false
+    let releasePointerClear: (() => void) | undefined
+    let pointerClearStarted: (() => void) | undefined
+    const pointerClearStartedPromise = new Promise<void>((resolve) => {
+      pointerClearStarted = resolve
+    })
+    const snapshots: ChannelSessionRecord[][] = []
+    const { router, sessions } = makeRouter(dir, {
+      saveChannelSessions: async (_agentDir, records) => {
+        snapshots.push(records.map((record) => ({ ...record })))
+        if (holdPointerClear && records[0]?.sessionId === undefined) {
+          pointerClearStarted?.()
+          await new Promise<void>((resolve) => {
+            releasePointerClear = resolve
+          })
+        }
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'shutdown-race')
+    await router.__testing!.flushDebounce(KEY)
+    for (let i = 1; i <= 2; i++) {
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    holdPointerClear = true
+    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
+    const rollover = router.__testing!.flushDebounce(KEY)
+    await pointerClearStartedPromise
+    let stopSettled = false
+    const stopping = router.stop().then(() => {
+      stopSettled = true
+    })
+    await Promise.resolve()
+    expect(stopSettled).toBe(false)
+
+    releasePointerClear?.()
+    await Promise.all([rollover, stopping])
+
+    expect(snapshots.some((records) => records[0]?.sessionId === undefined)).toBe(true)
+    expect(stopSettled).toBe(true)
+  })
+
+  test('reroutes an inbound that was awaiting membership while its poisoned live retires', async () => {
+    const dir = await tempDir()
+    let holdMembership = false
+    let releaseMembership: (() => void) | undefined
+    let membershipStarted: (() => void) | undefined
+    const membershipStartedPromise = new Promise<void>((resolve) => {
+      membershipStarted = resolve
+    })
+    const { router, sessions } = makeRouter(dir, {
+      onSessionCreated: (session) => {
+        if (sessions.length === 1) session.onPrompt = () => session.setAssistantText('recovered')
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    router.registerMembership('discord-bot', async () => {
+      if (holdMembership) {
+        membershipStarted?.()
+        await new Promise<void>((resolve) => {
+          releaseMembership = resolve
+        })
+      }
+      return { humans: 2, bots: 0, fetchedAt: Date.now(), truncated: false }
+    })
+
+    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'route-race')
+    await router.__testing!.flushDebounce(KEY)
+    for (let i = 1; i <= 2; i++) {
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    let racedRoute: Promise<void> | undefined
+    sessions[0]!.onPrompt = async () => {
+      const priorLeaf = sessions[0]!.leafEntry
+      const userEntry: SessionEntry = {
+        type: 'message',
+        id: 'route-race-third-user',
+        parentId: priorLeaf?.id ?? null,
+        timestamp: '2026-08-28T00:00:00.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'missed-3' }], timestamp: 1000 },
+      }
+      sessions[0]!.entriesById.set(userEntry.id, userEntry)
+      sessions[0]!.leafEntry = userEntry
+      holdMembership = true
+      racedRoute = router.route(
+        inbound({ text: 'raced inbound', authorId: 'bob', authorName: 'bob', externalMessageId: 'raced' }),
+      )
+      await membershipStartedPromise
+    }
+    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
+    const rollover = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.disposed === 1)
+    holdMembership = false
+    releaseMembership?.()
+    await rollover
+    await racedRoute
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.some((prompt) => prompt.includes('raced inbound'))).toBe(true)
+  })
+
   test('does not roll over slow or tool-heavy turns that produce assistant progress', async () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }

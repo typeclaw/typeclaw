@@ -4354,6 +4354,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
 
     const membership = await membershipForEngagement(live)
+    // A poisoned-session retirement can begin while this route awaits a slow
+    // membership lookup. Never enqueue onto the now-destroyed predecessor: run
+    // the full admission path again so ensureLive waits for the retirement
+    // barrier and targets the successor.
+    if (live.destroyed || liveSessions.get(live.keyId) !== live) {
+      logger.info(`[channels] ${live.keyId}: route retry after live-session replacement`)
+      return await route(event)
+    }
 
     const effectiveHumans = countEffectiveHumans(live.participants, membership, now())
     live.multiHumanGroup = isMultiHumanGroup(event.isDm, effectiveHumans)
@@ -6265,6 +6273,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   gcTimer.unref?.()
 
   const stop = async (): Promise<void> => {
+    // Pointer clearing during poison retirement must reach disk before closing
+    // seals persist(). Otherwise shutdown can preserve the poisoned sessionId
+    // and rehydrate it on the next boot.
+    while (retiring.size > 0) await Promise.all(retiring.values())
     closing = true
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
