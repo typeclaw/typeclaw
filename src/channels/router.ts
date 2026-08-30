@@ -337,6 +337,19 @@ export const CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS = 16384
 // straight to the fallback. See validateChannelTurn's candidate===null branch.
 export const MAX_EMPTY_TURN_RETRIES = 2
 
+// A structurally dead in-memory branch returns almost immediately without
+// appending an assistant entry, then repeats that exact shape for every new
+// inbound. Three consecutive fingerprints are required before rollover: one
+// empty completion can be a benign SDK edge, while the 2026-08-28 production
+// incident produced the same ~55ms/no-assistant result for fourteen messages.
+// The time ceiling excludes slow providers and long tool loops; the branch-entry
+// check excludes real assistant/tool progress even when validation finds no
+// postable text. Deliberate silence exits validation earlier and never counts.
+export const POISONED_SESSION_CONSECUTIVE_TURNS = 3
+export const POISONED_SESSION_FAST_TURN_MS = 1_000
+export const POISONED_SESSION_RESET_TEXT =
+  '⚠️ I reset a stuck conversation session and retried the messages that received no reply.'
+
 // Separate, tiny budget for the tool-call-leak self-correction retry. Kept
 // apart from MAX_EMPTY_TURN_RETRIES so a persistently-leaking model cannot
 // consume the empty-turn budget (or vice versa) and so it can't livelock: one
@@ -1098,6 +1111,19 @@ type LiveSession = {
   // increments it before injecting EMPTY_TURN_RETRY_NUDGE and reads it to decide
   // retry-vs-fallback. See the candidate===null branch.
   emptyTurnRetries: number
+  // Consecutive 2026-08-28 poison fingerprints. The matching inbounds are
+  // retained so rollover replays the work instead of merely replacing one
+  // silent drop with another. NO_REPLY, skip_response, awaiting-background-child,
+  // slow provider calls, and tool-heavy turns all fail at least one discriminator
+  // and clear this state.
+  rapidUnchangedEmptyTurns: number
+  rapidUnchangedEmptyInbounds: QueuedInbound[]
+  rapidUnchangedEmptyObserved: ObservedInbound[]
+  poisonedRolloverPending: boolean
+  // Armed only by the stranded-toolUse-after-send recovery path that preceded
+  // the 2026-08-28 collapse. Healthy empty turns outside that fingerprint can
+  // never accumulate toward rollover; any later assistant progress disarms it.
+  poisonWatchArmed: boolean
   // Count of tool-call-leak self-correction re-prompts spent this logical turn,
   // bounded by MAX_TOOL_LEAK_RETRIES. Separate from emptyTurnRetries so the two
   // failure modes can't drain each other's budget. Reset with the rest on a
@@ -1894,7 +1920,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       handler: async ({ live }) => {
         // requiresLiveSession:true guarantees the dispatch layer resolved a
         // session before running this handler, so `live` is non-null here.
-        await stopCurrentChannelTurn(live!)
+        const target = live!
+        const resetPoisonedSession = target.rapidUnchangedEmptyTurns > 0
+        await stopCurrentChannelTurn(target)
+        if (resetPoisonedSession) {
+          await retireLiveSession(target)
+          return { reply: 'Reset the stuck conversation session.' }
+        }
         return { reply: 'Stopped the current turn.' }
       },
     },
@@ -1979,6 +2011,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
     persistChain = next.catch(() => {})
     await next
+  }
+
+  const clearPersistedSessionPointer = async (live: LiveSession): Promise<void> => {
+    if (mappings === null) return
+    const idx = mappings.findIndex(
+      (record) =>
+        record.adapter === live.key.adapter &&
+        record.workspace === live.key.workspace &&
+        record.chat === live.key.chat &&
+        (record.thread ?? null) === (live.key.thread ?? null),
+    )
+    if (idx < 0) return
+    const previous = mappings[idx]!
+    mappings[idx] = {
+      adapter: previous.adapter,
+      workspace: previous.workspace,
+      chat: previous.chat,
+      thread: previous.thread,
+      participants: previous.participants,
+      lastInboundAt: 0,
+    }
+    await persist()
+  }
+
+  const retireLiveSession = async (live: LiveSession): Promise<void> => {
+    liveSessions.delete(live.keyId)
+    await tearDownLive(live)
+    await clearPersistedSessionPointer(live)
   }
 
   const persistGithubReviewRound = (live: LiveSession, round: GithubReviewFollowupRound | null): void => {
@@ -2500,6 +2560,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
         emptyTurnRetries: 0,
+        rapidUnchangedEmptyTurns: 0,
+        rapidUnchangedEmptyInbounds: [],
+        rapidUnchangedEmptyObserved: [],
+        poisonedRolloverPending: false,
+        poisonWatchArmed: false,
         toolLeakRetries: 0,
         emptyStopAfterToolWorkArmed: false,
         willingnessNudges: 0,
@@ -3351,7 +3416,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // session and posts "stopped" in a multi-agent channel. Mirrors exactly what
   // stopCurrentChannelTurn cancels: in-flight drain, queued prompts, reminders.
   const hasStoppableWork = (live: LiveSession): boolean =>
-    live.draining || live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0
+    live.draining ||
+    live.promptQueue.length > 0 ||
+    live.pendingSystemReminders.length > 0 ||
+    live.rapidUnchangedEmptyTurns > 0
 
   const hasPendingContinueReply = (live: LiveSession): boolean => {
     const progressReply = live.continueReplyTurn
@@ -3483,7 +3551,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       while (
         (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) &&
         !live.destroyed &&
-        !live.pendingTeardown
+        !live.pendingTeardown &&
+        !live.poisonedRolloverPending
       ) {
         live.typingTimedOut = false
         // Each turn starts with no held reactions; the model re-requests them
@@ -3654,6 +3723,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
         try {
+          const leafEntryBeforePromptId = live.session.sessionManager.getLeafEntry()?.id ?? null
+          const assistantEntryBeforePrompt = latestAssistantEntryId(live.session)
           const result = await promptPersistentTurnWithFallback({
             refs: resolveFallbackChain(getConfig().models, undefined),
             currentModelRef: live.activeModelRef,
@@ -3680,7 +3751,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             },
           })
           if (result.success) live.activeModelRef = result.refUsed
-          await validateChannelTurn(live, successfulSendsBeforePrompt)
+          const rapidUnchangedEmptyTurnsBeforePrompt = live.rapidUnchangedEmptyTurns
+          const poisonWatchArmedBeforePrompt = live.poisonWatchArmed
+          await validateChannelTurn(live, successfulSendsBeforePrompt, {
+            batch,
+            observed,
+            elapsedMs: now() - promptStart,
+            leafEntryBeforePromptId,
+            assistantEntryBeforePrompt,
+          })
+          if (!live.poisonedRolloverPending && live.rapidUnchangedEmptyTurns === rapidUnchangedEmptyTurnsBeforePrompt) {
+            live.rapidUnchangedEmptyTurns = 0
+            live.rapidUnchangedEmptyInbounds = []
+            live.rapidUnchangedEmptyObserved = []
+            if (
+              live.poisonWatchArmed === poisonWatchArmedBeforePrompt &&
+              (live.successfulChannelSends > successfulSendsBeforePrompt ||
+                latestAssistantEntryId(live.session) !== assistantEntryBeforePrompt)
+            ) {
+              live.poisonWatchArmed = false
+            }
+          }
           live.consecutiveAborts = 0
           // Resolve the pending logical-turn signal on a binary rule: ONLY a
           // usable assistant reply (real model prose the user saw) seeds the next
@@ -3823,6 +3914,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // to clear a flat-DM status; clearing it first would strand the indicator.
       await stopTypingHeartbeat(live)
       live.currentTurnTypingThread = null
+    }
+    if (live.poisonedRolloverPending && !live.destroyed) {
+      const carriedInbounds = [
+        ...live.rapidUnchangedEmptyInbounds,
+        ...live.promptQueue.splice(0, live.promptQueue.length),
+      ]
+      const carriedObserved = [
+        ...live.rapidUnchangedEmptyObserved,
+        ...live.contextBuffer.splice(0, live.contextBuffer.length),
+      ]
+      const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+      logger.warn(
+        `[channels] ${live.keyId}: poisoned-session-rollover replaying=${carriedInbounds.length} session=${live.sessionId}`,
+      )
+      const trigger = carriedInbounds.at(-1)
+      await retireLiveSession(live)
+      let successor: LiveSession
+      try {
+        successor = await ensureLive(live.key, trigger?.externalMessageId, trigger?.authorId, undefined, live.room)
+      } catch (err) {
+        logger.error(`[channels] ${live.keyId}: poisoned-session recreate failed: ${describeError(err)}`)
+        return
+      }
+      successor.promptQueue.push(...carriedInbounds)
+      successor.contextBuffer.push(...carriedObserved)
+      successor.pendingSystemReminders.push(...carriedReminders)
+      await drain(successor)
+      return
     }
     // A reload deferred this session's teardown so its in-flight reply could
     // land; now that the turn drained (and the loop stopped BEFORE draining any
@@ -5296,7 +5415,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return false
   }
 
-  const validateChannelTurn = async (live: LiveSession, successfulSendsBeforePrompt: number): Promise<void> => {
+  const validateChannelTurn = async (
+    live: LiveSession,
+    successfulSendsBeforePrompt: number,
+    prompt: {
+      batch: QueuedInbound[]
+      observed: ObservedInbound[]
+      elapsedMs: number
+      leafEntryBeforePromptId: string | null
+      assistantEntryBeforePrompt: string | null
+    },
+  ): Promise<void> => {
     // `skip_response` short-circuit. Honoring it bypasses recovery entirely.
     // Stale-flag protection: only honor when stamped on the just-completed
     // turn. A flag set by a previous turn that crashed before validation
@@ -5353,6 +5482,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
 
     const retryStrandedToolUse = async (cause: string, exhaustedCause: string): Promise<void> => {
+      if (cause === 'stranded_toolUse_after_send') live.poisonWatchArmed = true
       if (live.emptyTurnRetries < MAX_EMPTY_TURN_RETRIES) {
         live.emptyTurnRetries++
         const routerAbortReason =
@@ -5601,6 +5731,42 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // assistant message at all) keeps the historical silent bail —
       // re-prompting it would manufacture replies to nothing.
       if (live.currentTurnAuthorId === null || leafStopReason === undefined) {
+        const rapidUnchangedRealUserTurn =
+          live.poisonWatchArmed &&
+          prompt.batch.length > 0 &&
+          prompt.elapsedMs <= POISONED_SESSION_FAST_TURN_MS &&
+          prompt.leafEntryBeforePromptId !== (live.session.sessionManager.getLeafEntry()?.id ?? null) &&
+          prompt.assistantEntryBeforePrompt === latestAssistantEntryId(live.session) &&
+          live.successfulChannelSends === successfulSendsBeforePrompt
+        if (rapidUnchangedRealUserTurn) {
+          live.rapidUnchangedEmptyTurns++
+          live.rapidUnchangedEmptyInbounds.push(...prompt.batch)
+          live.rapidUnchangedEmptyObserved.push(...prompt.observed)
+          logger.warn(
+            `[channels] ${live.keyId}: rapid unchanged empty turn ` +
+              `count=${live.rapidUnchangedEmptyTurns}/${POISONED_SESSION_CONSECUTIVE_TURNS} elapsed_ms=${prompt.elapsedMs}`,
+          )
+          if (live.rapidUnchangedEmptyTurns >= POISONED_SESSION_CONSECUTIVE_TURNS) {
+            // 2026-08-28 Discord fingerprint: after stranded_toolUse_after_send,
+            // prompt() returned in 53-56ms for 14 real-user turns, appended no
+            // assistant entry, and kept swallowing messages until idle rollover.
+            live.poisonedRolloverPending = true
+            live.emptyTurnFallbackTurn = live.turnSeq
+            const notice = await send(
+              {
+                adapter: live.key.adapter,
+                workspace: live.key.workspace,
+                chat: live.key.chat,
+                thread: live.key.thread,
+                text: POISONED_SESSION_RESET_TEXT,
+              },
+              { source: 'system', outputKind: 'meta' },
+            )
+            if (!notice.ok) {
+              logger.warn(`[channels] ${live.keyId}: poisoned-session notice send failed: ${notice.error}`)
+            }
+          }
+        }
         logger.info(`[channels] ${live.keyId}: no recoverable assistant text in branch`)
         return
       }
@@ -7773,6 +7939,21 @@ async function raceWithTimeout<T>(work: Promise<T>, ms: number, label: string): 
   } finally {
     if (timer !== null) clearTimeout(timer)
   }
+}
+
+// Returns the newest assistant entry reachable from the current branch leaf.
+// A poisoned prompt still appends its USER entry, so comparing leaf ids would
+// mistake that bookkeeping for model progress. Walking to the nearest assistant
+// is the transcript-level discriminator the 2026-08-28 incident lacked: a real
+// reply or tool call changes this id; a dead branch that only accepts users does
+// not. The depth bound matches the other defensive branch walks below.
+function latestAssistantEntryId(session: AgentSession): string | null {
+  let cursor: SessionEntry | undefined = session.sessionManager.getLeafEntry()
+  for (let depth = 0; depth < 32 && cursor; depth++) {
+    if (cursor.type === 'message' && cursor.message.role === 'assistant') return cursor.id
+    cursor = cursor.parentId ? session.sessionManager.getEntry(cursor.parentId) : undefined
+  }
+  return null
 }
 
 // Walks the session branch backward from the leaf to find a recoverable

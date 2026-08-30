@@ -7679,6 +7679,185 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     expect(logs.some((m) => m.includes('no recoverable assistant text in branch'))).toBe(true)
   })
+
+  test('rolls over after consecutive fast turns append no assistant entry and replays every affected inbound', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        if (sessions.length === 0) {
+          let deadTurn = 0
+          session.onPrompt = async () => {
+            deadTurn++
+            if (deadTurn === 1) {
+              await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'working' })
+              strandOnUnansweredToolUse(session, 'poison-trigger')
+              return
+            }
+            const priorLeaf = session.leafEntry
+            const userEntry: SessionEntry = {
+              type: 'message',
+              id: `dead-user-${deadTurn}`,
+              parentId: priorLeaf?.id ?? null,
+              timestamp: '2026-08-28T00:00:00.000Z',
+              message: { role: 'user', content: [{ type: 'text', text: `missed-${deadTurn}` }], timestamp: 1000 },
+            }
+            session.entriesById.set(userEntry.id, userEntry)
+            session.leafEntry = userEntry
+          }
+        } else if (sessions.length === 1) {
+          session.onPrompt = async () => {
+            await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'recovered' })
+            session.setAssistantText('recovered')
+          }
+        }
+      },
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'start the work', externalMessageId: 'trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    for (let i = 1; i <= 3; i++) {
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+      if (i < 3) expect(sessions).toHaveLength(1)
+    }
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[0]!.disposed).toBe(1)
+    expect(sessions[1]!.prompts).toHaveLength(1)
+    expect(sessions[1]!.prompts[0]).toContain('missed-1')
+    expect(sessions[1]!.prompts[0]).toContain('missed-2')
+    expect(sessions[1]!.prompts[0]).toContain('missed-3')
+    expect(sent).toContain('⚠️ I reset a stuck conversation session and retried the messages that received no reply.')
+    expect(sent).toContain('recovered')
+    expect(logs.some((m) => m.includes('poisoned-session-rollover'))).toBe(true)
+  })
+
+  test('/stop sees a suspected poisoned session and resets the escape hatch', async () => {
+    const dir = await tempDir()
+    let promptCount = 0
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => {
+        session.onPrompt = async () => {
+          promptCount++
+          if (promptCount === 1) {
+            await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'working' })
+            strandOnUnansweredToolUse(session, 'stop-trigger')
+          } else {
+            const priorLeaf = session.leafEntry
+            const userEntry: SessionEntry = {
+              type: 'message',
+              id: `stop-dead-user-${promptCount}`,
+              parentId: priorLeaf?.id ?? null,
+              timestamp: '2026-08-28T00:00:00.000Z',
+              message: { role: 'user', content: [{ type: 'text', text: 'unanswered' }], timestamp: 1000 },
+            }
+            session.entriesById.set(userEntry.id, userEntry)
+            session.leafEntry = userEntry
+          }
+        }
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start the work', externalMessageId: 'trigger' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    await router.route(inbound({ text: 'first miss' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    const stopped = await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+    expect(stopped).toEqual({ kind: 'handled', name: 'stop', reply: 'Reset the stuck conversation session.' })
+    expect(sessions[0]!.aborted).toBeGreaterThanOrEqual(1)
+    expect(sessions[0]!.disposed).toBe(1)
+
+    await router.route(inbound({ text: 'fresh turn', externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(sessions).toHaveLength(2)
+  })
+
+  test('does not roll over slow or tool-heavy turns that produce assistant progress', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    for (let i = 1; i <= 4; i++) {
+      await router.route(inbound({ text: `deep-work-${i}`, externalMessageId: `m${i}` }))
+      sessions[0]!.onPrompt = () => {
+        const assistantToolCall = messageEntry({
+          ...assistantMessage(''),
+          content: [{ type: 'toolCall', id: `tool-${i}`, name: 'web_search', arguments: { query: 'topic' } }],
+          stopReason: 'toolUse',
+        })
+        assistantToolCall.id = `assistant-tool-${i}`
+        const toolResult: SessionEntry = {
+          type: 'message',
+          id: `tool-result-${i}`,
+          parentId: assistantToolCall.id,
+          timestamp: '2026-08-28T00:00:00.000Z',
+          message: {
+            role: 'toolResult',
+            toolCallId: `tool-${i}`,
+            toolName: 'web_search',
+            content: [{ type: 'text', text: 'result' }],
+            isError: false,
+            timestamp: 1000,
+          },
+        }
+        const answer = messageEntry(assistantMessage(`answer-${i}`))
+        answer.id = `assistant-answer-${i}`
+        answer.parentId = toolResult.id
+        sessions[0]!.entriesById.set(assistantToolCall.id, assistantToolCall)
+        sessions[0]!.entriesById.set(toolResult.id, toolResult)
+        sessions[0]!.entriesById.set(answer.id, answer)
+        sessions[0]!.leafEntry = answer
+        nowRef.value += 5_000
+      }
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.disposed).toBe(0)
+  })
+
+  test('does not count deliberate NO_REPLY, skip_response, or background-child waits as poison', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, {
+      newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_3' ? 1000 : null),
+    })
+
+    for (let i = 1; i <= 4; i++) {
+      await router.route(inbound({ text: `silent-${i}`, externalMessageId: `m-nr-${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    for (let i = 1; i <= 4; i++) {
+      await router.route(inbound({ text: `skip-${i}`, chat: 'c2', externalMessageId: `m-skip-${i}` }))
+      sessions[1]!.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'deliberate silence' })
+      }
+      await router.__testing!.flushDebounce({ ...KEY, chat: 'c2' })
+    }
+
+    for (let i = 1; i <= 4; i++) {
+      await router.route(inbound({ text: `waiting-${i}`, chat: 'c3', externalMessageId: `m-bg-${i}` }))
+      await router.__testing!.flushDebounce({ ...KEY, chat: 'c3' })
+    }
+
+    expect(sessions).toHaveLength(3)
+    expect(sessions.every((session) => session.disposed === 0)).toBe(true)
+  })
 })
 
 describe('ChannelRouter consecutive-send accounting', () => {
