@@ -6276,6 +6276,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Pointer clearing during poison retirement must reach disk before closing
     // seals persist(). Otherwise shutdown can preserve the poisoned sessionId
     // and rehydrate it on the next boot.
+    const trippedPoisoned = Array.from(liveSessions.values()).filter(
+      (live) => live.poisonedRolloverPending && !live.destroyed,
+    )
+    for (const live of trippedPoisoned) await retireLiveSession(live)
     while (retiring.size > 0) await Promise.all(retiring.values())
     closing = true
     if (gcTimer) clearInterval(gcTimer)

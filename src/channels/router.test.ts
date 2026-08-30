@@ -7884,9 +7884,9 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.__testing!.flushDebounce(KEY)
 
     expect(sessions).toHaveLength(2)
-    expect(sessions[1]!.prompts.join('\n')).toContain('retained-1')
-    expect(sessions[1]!.prompts.join('\n')).toContain('retained-2')
-    expect(sessions[1]!.prompts.join('\n')).toContain('retained-3')
+    for (let i = 1; i <= 3; i++) {
+      expect(sessions[1]!.prompts.filter((prompt) => prompt.includes(`retained-${i}`))).toHaveLength(1)
+    }
     expect(sent).toContain('recovered later')
   })
 
@@ -7936,6 +7936,48 @@ describe('ChannelRouter channel-turn protocol', () => {
 
     expect(snapshots.some((records) => records[0]?.sessionId === undefined)).toBe(true)
     expect(stopSettled).toBe(true)
+  })
+
+  test('shutdown retires a tripped poison before the drain registers retirement', async () => {
+    const dir = await tempDir()
+    let releaseNotice: (() => void) | undefined
+    let noticeStarted: (() => void) | undefined
+    const noticeStartedPromise = new Promise<void>((resolve) => {
+      noticeStarted = resolve
+    })
+    const snapshots: ChannelSessionRecord[][] = []
+    const { router, sessions } = makeRouter(dir, {
+      saveChannelSessions: async (_agentDir, records) => {
+        snapshots.push(records.map((record) => ({ ...record })))
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      if (message.text?.includes('conversation session stopped responding')) {
+        noticeStarted?.()
+        await new Promise<void>((resolve) => {
+          releaseNotice = resolve
+        })
+      }
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'prime', externalMessageId: 'prime' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'shutdown-before-retire')
+    await router.__testing!.flushDebounce(KEY)
+    for (let i = 1; i <= 2; i++) {
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
+    const rollover = router.__testing!.flushDebounce(KEY)
+    await noticeStartedPromise
+    const stopping = router.stop()
+    releaseNotice?.()
+    await Promise.all([rollover, stopping])
+
+    expect(snapshots.some((records) => records[0]?.sessionId === undefined)).toBe(true)
+    expect(sessions[0]!.disposed).toBe(1)
   })
 
   test('reroutes an inbound that was awaiting membership while its poisoned live retires', async () => {
