@@ -66,6 +66,7 @@ import {
   TYPING_HEARTBEAT_MS,
   MAX_WILLINGNESS_NUDGES,
   OUTBOUND_FLOOD_ERROR,
+  POISONED_SESSION_RESET_TEXT,
   SEND_RATE_WARN_THRESHOLD,
   SEND_RATE_WINDOW_MS,
   SEND_WILLINGNESS_NUDGE,
@@ -7765,6 +7766,58 @@ describe('ChannelRouter channel-turn protocol', () => {
     )
     expect(sent).toContain('recovered')
     expect(logs.some((m) => m.includes('poisoned-session-rollover'))).toBe(true)
+  })
+
+  test('stop during a held poison notice keeps the cleared pointer and review round', async () => {
+    const dir = await tempDir()
+    const reviewRound = {
+      kind: 'push' as const,
+      roundId: 'test-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    }
+    const noticeStarted = Promise.withResolvers<void>()
+    const releaseNotice = Promise.withResolvers<void>()
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (message) => {
+      if (message.text === POISONED_SESSION_RESET_TEXT) {
+        noticeStarted.resolve()
+        await releaseNotice.promise
+      }
+      return { ok: true }
+    })
+
+    await router.route(
+      inbound({ text: 'start the work', externalMessageId: 'trigger', githubReviewRound: reviewRound }),
+    )
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'shutdown-race')
+    await router.__testing!.flushDebounce(KEY)
+    for (let i = 1; i < 3; i++) {
+      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    await router.route(inbound({ text: 'missed-3', externalMessageId: 'm3' }))
+    const draining = router.__testing!.flushDebounce(KEY)
+    await noticeStarted.promise
+    await router.stop()
+
+    const persistedFile = (await Bun.file(channelsSessionsPath(dir)).json()) as { sessions: ChannelSessionRecord[] }
+    const [persisted] = persistedFile.sessions
+    expect(persisted?.sessionId).toBeUndefined()
+    expect(persisted?.sessionFile).toBeUndefined()
+    expect(persisted?.githubReviewRound).toMatchObject({
+      kind: reviewRound.kind,
+      roundId: reviewRound.roundId,
+      workspace: reviewRound.workspace,
+      prNumber: reviewRound.prNumber,
+      headSha: reviewRound.headSha,
+    })
+
+    releaseNotice.resolve()
+    await draining
   })
 
   test('/stop sees a suspected poisoned session and resets the escape hatch', async () => {

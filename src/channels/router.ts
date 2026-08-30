@@ -2007,7 +2007,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await next
   }
 
-  const retirePoisonedSession = async (live: LiveSession): Promise<void> => {
+  const clearPoisonedSessionPointer = async (live: LiveSession): Promise<void> => {
     if (mappings !== null) {
       const idx = mappings.findIndex(
         (record) =>
@@ -2018,6 +2018,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       if (idx >= 0) {
         const previous = mappings[idx]!
+        if (previous.sessionId === undefined && previous.sessionFile === undefined) return
         mappings[idx] = {
           adapter: previous.adapter,
           workspace: previous.workspace,
@@ -2027,10 +2028,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           githubReviewRound: previous.githubReviewRound,
           lastInboundAt: 0,
         }
+        await persist()
       }
     }
+  }
+
+  const retirePoisonedSession = async (live: LiveSession): Promise<void> => {
+    await clearPoisonedSessionPointer(live)
     liveSessions.delete(live.keyId)
-    await Promise.all([tearDownLive(live), persist()])
+    await tearDownLive(live)
   }
 
   const persistGithubReviewRound = (live: LiveSession, round: GithubReviewFollowupRound | null): void => {
@@ -5714,6 +5720,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // prompt() returned in 53-56ms for 14 real-user turns, appended no
             // assistant entry, and kept swallowing messages until idle rollover.
             live.emptyTurnFallbackTurn = live.turnSeq
+            await clearPoisonedSessionPointer(live)
             const notice = await send(
               {
                 adapter: live.key.adapter,
