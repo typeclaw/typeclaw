@@ -7706,9 +7706,12 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
+    const originRefs: SessionOriginRef[] = []
+    const replayAuthors: Array<string | undefined> = []
     let historyFetches = 0
     const { router, sessions } = makeRouter(dir, {
       logs,
+      originRefs,
       onSessionCreated: (session) => {
         if (sessions.length === 0) {
           let deadTurn = 0
@@ -7732,6 +7735,10 @@ describe('ChannelRouter channel-turn protocol', () => {
           }
         } else if (sessions.length === 1) {
           session.onPrompt = async () => {
+            const origin = originRefs[1]?.current
+            replayAuthors.push(
+              origin !== undefined && origin.kind === 'channel' ? origin.lastInboundAuthorId : undefined,
+            )
             await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'recovered' })
             session.setAssistantText('recovered')
           }
@@ -7751,18 +7758,23 @@ describe('ChannelRouter channel-turn protocol', () => {
     await router.__testing!.flushDebounce(KEY)
 
     for (let i = 1; i <= 3; i++) {
-      await router.route(inbound({ text: `missed-${i}`, externalMessageId: `m${i}` }))
+      await router.route(
+        inbound({ text: `missed-${i}`, externalMessageId: `m${i}`, authorId: i === 2 ? 'owner' : 'guest' }),
+      )
       await router.__testing!.flushDebounce(KEY)
       if (i < 3) expect(sessions).toHaveLength(1)
     }
 
     expect(sessions).toHaveLength(2)
     expect(sessions[0]!.disposed).toBe(1)
-    expect(sessions[1]!.prompts).toHaveLength(1)
+    expect(sessions[1]!.prompts).toHaveLength(3)
     expect(sessions[1]!.prompts[0]).toContain('missed-1')
-    expect(sessions[1]!.prompts[0]).toContain('missed-2')
-    expect(sessions[1]!.prompts[0]).toContain('missed-3')
-    expect(sent).toContain('⚠️ I reset a stuck conversation session and retried the messages that received no reply.')
+    expect(sessions[1]!.prompts[1]).toContain('missed-2')
+    expect(sessions[1]!.prompts[2]).toContain('missed-3')
+    expect(replayAuthors).toEqual(['guest', 'owner', 'guest'])
+    expect(sent).toContain(
+      '⚠️ This conversation session stopped responding. I’m resetting it and will retry the unanswered messages.',
+    )
     expect(sent).toContain('recovered')
     expect(historyFetches).toBe(1)
     expect(logs.some((m) => m.includes('poisoned-session-rollover'))).toBe(true)

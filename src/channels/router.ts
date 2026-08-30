@@ -1935,11 +1935,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // session before running this handler, so `live` is non-null here.
         const target = live!
         const resetPoisonedSession = target.rapidUnchangedEmptyTurns > 0
-        await stopCurrentChannelTurn(target)
         if (resetPoisonedSession) {
           await retireLiveSession(target)
           return { reply: 'Reset the stuck conversation session.' }
         }
+        await stopCurrentChannelTurn(target)
         return { reply: 'Stopped the current turn.' }
       },
     },
@@ -2051,15 +2051,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const retireLiveSession = async (live: LiveSession): Promise<void> => {
     const existing = retiring.get(live.keyId)
     if (existing !== undefined) return existing
-    const retirement = (async () => {
-      liveSessions.delete(live.keyId)
+    const retirement = Promise.resolve().then(async () => {
       try {
         await clearPersistedSessionPointer(live)
       } catch (err) {
         logger.error(`[channels] ${live.keyId}: session pointer clear failed during reset: ${describeError(err)}`)
       }
+      liveSessions.delete(live.keyId)
       await tearDownLive(live)
-    })()
+    })
     retiring.set(live.keyId, retirement)
     try {
       await retirement
@@ -4043,6 +4043,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return running
   }
 
+  // Replay each swallowed real-user turn separately. Collapsing them into one
+  // batch would authorize every earlier speaker as the final speaker, allowing a
+  // low-privilege request to inherit a later owner's tool permissions.
+  const replayPendingPoisonTurns = async (live: LiveSession): Promise<void> => {
+    const active = activePoisonReplays.get(live.keyId)
+    if (active !== undefined) return await active
+    const replay = (async () => {
+      const pending = pendingPoisonReplays.get(live.keyId)
+      if (pending === undefined) return
+      while (pending.turns.length > 0) {
+        const turn = pending.turns[0]!
+        live.contextBuffer.push(...turn.observed)
+        live.promptQueue.push(...turn.inbounds)
+        await drain(live)
+        pending.turns.shift()
+      }
+      live.pendingSystemReminders.push(...pending.reminders)
+      pending.reminders.length = 0
+      pendingPoisonReplays.delete(live.keyId)
+      if (live.pendingSystemReminders.length > 0) await drain(live)
+    })()
+    activePoisonReplays.set(live.keyId, replay)
+    try {
+      await replay
+    } finally {
+      if (activePoisonReplays.get(live.keyId) === replay) activePoisonReplays.delete(live.keyId)
+    }
+  }
+
   // Resolves once no drain is running. Loops because a drain's post-`draining`
   // tail can start a rival, and because work queued during one turn opens the
   // next; a snapshot `Promise.all` would return with that successor in flight.
@@ -4292,14 +4321,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.room = event.room
     const pendingPoisonReplay = pendingPoisonReplays.get(live.keyId)
     if (pendingPoisonReplay !== undefined) {
-      pendingPoisonReplays.delete(live.keyId)
-      live.promptQueue.push(...pendingPoisonReplay.inbounds)
-      live.contextBuffer.push(...pendingPoisonReplay.observed)
-      live.pendingSystemReminders.push(...pendingPoisonReplay.reminders)
-      logger.warn(
-        `[channels] ${live.keyId}: poisoned-session replay resumed count=${pendingPoisonReplay.inbounds.length}`,
-      )
-      void drain(live)
+      const replayCount = pendingPoisonReplay.turns.reduce((count, turn) => count + turn.inbounds.length, 0)
+      logger.warn(`[channels] ${live.keyId}: poisoned-session replay resumed count=${replayCount}`)
+      await replayPendingPoisonTurns(live)
     }
 
     const isNewAuthor = !live.participants.some((p) => p.authorId === event.authorId)
@@ -5798,6 +5822,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const branchLeaf = live.session.sessionManager.getLeafEntry()
         const trigger = prompt.batch.at(-1)
         const rapidUnchangedRealUserTurn =
+          live.key.adapter === 'discord-bot' &&
           live.poisonWatchArmed &&
           prompt.batch.length > 0 &&
           trigger?.authorIsBot === false &&
