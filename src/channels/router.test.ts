@@ -296,6 +296,28 @@ function strandOnUnansweredToolUse(session: FakeSession, id: string = 'strand'):
   session.leafEntry = toolResultEntry
 }
 
+function installPoisonWatchTrigger(router: ChannelRouter, session: FakeSession, key: ChannelKey, id: string): void {
+  let promptCount = 0
+  session.onPrompt = async () => {
+    promptCount++
+    if (promptCount === 1) {
+      await router.send({ ...key, text: 'working' })
+      strandOnUnansweredToolUse(session, id)
+      return
+    }
+    const priorLeaf = session.leafEntry
+    const userEntry: SessionEntry = {
+      type: 'message',
+      id: `${id}-retry-user-${promptCount}`,
+      parentId: priorLeaf?.id ?? null,
+      timestamp: '2026-08-28T00:00:00.000Z',
+      message: { role: 'user', content: [{ type: 'text', text: 'retry' }], timestamp: 1000 },
+    }
+    session.entriesById.set(userEntry.id, userEntry)
+    session.leafEntry = userEntry
+  }
+}
+
 // A bare-empty `stop` leaf whose parentId chain runs back through a web_search
 // tool call to a bounding user entry — the production shape recoverableAssistantText
 // recovers as { text: '', source: 'leaf' } while attemptMadeToolCall still finds
@@ -7684,6 +7706,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: string[] = []
+    let historyFetches = 0
     const { router, sessions } = makeRouter(dir, {
       logs,
       onSessionCreated: (session) => {
@@ -7719,6 +7742,10 @@ describe('ChannelRouter channel-turn protocol', () => {
       sent.push(msg.text ?? '')
       return { ok: true }
     })
+    router.registerHistory('discord-bot', async () => {
+      historyFetches++
+      return { ok: true, messages: [historyMessage({ externalMessageId: 'm1', text: 'missed-1' })] }
+    })
 
     await router.route(inbound({ text: 'start the work', externalMessageId: 'trigger' }))
     await router.__testing!.flushDebounce(KEY)
@@ -7737,6 +7764,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sessions[1]!.prompts[0]).toContain('missed-3')
     expect(sent).toContain('⚠️ I reset a stuck conversation session and retried the messages that received no reply.')
     expect(sent).toContain('recovered')
+    expect(historyFetches).toBe(1)
     expect(logs.some((m) => m.includes('poisoned-session-rollover'))).toBe(true)
   })
 
@@ -7785,11 +7813,80 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sessions).toHaveLength(2)
   })
 
+  test('keeps affected inbounds queued when successor creation fails and retries them on the next message', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    let failedSuccessorOnce = false
+    const { router, sessions } = makeRouter(dir, {
+      onSessionCreated: (session) => {
+        if (sessions.length === 0) {
+          let promptCount = 0
+          session.onPrompt = async () => {
+            promptCount++
+            if (promptCount === 1) {
+              await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'working' })
+              strandOnUnansweredToolUse(session, 'recreate-failure-trigger')
+              return
+            }
+            const priorLeaf = session.leafEntry
+            const userEntry: SessionEntry = {
+              type: 'message',
+              id: `recreate-failure-user-${promptCount}`,
+              parentId: priorLeaf?.id ?? null,
+              timestamp: '2026-08-28T00:00:00.000Z',
+              message: { role: 'user', content: [{ type: 'text', text: 'unanswered' }], timestamp: 1000 },
+            }
+            session.entriesById.set(userEntry.id, userEntry)
+            session.leafEntry = userEntry
+          }
+          return
+        }
+        if (!failedSuccessorOnce) {
+          failedSuccessorOnce = true
+          throw new Error('synthetic successor failure')
+        }
+        session.onPrompt = async () => {
+          await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'recovered later' })
+          session.setAssistantText('recovered later')
+        }
+      },
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'start work', externalMessageId: 'm-start' }))
+    await router.__testing!.flushDebounce(KEY)
+    for (let i = 1; i <= 3; i++) {
+      await router.route(inbound({ text: `retained-${i}`, externalMessageId: `m${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+
+    expect(sessions).toHaveLength(1)
+    expect(sent).toContain(
+      '⚠️ The stuck session was reset, but the replacement could not start. Your unanswered messages remain queued and will retry with the next message.',
+    )
+
+    await router.route(inbound({ text: 'retry now', externalMessageId: 'm-retry' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(2)
+    expect(sessions[1]!.prompts.join('\n')).toContain('retained-1')
+    expect(sessions[1]!.prompts.join('\n')).toContain('retained-2')
+    expect(sessions[1]!.prompts.join('\n')).toContain('retained-3')
+    expect(sent).toContain('recovered later')
+  })
+
   test('does not roll over slow or tool-heavy turns that produce assistant progress', async () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
     router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'start deep work', externalMessageId: 'm-start' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'slow-safe')
+    await router.__testing!.flushDebounce(KEY)
 
     for (let i = 1; i <= 4; i++) {
       await router.route(inbound({ text: `deep-work-${i}`, externalMessageId: `m${i}` }))
@@ -7832,15 +7929,27 @@ describe('ChannelRouter channel-turn protocol', () => {
 
   test('does not count deliberate NO_REPLY, skip_response, or background-child waits as poison', async () => {
     const dir = await tempDir()
+    let backgroundChildRunning = false
     const { router, sessions } = makeRouter(dir, {
-      newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_3' ? 1000 : null),
+      newestRunningChildSubagentStartedAt: (sessionId) =>
+        backgroundChildRunning && sessionId === 'ses_fake_3' ? 1000 : null,
     })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'prime no reply', externalMessageId: 'prime-nr' }))
+    installPoisonWatchTrigger(router, sessions[0]!, KEY, 'no-reply-safe')
+    await router.__testing!.flushDebounce(KEY)
 
     for (let i = 1; i <= 4; i++) {
       await router.route(inbound({ text: `silent-${i}`, externalMessageId: `m-nr-${i}` }))
       sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
       await router.__testing!.flushDebounce(KEY)
     }
+
+    const skipKey = { ...KEY, chat: 'c2' }
+    await router.route(inbound({ text: 'prime skip', chat: 'c2', externalMessageId: 'prime-skip' }))
+    installPoisonWatchTrigger(router, sessions[1]!, skipKey, 'skip-safe')
+    await router.__testing!.flushDebounce(skipKey)
 
     for (let i = 1; i <= 4; i++) {
       await router.route(inbound({ text: `skip-${i}`, chat: 'c2', externalMessageId: `m-skip-${i}` }))
@@ -7849,6 +7958,12 @@ describe('ChannelRouter channel-turn protocol', () => {
       }
       await router.__testing!.flushDebounce({ ...KEY, chat: 'c2' })
     }
+
+    const backgroundKey = { ...KEY, chat: 'c3' }
+    await router.route(inbound({ text: 'prime background wait', chat: 'c3', externalMessageId: 'prime-bg' }))
+    installPoisonWatchTrigger(router, sessions[2]!, backgroundKey, 'background-safe')
+    await router.__testing!.flushDebounce(backgroundKey)
+    backgroundChildRunning = true
 
     for (let i = 1; i <= 4; i++) {
       await router.route(inbound({ text: `waiting-${i}`, chat: 'c3', externalMessageId: `m-bg-${i}` }))
