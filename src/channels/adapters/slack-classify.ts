@@ -9,6 +9,8 @@ import { encodeSlackReactionRef } from './slack-reactions'
 
 export type SlackInboundMessageEvent = SlackRTMMessageEvent & {
   channel_type?: string
+  // Modern RTM file messages are subtype-less but retain the `files` array.
+  files?: SlackFile[]
   is_mpim?: boolean
 }
 
@@ -35,10 +37,11 @@ export function classifyInbound(
   if (context.selfUserId !== null && event.user === context.selfUserId) return { kind: 'drop', reason: 'self_author' }
   if (event.user === undefined || event.user === '') return { kind: 'drop', reason: 'no_user' }
   if (!isRouteableSlackMessageSubtype(event.subtype)) return { kind: 'drop', reason: 'slack_system_message' }
-  if ((event.text ?? '') === '') return { kind: 'drop', reason: 'empty_text' }
+  const rawText = event.text ?? ''
+  const { text, attachments } = splitSlackFiles(rawText, event.files)
+  if (text === '') return { kind: 'drop', reason: 'empty_text' }
   if (context.selfUserId === null) return { kind: 'drop', reason: 'pre_connect' }
 
-  const rawText = event.text ?? ''
   const conversationType = classifyConversation(event, context.conversationType)
   const isDm = conversationType === 'im'
   const workspace = isDm ? '@dm' : context.teamId
@@ -57,7 +60,8 @@ export function classifyInbound(
       chat: event.channel,
       thread,
       ...(thread !== null ? { room: { kind: 'thread' as const } } : {}),
-      text: rawText,
+      text,
+      ...(attachments.length > 0 ? { attachments } : {}),
       externalMessageId: event.ts,
       reactionRef: encodeSlackReactionRef({ channel: event.channel, ts: event.ts }),
       authorId: event.user,
@@ -91,12 +95,11 @@ export function isRouteableSlackMessageSubtype(subtype: string | undefined): boo
   return subtype === undefined || subtype === 'me_message'
 }
 
-// The REST history fetch bypasses the inbound classifier, so files on
-// already-posted messages must be described here too. Registering the ref
+// Live inbound and REST history share the same attachment rendering contract.
+// Registering the ref
 // without also baking a `#N` placeholder into the text is not enough: the
 // agent has no way to learn the id exists, so look_at_channel_attachment stays
-// unreachable in practice. Kept in the classifier module so the live inbound
-// path can adopt the same rendering.
+// unreachable in practice.
 export function splitSlackFiles(text: string, files: readonly SlackFile[] | undefined): SplitSlackFiles {
   const attachments = (files ?? []).map(describeSlackFile)
   if (attachments.length === 0) return { text, attachments: [] }
