@@ -188,6 +188,20 @@ describe('decideContinuation', () => {
     expect(d.kind).toBe('inject')
   })
 
+  test('trusts terminal channel-reply provenance independently of the transport stop reason', () => {
+    const d = decide(
+      baseState({
+        lastTurnOutcome: {
+          turnId: 't',
+          stopReason: 'unknown',
+          termination: 'terminal-after-channel-reply',
+          endedAt: 1,
+        },
+      }),
+    )
+    expect(d.kind).toBe('inject')
+  })
+
   test('injects after a length truncation (budget exhaustion is continuation-eligible)', () => {
     const d = decide(baseState({ lastTurnOutcome: { turnId: 't', stopReason: 'length', endedAt: 1 } }))
     expect(d.kind).toBe('inject')

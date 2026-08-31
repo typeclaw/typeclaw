@@ -3,8 +3,21 @@ import { mkdir, mkdtemp, rm, writeFile as writeFileFs } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
-import type { AfterToolCallContext, AfterToolCallResult, StreamFn } from '@mariozechner/pi-agent-core'
-import type { AssistantMessage } from '@mariozechner/pi-ai'
+import {
+  Agent,
+  type AgentMessage,
+  type AfterToolCallContext,
+  type AfterToolCallResult,
+  type StreamFn,
+} from '@mariozechner/pi-agent-core'
+import {
+  fauxAssistantMessage,
+  fauxText,
+  fauxToolCall,
+  registerFauxProvider,
+  Type,
+  type AssistantMessage,
+} from '@mariozechner/pi-ai'
 import type { SessionEntry } from '@mariozechner/pi-coding-agent'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
@@ -166,6 +179,30 @@ class FakeSession {
   public sessionManager = {
     getLeafEntry: (): SessionEntry | undefined => this.leafEntry,
     getEntry: (id: string): SessionEntry | undefined => this.entriesById.get(id),
+    getBranch: (): SessionEntry[] => {
+      const reversed: SessionEntry[] = []
+      let cursor = this.leafEntry
+      while (cursor) {
+        reversed.push(cursor)
+        cursor = cursor.parentId ? this.entriesById.get(cursor.parentId) : undefined
+      }
+      return reversed.reverse()
+    },
+    appendMessage: (message: AgentMessage): string => {
+      const parentId = this.leafEntry?.id ?? null
+      if (this.leafEntry) this.entriesById.set(this.leafEntry.id, this.leafEntry)
+      const id = `appended-${this.entriesById.size + 1}`
+      const entry: SessionEntry = {
+        type: 'message',
+        id,
+        parentId,
+        timestamp: '2026-08-28T10:20:18.000Z',
+        message,
+      }
+      this.entriesById.set(id, entry)
+      this.leafEntry = entry
+      return id
+    },
   }
 
   private subscribers = new Set<(event: Record<string, unknown> & { type: string }) => void>()
@@ -234,6 +271,42 @@ async function streamOnce(session: FakeSession): Promise<void> {
   )
 }
 
+function connectCoreAgent(session: FakeSession, coreAgent: Agent): void {
+  const fallbackController = new AbortController()
+  let eventPersistence = Promise.resolve()
+  coreAgent.subscribe((event) => {
+    if (event.type !== 'message_end') return
+    eventPersistence = eventPersistence.then(async () => {
+      if (event.message.role === 'toolResult') await new Promise((resolve) => setTimeout(resolve, 5))
+      session.sessionManager.appendMessage(event.message)
+      session.emit(event)
+    })
+  })
+  session.agent = {
+    controller: fallbackController,
+    get signal(): AbortSignal {
+      return coreAgent.signal ?? fallbackController.signal
+    },
+    get state(): { messages: Array<{ role: string; stopReason?: string }> } {
+      return coreAgent.state
+    },
+    continue: async () => await coreAgent.continue(),
+    abort: () => coreAgent.abort(),
+    get afterToolCall() {
+      return coreAgent.afterToolCall
+    },
+    set afterToolCall(hook) {
+      coreAgent.afterToolCall = hook
+    },
+    get streamFn() {
+      return coreAgent.streamFn
+    },
+    set streamFn(fn) {
+      coreAgent.streamFn = fn
+    },
+  }
+}
+
 function assistantMessage(text: string): AssistantMessage {
   return {
     role: 'assistant',
@@ -296,6 +369,23 @@ function strandOnUnansweredToolUse(session: FakeSession, id: string = 'strand'):
   session.leafEntry = toolResultEntry
 }
 
+function strandOnMissingToolResult(session: FakeSession, id: string = 'missing-result'): void {
+  const assistantEntry: SessionEntry = {
+    type: 'message',
+    id: `assistant-${id}`,
+    parentId: null,
+    timestamp: '2026-08-28T10:20:18.000Z',
+    message: {
+      ...assistantMessage(''),
+      content: [{ type: 'toolCall', id: `tool-${id}`, name: 'channel_reply', arguments: { text: 'Done.' } }],
+      stopReason: 'toolUse',
+    },
+  }
+  session.entriesById.set(assistantEntry.id, assistantEntry)
+  session.leafEntry = assistantEntry
+  session.agent.state.messages = [assistantEntry.message]
+}
+
 // A bare-empty `stop` leaf whose parentId chain runs back through a web_search
 // tool call to a bounding user entry — the production shape recoverableAssistantText
 // recovers as { text: '', source: 'leaf' } while attemptMadeToolCall still finds
@@ -351,14 +441,19 @@ function emptyStopAfterToolWork(session: FakeSession, id: string = 'tw', userId:
 }
 
 function terminalReplyContext(replyText: string): AfterToolCallContext {
+  const toolCall = {
+    type: 'toolCall' as const,
+    id: 'tc-terminal-reply',
+    name: 'channel_reply',
+    arguments: { text: replyText },
+  }
   return {
-    assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
-    toolCall: {
-      type: 'toolCall',
-      id: 'tc-terminal-reply',
-      name: 'channel_reply',
-      arguments: { text: replyText },
-    } as AfterToolCallContext['toolCall'],
+    assistantMessage: {
+      ...assistantMessage(''),
+      content: [toolCall],
+      stopReason: 'toolUse',
+    } as AfterToolCallContext['assistantMessage'],
+    toolCall: toolCall as AfterToolCallContext['toolCall'],
     args: { text: replyText },
     result: {
       content: [{ type: 'text' as const, text: 'ignored' }],
@@ -7524,13 +7619,66 @@ describe('ChannelRouter channel-turn protocol', () => {
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Done.' })
       const terminal = await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Done.'))
-      expect(terminal).toMatchObject({ terminate: true })
+      expect(terminal).toBeUndefined()
       strandOnUnansweredToolUse(sessions[0]!, 'terminal-reply')
+      await streamOnce(sessions[0]!)
     }
     await router.__testing!.flushDebounce(KEY)
 
     expect(sessions[0]!.prompts).toHaveLength(1)
     expect(sent).toEqual(['Done.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_after_send'))).toBe(false)
+  })
+
+  test('repairs an already-poisoned unmatched toolUse before later user messages run', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      onSessionCreated: (session) => strandOnMissingToolResult(session, 'persisted-terminal-reply'),
+    })
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'are you still there?' }))
+    sessions[0]!.onPrompt = async () => {
+      const leaf = sessions[0]!.sessionManager.getLeafEntry()
+      if (leaf?.type !== 'message' || leaf.message.role !== 'toolResult') return
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Yes — continuing normally.' })
+      sessions[0]!.setAssistantText('Yes — continuing normally.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual(['Yes — continuing normally.'])
+    expect(logs.some((message) => message.includes('branch_repair=missing_tool_result'))).toBe(true)
+
+    await router.route(inbound({ text: 'and this one?', externalMessageId: 'm2' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual(['Yes — continuing normally.', 'Yes — continuing normally.'])
+  })
+
+  test('textless terminal channel_reply still records completion and avoids stranded recovery', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    await router.route(inbound({ text: 'send the file' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1' })
+      const context = terminalReplyContext('unused')
+      context.toolCall.arguments = {}
+      await sessions[0]!.agent.afterToolCall!(context)
+      strandOnUnansweredToolUse(sessions[0]!, 'terminal-attachment')
+      await streamOnce(sessions[0]!)
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
     expect(logs.some((message) => message.includes('cause=stranded_toolUse_after_send'))).toBe(false)
   })
 
@@ -8450,8 +8598,6 @@ describe('ChannelRouter commands', () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
       await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
       await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
-      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
-      sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
     }
     await router.__testing!.flushDebounce(KEY)
 
@@ -8497,7 +8643,7 @@ describe('ChannelRouter commands', () => {
     sessions[0]!.onPrompt = async () => {
       await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Stopping as requested.' })
       await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Stopping as requested.'))
-      sessions[0]!.setAssistantMidTurn('Stopping as requested.', 'aborted')
+      await streamOnce(sessions[0]!)
       sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
       await waitFor(() => terminalWriteStarted)
       const stopping = router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
@@ -14428,9 +14574,14 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
       details: result,
     }
     const args = replyText !== undefined ? { text: replyText } : {}
+    const toolCall = { type: 'toolCall' as const, id: 'tc1', name: toolName, arguments: args }
     return {
-      assistantMessage: assistantMessage('') as AfterToolCallContext['assistantMessage'],
-      toolCall: { type: 'toolCall', id: 'tc1', name: toolName, arguments: args } as AfterToolCallContext['toolCall'],
+      assistantMessage: {
+        ...assistantMessage(''),
+        content: [toolCall],
+        stopReason: 'toolUse',
+      } as AfterToolCallContext['assistantMessage'],
+      toolCall: toolCall as AfterToolCallContext['toolCall'],
       args,
       result: toolResult as AfterToolCallContext['result'],
       isError,
@@ -14438,31 +14589,209 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     }
   }
 
-  async function liveAgentAfterRoute(dir: string): Promise<FakeSession['agent']> {
+  async function liveSessionAfterRoute(dir: string): Promise<FakeSession> {
     const { router, sessions } = makeRouter(dir)
     await router.route(inbound())
     await router.__testing!.flushDebounce(KEY)
-    return sessions[0]!.agent
+    return sessions[0]!
   }
 
-  test('terminates the tool batch after a successful channel_reply without aborting result persistence', async () => {
+  async function liveAgentAfterRoute(dir: string): Promise<FakeSession['agent']> {
+    return (await liveSessionAfterRoute(dir)).agent
+  }
+
+  test('suppresses the provider at the post-tool stream boundary', async () => {
     // given a live channel session with the terminal hook installed
-    const agent = await liveAgentAfterRoute(await tempDir())
+    const session = await liveSessionAfterRoute(await tempDir())
+    const agent = session.agent
     expect(agent.afterToolCall).toBeDefined()
 
     // when channel_reply succeeds (details.ok === true, not an error)
     const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
 
-    // then pi-agent-core persists the matching toolResult before honoring the
-    // terminate flag, and no aborted run can leave the branch looking stranded.
-    expect(result).toMatchObject({ terminate: true })
+    // The hook itself does not abort before pi-agent-core emits the result.
+    expect(result).toBeUndefined()
     expect(agent.signal.aborted).toBe(false)
+
+    await streamOnce(session)
+
+    expect(agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeUndefined()
+  })
+
+  test('preserves a prior afterToolCall result when adding terminal completion', async () => {
+    const { router, sessions } = makeRouter(await tempDir(), {
+      onSessionCreated: (session) => {
+        session.agent.afterToolCall = async () => ({
+          content: [{ type: 'text', text: 'prior content' }],
+          details: { prior: true },
+          isError: false,
+        })
+      },
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+
+    const result = await sessions[0]!.agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+
+    expect(result).toMatchObject({
+      content: [{ type: 'text', text: 'prior content' }],
+      details: { prior: true },
+      isError: false,
+    })
+  })
+
+  test('preserves assistant token usage in the explicit terminal outcome', async () => {
+    const writes: Array<{ termination?: string; tokens?: number }> = []
+    const { router, sessions } = makeRouter(await tempDir(), {
+      recordTurnOutcome: async (args) => {
+        writes.push({
+          ...(args.termination !== undefined ? { termination: args.termination } : {}),
+          ...(args.tokens !== undefined ? { tokens: args.tokens } : {}),
+        })
+      },
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const context = afterToolContext('channel_reply', { ok: true }, false)
+    context.assistantMessage = {
+      ...context.assistantMessage,
+      usage: { ...context.assistantMessage.usage, totalTokens: 73 },
+    }
+
+    await sessions[0]!.agent.afterToolCall!(context)
+    await streamOnce(sessions[0]!)
+    sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
+    await waitFor(() => writes.some((write) => write.termination === 'terminal-after-channel-reply'))
+
+    expect(writes.filter((write) => write.termination === 'terminal-after-channel-reply')).toEqual([
+      { termination: 'terminal-after-channel-reply', tokens: 73 },
+    ])
+  })
+
+  test('the pinned parallel agent loop finalizes a mixed batch and makes exactly one provider call', async () => {
+    const registration = registerFauxProvider({
+      provider: 'router-terminal-reply-test',
+      api: 'router-terminal-reply-test',
+      tokenSize: { min: 1, max: 1 },
+    })
+    try {
+      const model = registration.getModel()
+      const executed: string[] = []
+      const tool = (name: string, delayMs: number) => ({
+        name,
+        label: name,
+        description: name,
+        parameters: Type.Object({ text: Type.String() }),
+        execute: async (_toolCallId: string, params: unknown) => {
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
+          executed.push(name)
+          const text =
+            typeof params === 'object' && params !== null && 'text' in params && typeof params.text === 'string'
+              ? params.text
+              : ''
+          return {
+            content: [{ type: 'text' as const, text: `${name}:${text}` }],
+            details: { ok: true },
+          }
+        },
+      })
+      registration.setResponses([
+        fauxAssistantMessage(
+          [
+            fauxToolCall('channel_reply', { text: 'Done.' }, { id: 'reply-call' }),
+            fauxToolCall('sibling', { text: 'Result.' }, { id: 'sibling-call' }),
+          ],
+          { stopReason: 'toolUse' },
+        ),
+        fauxAssistantMessage(fauxText('duplicate follow-up')),
+      ])
+      const coreAgent = new Agent({
+        initialState: {
+          model,
+          tools: [tool('channel_reply', 20), tool('sibling', 1)],
+        },
+        toolExecution: 'parallel',
+      })
+      let sessionRef: FakeSession | undefined
+      let persistedResultsAtOutcome = 0
+      const { router } = makeRouter(await tempDir(), {
+        recordTurnOutcome: async (args) => {
+          if (args.termination !== 'terminal-after-channel-reply') return
+          persistedResultsAtOutcome =
+            sessionRef?.sessionManager
+              .getBranch()
+              .filter((entry) => entry.type === 'message' && entry.message.role === 'toolResult').length ?? 0
+        },
+        onSessionCreated: (session) => {
+          sessionRef = session
+          connectCoreAgent(session, coreAgent)
+        },
+      })
+      await router.route(inbound())
+      await router.__testing!.flushDebounce(KEY)
+
+      await coreAgent.prompt('run both tools')
+      await waitFor(() => persistedResultsAtOutcome > 0)
+
+      expect(executed).toEqual(['sibling', 'channel_reply'])
+      expect(
+        coreAgent.state.messages
+          .filter((message) => message.role === 'toolResult')
+          .map((message) => message.toolCallId),
+      ).toEqual(['reply-call', 'sibling-call'])
+      expect(persistedResultsAtOutcome).toBe(2)
+      expect(
+        sessionRef?.sessionManager
+          .getBranch()
+          .filter((entry) => entry.type === 'message' && entry.message.role === 'toolResult')
+          .map((entry) =>
+            entry.type === 'message' && entry.message.role === 'toolResult' ? entry.message.toolCallId : '',
+          ),
+      ).toEqual(['reply-call', 'sibling-call'])
+      expect(registration.state.callCount).toBe(1)
+    } finally {
+      registration.unregister()
+    }
+  })
+
+  test('keeps a mixed batch alive when its sole channel_reply fails', async () => {
+    const session = await liveSessionAfterRoute(await tempDir())
+    const agent = session.agent
+    const replyCall = {
+      type: 'toolCall' as const,
+      id: 'reply-call',
+      name: 'channel_reply',
+      arguments: { text: 'Done.' },
+    }
+    const readCall = { type: 'toolCall' as const, id: 'read-call', name: 'read', arguments: { path: 'README.md' } }
+    const assistant = {
+      ...assistantMessage(''),
+      content: [replyCall, readCall],
+      stopReason: 'toolUse' as const,
+    }
+
+    const replyResult = await agent.afterToolCall!({
+      ...afterToolContext('channel_reply', { ok: false }, false, 'Done.'),
+      assistantMessage: assistant,
+      toolCall: replyCall,
+    } as AfterToolCallContext)
+
+    expect(replyResult).toBeUndefined()
+    await streamOnce(session)
+    expect(agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeDefined()
   })
 
   test('does NOT abort when channel_reply opts out with more_work_this_turn: true', async () => {
-    const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false))
-    expect(agent.signal.aborted).toBe(false)
+    const session = await liveSessionAfterRoute(await tempDir())
+    const result = await session.agent.afterToolCall!(
+      afterToolContext('channel_reply', { ok: true, more_work_this_turn: true }, false),
+    )
+    expect(result).toBeUndefined()
+    await streamOnce(session)
+    expect(session.agent.signal.aborted).toBe(false)
+    expect(session.lastStreamMaxTokens).toBeDefined()
   })
 
   test('logs a diagnostic line identifying the session, reason, and site when channel_reply ends the turn', async () => {
@@ -14475,7 +14804,7 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
 
     const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
 
-    expect(result).toMatchObject({ terminate: true })
+    expect(result).toBeUndefined()
     expect(agent.signal.aborted).toBe(false)
     const abortLog = logs.find((m) => m.includes('site=terminal_after_channel_reply'))
     expect(abortLog).toBeDefined()
@@ -14497,13 +14826,15 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
 
   test('does NOT abort after a read-only tool so genuine multi-step turns continue', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('read', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('read', { ok: true }, false))
+    expect(result?.terminate).not.toBe(true)
     expect(agent.signal.aborted).toBe(false)
   })
 
   test('does NOT abort after a successful channel_send (only channel_reply is terminal)', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_send', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('channel_send', { ok: true }, false))
+    expect(result?.terminate).not.toBe(true)
     expect(agent.signal.aborted).toBe(false)
   })
 
@@ -14588,7 +14919,7 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     const result = await agent.afterToolCall!(
       afterToolContext('channel_reply', { ok: true }, false, '바로 계속 확인하겠습니다'),
     )
-    expect(result).toMatchObject({ terminate: true })
+    expect(result).toBeUndefined()
     expect(agent.signal.aborted).toBe(false)
   })
 
@@ -14619,15 +14950,21 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     sessions[0]!.onPrompt = async (text) => {
       attempt++
       if (attempt === 1) {
+        // Match pi 0.73.1 ordering: the assistant toolUse message ends before
+        // channel_reply executes; the matching toolResult persists before the
+        // deferred abort prevents a later provider call.
+        sessions[0]!.setAssistantMidTurn('')
+        sessions[0]!.emit({
+          type: 'message_end',
+          message: { ...assistantMessage(''), stopReason: 'toolUse' },
+        })
         await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'First step is done.' })
         await sessions[0]!.agent.afterToolCall!(
           afterToolContext('channel_reply', { ok: true }, false, 'First step is done.'),
         )
-        sessions[0]!.setAssistantMidTurn('First step is done.', 'aborted')
-        sessions[0]!.emit({
-          type: 'message_end',
-          message: { ...assistantMessage(''), stopReason: 'aborted' },
-        })
+        strandOnUnansweredToolUse(sessions[0]!, 'terminal-todo')
+        await streamOnce(sessions[0]!)
+        sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
         return
       }
 
