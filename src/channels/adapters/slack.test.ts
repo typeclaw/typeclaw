@@ -9,6 +9,7 @@ import type { InboundMessage, OutboundCallback } from '@/channels/types'
 import type { SlackAccountRecord } from '@/secrets/schema'
 
 import { createSlackAdapter, createSlackHistoryCallback, type SlackAdapterLogger } from './slack'
+import type { SlackInboundMessageEvent } from './slack-classify'
 
 const config = channelsSchema.parse({ slack: {} }).slack!
 
@@ -217,6 +218,53 @@ describe('createSlackAdapter', () => {
     expect(listener.stopped).toBe(true)
     expect(r.unregistered).toContain('outbound:slack')
     expect(r.unregistered).toContain('remove-reaction:slack')
+  })
+
+  test('subtype-less RTM file messages reach the router with the same attachment descriptors as history', async () => {
+    for (const [text, expectedText] of [
+      ['', '[Slack attachment #1: file application/pdf name=report.pdf]'],
+      ['please review', 'please review\n[Slack attachment #1: file application/pdf name=report.pdf]'],
+    ] as const) {
+      const r = router()
+      const listener = new FakeListener()
+      const adapter = createSlackAdapter({
+        router: r,
+        configRef: () => config,
+        logger: logger(),
+        credentialsStore: { getAccount: async () => account() },
+        createClient: () => fakeClient(),
+        createListener: () => listener as unknown as SlackListener,
+      })
+
+      await adapter.start()
+      listener.emit('message', {
+        type: 'message',
+        channel: 'C0123456789',
+        user: 'UUSER',
+        text,
+        ts: '1770000000.000100',
+        files: [
+          {
+            id: 'F0001',
+            name: 'report.pdf',
+            title: 'report.pdf',
+            mimetype: 'application/pdf',
+            size: 1024,
+            url_private: 'https://files.slack.com/files-pri/T1-F0001/report.pdf',
+            created: 1,
+            user: 'UUSER',
+          },
+        ],
+      } satisfies SlackInboundMessageEvent)
+      await adapter.stop()
+
+      expect(r.routed).toHaveLength(1)
+      expect(r.routed[0]?.text).toBe(expectedText)
+      expect(r.routed[0]?.externalMessageId).toBe('1770000000.000100')
+      expect(r.routed[0]?.attachments).toEqual([
+        { id: 1, kind: 'file', ref: 'F0001', filename: 'report.pdf', mimetype: 'application/pdf' },
+      ])
+    }
   })
 
   test('G-prefixed conversations use Slack metadata to distinguish MPIMs from private channels', async () => {
