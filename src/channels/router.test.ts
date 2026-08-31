@@ -7506,6 +7506,34 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(logs.some((m) => m.includes('empty_turn_retry attempt=1'))).toBe(true)
   })
 
+  // Regression for the 2026-08-28 Discord fingerprint. A terminal
+  // channel_reply deliberately ends on its matching toolResult with no
+  // follow-up assistant message. That is a completed turn, not the
+  // `more_work_this_turn: true` stranded-work shape above.
+  test('terminal channel_reply does not enter stranded-toolUse recovery after its result is persisted', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: 'is it done?' }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Done.' })
+      const terminal = await sessions[0]!.agent.afterToolCall!(terminalReplyContext('Done.'))
+      expect(terminal).toMatchObject({ terminate: true })
+      strandOnUnansweredToolUse(sessions[0]!, 'terminal-reply')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toEqual(['Done.'])
+    expect(logs.some((message) => message.includes('cause=stranded_toolUse_after_send'))).toBe(false)
+  })
+
   test('continue-reply guard: logs policy-denied abort provenance when retrying stranded toolUse', async () => {
     const dir = await tempDir()
     const logs: string[] = []
@@ -7526,6 +7554,7 @@ describe('ChannelRouter channel-turn protocol', () => {
           await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'checking now' })
         }
         strandOnUnansweredToolUse(sessions[0]!, 'policy-denied')
+        sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
         return
       }
       expect(text).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
@@ -14416,16 +14445,18 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     return sessions[0]!.agent
   }
 
-  test('aborts the run after a successful channel_reply so no post-tool follow-up LLM call runs', async () => {
+  test('terminates the tool batch after a successful channel_reply without aborting result persistence', async () => {
     // given a live channel session with the terminal hook installed
     const agent = await liveAgentAfterRoute(await tempDir())
     expect(agent.afterToolCall).toBeDefined()
 
     // when channel_reply succeeds (details.ok === true, not an error)
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
 
-    // then the run's abort signal is fired — the follow-up stream sees it aborted
-    expect(agent.signal.aborted).toBe(true)
+    // then pi-agent-core persists the matching toolResult before honoring the
+    // terminate flag, and no aborted run can leave the branch looking stranded.
+    expect(result).toMatchObject({ terminate: true })
+    expect(agent.signal.aborted).toBe(false)
   })
 
   test('does NOT abort when channel_reply opts out with more_work_this_turn: true', async () => {
@@ -14442,9 +14473,10 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     await router.__testing!.flushDebounce(KEY)
     const agent = sessions[0]!.agent
 
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
+    const result = await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false))
 
-    expect(agent.signal.aborted).toBe(true)
+    expect(result).toMatchObject({ terminate: true })
+    expect(agent.signal.aborted).toBe(false)
     const abortLog = logs.find((m) => m.includes('site=terminal_after_channel_reply'))
     expect(abortLog).toBeDefined()
     expect(abortLog).toContain('session=ses_fake_1')
@@ -14553,8 +14585,11 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
 
   test('stashes the reply text on a terminal channel_reply so the willingness nudge can read it', async () => {
     const agent = await liveAgentAfterRoute(await tempDir())
-    await agent.afterToolCall!(afterToolContext('channel_reply', { ok: true }, false, '바로 계속 확인하겠습니다'))
-    expect(agent.signal.aborted).toBe(true)
+    const result = await agent.afterToolCall!(
+      afterToolContext('channel_reply', { ok: true }, false, '바로 계속 확인하겠습니다'),
+    )
+    expect(result).toMatchObject({ terminate: true })
+    expect(agent.signal.aborted).toBe(false)
   })
 
   test('does NOT stash when more_work_this_turn:true (the turn stays alive, no nudge needed)', async () => {

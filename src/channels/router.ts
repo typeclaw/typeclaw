@@ -2551,13 +2551,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (usage === null) return
         const stampedAbort = live.abortReasonThisTurn
         const termination: 'terminal-after-channel-reply' | undefined =
-          usage.stopReason === 'aborted' &&
+          (usage.stopReason === 'aborted' || usage.stopReason === 'unknown') &&
           live.userStoppedTurnSeq !== live.turnSeq &&
           stampedAbort?.turnSeq === live.turnSeq &&
           stampedAbort.reason === 'terminal_after_channel_reply'
             ? 'terminal-after-channel-reply'
             : undefined
-        if (stampedAbort?.turnSeq === live.turnSeq) live.abortReasonThisTurn = null
+        // Keep the same-turn stamp through validateChannelTurn. Clearing it on
+        // the aborted assistant event made the later stranded-toolUse retry log
+        // `abort_reason=unknown`, even though this subscriber had just consumed
+        // the exact internal reason. A fresh user batch clears the stamp, and
+        // every reader also requires a matching turnSeq, so retaining it cannot
+        // attribute a later turn to this abort.
         const outcomeArgs = {
           agentDir: options.agentDir,
           origin: buildLiveOrigin(live),
@@ -2879,23 +2884,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // After a successful `channel_reply`, the model has delivered its user-facing
-  // response and the turn is semantically done. pi-agent-core's loop, however,
-  // unconditionally makes one more LLM call after any tool result (the
-  // "post-tool follow-up") to let multi-step tool chains continue. On a turn
-  // that ended with `channel_reply` there is nothing left to say, and Fireworks'
-  // kimi-k2p6-turbo degenerates that empty follow-up into a 32000-token
-  // repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS). Aborting the run's signal
-  // from `afterToolCall` — which runs during tool execution, before the loop
-  // re-enters the LLM stream — makes the follow-up stream observe an already-
-  // aborted signal and return `stopReason: 'aborted'` without generating. This
-  // is the same `agent.abort()` lever the policy-denied-send cap uses; the
-  // tool's own result is already persisted, so the reply still lands.
+  // response and the turn is semantically done. pi-agent-core otherwise makes
+  // one more LLM call after the tool result (the "post-tool follow-up") so real
+  // multi-step chains can continue. On a terminal reply there is nothing left
+  // to say, and Fireworks' kimi-k2p6-turbo can degenerate that empty follow-up
+  // into a 32000-token repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS).
+  // `ToolResult.terminate` is the SDK's clean stop boundary: pi-agent-core emits
+  // and persists the matching toolResult, then exits without another provider
+  // call. Do not abort here. In the 2026-08-28 Discord incident, the abort path
+  // could finish without a persisted aborted assistant leaf, so validation saw
+  // the preceding tool result as `stranded_toolUse_after_send` and opened a
+  // recovery turn after an already-complete reply.
   //
   // Scope is deliberately narrow: only `channel_reply` (the current-chat user-
   // facing response), only on success, and only for channel sessions. Read-only
   // tools and `channel_send` must keep the follow-up so genuine multi-step turns
-  // continue. A prior non-typeclaw `afterToolCall` (none today) would be
-  // composed, not clobbered.
+  // continue. A prior non-typeclaw `afterToolCall` (none today) is composed, and
+  // its result fields are preserved when the terminal flag is added.
   //
   // `channel_reply({ more_work_this_turn: true })` is the explicit opt-out: a
   // mid-turn status reply ("working on it…") that the model follows with more
@@ -2931,14 +2936,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
         }
       }
-      if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true && live.userStoppedTurnSeq !== live.turnSeq) {
+      if (succeeded && !keepTurnAlive && live.userStoppedTurnSeq !== live.turnSeq) {
         logger.info(
           `[channels] ${live.keyId} terminal_after_channel_reply site=terminal_after_channel_reply session=${live.sessionId} reason=terminal_after_channel_reply`,
         )
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
         live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
+        // This stamp now records semantic termination rather than an actual
+        // signal abort. Outcome persistence still needs the same provenance so
+        // completed terminal replies may authorize bounded todo continuation.
         live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'terminal_after_channel_reply' }
-        agent.abort()
+        return { ...result, terminate: true }
       }
       return result
     }
@@ -5406,6 +5414,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // the send is narration the model emitted with/before the reply that already
     // landed — suppress it, as before.
     if (live.successfulChannelSends > successfulSendsBeforePrompt) {
+      const terminalReplyCompletedThisTurn = live.lastTerminalReplyAbort?.turnSeq === live.turnSeq
       maybeNudgeContinuationWillingness(live)
 
       // A `channel_reply({ more_work_this_turn: true })` progress ack landed this turn (the
@@ -5484,6 +5493,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         return
       }
+
+      // A terminal channel_reply now ends the SDK tool batch with
+      // ToolResult.terminate after its matching result is persisted. The leaf
+      // therefore has the same toolResult-under-toolUse shape as genuinely
+      // stranded post-status work, but this turn already delivered its final
+      // answer and explicitly terminated. The 2026-08-28 Discord incident
+      // crossed this distinction: validation re-prompted the completed turn as
+      // `stranded_toolUse_after_send`, then subsequent inbounds accumulated on
+      // the failed recovery branch. Keep willingness nudges queued above, but do
+      // not send terminal completion through stranded-work recovery.
+      if (terminalReplyCompletedThisTurn) return
 
       const trailing = recoverableAssistantText(live.session)
       if (trailing === null || trailing.source !== 'leaf') {
