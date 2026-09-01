@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { ReloadRegistry, type ReloadResult } from '@/reload'
 
+import { createProviderAuthReloadable } from './auth-reloadable'
 import { createReloadTool } from './reload-tool'
 
 function regWith(...results: ReloadResult[]): ReloadRegistry {
@@ -161,5 +162,54 @@ describe('createReloadTool', () => {
 
     // then
     expect(calls).toEqual(['config', 'cron'])
+  })
+
+  test('without scope arg, skips forced provider invalidation', async () => {
+    const calls: string[] = []
+    let liveSessionTeardowns = 0
+    const reg = new ReloadRegistry()
+    for (const scope of ['config', 'cron']) {
+      reg.register({
+        scope,
+        description: scope,
+        reload: async () => {
+          calls.push(scope)
+          return { scope, ok: true, summary: `${scope} ok` }
+        },
+      })
+    }
+    reg.register(
+      createProviderAuthReloadable({
+        onProviderAuthChanged: () => {
+          liveSessionTeardowns++
+        },
+      }),
+    )
+
+    const result = await execute(createReloadTool({ registry: reg }))
+
+    expect(calls).toEqual(['config', 'cron'])
+    expect(liveSessionTeardowns).toBe(0)
+    expect((result.details as { results: ReloadResult[] }).results.map((item) => item.scope)).toEqual([
+      'config',
+      'cron',
+    ])
+  })
+
+  test('explicit providers scope still forces provider invalidation', async () => {
+    let liveSessionTeardowns = 0
+    const reg = new ReloadRegistry()
+    reg.register(
+      createProviderAuthReloadable({
+        onProviderAuthChanged: () => {
+          liveSessionTeardowns++
+        },
+      }),
+    )
+
+    const result = await execute(createReloadTool({ registry: reg }), { scope: 'providers' })
+
+    expect(liveSessionTeardowns).toBe(1)
+    expect((result.details as { results: ReloadResult[] }).results.map((item) => item.scope)).toEqual(['providers'])
   })
 })
