@@ -9104,6 +9104,28 @@ describe('ChannelRouter.executeCommand (native slash-command surface)', () => {
     expect(sessions[0]!.aborted).toBe(1)
   })
 
+  // Production fingerprint, Discord 2026-08-28: one registered session
+  // consumed repeated user messages while every prompt completed without an
+  // assistant entry. Native /stop resolved the exact channel key but rejected
+  // the idle-between-prompts session as "no-live-session", removing the only
+  // user-controlled escape hatch until stale rollover.
+  test('Discord /stop aborts an exact live session that repeatedly produced no assistant output', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+
+    await router.route(inbound({ text: 'first attempt', externalMessageId: 'm-first' }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ text: 'second attempt', externalMessageId: 'm-second' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    const result = await router.executeCommand(KEY, 'stop', { invokerId: 'alice' })
+
+    expect(result).toEqual({ kind: 'handled', name: 'stop', reply: 'Stopped the current turn.' })
+    expect(sessions[0]!.aborted).toBe(1)
+  })
+
   test('stop on a queued (pre-drain) session clears the queue and aborts', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
@@ -9336,20 +9358,30 @@ describe('ChannelRouter.executeCommand (native slash-command surface)', () => {
     expect(sessions[0]!.aborted).toBe(0)
   })
 
-  test('stop on an observe-only exact-thread session reports no-live-session and aborts nothing', async () => {
+  test('Slack stop on an observe-only exact-thread session reports no-live-session and aborts nothing', async () => {
     const dir = await tempDir()
     const { router, sessions } = makeRouter(dir)
+    const slackThreadKey: ChannelKey = { adapter: 'slack-bot', workspace: 'g1', chat: 'c1', thread: 'thr-1' }
     // Prime a second human so the strict multi-human gate applies and an
     // unaddressed thread message observes (creating a live session) rather than
     // engaging — the bystander state the fix must treat as "nothing to stop".
-    await router.route(inbound({ thread: 'thr-1', isBotMention: true, authorId: 'carol', authorName: 'carol' }))
-    await router.__testing!.flushDebounce({ ...KEY, thread: 'thr-1' })
+    await router.route(
+      inbound({ adapter: 'slack-bot', thread: 'thr-1', isBotMention: true, authorId: 'carol', authorName: 'carol' }),
+    )
+    await router.__testing!.flushDebounce(slackThreadKey)
     const engagedSessions = sessions.length
     await router.route(
-      inbound({ thread: 'thr-1', isBotMention: false, authorId: 'bob', authorName: 'bob', externalMessageId: 'm-obs' }),
+      inbound({
+        adapter: 'slack-bot',
+        thread: 'thr-1',
+        isBotMention: false,
+        authorId: 'bob',
+        authorName: 'bob',
+        externalMessageId: 'm-obs',
+      }),
     )
 
-    const result = await router.executeCommand({ ...KEY, thread: 'thr-1' }, 'stop', { invokerId: 'alice' })
+    const result = await router.executeCommand(slackThreadKey, 'stop', { invokerId: 'alice' })
 
     expect(result).toEqual({ kind: 'no-live-session' })
     // The observe-only inbound created no new session that got aborted, and the
