@@ -199,6 +199,34 @@ describe('createScheduler', () => {
     scheduler.stop()
   })
 
+  test('does not fire a long-delay job when Node clamps an oversized timer', async () => {
+    const clock = createFakeClock()
+    const nodeMaxTimeoutMs = 2 ** 31 - 1
+    const nodeLikeClock: SchedulerClock & Pick<typeof clock, 'advance'> = {
+      ...clock,
+      setTimeout: (cb, ms) => clock.setTimeout(cb, ms > nodeMaxTimeoutMs ? 1 : ms),
+    }
+    const recorder = createFireRecorder()
+    const dueAt = new Date('2026-02-01T00:00:00Z').toISOString()
+    const scheduler = createScheduler({
+      jobs: [{ id: 'long-delay', at: dueAt, kind: 'prompt', prompt: 'run', enabled: true }],
+      onFire: recorder.onFire,
+      clock: nodeLikeClock,
+      logger: silentLogger,
+    })
+
+    scheduler.start()
+    await nodeLikeClock.advance(nodeMaxTimeoutMs)
+
+    expect(recorder.fires).toHaveLength(0)
+
+    await nodeLikeClock.advance(new Date(dueAt).getTime() - nodeLikeClock.now())
+
+    expect(recorder.firesByJob.get('long-delay')).toHaveLength(1)
+
+    scheduler.stop()
+  })
+
   test('stop() prevents future fires', async () => {
     const clock = createFakeClock()
     const recorder = createFireRecorder()
