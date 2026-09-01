@@ -6648,9 +6648,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (resolved.kind === 'ambiguous') {
         return { kind: 'ambiguous', matchCount: resolved.count }
       }
-      // A resolved session that isn't actually running has nothing for /stop to
-      // cancel; report it as no-live-session so bystander agents stay silent.
-      if (lowered === 'stop' && !hasStoppableWork(resolved.session)) {
+      // Slack broadcasts slash commands to every installed app, so an idle
+      // fallback/observe-only session must stay silent instead of claiming it
+      // stopped work. Discord interactions are delivered only to the selected
+      // application, and its exact channel key is authoritative even between
+      // prompts. In the 2026-08-28 incident, one exact Discord session consumed
+      // 14 messages into a no-assistant-output branch; each prompt ended in
+      // ~53ms, so /stop landed while `draining`, queues, and reminders were all
+      // empty and incorrectly reported no-live-session. Always pass that exact
+      // session to stopCurrentChannelTurn so the user's escape hatch remains.
+      const exactDiscordSession = key.adapter === 'discord-bot' && resolved.session.keyId === channelKeyId(key)
+      if (lowered === 'stop' && !exactDiscordSession && !hasStoppableWork(resolved.session)) {
         return { kind: 'no-live-session' }
       }
       live = resolved.session
