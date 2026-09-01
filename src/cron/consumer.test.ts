@@ -8,7 +8,7 @@ import type { HookBus } from '@/plugin'
 import { createStream } from '@/stream'
 
 import { createCronConsumer, type CronConsumerLogger, type CronSession } from './consumer'
-import type { CronJob, ExecJob, PromptJob } from './schema'
+import type { CronJob, ExecJob, HandlerJob, PromptJob } from './schema'
 
 async function waitForFile(path: string): Promise<string> {
   for (let i = 0; i < 200; i++) {
@@ -98,6 +98,14 @@ const execJob = (id: string, command: string[]): ExecJob => ({
   command,
 })
 
+const handlerJob = (id: string): HandlerJob => ({
+  id,
+  schedule: '* * * * *',
+  enabled: true,
+  kind: 'handler',
+  handler: async () => {},
+})
+
 function publishCron(stream: ReturnType<typeof createStream>, job: CronJob): string {
   return stream.publish({ target: { kind: 'cron', jobId: job.id }, payload: job })
 }
@@ -124,6 +132,134 @@ function makeFakeSessionFactory(): {
 }
 
 describe('createCronConsumer', () => {
+  test('logs correlated start and successful end lines with elapsed time', async () => {
+    const stream = createStream()
+    const info: string[] = []
+    let time = 1_000
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: async () => ({ prompt: async () => {} }),
+      invokeHandler: async () => {
+        time = 1_125
+      },
+      intervalNow: () => time,
+      logger: { ...silentLogger, info: (message) => info.push(message) },
+    })
+    consumer.start()
+
+    publishCron(stream, handlerJob('observed-success'))
+    await waitForConsumerIdle(consumer)
+
+    expect(info).toHaveLength(2)
+    const fireId = info[0]?.match(/fire_id=(\S+)/)?.[1]
+    expect(fireId).toBeTruthy()
+    expect(info[0]).toBe(`[cron] observed-success: run started fire_id=${fireId}`)
+    expect(info[1]).toBe(`[cron] observed-success: run ended fire_id=${fireId} outcome=success elapsed_ms=125`)
+
+    consumer.stop()
+  })
+
+  test('logs a failed end line when dispatch throws', async () => {
+    const stream = createStream()
+    const info: string[] = []
+    let time = 2_000
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: async () => ({ prompt: async () => {} }),
+      invokeHandler: async () => {
+        time = 2_075
+        throw new Error('synthetic failure')
+      },
+      intervalNow: () => time,
+      logger: { ...silentLogger, info: (message) => info.push(message) },
+    })
+    consumer.start()
+
+    publishCron(stream, handlerJob('observed-failure'))
+    await waitForConsumerIdle(consumer)
+
+    expect(info).toHaveLength(2)
+    const fireId = info[0]?.match(/fire_id=(\S+)/)?.[1]
+    expect(fireId).toBeTruthy()
+    expect(info[1]).toBe(`[cron] observed-failure: run ended fire_id=${fireId} outcome=failed elapsed_ms=75`)
+
+    consumer.stop()
+  })
+
+  test('logs the blocking fire id and active duration for an overlapping skip', async () => {
+    const stream = createStream()
+    const info: string[] = []
+    const warnings: string[] = []
+    let time = 3_000
+    let release: (() => void) | undefined
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: async () => ({ prompt: async () => {} }),
+      invokeHandler: async () =>
+        new Promise<void>((resolve) => {
+          release = resolve
+        }),
+      intervalNow: () => time,
+      logger: {
+        ...silentLogger,
+        info: (message) => info.push(message),
+        warn: (message) => warnings.push(message),
+      },
+    })
+    consumer.start()
+
+    const job = handlerJob('observed-overlap')
+    publishCron(stream, job)
+    await new Promise((resolve) => setImmediate(resolve))
+    time = 3_250
+    publishCron(stream, job)
+    await new Promise((resolve) => setImmediate(resolve))
+
+    const blockingFireId = info[0]?.match(/fire_id=(\S+)/)?.[1]
+    expect(blockingFireId).toBeTruthy()
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('previous run still in progress, skipping')
+    expect(warnings[0]).toContain(`blocking_fire_id=${blockingFireId}`)
+    expect(warnings[0]).toContain('active_for_ms=250')
+
+    release?.()
+    await waitForConsumerIdle(consumer)
+    consumer.stop()
+  })
+
+  test('releases the in-flight reservation when the completion logger throws', async () => {
+    const stream = createStream()
+    let runs = 0
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: async () => ({ prompt: async () => {} }),
+      invokeHandler: async () => {
+        runs++
+      },
+      logger: {
+        ...silentLogger,
+        info: (message) => {
+          if (message.includes('run ended')) throw new Error('synthetic logger failure')
+        },
+      },
+    })
+    consumer.start()
+
+    const job = handlerJob('throwing-logger')
+    publishCron(stream, job)
+    await waitForConsumerIdle(consumer)
+    publishCron(stream, job)
+    await waitForConsumerIdle(consumer)
+
+    expect(runs).toBe(2)
+
+    consumer.stop()
+  })
+
   test('dispatches a prompt job to createSessionForCron and forwards the prompt text', async () => {
     const stream = createStream()
     const factory = makeFakeSessionFactory()
@@ -880,6 +1016,7 @@ describe('createCronConsumer model fallback', () => {
     try {
       const stream = createStream()
       const errors: string[] = []
+      const info: string[] = []
       const attempted: string[] = []
       const consumer = createCronConsumer({
         stream,
@@ -895,18 +1032,19 @@ describe('createCronConsumer model fallback', () => {
             }),
           }
         },
-        logger: { ...silentLogger, error: (m) => errors.push(m) },
+        logger: { ...silentLogger, error: (m) => errors.push(m), info: (m) => info.push(m) },
       })
       consumer.start()
 
       // when
       publishCron(stream, promptJob('all-down', 'attempt'))
-      await new Promise((r) => setImmediate(r))
+      await waitForConsumerIdle(consumer)
 
       // then
       expect(attempted).toEqual(['openai/gpt-5.4-nano', 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo'])
       expect(errors.some((e) => /all 2 model\(s\) failed/.test(e))).toBe(true)
       expect(errors.some((e) => /down: fireworks/.test(e))).toBe(true)
+      expect(info.some((line) => /run ended .* outcome=failed elapsed_ms=\d+$/.test(line))).toBe(true)
 
       consumer.stop()
     } finally {

@@ -63,6 +63,7 @@ export type CreateCronConsumerOptions = {
   // count. Optional so test fakes that don't exercise counts stay one-liners.
   countStore?: ConsumerCountStore
   now?: () => number
+  intervalNow?: () => number
   logger?: CronConsumerLogger
 }
 
@@ -92,9 +93,10 @@ export function createCronConsumer({
   invokeHandler,
   countStore,
   now = Date.now,
+  intervalNow = () => performance.now(),
   logger = consoleLogger,
 }: CreateCronConsumerOptions): CronConsumer {
-  const inFlight = new Set<string>()
+  const inFlight = new Map<string, { fireId: string; activeSince: number }>()
   let unsubscribe: Unsubscribe | null = null
 
   return {
@@ -106,13 +108,19 @@ export function createCronConsumer({
           logger.warn(`[cron-consumer] received message ${msg.id} with invalid payload, ignoring`)
           return
         }
-        if (inFlight.has(job.id)) {
-          logger.warn(`[cron] ${job.id}: previous run still in progress, skipping`)
+        const blockingFire = inFlight.get(job.id)
+        if (blockingFire !== undefined) {
+          logger.warn(
+            `[cron] ${job.id}: previous run still in progress, skipping blocking_fire_id=${blockingFire.fireId} active_for_ms=${elapsedMs(blockingFire.activeSince, intervalNow())}`,
+          )
           return
         }
         // Reserve before the count gate so two close occurrences can't both
         // pass the `firedCount < count` check before either increment lands.
-        inFlight.add(job.id)
+        const fireId = msg.id
+        inFlight.set(job.id, { fireId, activeSince: intervalNow() })
+        let runStartedAt: number | undefined
+        let outcome: 'success' | 'failed' = 'success'
         try {
           if (job.count !== undefined && countStore !== undefined) {
             if (countStore.get(job.id, job) >= job.count) {
@@ -130,8 +138,10 @@ export function createCronConsumer({
               return
             }
           }
+          runStartedAt = intervalNow()
+          logger.info(`[cron] ${job.id}: run started fire_id=${fireId}`)
           if (job.kind === 'prompt') {
-            await runPrompt(job, createSessionForCron, stream, logger)
+            if (!(await runPrompt(job, createSessionForCron, stream, logger))) outcome = 'failed'
           } else if (job.kind === 'exec') {
             await runExec(job, cwd)
           } else {
@@ -143,10 +153,16 @@ export function createCronConsumer({
             await invokeHandler(job)
           }
         } catch (err) {
+          outcome = 'failed'
           const message = err instanceof Error ? err.message : String(err)
           logger.error(`[cron] ${job.id} failed: ${message}`)
         } finally {
           inFlight.delete(job.id)
+          if (runStartedAt !== undefined) {
+            logger.info(
+              `[cron] ${job.id}: run ended fire_id=${fireId} outcome=${outcome} elapsed_ms=${elapsedMs(runStartedAt, intervalNow())}`,
+            )
+          }
         }
       })
     },
@@ -160,12 +176,16 @@ export function createCronConsumer({
   }
 }
 
+function elapsedMs(startedAt: number, endedAt: number): number {
+  return Math.max(0, Math.round(endedAt - startedAt))
+}
+
 async function runPrompt(
   job: PromptJob,
   createSessionForCron: (job: PromptJob, refOverride?: ModelRef) => Promise<CronSession>,
   stream: Stream,
   logger: CronConsumerLogger,
-): Promise<void> {
+): Promise<boolean> {
   if (job.subagent !== undefined) {
     // Propagate the cron job's role and origin into the spawned subagent.
     // Without this, every cron-triggered subagent (e.g. memory dreaming)
@@ -187,14 +207,14 @@ async function runPrompt(
       },
       payload: job.payload,
     })
-    return
+    return true
   }
   // Resolve the model fallback chain for the cron profile (cron jobs run
   // under the `default` profile today). Single-ref configs produce a length-1
   // chain; multi-ref configs (e.g. `"default": ["openai/...", "fireworks/..."]`)
   // drive the retry-on-failure loop inside `runPromptOnce`.
   const refs = resolveFallbackChain(getConfig().models, undefined)
-  await runPromptOnce(job, refs, createSessionForCron, logger)
+  return runPromptOnce(job, refs, createSessionForCron, logger)
 }
 
 async function runPromptOnce(
@@ -202,7 +222,7 @@ async function runPromptOnce(
   refs: ModelRef[],
   createSessionForCron: (job: PromptJob, refOverride?: ModelRef) => Promise<CronSession>,
   logger: CronConsumerLogger,
-): Promise<void> {
+): Promise<boolean> {
   // Per-attempt lifecycle: every session we create gets full
   // turn-start → turn-end → session-end → dispose bracketing, regardless of
   // whether the helper chose it as the final session or disposed it as a
@@ -320,6 +340,7 @@ async function runPromptOnce(
     }
     await result.dispose()
   }
+  return result.success
 }
 
 function describe(err: unknown): string {
