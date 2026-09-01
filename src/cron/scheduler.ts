@@ -99,17 +99,21 @@ export function createScheduler({
       return
     }
 
+    arm(id, result.nextFire)
+  }
+
+  function arm(id: string, nextFire: number): void {
     cancel(id)
 
-    const delay = Math.max(0, result.nextFire - clock.now())
+    const delay = Math.max(0, nextFire - clock.now())
     const handle = clock.setTimeout(
       () => {
         handles.delete(id)
         if (!started) return
         const live = currentEnabled(id)
         if (!live) return
-        if (clock.now() < result.nextFire) {
-          scheduleNext(id)
+        if (clock.now() < nextFire) {
+          arm(id, nextFire)
           return
         }
         fire(live)
