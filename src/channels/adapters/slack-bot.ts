@@ -289,6 +289,8 @@ export type SlackBotAdapterOptions = {
   // tests and ad-hoc adapter constructions stay backwards-compatible.
   selfAliasesRef?: () => readonly string[]
   fetchImpl?: typeof fetch
+  createClient?: () => SlackBotClient
+  createListener?: (client: SlackBotClient, appToken: string) => SlackBotListener
 }
 
 export type SlackBotAdapter = {
@@ -1146,11 +1148,12 @@ function stringField(record: Record<string, unknown>, key: string): string | nul
 
 export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBotAdapter {
   const logger = options.logger ?? consoleLogger
-  const client = new SlackBotClient()
+  const client = options.createClient?.() ?? new SlackBotClient()
   const fetchImpl = options.fetchImpl ?? fetch
   let listener: SlackBotListener | null = null
   let botUserId: string | null = null
   let teamId: string | null = null
+  let socketConnected = false
   let started = false
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
@@ -1376,14 +1379,19 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         throw err
       }
 
-      listener = new SlackBotListener(client, { appToken: options.appToken })
+      listener =
+        options.createListener?.(client, options.appToken) ??
+        new SlackBotListener(client, { appToken: options.appToken })
       listener.on('connected', (info) => {
+        socketConnected = started
         logger.info(`[slack-bot] connected (app_id=${info.app_id ?? 'unknown'})`)
       })
       listener.on('disconnected', () => {
+        socketConnected = false
         logger.warn('[slack-bot] disconnected; SDK will reconnect with backoff')
       })
       listener.on('error', (err) => {
+        if (recordValue(err)?.code === 'disconnect_terminal') socketConnected = false
         logger.error(`[slack-bot] socket-mode error: ${describeError(err)}`)
       })
       listener.on('message', ({ ack, event }) => {
@@ -1461,6 +1469,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         listener = null
         botUserId = null
         teamId = null
+        socketConnected = false
         started = false
         logger.error(`[slack-bot] listener start failed: ${describeError(err)}`)
         throw err
@@ -1470,6 +1479,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      socketConnected = false
       options.router.unregisterOutbound('slack-bot', outboundCallback)
       options.router.unregisterReaction('slack-bot', reactionCallback)
       options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
@@ -1495,7 +1505,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     },
 
     isConnected(): boolean {
-      return botUserId !== null && teamId !== null
+      return started && socketConnected
     },
   }
 }

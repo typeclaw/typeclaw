@@ -378,6 +378,30 @@ describe('createSlackAdapter', () => {
     expect(adapter.isConnected()).toBe(true)
   })
 
+  test('reports RTM disconnects and reconnects', async () => {
+    const listener = new FakeListener()
+    const adapter = createSlackAdapter({
+      router: router(),
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () => fakeClient(),
+      createListener: () => listener as unknown as SlackListener,
+    })
+
+    await adapter.start()
+    expect(adapter.isConnected()).toBe(true)
+
+    listener.emit('disconnected', undefined)
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emitConnected()
+    expect(adapter.isConnected()).toBe(true)
+
+    await adapter.stop()
+    expect(adapter.isConnected()).toBe(false)
+  })
+
   test('an error before connected rolls back with the real reason, not [object ErrorEvent]', async () => {
     const r = router()
     const log = logger()
