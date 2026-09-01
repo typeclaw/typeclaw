@@ -1,7 +1,7 @@
 import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
-import type { AssistantMessage } from '@mariozechner/pi-ai'
+import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from '@mariozechner/pi-ai'
 import { type SessionEntry, SessionManager } from '@mariozechner/pi-coding-agent'
 
 import { createSession, renderTurnRoleAnchor, renderTurnTimeAnchor, type AgentSession } from '@/agent'
@@ -1131,13 +1131,20 @@ type LiveSession = {
   // user batch starts (batch.length > 0), NOT on the reminder-only iteration the
   // nudge itself queues — same anti-reloop discipline as the empty-turn budget.
   willingnessNudges: number
-  // Stashed by `installChannelReplyTerminalHook` just before it aborts the turn
-  // after a successful `channel_reply` that omitted `more_work_this_turn: true`. Read once
+  // Stashed by `installChannelReplyTerminalHook` after a successful
+  // `channel_reply` that omitted `more_work_this_turn: true`. Read once
   // by `validateChannelTurn` to decide the continuation nudge. `turnSeq`-stamped
   // (like `skippedTurn`/`skipLockedSendTurn`) so a stale record from an earlier
   // turn can never trigger a nudge on a later one. `null` when no such reply
   // ended this turn.
-  lastTerminalReplyAbort: { turnSeq: number; text: string } | null
+  lastTerminalReplyCompletion: { turnSeq: number; text?: string; tokens: number } | null
+  // Armed after a successful terminal reply. pi-agent-core invokes streamFn
+  // again only after emitting every matching toolResult into its event queue;
+  // the wrapper consumes this marker at that awaited provider boundary and
+  // returns a local aborted response instead of calling the provider. Event
+  // queue ordering then persists every toolResult before the synthetic aborted
+  // assistant. Cleared on consumption, stop, or a fresh user turn.
+  pendingTerminalReplyStop: { turnSeq: number; tokens: number } | null
   // Stamped by `installChannelReplyTerminalHook` when a successful `channel_reply`
   // set `more_work_this_turn: true` — the machine-readable "I'll keep working this turn"
   // promise. `validateChannelTurn` reads it to recover a turn that made that promise,
@@ -2711,7 +2718,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         toolLeakRetries: 0,
         emptyStopAfterToolWorkArmed: false,
         willingnessNudges: 0,
-        lastTerminalReplyAbort: null,
+        lastTerminalReplyCompletion: null,
+        pendingTerminalReplyStop: null,
         continueReplyTurn: null,
         abortReasonThisTurn: null,
         userStoppedTurnSeq: null,
@@ -2765,7 +2773,29 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           stampedAbort.reason === 'terminal_after_channel_reply'
             ? 'terminal-after-channel-reply'
             : undefined
-        if (stampedAbort?.turnSeq === live.turnSeq) live.abortReasonThisTurn = null
+        // Keep the same-turn stamp through validateChannelTurn. Clearing it on
+        // the aborted assistant event made the later stranded-toolUse retry log
+        // `abort_reason=unknown`, even though this subscriber had just consumed
+        // the exact internal reason. A fresh user batch clears the stamp, and
+        // every reader also requires a matching turnSeq, so retaining it cannot
+        // attribute a later turn to this abort.
+        // AgentSession processes message events through one serial queue. By
+        // the time this synthetic aborted message_end reaches the subscriber,
+        // every preceding toolResult event has completed extension handling
+        // and SessionManager persistence. Preserve the original assistant
+        // usage rather than recording this local stream's zero-token envelope.
+        const terminalCompletion = live.lastTerminalReplyCompletion
+        if (termination !== undefined && terminalCompletion?.turnSeq === live.turnSeq) {
+          enqueueTodoOutcomeWrite(live, {
+            agentDir: options.agentDir,
+            origin: buildLiveOrigin(live),
+            turnId: live.sessionId,
+            stopReason: usage.stopReason,
+            termination,
+            tokens: terminalCompletion.tokens,
+          })
+          return
+        }
         const outcomeArgs = {
           agentDir: options.agentDir,
           origin: buildLiveOrigin(live),
@@ -3097,23 +3127,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // After a successful `channel_reply`, the model has delivered its user-facing
-  // response and the turn is semantically done. pi-agent-core's loop, however,
-  // unconditionally makes one more LLM call after any tool result (the
-  // "post-tool follow-up") to let multi-step tool chains continue. On a turn
-  // that ended with `channel_reply` there is nothing left to say, and Fireworks'
-  // kimi-k2p6-turbo degenerates that empty follow-up into a 32000-token
-  // repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS). Aborting the run's signal
-  // from `afterToolCall` — which runs during tool execution, before the loop
-  // re-enters the LLM stream — makes the follow-up stream observe an already-
-  // aborted signal and return `stopReason: 'aborted'` without generating. This
-  // is the same `agent.abort()` lever the policy-denied-send cap uses; the
-  // tool's own result is already persisted, so the reply still lands.
+  // response and the turn is semantically done. pi-agent-core otherwise makes
+  // one more LLM call after the tool result (the "post-tool follow-up") so real
+  // multi-step chains can continue. On a terminal reply there is nothing left
+  // to say, and Fireworks' kimi-k2p6-turbo can degenerate that empty follow-up
+  // into a 32000-token repetition loop (see CHANNEL_MAX_OUTPUT_TOKENS).
+  // Suppress the provider only at its next stream boundary. agent-core reaches
+  // that boundary after emitting every toolResult for the batch, and
+  // AgentSession preserves the event order even when extensions delay
+  // persistence. In the 2026-08-28 Discord incident, aborting from afterToolCall
+  // left validation looking at the preceding result as
+  // `stranded_toolUse_after_send` and opened a recovery turn after an
+  // already-complete reply.
   //
   // Scope is deliberately narrow: only `channel_reply` (the current-chat user-
   // facing response), only on success, and only for channel sessions. Read-only
   // tools and `channel_send` must keep the follow-up so genuine multi-step turns
-  // continue. A prior non-typeclaw `afterToolCall` (none today) would be
-  // composed, not clobbered.
+  // continue. A prior non-typeclaw `afterToolCall` (none today) is composed.
   //
   // `channel_reply({ more_work_this_turn: true })` is the explicit opt-out: a
   // mid-turn status reply ("working on it…") that the model follows with more
@@ -3149,14 +3179,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
         }
       }
-      if (succeeded && !keepTurnAlive && agent.signal?.aborted !== true && live.userStoppedTurnSeq !== live.turnSeq) {
+      if (succeeded && !keepTurnAlive && live.userStoppedTurnSeq !== live.turnSeq) {
         logger.info(
           `[channels] ${live.keyId} terminal_after_channel_reply site=terminal_after_channel_reply session=${live.sessionId} reason=terminal_after_channel_reply`,
         )
         const replyText = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
-        live.lastTerminalReplyAbort = typeof replyText === 'string' ? { turnSeq: live.turnSeq, text: replyText } : null
-        live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'terminal_after_channel_reply' }
-        agent.abort()
+        live.lastTerminalReplyCompletion = {
+          turnSeq: live.turnSeq,
+          ...(typeof replyText === 'string' ? { text: replyText } : {}),
+          tokens: context.assistantMessage.usage.totalTokens,
+        }
+        live.pendingTerminalReplyStop = {
+          turnSeq: live.turnSeq,
+          tokens: context.assistantMessage.usage.totalTokens,
+        }
       }
       return result
     }
@@ -3173,13 +3209,48 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const installChannelOutputCap = (live: LiveSession): void => {
     const { agent } = live.session
     const inner = agent.streamFn
-    agent.streamFn = (model, context, options) => {
-      let maxTokens = options?.maxTokens
+    agent.streamFn = async (model, context, streamOptions) => {
+      const pendingTerminalStop = live.pendingTerminalReplyStop
+      if (pendingTerminalStop?.turnSeq === live.turnSeq && live.userStoppedTurnSeq !== pendingTerminalStop.turnSeq) {
+        live.pendingTerminalReplyStop = null
+        live.abortReasonThisTurn = {
+          turnSeq: pendingTerminalStop.turnSeq,
+          reason: 'terminal_after_channel_reply',
+        }
+        // This boundary runs only after agent-core has emitted all toolResults
+        // for the batch. Return a local aborted assistant event instead of
+        // entering the provider. Its later message_end is queued behind those
+        // result events; that persistence-ordered subscriber records the
+        // trusted outcome and original token usage.
+        const message: AssistantMessage = {
+          role: 'assistant',
+          content: [],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'aborted',
+          errorMessage: 'terminal channel reply completed',
+          timestamp: Date.now(),
+        }
+        const stream = createAssistantMessageEventStream()
+        stream.push({ type: 'start', partial: message })
+        stream.push({ type: 'error', reason: 'aborted', error: message })
+        return stream
+      }
+      let maxTokens = streamOptions?.maxTokens
       if (maxTokens === undefined && live.nextPromptMaxTokens !== undefined) {
         maxTokens = live.nextPromptMaxTokens
         live.nextPromptMaxTokens = undefined
       }
-      return inner(model, context, { ...options, maxTokens: maxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS })
+      return await inner(model, context, { ...streamOptions, maxTokens: maxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS })
     }
   }
 
@@ -3536,7 +3607,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const stopCurrentChannelTurn = async (live: LiveSession): Promise<void> => {
     live.userStoppedTurnSeq = live.turnSeq
-    live.lastTerminalReplyAbort = null
+    live.lastTerminalReplyCompletion = null
+    live.pendingTerminalReplyStop = null
     live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'user_stop' }
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     live.debounceTimer = null
@@ -3788,6 +3860,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.stagedFallbackCause = null
           }
           live.abortReasonThisTurn = null
+          live.pendingTerminalReplyStop = null
           live.userStoppedTurnSeq = null
           live.nextPromptMaxTokens = undefined
           // Cleared with the retry budgets (NOT beside resetReviewTurn below) so a
@@ -3836,6 +3909,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           systemReminders: reminders.map((r) => r.text),
           role: liveRole,
         })
+
+        const repairedToolCalls = repairDanglingToolUseBranch(live.session, now())
+        if (repairedToolCalls.length > 0) {
+          logger.warn(
+            `[channels] ${live.keyId} branch_repair=missing_tool_result session=${live.sessionId} ` +
+              `count=${repairedToolCalls.length} tools=${repairedToolCalls.join(',')}`,
+          )
+        }
 
         // Bracketing logs around the LLM call so a hung prompt() is
         // diagnosable from logs alone (we see prompting without prompted).
@@ -5450,18 +5531,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  // The turn ended via the terminal-reply abort. If that reply promised to keep
+  // The turn ended via terminal channel_reply completion. If that reply promised to keep
   // working but omitted `more_work_this_turn: true`, queue ONE reminder-only re-prompt so
-  // the model gets a second chance to actually do it. The abort already fired
-  // (safe default preserved); this only adds an optional nudge. Bounded by
+  // the model gets a second chance to actually do it. The tool batch already
+  // terminated (safe default preserved); this only adds an optional nudge. Bounded by
   // MAX_WILLINGNESS_NUDGES and gated on `promptQueue` being empty so a real
   // inbound that coalesced into this turn is never answered with a stale nudge.
   const maybeNudgeContinuationWillingness = (live: LiveSession): void => {
-    const record = live.lastTerminalReplyAbort
-    live.lastTerminalReplyAbort = null
+    const record = live.lastTerminalReplyCompletion
+    live.lastTerminalReplyCompletion = null
     if (record === null || record.turnSeq !== live.turnSeq) return
     if (live.willingnessNudges >= MAX_WILLINGNESS_NUDGES) return
     if (live.promptQueue.length > 0) return
+    if (record.text === undefined) return
     if (!detectContinuationWillingness(record.text)) return
     live.willingnessNudges++
     logger.info(
@@ -5619,6 +5701,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // the send is narration the model emitted with/before the reply that already
     // landed — suppress it, as before.
     if (live.successfulChannelSends > successfulSendsBeforePrompt) {
+      const terminalReplyCompletedThisTurn = live.lastTerminalReplyCompletion?.turnSeq === live.turnSeq
       maybeNudgeContinuationWillingness(live)
 
       // A `channel_reply({ more_work_this_turn: true })` progress ack landed this turn (the
@@ -5666,7 +5749,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // then an EMPTY `stop` leaf: the model computed the answer in its reasoning
       // / tool results but never sent it (the Kimi/Fireworks empty-completion
       // flake). `maybeNudgeContinuationWillingness` above can't catch this — it
-      // reads `lastTerminalReplyAbort`, which only a `channel_reply` sets;
+      // reads `lastTerminalReplyCompletion`, which only a `channel_reply` sets;
       // `channel_send` keeps the turn alive and stamps nothing. And the
       // stranded-toolUse retry below requires `source !== 'leaf'`, but an empty
       // `stop` leaf recovers as `source: 'leaf'`, so this shape would otherwise
@@ -5697,6 +5780,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         return
       }
+
+      // A terminal channel_reply now ends the SDK tool batch with
+      // ToolResult.terminate after its matching result is persisted. The leaf
+      // therefore has the same toolResult-under-toolUse shape as genuinely
+      // stranded post-status work, but this turn already delivered its final
+      // answer and explicitly terminated. The 2026-08-28 Discord incident
+      // crossed this distinction: validation re-prompted the completed turn as
+      // `stranded_toolUse_after_send`, then subsequent inbounds accumulated on
+      // the failed recovery branch. Keep willingness nudges queued above, but do
+      // not send terminal completion through stranded-work recovery.
+      if (terminalReplyCompletedThisTurn) return
 
       const trailing = recoverableAssistantText(live.session)
       if (trailing === null || trailing.source !== 'leaf') {
@@ -8142,6 +8236,57 @@ function leafIsStrandedToolUse(session: AgentSession): boolean {
     cursor = parent
   }
   return false
+}
+
+// Permanently close a trailing tool batch whose assistant toolUse has one or
+// more missing results. PR #1386 could recognize this shape and re-prompt, but
+// the 2026-08-28 Discord fingerprint showed the poisoned branch rejecting each
+// retry in ~53ms before provider generation: 15 user entries accumulated with
+// no assistant entry until idle rollover. Append-only error results preserve
+// the full conversation and any completed sibling results while making both
+// the live Agent state and persisted SessionManager branch valid again.
+function repairDanglingToolUseBranch(session: AgentSession, timestamp: number): string[] {
+  const branch = session.sessionManager.getBranch?.()
+  if (!branch) return []
+  const messages = branch.filter(
+    (entry): entry is Extract<SessionEntry, { type: 'message' }> => entry.type === 'message',
+  )
+  if (messages.length === 0) return []
+
+  const completed = new Set<string>()
+  let index = messages.length - 1
+  while (index >= 0) {
+    const message = messages[index]!.message
+    if (message.role !== 'toolResult') break
+    completed.add(message.toolCallId)
+    index--
+  }
+
+  const assistantEntry = messages[index]
+  if (!assistantEntry || assistantEntry.message.role !== 'assistant') return []
+  if (assistantEntry.message.stopReason !== 'toolUse') return []
+  const missing = assistantEntry.message.content.filter(
+    (block): block is Extract<(typeof assistantEntry.message.content)[number], { type: 'toolCall' }> =>
+      block.type === 'toolCall' && !completed.has(block.id),
+  )
+  if (missing.length === 0) return []
+
+  const repairedMessages: ToolResultMessage[] = missing.map((toolCall) => ({
+    role: 'toolResult',
+    toolCallId: toolCall.id,
+    toolName: toolCall.name,
+    content: [
+      {
+        type: 'text',
+        text: 'Tool execution was interrupted before its result was recorded. Continue from the preserved conversation without assuming the tool succeeded.',
+      },
+    ],
+    isError: true,
+    timestamp,
+  }))
+  for (const message of repairedMessages) session.sessionManager.appendMessage(message)
+  session.agent.state.messages = [...session.agent.state.messages, ...repairedMessages]
+  return missing.map((toolCall) => toolCall.name)
 }
 
 // The turn-end leaf is a FRESH empty `stop` — an assistant message with no visible

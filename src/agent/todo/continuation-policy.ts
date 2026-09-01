@@ -213,12 +213,11 @@ export function decideContinuation(args: {
   if (state.autoResumeBlockedUntilRealUserTurn) return { kind: 'skip', reason: 'user-abort-blocked' }
 
   const outcome = state.lastTurnOutcome
-  const isSafeTerminalReplyAbort =
-    outcome?.stopReason === 'aborted' && outcome.termination === 'terminal-after-channel-reply'
+  const isSafeTerminalReply = outcome?.termination === 'terminal-after-channel-reply'
   if (
     outcome === null ||
-    outcome.stopReason === 'unknown' ||
-    (outcome.stopReason === 'aborted' && !isSafeTerminalReplyAbort)
+    (outcome.stopReason === 'unknown' && !isSafeTerminalReply) ||
+    (outcome.stopReason === 'aborted' && !isSafeTerminalReply)
   ) {
     return { kind: 'skip', reason: 'turn-not-safe' }
   }
