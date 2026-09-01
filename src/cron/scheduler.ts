@@ -58,6 +58,10 @@ const consoleLogger: SchedulerLogger = {
   error: (m) => console.error(m),
 }
 
+// Node clamps delays greater than this to 1ms. Re-arm long waits instead of
+// allowing an early callback to dispatch a future occurrence.
+const maxTimeoutMs = 2 ** 31 - 1
+
 export function createScheduler({
   jobs,
   onFire,
@@ -95,17 +99,28 @@ export function createScheduler({
       return
     }
 
+    arm(id, result.nextFire)
+  }
+
+  function arm(id: string, nextFire: number): void {
     cancel(id)
 
-    const delay = Math.max(0, result.nextFire - clock.now())
-    const handle = clock.setTimeout(() => {
-      handles.delete(id)
-      if (!started) return
-      const live = currentEnabled(id)
-      if (!live) return
-      fire(live)
-      scheduleNext(id)
-    }, delay)
+    const delay = Math.max(0, nextFire - clock.now())
+    const handle = clock.setTimeout(
+      () => {
+        handles.delete(id)
+        if (!started) return
+        const live = currentEnabled(id)
+        if (!live) return
+        if (clock.now() < nextFire) {
+          arm(id, nextFire)
+          return
+        }
+        fire(live)
+        scheduleNext(id)
+      },
+      Math.min(delay, maxTimeoutMs),
+    )
     handles.set(id, handle)
   }
 
