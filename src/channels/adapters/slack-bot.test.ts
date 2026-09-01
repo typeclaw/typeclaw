@@ -1,14 +1,16 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { SlackBotClient, SlackFile, SlackMessage } from 'agent-messenger/slackbot'
+import type { SlackBotClient, SlackBotListener, SlackFile, SlackMessage } from 'agent-messenger/slackbot'
 
 import { MEMBERSHIP_CACHE_TRANSIENT_TTL_MS } from '@/channels/membership'
-import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
+import type { ChannelRouter } from '@/channels/router'
+import { channelsSchema, defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
 import type { ChannelKey, FetchHistoryResult, HistoryCallback, OutboundMessage } from '@/channels/types'
 import { SLACK_APP_MANIFEST } from '@/cli/ui'
 
 import {
   createOutboundCallback,
+  createSlackBotAdapter,
   createSlackHistoryCallback,
   createSlackListCallback,
   createSlackMembershipResolver,
@@ -25,6 +27,98 @@ import {
 import { classifyInbound, type SlackInboundAppMentionEvent } from './slack-bot-classify'
 import { createSlackDedupe } from './slack-bot-dedupe'
 import { encodeSlackReactionRef } from './slack-bot-reactions'
+
+class FakeSlackBotListener {
+  private handlers = new Map<string, Array<(value: unknown) => void>>()
+
+  on(event: string, handler: (value: unknown) => void): void {
+    this.handlers.set(event, [...(this.handlers.get(event) ?? []), handler])
+  }
+
+  async start(): Promise<void> {}
+
+  stop(): void {}
+
+  emit(event: string, value: unknown): void {
+    for (const handler of this.handlers.get(event) ?? []) handler(value)
+  }
+}
+
+function lifecycleRouter(): ChannelRouter {
+  const noop = (): void => {}
+  return {
+    route: async () => {},
+    executeCommand: async () => ({ kind: 'unknown-command' }),
+    registerOutbound: noop,
+    unregisterOutbound: noop,
+    registerReaction: noop,
+    unregisterReaction: noop,
+    registerRemoveReaction: noop,
+    unregisterRemoveReaction: noop,
+    registerTyping: noop,
+    unregisterTyping: noop,
+    setTypingCapability: noop,
+    registerChannelNameResolver: noop,
+    unregisterChannelNameResolver: noop,
+    registerSelfIdentity: noop,
+    unregisterSelfIdentity: noop,
+    registerMembership: noop,
+    unregisterMembership: noop,
+    registerHistory: noop,
+    unregisterHistory: noop,
+    registerMessageGet: noop,
+    unregisterMessageGet: noop,
+    registerList: noop,
+    unregisterList: noop,
+    registerEditMessage: noop,
+    unregisterEditMessage: noop,
+    registerFetchAttachment: noop,
+    unregisterFetchAttachment: noop,
+  } as unknown as ChannelRouter
+}
+
+describe('createSlackBotAdapter', () => {
+  test('reports Socket Mode disconnects and reconnects independently of authenticated identity', async () => {
+    const listener = new FakeSlackBotListener()
+    const adapter = createSlackBotAdapter({
+      router: lifecycleRouter(),
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'U0123456789', team_id: 'T0123456789' }),
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+    })
+
+    await adapter.start()
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', { app_id: 'A0123456789' })
+    expect(adapter.isConnected()).toBe(true)
+
+    listener.emit('error', { code: 'socket_error' })
+    expect(adapter.isConnected()).toBe(true)
+
+    listener.emit('disconnected', undefined)
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', { app_id: 'A0123456789' })
+    expect(adapter.isConnected()).toBe(true)
+
+    listener.emit('error', { code: 'disconnect_terminal' })
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', { app_id: 'A0123456789' })
+    expect(adapter.isConnected()).toBe(true)
+
+    await adapter.stop()
+    expect(adapter.isConnected()).toBe(false)
+  })
+})
 
 describe('slack-bot createTypingCallback', () => {
   type SetStatusCall = { channel: string; threadTs: string; status: string }
