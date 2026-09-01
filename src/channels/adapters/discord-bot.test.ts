@@ -2041,7 +2041,7 @@ describe('createInteractionHandler', () => {
     expect(routerCalls).toHaveLength(1)
     expect(fetchCalls).toHaveLength(1)
     const body = JSON.parse(fetchCalls[0]!.init.body as string)
-    expect(body.data.content).toContain('Nothing to stop')
+    expect(body.data.content).toBe('Nothing to stop — no active turn in this channel. Send a new message to start one.')
   })
 
   test('non-CHAT_INPUT interactions (buttons, modals, autocomplete) are silently dropped', async () => {

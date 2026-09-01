@@ -88,7 +88,7 @@ const SLASH_COMMANDS: readonly DiscordCommandDeclaration[] = [
 const SLASH_COMMAND_NAMES: ReadonlySet<string> = new Set(SLASH_COMMANDS.map((c) => c.name))
 
 const STOP_REPLY_ABORTED = 'Stopped the current turn.'
-const STOP_REPLY_NO_LIVE_SESSION = 'Nothing to stop — no active turn in this channel.'
+const STOP_REPLY_NO_LIVE_SESSION = 'Nothing to stop — no active turn in this channel. Send a new message to start one.'
 const STOP_REPLY_FAILED = 'Could not stop the current turn (internal error).'
 const STOP_REPLY_PERMISSION_DENIED = 'You do not have permission to stop the current turn in this channel.'
 
