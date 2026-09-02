@@ -244,6 +244,72 @@ describe('startDaemon', () => {
     expect((list.result as ListResult).registrations.map((r) => r.containerName)).toContain('coder')
   })
 
+  test('GC gives a re-registration a full renewed miss budget after partial misses', async () => {
+    let phase: 'partial' | 'renewed' = 'partial'
+    let partialProbes = 0
+    let partialProbeStarted = false
+    let renewedProbes = 0
+    const releasePartialProbe = deferred()
+    const exec: DockerExec = async (args) => {
+      if (args[0] !== 'ps') return { exitCode: 1, stdout: '', stderr: 'unknown command' }
+      if (phase === 'partial') {
+        partialProbes += 1
+        if (partialProbes === 1) return { exitCode: 0, stdout: '', stderr: '' }
+        partialProbeStarted = true
+        await releasePartialProbe.promise
+      } else {
+        renewedProbes += 1
+      }
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    daemon = await startDaemon({ exec, gcIntervalMs: 20, gcMissesToDeregister: 3 })
+    await send({ kind: 'register', containerName: 'coder', cwd: '/old' })
+
+    await waitFor(() => partialProbeStarted)
+    phase = 'renewed'
+    expect((await send({ kind: 'register', containerName: 'coder', cwd: '/renewed' })).ok).toBe(true)
+    releasePartialProbe.resolve()
+
+    await waitFor(() => renewedProbes >= 2)
+    const beforeFinalMiss = await send({ kind: 'list' })
+    expect(beforeFinalMiss.ok).toBe(true)
+    if (!beforeFinalMiss.ok) return
+    expect((beforeFinalMiss.result as ListResult).registrations).toEqual([{ containerName: 'coder', cwd: '/renewed' }])
+
+    await waitFor(async () => {
+      const list = await send({ kind: 'list' })
+      return renewedProbes >= 3 && list.ok && (list.result as ListResult).registrations.length === 0
+    })
+  })
+
+  test('GC ignores a threshold probe that raced a re-registration', async () => {
+    const probeStarted = deferred()
+    const releaseProbe = deferred()
+    const exec: DockerExec = async (args) => {
+      if (args[0] !== 'ps') return { exitCode: 1, stdout: '', stderr: 'unknown command' }
+      probeStarted.resolve()
+      await releaseProbe.promise
+      return { exitCode: 0, stdout: '', stderr: '' }
+    }
+    daemon = await startDaemon({ exec, gcIntervalMs: 20, gcMissesToDeregister: 1 })
+    await send({ kind: 'register', containerName: 'coder', cwd: '/old' })
+
+    await probeStarted.promise
+    expect((await send({ kind: 'register', containerName: 'coder', cwd: '/renewed' })).ok).toBe(true)
+    releaseProbe.resolve()
+
+    await waitFor(async () => {
+      const list = await send({ kind: 'list' })
+      return (
+        list.ok && (list.result as ListResult).registrations.some((registration) => registration.cwd === '/renewed')
+      )
+    })
+    const list = await send({ kind: 'list' })
+    expect(list.ok).toBe(true)
+    if (!list.ok) return
+    expect((list.result as ListResult).registrations).toEqual([{ containerName: 'coder', cwd: '/renewed' }])
+  })
+
   test('GC tolerates docker ps failures (status=unknown does not count as gone)', async () => {
     let psFails = 0
     const exec: DockerExec = async (args) => {
@@ -336,7 +402,7 @@ describe('startDaemon', () => {
     expect(restartCalls[0]?.currentHostDaemon?.httpPort).toBeGreaterThan(0)
   })
 
-  test('populates the currentHostDaemon holder with an in-process registrar once booted', async () => {
+  test('populates the currentHostDaemon holder with in-process registration lifecycle callbacks', async () => {
     const holder = createCurrentHostDaemonHolder()
     daemon = await startDaemon({
       exec: fakeExec(),
@@ -344,7 +410,7 @@ describe('startDaemon', () => {
       currentHostDaemonHolder: holder,
     })
 
-    // then: the holder is populated and its registrar records a registration in-process
+    // then: the holder's callbacks mutate registration state in-process
     const current = await holder.ready()
     expect(current.httpPort).toBeGreaterThan(0)
     const reply = await current.register({
@@ -357,6 +423,9 @@ describe('startDaemon', () => {
     })
     expect(reply).toEqual({ ok: true })
     expect(daemon.registered()).toContain('coder')
+
+    await current.deregister('coder')
+    expect(daemon.registered()).not.toContain('coder')
   })
 
   test('restart RPC forwards build:true to the supervisor', async () => {

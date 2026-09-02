@@ -130,6 +130,7 @@ describe('buildHostdRestart', () => {
   test('forwards the daemon-supplied currentHostDaemon into start()', async () => {
     const starts: RestartOptions[] = []
     const register = async (): Promise<{ ok: true }> => ({ ok: true })
+    const deregister = async (): Promise<void> => {}
     const restart = buildHostdRestart('/repo/src/cli/index.ts', {
       validateConfig: () => ({ ok: true }),
       loadConfigSync: () => configSchema.parse({ port: 61234 }),
@@ -142,11 +143,11 @@ describe('buildHostdRestart', () => {
     const result = await restart({
       containerName: 'agent',
       cwd: '/agent-dir',
-      currentHostDaemon: { httpPort: 8974, register },
+      currentHostDaemon: { httpPort: 8974, register, deregister },
     })
 
     expect(result.ok).toBe(true)
-    expect(starts[0]?.currentHostDaemon).toEqual({ httpPort: 8974, register })
+    expect(starts[0]?.currentHostDaemon).toEqual({ httpPort: 8974, register, deregister })
   })
 
   test('omits currentHostDaemon when the daemon does not supply one', async () => {

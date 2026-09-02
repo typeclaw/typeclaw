@@ -119,13 +119,14 @@ export type HostDaemonRegisterPayload = {
 }
 
 // Injected only on the daemon-owned restart path (reuseCurrentHostDaemon).
-// The daemon registers the container in-process and reports its own HTTP port,
-// so the restart skips the `http-info`/`register` self-RPCs — those round-trips
-// can time out under IPC congestion and silently drop the TYPECLAW_HOSTD_* env
-// triple, booting a container whose hostd-bridged adapters can't construct.
+// The daemon updates the container registration in-process and reports its own
+// HTTP port, so restart lifecycle changes skip socket self-RPCs — those
+// round-trips can time out under IPC congestion and silently drop the
+// TYPECLAW_HOSTD_* env triple or leave stale broker state behind.
 export type CurrentHostDaemon = {
   httpPort: number
   register: (payload: HostDaemonRegisterPayload) => Promise<{ ok: true } | { ok: false; reason: string }>
+  deregister: (containerName: string) => Promise<void>
 }
 
 export type StartOptions = {
@@ -144,9 +145,10 @@ export type StartOptions = {
   // Hostd's supervisor restart callback already runs inside the daemon process.
   // Reusing that daemon avoids a self-shutdown when disk source has drifted.
   reuseCurrentHostDaemon?: boolean
-  // Set by hostd's supervisor restart wrapper. When present, registration goes
-  // through the daemon in-process (no socket round-trips), so the env triple is
-  // injected from known-good values even under IPC congestion. See type docs.
+  // Set by hostd's supervisor restart wrapper. When present, registration
+  // lifecycle changes go through the daemon in-process (no socket round-trips),
+  // so known-good control values and rollback survive IPC congestion.
+  // See type docs.
   currentHostDaemon?: CurrentHostDaemon
   ensureDeps?: (cwd: string, opts?: { force?: boolean }) => Promise<EnsureDepsResult>
   // Test seam for host embedding model provisioning. Production callers use
@@ -592,6 +594,44 @@ async function runStart({
       }
     }
 
+    // The build and model provisioning above can outlive a hostd registration.
+    // Refresh both the registry entry and the launch plan at the run boundary:
+    // a broker restart may have invalidated the initial control tokens while
+    // those pre-run steps were in flight. Keep that early registration because
+    // it remains the cleanup target for build/model failures.
+    const initialHostd = hostd
+    try {
+      if (cliEntry) {
+        const refreshedHostd = await registerWithDaemon({
+          cwd,
+          containerName,
+          cliEntry,
+          hostPort,
+          reuseCurrentHostDaemon,
+          currentHostDaemon,
+        })
+        if (refreshedHostd.state !== 'registered') {
+          await cleanupHostDaemonRegistration(containerName, initialHostd)
+        }
+        hostd = refreshedHostd
+        hostdControl = refreshedHostd.state === 'registered' ? refreshedHostd.control : undefined
+        plan = await planStart({
+          cwd,
+          hostPort,
+          imageExists: true,
+          forceBuild: false,
+          hostdControl,
+          publishHost,
+          tuiToken,
+          platform,
+          hostIdentity,
+        })
+      }
+    } catch (error) {
+      await cleanupHostDaemonRegistration(containerName, hostd.state === 'registered' ? hostd : initialHostd)
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
+
     let run = await execRunWithConflictRetry(exec, plan.runArgs, cwd, containerName, archiveBeforeRemove)
 
     // TOCTOU: another process may have grabbed the port between our probe and
@@ -633,7 +673,8 @@ async function runStart({
       }
       hostPort = await allocatePort(0)
       if (cliEntry) {
-        hostd = await registerWithDaemon({
+        const previousHostd = hostd
+        const retriedHostd = await registerWithDaemon({
           cwd,
           containerName,
           cliEntry,
@@ -641,7 +682,11 @@ async function runStart({
           reuseCurrentHostDaemon,
           currentHostDaemon,
         })
-        hostdControl = hostd.state === 'registered' ? hostd.control : undefined
+        if (retriedHostd.state !== 'registered') {
+          await cleanupHostDaemonRegistration(containerName, previousHostd)
+        }
+        hostd = retriedHostd
+        hostdControl = retriedHostd.state === 'registered' ? retriedHostd.control : undefined
       }
       plan = await planStart({
         cwd,
@@ -1471,6 +1516,7 @@ async function registerWithDaemon({
     return {
       state: 'registered',
       control: { url: `http://${CONTAINER_HOSTD_HOST}:${currentHostDaemon.httpPort}`, token, brokerToken },
+      deregister: (registeredContainerName) => currentHostDaemon.deregister(registeredContainerName),
     }
   }
 
@@ -1481,6 +1527,9 @@ async function registerWithDaemon({
   return {
     state: 'registered',
     control: { url: `http://${CONTAINER_HOSTD_HOST}:${prepared.httpPort}`, token, brokerToken },
+    deregister: async (registeredContainerName) => {
+      await sendToDaemon({ kind: 'deregister', containerName: registeredContainerName })
+    },
   }
 }
 
@@ -1515,7 +1564,7 @@ async function useCurrentHostDaemon(): Promise<{ ok: true; httpPort: number } | 
 }
 
 type PreparedHostDaemonStatus =
-  | { state: 'registered'; control: HostDaemonControl }
+  | { state: 'registered'; control: HostDaemonControl; deregister: (containerName: string) => Promise<void> }
   | { state: 'unavailable'; reason: string }
   | { state: 'disabled' }
 
@@ -1526,7 +1575,7 @@ function stripHostDaemonControl(status: PreparedHostDaemonStatus): HostDaemonSta
 
 async function cleanupHostDaemonRegistration(containerName: string, status: PreparedHostDaemonStatus): Promise<void> {
   if (status.state !== 'registered') return
-  await sendToDaemon({ kind: 'deregister', containerName }).catch(() => {})
+  await status.deregister(containerName).catch(() => {})
 }
 
 // process.env.TZ is honored first because users who explicitly set it (e.g.
