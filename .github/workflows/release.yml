@@ -246,6 +246,11 @@ jobs:
       packages: write
 
     steps:
+      # Needed for scripts/verify-mask-fd-sandbox.sh below. The base image
+      # carries no repo source, so the sandbox smoke test ships as a script
+      # this job checks out and runs against the freshly published image.
+      - uses: actions/checkout@v4
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: actions/download-artifact@v4
@@ -319,6 +324,30 @@ jobs:
           docker pull --platform linux/amd64 "$IMAGE"
           docker pull --platform linux/arm64 "$IMAGE"
           docker buildx imagetools inspect "${REGISTRY_IMAGE}:latest"
+
+      - name: Verify the sandbox file-mask contract against the shipped bwrap
+        # `bubblewrap` is installed unpinned, so the sandboxer can change
+        # behaviour on any base-image rebuild with no typeclaw commit. That is
+        # exactly how 0.48.8 shipped a total model-bash outage: bwrap 0.12.0
+        # started rejecting the reused --ro-bind-data fd that <= 0.11.0 had
+        # tolerated, and every sandboxed command — down to `echo` — died.
+        #
+        # The bwrap-gated unit test cannot catch this: `ubuntu-latest` has no
+        # bwrap, and even where one exists it is not the build that ships. So
+        # exercise the real mask argv inside the image we just published.
+        # `release` needs: this job, so a failure here blocks the irreversible
+        # npm publish rather than stranding users on a dead bash surface.
+        #
+        # The platform is passed explicitly and derived from the runner: the
+        # step above pulls BOTH architectures under this one tag, and on the
+        # classic image store that leaves the tag pointing at whichever it
+        # pulled last (arm64). Running that unqualified here would exec a
+        # foreign-arch binary with no QEMU registered and fail the release on
+        # exec format instead of on bwrap.
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          PLATFORM: linux/${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+        run: scripts/verify-mask-fd-sandbox.sh "${REGISTRY_IMAGE}:${VERSION}" "${PLATFORM}"
 
   # ─────────────────────────── release ───────────────────────────
   # The irreversible publish path, gated on a verified multi-arch base image.
