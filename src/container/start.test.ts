@@ -1542,6 +1542,10 @@ type RecordedCall = {
   args: string[]
   dockerfileSnapshot: string | null
   env?: Record<string, string | undefined>
+  inheritStdio?: boolean
+  captureStderr?: boolean
+  captureStdout?: boolean
+  maxCapturedStderrBytes?: number
   // Snapshot, taken at call time, of whether the build's DOCKER_CONFIG dir has a
   // `contexts/` subdir. Lets a test assert the sanitized config deep-copied the
   // docker context state BEFORE runImageBuild's finally removes the temp dir.
@@ -1578,6 +1582,8 @@ function fakeDockerExec(scenario: {
   dockerPlatformName?: string
   buildxAvailable?: boolean
   buildxBuildFails?: boolean
+  buildFails?: boolean
+  buildStderr?: string
   // Simulate a broken credential helper: build calls fail with the helper-not-
   // found stderr UNTIL the call is made with DOCKER_CONFIG set in its env (the
   // sanitized-config retry), at which point the build succeeds.
@@ -1603,7 +1609,16 @@ function fakeDockerExec(scenario: {
     }
     const dockerConfig = options?.env?.DOCKER_CONFIG
     const dockerConfigHasContexts = dockerConfig === undefined ? undefined : existsSync(join(dockerConfig, 'contexts'))
-    calls.push({ args, dockerfileSnapshot, env: options?.env, dockerConfigHasContexts })
+    calls.push({
+      args,
+      dockerfileSnapshot,
+      env: options?.env,
+      inheritStdio: options?.inheritStdio,
+      captureStderr: options?.captureStderr,
+      captureStdout: options?.captureStdout,
+      maxCapturedStderrBytes: options?.maxCapturedStderrBytes,
+      dockerConfigHasContexts,
+    })
 
     if (args[0] === 'image' && args[1] === 'inspect') {
       return { exitCode: scenario.imageExists ? 0 : 1, stdout: '', stderr: '' }
@@ -1681,6 +1696,9 @@ function fakeDockerExec(scenario: {
       return { exitCode: 0, stdout: '', stderr: '' }
     }
     if (isBuildCall(args)) {
+      if (scenario.buildFails) {
+        return { exitCode: 1, stdout: '', stderr: scenario.buildStderr ?? 'build exploded' }
+      }
       // Simulate "buildx plugin present but the build fails" (e.g. no usable
       // builder). The legacy `docker build` retry still succeeds.
       if (scenario.buildxBuildFails && args[0] === 'buildx') {
@@ -2054,6 +2072,36 @@ describe('start (composition)', () => {
     }
   })
 
+  test('returns warnings instead of writing them while a parent renderer owns the terminal', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const warnings: string[] = []
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        streamOutput: false,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        provisionGithubCliStore: () => ({ ok: false, reason: 'sensitive-command-output' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warnings).toEqual([expect.stringContaining('Could not refresh GitHub CLI credentials')])
+      expect(warnings.join('')).not.toContain('sensitive-command-output')
+      expect(stderr).not.toHaveBeenCalled()
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+
   test('passes the canonical agent root and configured writable mount roots to GitHub CLI refresh', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -2279,6 +2327,97 @@ describe('start (composition)', () => {
     expect(buildCall?.args).toContain('--load')
     expect(buildCall?.dockerfileSnapshot).toContain('# syntax=docker/dockerfile:1.7')
     expect(buildCall?.dockerfileSnapshot).toContain('--mount=type=cache')
+    expect(buildCall?.inheritStdio).toBe(true)
+    expect(buildCall?.captureStderr).toBe(true)
+  })
+
+  test('captures build output when streaming is disabled by a live parent renderer', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      buildxBuildFails: true,
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    const buildCalls = calls.filter((call) => isBuildCall(call.args))
+    expect(buildCalls).toHaveLength(2)
+    for (const buildCall of buildCalls) {
+      expect(buildCall.inheritStdio).toBeUndefined()
+      expect(buildCall.captureStderr).toBeUndefined()
+      expect(buildCall.captureStdout).toBe(false)
+      expect(buildCall.maxCapturedStderrBytes).toBe(32 * 1024)
+    }
+  })
+
+  test('returns a safe recovery command when a live parent renderer suppresses build output', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      buildFails: true,
+      buildStderr: 'docker: Error response from daemon: unavailable\n',
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        'docker build failed (exit code 1). Run `typeclaw start --build` from this agent directory to view the full build output.',
+    })
+  })
+
+  test('does not expose captured build output in the compose failure reason', async () => {
+    await writeFile(join(root, 'Dockerfile'), 'FROM stale\n# no git\n')
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({
+      imageExists: false,
+      container: { exists: false },
+      buildxAvailable: true,
+      buildFails: true,
+      buildStderr: '\x1b[31msensitive-build-output\x1b[0m\r',
+    })
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).not.toContain('sensitive-build-output')
+    expect(result.reason).toContain('typeclaw start --build')
   })
 
   test('without buildx, falls back to legacy `docker build` against a BuildKit-stripped Dockerfile so start still succeeds', async () => {
