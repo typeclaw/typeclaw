@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { Controller, RestartOptions } from '@/container'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
 import { composeRestart, type ComposeRestartEvent } from './restart'
@@ -23,6 +24,12 @@ async function makeInvalidAgent(parent: string, name: string): Promise<void> {
   const dir = join(parent, name)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, 'typeclaw.json'), 'this is not json\n')
+}
+
+async function makeValidAgent(parent: string, name: string): Promise<void> {
+  const dir = join(parent, name)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'typeclaw.json'), '{}\n')
 }
 
 describe('composeRestart events', () => {
@@ -117,5 +124,25 @@ describe('composeRestart events', () => {
     await makeInvalidAgent(root, 'alpha')
     const { results } = await composeRestart({ rootCwd: root, preferredHostPort: 8973 })
     expect(results).toHaveLength(1)
+  })
+
+  test('keeps inherited build output away from the live compose board', async () => {
+    await makeValidAgent(root, 'alpha')
+    let restartOptions: RestartOptions | undefined
+    const restart: Controller['restart'] = async (options) => {
+      restartOptions = options
+      options.onWarning?.('captured warning')
+      return { ok: false, reason: 'simulated failure' }
+    }
+
+    const { results } = await composeRestart({ rootCwd: root, preferredHostPort: 8973 }, { restart })
+
+    expect(restartOptions?.streamOutput).toBe(false)
+    expect(results[0]).toEqual({
+      name: 'alpha',
+      ok: false,
+      reason: 'simulated failure',
+      warnings: ['captured warning'],
+    })
   })
 })
