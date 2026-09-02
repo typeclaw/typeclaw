@@ -40,6 +40,10 @@ CLI: `typeclaw channel add webex-bot` (interactive), `typeclaw channel set webex
 | Threading               | no        | `sendMessage` has no `parentId`; thread replies post to the room root (logged as a warning)                  |
 | Membership              | partial   | The membership API can't split bot/human counts; group reports humans = total − 1, bots = 1                  |
 
+## Quirks
+
+- **Reconnect catch-up is bounded**: each attempt reconciles at most 100 recent spaces × 100 messages through the same inbound path, with up to three attempts (1s/5s backoff); group-space history is mentions-only. A 30s attempt/live-gate timeout or 1,000 queued-live threshold releases live delivery and logs the deferral. Gaps and dedupe survive same-credential manager replacement, but the SDK exposes no cancellation: a timed-out read must settle before another catch-up read can start, and if it never settles recovery stays partial while live delivery continues.
+
 ## Config
 
 ```json
