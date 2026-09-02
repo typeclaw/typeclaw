@@ -323,6 +323,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   const cwds = new Map<string, string>()
   const restartTokens = new Map<string, string>()
   const brokerTokens = new Map<string, string>()
+  const registrationGenerations = new Map<string, number>()
+  let nextRegistrationGeneration = 0
   const perContainerSerial = new Map<string, Promise<unknown>>()
   const gcMisses = new Map<string, number>()
   let stopped = false
@@ -398,6 +400,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       brokerTokens.delete(containerName)
       cwds.delete(containerName)
       restartTokens.delete(containerName)
+      registrationGenerations.delete(containerName)
       gcMisses.delete(containerName)
       if (opts.portbroker)
         await withCleanupTimeout(opts.portbroker.stop(containerName, 'fatal-auth'), cleanupStepTimeoutMs)
@@ -410,6 +413,8 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
 
   const applyRegistration = async (payload: RegisterPayload): Promise<void> => {
     const alreadyRegistered = cwds.has(payload.containerName)
+    registrationGenerations.set(payload.containerName, ++nextRegistrationGeneration)
+    gcMisses.delete(payload.containerName)
     cwds.set(payload.containerName, payload.cwd)
     if (payload.restartToken) restartTokens.set(payload.containerName, payload.restartToken)
     else restartTokens.delete(payload.containerName)
@@ -471,6 +476,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       const hadCwd = cwds.delete(req.containerName)
       restartTokens.delete(req.containerName)
       brokerTokens.delete(req.containerName)
+      registrationGenerations.delete(req.containerName)
       gcMisses.delete(req.containerName)
       if (opts.portbroker)
         await withCleanupTimeout(opts.portbroker.stop(req.containerName, 'deregistered'), cleanupStepTimeoutMs)
@@ -500,15 +506,20 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return { ok: true, result }
   }
 
-  // Lets the supervisor's restart re-register the child in-process instead of
-  // over the socket. Awaits restore for the same no-mutation-before-restore
-  // invariant the socket dispatcher enforces before handleRegister.
+  // Lets the supervisor's restart update child registration lifecycle
+  // in-process instead of over the socket. Both callbacks await restore for
+  // the same no-mutation-before-restore invariant as the socket dispatcher.
   const registerCurrentChild = async (
     payload: HostDaemonRegisterPayload,
   ): Promise<{ ok: true } | { ok: false; reason: string }> => {
     await awaitRestored()
     const reply = await registerContainer(payload)
     return reply.ok ? { ok: true } : { ok: false, reason: reply.reason }
+  }
+
+  const deregisterCurrentChild = async (containerName: string): Promise<void> => {
+    await awaitRestored()
+    await handleDeregister({ containerName })
   }
 
   // Auth: only restart containers that registered with this daemon. The
@@ -531,7 +542,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       containerName: req.containerName,
       cwd,
       build: req.build,
-      currentHostDaemon: { httpPort, register: registerCurrentChild },
+      currentHostDaemon: { httpPort, register: registerCurrentChild, deregister: deregisterCurrentChild },
     })
     if (!ack.ok) return ack
     const result: RestartResult = { containerName: req.containerName, scheduled: true }
@@ -790,7 +801,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   }
   httpPort = httpServer.port ?? 0
   log({ kind: 'daemon-http-listening', host: httpHostname, port: httpPort })
-  opts.currentHostDaemonHolder?.set({ httpPort, register: registerCurrentChild })
+  opts.currentHostDaemonHolder?.set({
+    httpPort,
+    register: registerCurrentChild,
+    deregister: deregisterCurrentChild,
+  })
 
   const sockets = new Set<NetSocket>()
   const listener = createServer((socket) => {
@@ -812,28 +827,36 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
 
   const runGc = async (): Promise<void> => {
     for (const name of Array.from(cwds.keys())) {
+      const generation = registrationGenerations.get(name)
+      if (generation === undefined) continue
       const status = await probeContainerAlive(name)
-      if (status === 'alive') {
-        gcMisses.delete(name)
-        continue
-      }
-      if (status === 'unknown') continue
-      const misses = (gcMisses.get(name) ?? 0) + 1
-      if (misses < gcMissesToDeregister) {
-        gcMisses.set(name, misses)
-        continue
-      }
-      gcMisses.delete(name)
       void runSerially(name, async () => {
+        // A probe is only authoritative for the registration it observed before
+        // awaiting Docker. Re-registration installs a new generation before any
+        // later async registration work, so stale probes cannot spend its miss
+        // budget or remove it.
+        if (registrationGenerations.get(name) !== generation) return
+        if (status === 'alive') {
+          gcMisses.delete(name)
+          return
+        }
+        if (status === 'unknown') return
+        const misses = (gcMisses.get(name) ?? 0) + 1
+        if (misses < gcMissesToDeregister) {
+          gcMisses.set(name, misses)
+          return
+        }
+        gcMisses.delete(name)
         const hadCwd = cwds.delete(name)
         restartTokens.delete(name)
+        brokerTokens.delete(name)
+        registrationGenerations.delete(name)
         if (opts.portbroker) await withCleanupTimeout(opts.portbroker.stop(name, 'deregistered'), cleanupStepTimeoutMs)
         if (opts.kakaoRenewal) await withCleanupTimeout(opts.kakaoRenewal.stop(name), cleanupStepTimeoutMs)
         if (opts.webexRenewal) await withCleanupTimeout(opts.webexRenewal.stop(name), cleanupStepTimeoutMs)
         if (opts.teamsRenewal) await withCleanupTimeout(opts.teamsRenewal.stop(name), cleanupStepTimeoutMs)
         await removeRegistrationFile(name)
         if (hadCwd) log({ kind: 'deregister', containerName: name, reason: 'gone' })
-        return { ok: true }
       })
     }
   }
