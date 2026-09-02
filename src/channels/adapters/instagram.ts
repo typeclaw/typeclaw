@@ -22,6 +22,7 @@ import type {
 import { describeError } from '../describe-error'
 import { createInstagramChannelResolver } from './instagram-channel-resolver'
 import { classifyInbound } from './instagram-classify'
+import { loadInstagramContinuityStore, type InstagramContinuityStore } from './instagram-continuity-store'
 import { toInstagramPlainText } from './instagram-format'
 
 export interface InstagramClientShape {
@@ -89,6 +90,7 @@ const consoleLogger: InstagramAdapterLogger = {
 }
 
 export type InstagramAdapterOptions = {
+  agentDir?: string
   router: ChannelRouter
   configRef: () => ChannelAdapterConfig
   logger?: InstagramAdapterLogger
@@ -97,6 +99,7 @@ export type InstagramAdapterOptions = {
   client?: InstagramClientShape
   clientFactory?: (credManager?: InstagramCredentialManager) => InstagramClientShape
   listenerCtorResolver?: () => { ctor: InstagramListenerCtor; transport: 'hybrid' | 'polling' }
+  continuityStore?: InstagramContinuityStore
   now?: () => number
 }
 
@@ -107,6 +110,7 @@ export type InstagramAdapter = {
 }
 
 export const INSTAGRAM_HISTORY_LIMIT_MAX = 200
+const INSTAGRAM_RECOVERY_CHAT_LIMIT = 100
 
 export function createOutboundCallback(deps: {
   client: Pick<InstagramClientShape, 'sendMessage'>
@@ -177,6 +181,13 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
   let started = false
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
+  let continuityStore: InstagramContinuityStore | null = options.continuityStore ?? null
+  let activeTransport: 'realtime' | 'polling' = 'polling'
+  let inboundQueue = Promise.resolve()
+  let adapterStartedAt = 0
+  const bootstrapBaselines = new Map<string, readonly string[]>()
+  const recoveryLimitWarnedThreads = new Set<string>()
+  let recoveryChatLimitWarned = false
 
   const channelResolver = createInstagramChannelResolver({ client, logger })
 
@@ -190,7 +201,7 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
   const historyCallback = createInstagramHistoryCallback({ client, logger, selfUserIdRef: () => selfUserId })
   const outboundCallback = createOutboundCallback({ client, logger, formatChannelTag })
 
-  const processInbound = async (message: InstagramMessageSummary): Promise<void> => {
+  const processInbound = async (message: InstagramMessageSummary): Promise<boolean> => {
     inflightInbounds++
     try {
       if (channelResolver.lookupChat(message.thread_id) === null) {
@@ -216,15 +227,17 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       })
       if (verdict.kind === 'drop') {
         logger.info(`[instagram] dropped message_id=${message.id} reason=${verdict.reason}`)
-        return
+        return true
       }
 
       logger.info(
         `[instagram] routed message_id=${message.id} ${inboundTag} mention=${verdict.payload.isBotMention} dm=${verdict.payload.isDm}`,
       )
       await options.router.route(verdict.payload)
+      return true
     } catch (err) {
       logger.error(`[instagram] handleInbound failed: ${describeError(err)}`)
+      return false
     } finally {
       inflightInbounds--
       if (inflightInbounds === 0 && stopWaiters.length > 0) {
@@ -235,10 +248,117 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
     }
   }
 
+  const markDelivered = async (message: InstagramMessageSummary): Promise<void> => {
+    if (continuityStore === null || selfUserId === null) return
+    await continuityStore.markMessage(selfUserId, message.thread_id, message.id)
+  }
+
+  const deliverUnseen = async (message: InstagramMessageSummary): Promise<boolean> => {
+    if (
+      continuityStore !== null &&
+      selfUserId !== null &&
+      continuityStore.hasMessage(selfUserId, message.thread_id, message.id)
+    ) {
+      return true
+    }
+    if (!(await processInbound(message))) return false
+    // Checkpoint only after the router accepts the message. A crash can replay
+    // once, but persisting first would silently lose a message when routing fails.
+    await markDelivered(message)
+    return true
+  }
+
+  const fetchRecoveryMessages = async (threadId: string): Promise<InstagramMessageSummary[]> => {
+    const messages = await client.getMessages(threadId, INSTAGRAM_HISTORY_LIMIT_MAX)
+    if (messages.length === INSTAGRAM_HISTORY_LIMIT_MAX && !recoveryLimitWarnedThreads.has(threadId)) {
+      recoveryLimitWarnedThreads.add(threadId)
+      logger.warn(
+        `[instagram] recovery history reached limit=${INSTAGRAM_HISTORY_LIMIT_MAX} chat=${threadId}; older unseen messages cannot be recovered without upstream pagination`,
+      )
+    }
+    return messages.toSorted((left, right) => Date.parse(left.timestamp) - Date.parse(right.timestamp))
+  }
+
+  const establishUnknownThread = async (
+    threadId: string,
+    messages: readonly InstagramMessageSummary[],
+  ): Promise<void> => {
+    if (continuityStore === null || selfUserId === null) return
+    const bootstrapIds = bootstrapBaselines.get(threadId)
+    const baselineIds = bootstrapIds ?? messages.filter(isBeforeAdapterStart).map((message) => message.id)
+    await continuityStore.seedThread(selfUserId, threadId, baselineIds)
+    bootstrapBaselines.delete(threadId)
+  }
+
+  const reconcileThread = async (threadId: string): Promise<boolean> => {
+    if (continuityStore === null || selfUserId === null) return true
+    const messages = await fetchRecoveryMessages(threadId)
+    if (!continuityStore.knowsThread(selfUserId, threadId)) await establishUnknownThread(threadId, messages)
+    for (const message of messages) {
+      if (!(await deliverUnseen(message))) return false
+    }
+    return true
+  }
+
+  const reconcileAll = async (): Promise<void> => {
+    const chats = await client.listChats(INSTAGRAM_RECOVERY_CHAT_LIMIT)
+    warnIfChatLimitReached(chats.length)
+    for (const chat of chats) {
+      try {
+        await reconcileThread(chat.id)
+      } catch (err) {
+        logger.error(`[instagram] recovery failed chat=${chat.id}: ${describeError(err)}`)
+      }
+    }
+  }
+
+  const seedBootstrap = async (): Promise<void> => {
+    const chats = await client.listChats(INSTAGRAM_RECOVERY_CHAT_LIMIT)
+    warnIfChatLimitReached(chats.length)
+    for (const chat of chats) {
+      try {
+        if (continuityStore === null || selfUserId === null || continuityStore.knowsThread(selfUserId, chat.id)) {
+          await reconcileThread(chat.id)
+          continue
+        }
+        const messages = await fetchRecoveryMessages(chat.id)
+        const baselineIds = messages.filter(isBeforeAdapterStart).map((message) => message.id)
+        bootstrapBaselines.set(chat.id, baselineIds)
+        await continuityStore.seedThread(selfUserId, chat.id, baselineIds)
+        bootstrapBaselines.delete(chat.id)
+        for (const message of messages) {
+          if (!(await deliverUnseen(message))) break
+        }
+      } catch (err) {
+        logger.error(`[instagram] bootstrap failed chat=${chat.id}: ${describeError(err)}`)
+      }
+    }
+  }
+
+  const warnIfChatLimitReached = (chatCount: number): void => {
+    if (chatCount !== INSTAGRAM_RECOVERY_CHAT_LIMIT || recoveryChatLimitWarned) return
+    recoveryChatLimitWarned = true
+    logger.warn(
+      `[instagram] recovery chat list reached limit=${INSTAGRAM_RECOVERY_CHAT_LIMIT}; older chats cannot be recovered without upstream pagination`,
+    )
+  }
+
+  const isBeforeAdapterStart = (message: InstagramMessageSummary): boolean => {
+    const timestamp = Date.parse(message.timestamp)
+    return Number.isNaN(timestamp) || timestamp < adapterStartedAt
+  }
+
+  const enqueueInbound = (task: () => Promise<void>): void => {
+    inboundQueue = inboundQueue.then(task).catch((err: unknown) => {
+      logger.error(`[instagram] recovery failed: ${describeError(err)}`)
+    })
+  }
+
   return {
     async start(): Promise<void> {
       if (started) return
       started = true
+      adapterStartedAt = (options.now ?? Date.now)()
 
       try {
         const credentialStore = options.credentialsStore ?? null
@@ -269,28 +389,52 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
         throw err
       }
 
+      if (continuityStore === null && options.agentDir !== undefined) {
+        continuityStore = await loadInstagramContinuityStore(options.agentDir, logger)
+      }
+
       try {
         await channelResolver.refresh()
       } catch (err) {
         logger.warn(`[instagram] initial chat list fetch failed: ${describeError(err)}`)
       }
 
+      try {
+        await seedBootstrap()
+      } catch (err) {
+        logger.warn(`[instagram] initial recovery failed: ${describeError(err)}`)
+      }
+
       const resolved = (options.listenerCtorResolver ?? resolveInstagramListenerCtor)()
       listener = new resolved.ctor(client, { pollInterval: 5_000 })
       logger.info(`[instagram] listener transport=${resolved.transport}`)
       listener.on('connected', ({ userId, transport = 'polling' }) => {
+        if (!started) return
         connected = true
+        activeTransport = transport
         logger.info(`[instagram] connected (user_id=${userId}, transport=${transport})`)
+        enqueueInbound(reconcileAll)
       })
       listener.on('disconnected', () => {
+        if (!started) return
         connected = false
         logger.warn('[instagram] disconnected; SDK will reconnect with backoff')
       })
       listener.on('error', (err) => {
+        if (!started) return
         logger.error(`[instagram] listener error: ${describeError(err)}`)
       })
       listener.on('message', (message) => {
-        void processInbound(message)
+        if (!started) return
+        const transport = activeTransport
+        enqueueInbound(async () => {
+          const unknownThread =
+            continuityStore !== null &&
+            selfUserId !== null &&
+            !continuityStore.knowsThread(selfUserId, message.thread_id)
+          if ((transport === 'polling' || unknownThread) && !(await reconcileThread(message.thread_id))) return
+          await deliverUnseen(message)
+        })
       })
 
       try {
@@ -318,12 +462,13 @@ export function createInstagramAdapter(options: InstagramAdapterOptions): Instag
       options.router.unregisterOutbound('instagram', outboundCallback)
       options.router.unregisterChannelNameResolver('instagram', channelResolver.resolve)
       options.router.unregisterHistory('instagram', historyCallback)
+      listener?.stop()
+      await inboundQueue
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)
         })
       }
-      listener?.stop()
       listener = null
       selfUserId = null
       connected = false

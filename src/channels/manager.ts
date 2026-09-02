@@ -362,6 +362,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       )
       if (credentialsStore === null) return null
       return createInstagram({
+        agentDir: options.agentDir,
         router,
         configRef: () => options.channelsConfigRef()[name] ?? cfg,
         logger,

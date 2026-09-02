@@ -101,6 +101,7 @@ Use the `instagram` platform token in role match rules. Instagram is scoped by i
 - **No surfaced mentions or replies**: there is no native @-mention or per-message reply metadata, so group engagement is alias-driven while DMs engage every message. No threading is exposed.
 - **2FA / checkpoint not supported**: login fails hard if the account requires a second factor or a challenge.
 - **Provisional registration**: chats not yet surfaced by the chat list are registered provisionally as `@instagram-group` (the stricter bucket) on first message, until the next refresh can reclassify them.
+- **Bounded outage recovery**: the adapter keeps durable per-chat message IDs and backfills missed messages after polling gaps or restarts. Instagram's SDK exposes no history cursor, so recovery is limited to the 100 most recent chats and 200 most recent messages per chat; TypeClaw logs a warning when either window is full.
 
 ## Config
 
