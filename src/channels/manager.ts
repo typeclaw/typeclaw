@@ -276,6 +276,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const failed = new Map<AdapterId, FailedAdapter>()
   const failedInputSignatures = new WeakMap<FailedAdapter, string>()
   const perAdapterSerial = new Map<AdapterId, Promise<unknown>>()
+  const deferredStops = new Map<AdapterId, Promise<void>>()
+  const deferredRestarts = new Set<AdapterId>()
   const recovery = options.connectionRecovery ?? {}
   const recoveryCheckIntervalMs = recovery.checkIntervalMs ?? 5_000
   const recoveryDisconnectedGraceMs = recovery.disconnectedGraceMs ?? 90_000
@@ -444,6 +446,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       const token = env.TELEGRAM_BOT_TOKEN
       if (token === undefined || token.trim() === '') return null
       return createTelegramAdapter({
+        agentDir: options.agentDir,
         router,
         configRef: () => options.channelsConfigRef()[name] ?? cfg,
         token,
@@ -482,6 +485,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     canCommit: () => boolean,
   ): Promise<StartAdapterResult | { status: 'credential-changed' }> => {
     if (!canCommit()) return { status: 'aborted' }
+    if (deferredStops.has(name)) return { status: 'aborted' }
     if (cfg.enabled === false) {
       logger.info(`[channels] adapter "${name}" is disabled; skipping`)
       return { status: 'disabled' }
@@ -697,6 +701,22 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     if (!entry) return true
     try {
       await entry.adapter.stop()
+      const completion = 'stopCompletion' in entry.adapter ? (entry.adapter.stopCompletion?.() ?? null) : null
+      if (completion !== null) {
+        deferredStops.set(name, completion)
+        void completion.then(
+          () => {
+            if (live.get(name) === entry) live.delete(name)
+            if (deferredStops.get(name) === completion) deferredStops.delete(name)
+            logger.info(`[channels] adapter "${name}" stopped after inbound drain`)
+          },
+          (err: unknown) => {
+            if (deferredStops.get(name) === completion) deferredStops.delete(name)
+            logger.error(`[channels] adapter "${name}" deferred stop failed: ${describeError(err)}`)
+          },
+        )
+        return true
+      }
       if (live.get(name) === entry) live.delete(name)
       logger.info(`[channels] adapter "${name}" stopped`)
       return true
@@ -716,9 +736,35 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     const previousFailure = failed.get(name)
     failed.delete(name)
     if (!(await stopAdapter(name))) return 'stop-failed'
+    const deferredStop = deferredStops.get(name)
+    if (deferredStop !== undefined) {
+      scheduleRestartAfterDeferredStop(name, deferredStop)
+      return 'recovery-pending'
+    }
     const queuedEpoch = lifecycleEpoch
     const result = await startAdapter(name, currentCfg, () => running && queuedEpoch === lifecycleEpoch)
     return applyStartResult(name, currentCfg, result, previousFailure) ? 'restarted' : 'recovery-pending'
+  }
+
+  const scheduleRestartAfterDeferredStop = (name: AdapterId, completion: Promise<void>): void => {
+    if (deferredRestarts.has(name)) return
+    deferredRestarts.add(name)
+    void completion
+      .then(() =>
+        runSerially(name, async () => {
+          if (!running || deferredStops.has(name) || live.has(name)) return
+          const cfg = options.channelsConfigRef()[name]
+          if (cfg === undefined || cfg.enabled === false) return
+          const queuedEpoch = lifecycleEpoch
+          const result = await startAdapter(name, cfg, () => {
+            const latest = options.channelsConfigRef()[name]
+            return running && queuedEpoch === lifecycleEpoch && latest !== undefined && latest.enabled !== false
+          })
+          applyStartResult(name, cfg, result)
+        }),
+      )
+      .catch((err) => logger.error(`[channels] deferred restart for "${name}" failed: ${describeError(err)}`))
+      .finally(() => deferredRestarts.delete(name))
   }
 
   const superviseAdapters = (): void => {
@@ -759,6 +805,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
           }
           const stopped = await stopAdapter(name)
           if (!stopped || !running || queuedEpoch !== lifecycleEpoch) return
+          const deferredStop = deferredStops.get(name)
+          if (deferredStop !== undefined) {
+            scheduleRestartAfterDeferredStop(name, deferredStop)
+            return
+          }
           const latestCfg = options.channelsConfigRef()[name]
           if (latestCfg === undefined || latestCfg.enabled === false) return
           try {

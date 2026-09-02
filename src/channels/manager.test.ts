@@ -35,6 +35,14 @@ function deferred<T = void>(): Deferred<T> {
   return { promise, resolve, reject }
 }
 
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (predicate()) return
+    await Bun.sleep(1)
+  }
+  throw new Error('condition was not met')
+}
+
 function makeFakeAdapter(): FakeAdapter & { connected: boolean } {
   const adapter = {
     connected: true,
@@ -959,6 +967,83 @@ describe('channel manager — connection recovery', () => {
 })
 
 describe('channel manager — restartAdapter serialization', () => {
+  test('defers a Telegram replacement until an inbound stop completion drains', async () => {
+    cfg['telegram-bot'] = enabledAdapterCfg()
+    const events: string[] = []
+    const drain = deferred<void>()
+    const oldAdapter = makeRecordingAdapter(events, 'telegram#1')
+    const deferredOldAdapter = {
+      ...oldAdapter,
+      stopCompletion: () => drain.promise,
+    }
+    const replacement = makeRecordingAdapter(events, 'telegram#2')
+    const adapters = [deferredOldAdapter, replacement]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { TELEGRAM_BOT_TOKEN: 'test-token' },
+      createTelegramAdapter: () => adapters.shift()!,
+    })
+
+    await mgr.start()
+    await mgr.restartAdapter('telegram-bot')
+
+    expect(events).toEqual([
+      'telegram#1:start:begin',
+      'telegram#1:start:end',
+      'telegram#1:stop:begin',
+      'telegram#1:stop:end',
+    ])
+
+    drain.resolve()
+    await waitUntil(() => events.includes('telegram#2:start:end'))
+    expect(events).toContain('telegram#2:start:end')
+    await mgr.stop()
+  })
+
+  test('does not commit a deferred Telegram replacement disabled while start is pending', async () => {
+    cfg['telegram-bot'] = enabledAdapterCfg()
+    const events: string[] = []
+    const drain = deferred<void>()
+    const startGate = deferred<void>()
+    const oldAdapter = makeRecordingAdapter(events, 'telegram#1')
+    const deferredOldAdapter = {
+      ...oldAdapter,
+      stopCompletion: () => drain.promise,
+    }
+    const replacement = makeRecordingAdapter(events, 'telegram#2', { start: startGate.promise })
+    const adapters = [deferredOldAdapter, replacement]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { TELEGRAM_BOT_TOKEN: 'test-token' },
+      createTelegramAdapter: () => adapters.shift()!,
+    })
+
+    await mgr.start()
+    await mgr.restartAdapter('telegram-bot')
+    drain.resolve()
+    await waitUntil(() => events.includes('telegram#2:start:begin'))
+
+    cfg['telegram-bot'] = { ...enabledAdapterCfg(), enabled: false }
+    startGate.resolve()
+    await waitUntil(() => replacement.stopCalls === 1)
+
+    expect(events).toEqual([
+      'telegram#1:start:begin',
+      'telegram#1:start:end',
+      'telegram#1:stop:begin',
+      'telegram#1:stop:end',
+      'telegram#2:start:begin',
+      'telegram#2:start:end',
+      'telegram#2:stop:begin',
+      'telegram#2:stop:end',
+    ])
+    await mgr.reload()
+    await mgr.stop()
+    expect(replacement.stopCalls).toBe(1)
+  })
+
   test('restartAdapter stops a live github adapter before starting it again', async () => {
     cfg.github = enabledGithubCfg()
     await writeGithubSecrets(agentDir)
@@ -1599,7 +1684,7 @@ describe('channel manager — telegram adapter lifecycle', () => {
   test('starts telegram adapter and forwards TELEGRAM_BOT_TOKEN to it', async () => {
     cfg['telegram-bot'] = enabledAdapterCfg()
     const fake = makeFakeAdapter()
-    let captured: { token?: string; configRef?: () => unknown } | undefined
+    let captured: { agentDir?: string; token?: string; configRef?: () => unknown } | undefined
     const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN: 'tg-tok-abc' }
     const mgr = createChannelManager({
       agentDir,
@@ -1617,6 +1702,7 @@ describe('channel manager — telegram adapter lifecycle', () => {
     // wrong env var (or hardcoded a string) would still pass any test
     // that didn't capture the actual token passed to the adapter.
     expect(captured?.token).toBe('tg-tok-abc')
+    expect(captured?.agentDir).toBe(agentDir)
     expect(typeof captured?.configRef).toBe('function')
 
     await mgr.stop()

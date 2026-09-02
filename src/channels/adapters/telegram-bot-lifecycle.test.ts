@@ -3,18 +3,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import type {
-  TelegramBotClient,
-  TelegramBotListener,
-  TelegramBotListenerEventMap,
-  TelegramBotUser,
-  TelegramMessage,
-} from 'agent-messenger/telegrambot'
+import type { TelegramBotClient, TelegramBotUser, TelegramMessage } from 'agent-messenger/telegrambot'
 
 import { createChannelRouter } from '@/channels/router'
 import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
 
 import { createTelegramBotAdapter, type TelegramBotAdapterLogger } from './telegram-bot'
+import type { TelegramBotPollingListenerEventMap } from './telegram-bot-listener'
 
 const BOT_USER: TelegramBotUser = { id: 999, is_bot: true, first_name: 'TypeClaw', username: 'typeclaw_bot' }
 
@@ -41,12 +36,13 @@ function silentLogger(): TelegramBotAdapterLogger & { errors: string[]; warns: s
   }
 }
 
-type ListenerEvent = keyof TelegramBotListenerEventMap
+type ListenerEvent = keyof TelegramBotPollingListenerEventMap
 
 class FakeListener {
   started = false
   stopped = 0
   startCalls = 0
+  stopGate: Promise<void> | null = null
   startBehavior: 'emit-connected' | 'silent-fail' | 'error-event' | 'throw' | 'wait-for-connected-call' =
     'emit-connected'
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -82,14 +78,20 @@ class FakeListener {
     // 'wait-for-connected-call' — caller will trigger the event manually
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.stopped++
     this.started = false
+    await this.stopGate
   }
 
-  emit<K extends ListenerEvent>(event: K, ...args: TelegramBotListenerEventMap[K]): void {
+  emit<K extends ListenerEvent>(event: K, ...args: TelegramBotPollingListenerEventMap[K]): void {
     const list = this.handlers.get(event) ?? []
     for (const h of list) h(...args)
+  }
+
+  async emitAsync<K extends ListenerEvent>(event: K, ...args: TelegramBotPollingListenerEventMap[K]): Promise<void> {
+    const list = this.handlers.get(event) ?? []
+    for (const h of list) await h(...args)
   }
 }
 
@@ -153,11 +155,12 @@ describe('createTelegramBotAdapter — startup correctness', () => {
 
     const adapter = createTelegramBotAdapter({
       router,
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger,
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     let thrown: unknown = null
@@ -187,11 +190,12 @@ describe('createTelegramBotAdapter — startup correctness', () => {
 
     const adapter = createTelegramBotAdapter({
       router: makeRouter(),
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger,
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     let thrown: unknown = null
@@ -214,17 +218,50 @@ describe('createTelegramBotAdapter — startup correctness', () => {
 
     const adapter = createTelegramBotAdapter({
       router,
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     await expect(adapter.start()).rejects.toThrow('listener.start threw')
     expect(adapter.isConnected()).toBe(false)
     const sendResult = await router.send({ adapter: 'telegram-bot', workspace: 'telegram', chat: '-100123', text: 'x' })
     expect(sendResult.ok).toBe(false)
+  })
+
+  test('startup rollback waits for listener shutdown to drain', async () => {
+    const fakeClient = new FakeClient()
+    const fakeListener = new FakeListener()
+    fakeListener.startBehavior = 'throw'
+    const stopGate = deferred<void>()
+    fakeListener.stopGate = stopGate.promise
+    const adapter = createTelegramBotAdapter({
+      router: makeRouter(),
+      agentDir,
+      configRef: () => adapterCfg,
+      token: 'tok',
+      logger: silentLogger(),
+      createClient: () => fakeClient as unknown as TelegramBotClient,
+      createListener: () => fakeListener,
+    })
+    let settled = false
+    const startPromise = adapter.start().then(
+      () => null,
+      (error: unknown) => error,
+    )
+    void startPromise.finally(() => {
+      settled = true
+    })
+
+    await Bun.sleep(10)
+    expect(fakeListener.stopped).toBe(1)
+    expect(settled).toBe(false)
+
+    stopGate.resolve()
+    expect(await startPromise).toEqual(new Error('listener.start threw'))
   })
 
   test('throws on getMe() failure WITHOUT constructing the listener (preflight bails early)', async () => {
@@ -235,13 +272,14 @@ describe('createTelegramBotAdapter — startup correctness', () => {
 
     const adapter = createTelegramBotAdapter({
       router: makeRouter(),
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
       createListener: () => {
         listenerConstructed = true
-        return fakeListener as unknown as TelegramBotListener
+        return fakeListener
       },
     })
 
@@ -257,11 +295,12 @@ describe('createTelegramBotAdapter — startup correctness', () => {
 
     const adapter = createTelegramBotAdapter({
       router,
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     await adapter.start()
@@ -269,6 +308,74 @@ describe('createTelegramBotAdapter — startup correctness', () => {
     expect(adapter.isConnected()).toBe(true)
     expect(fakeClient.getMeCalls).toBe(1)
     expect(fakeListener.startCalls).toBe(1)
+  })
+
+  test('reflects transient listener disconnect and recovery in adapter liveness', async () => {
+    const fakeClient = new FakeClient()
+    const fakeListener = new FakeListener()
+    const adapter = createTelegramBotAdapter({
+      router: makeRouter(),
+      agentDir,
+      configRef: () => adapterCfg,
+      token: 'tok',
+      logger: silentLogger(),
+      createClient: () => fakeClient as unknown as TelegramBotClient,
+      createListener: () => fakeListener,
+    })
+
+    await adapter.start()
+    fakeListener.emit('disconnected')
+    expect(adapter.isConnected()).toBe(false)
+
+    fakeListener.emit('connected', { user: BOT_USER })
+    expect(adapter.isConnected()).toBe(true)
+    await adapter.stop()
+  })
+
+  test('post-connect terminal listener failure makes adapter liveness false', async () => {
+    const fakeClient = new FakeClient()
+    const fakeListener = new FakeListener()
+    const adapter = createTelegramBotAdapter({
+      router: makeRouter(),
+      agentDir,
+      configRef: () => adapterCfg,
+      token: 'tok',
+      logger: silentLogger(),
+      createClient: () => fakeClient as unknown as TelegramBotClient,
+      createListener: () => fakeListener,
+    })
+
+    await adapter.start()
+    fakeListener.emit('error', new Error('route handler failed'))
+    fakeListener.emit('disconnected')
+
+    expect(adapter.isConnected()).toBe(false)
+    await adapter.stop()
+  })
+
+  test('router rejection propagates while intentional classification drops resolve', async () => {
+    const fakeClient = new FakeClient()
+    const fakeListener = new FakeListener()
+    const router = makeRouter()
+    router.route = async () => {
+      throw new Error('route failed')
+    }
+    const adapter = createTelegramBotAdapter({
+      router,
+      agentDir,
+      configRef: () => adapterCfg,
+      token: 'tok',
+      logger: silentLogger(),
+      createClient: () => fakeClient as unknown as TelegramBotClient,
+      createListener: () => fakeListener,
+    })
+    await adapter.start()
+
+    await expect(
+      fakeListener.emitAsync('message', inboundMessage({ id: 1, is_bot: false, first_name: 'Alice' })),
+    ).rejects.toThrow('route failed')
+    await expect(fakeListener.emitAsync('message', inboundMessage(BOT_USER))).resolves.toBeUndefined()
+    await adapter.stop()
   })
 })
 
@@ -300,11 +407,12 @@ describe('createTelegramBotAdapter — shutdown race', () => {
 
     const adapter = createTelegramBotAdapter({
       router,
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     await adapter.start()
@@ -354,11 +462,12 @@ describe('createTelegramBotAdapter — shutdown race', () => {
 
     const adapter = createTelegramBotAdapter({
       router,
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     await adapter.start()
@@ -373,11 +482,12 @@ describe('createTelegramBotAdapter — shutdown race', () => {
 
     const adapter = createTelegramBotAdapter({
       router: makeRouter(),
+      agentDir,
       configRef: () => adapterCfg,
       token: 'tok',
       logger: silentLogger(),
       createClient: () => fakeClient as unknown as TelegramBotClient,
-      createListener: () => fakeListener as unknown as TelegramBotListener,
+      createListener: () => fakeListener,
     })
 
     await adapter.start()
@@ -385,4 +495,53 @@ describe('createTelegramBotAdapter — shutdown race', () => {
     await adapter.stop()
     expect(fakeListener.stopped).toBe(1)
   })
+
+  test('adapter stop waits for listener drain before resolving', async () => {
+    const fakeClient = new FakeClient()
+    const fakeListener = new FakeListener()
+    const stopGate = deferred<void>()
+    fakeListener.stopGate = stopGate.promise
+    const adapter = createTelegramBotAdapter({
+      router: makeRouter(),
+      agentDir,
+      configRef: () => adapterCfg,
+      token: 'tok',
+      logger: silentLogger(),
+      createClient: () => fakeClient as unknown as TelegramBotClient,
+      createListener: () => fakeListener,
+    })
+    await adapter.start()
+    let settled = false
+    const stopPromise = adapter.stop().then(() => {
+      settled = true
+    })
+
+    await Bun.sleep(10)
+    expect(fakeListener.stopped).toBe(1)
+    expect(settled).toBe(false)
+
+    stopGate.resolve()
+    await stopPromise
+    expect(settled).toBe(true)
+  })
 })
+
+function inboundMessage(from: TelegramBotUser): TelegramMessage {
+  return {
+    message_id: 17,
+    date: 1_700_000_000,
+    chat: { id: -100123, type: 'supergroup', title: 'Eng' },
+    from,
+    text: 'hello @typeclaw_bot',
+  }
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
