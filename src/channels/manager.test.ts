@@ -161,6 +161,29 @@ const writeSlackSecrets = async (dir: string): Promise<void> => {
   )
 }
 
+const writeInstagramSecrets = async (dir: string): Promise<void> => {
+  await writeFile(
+    join(dir, 'secrets.json'),
+    JSON.stringify({
+      version: 2,
+      providers: {},
+      channels: {
+        instagram: {
+          currentAccount: 'ig-account',
+          accounts: {
+            'ig-account': {
+              account_id: 'ig-account',
+              username: 'test-user',
+              created_at: '2026-01-01T00:00:00.000Z',
+              updated_at: '2026-01-01T00:00:00.000Z',
+            },
+          },
+        },
+      },
+    }),
+  )
+}
+
 function recordingLogger(): {
   info: (msg: string) => void
   warn: (msg: string) => void
@@ -1221,6 +1244,30 @@ describe('channel manager — restartAdapter serialization', () => {
     await mgr.start()
 
     expect(constructed).toBe(true)
+    await mgr.stop()
+  })
+})
+
+describe('channel manager — instagram adapter lifecycle', () => {
+  test('passes agentDir to the instagram adapter continuity store', async () => {
+    cfg.instagram = enabledAdapterCfg()
+    await writeInstagramSecrets(agentDir)
+    const fake = makeFakeAdapter()
+    let capturedAgentDir: string | undefined
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createInstagramAdapter: (options) => {
+        capturedAgentDir = options.agentDir
+        return fake
+      },
+    })
+
+    await mgr.start()
+
+    expect(capturedAgentDir).toBe(agentDir)
+    expect(fake.startCalls).toBe(1)
     await mgr.stop()
   })
 })
