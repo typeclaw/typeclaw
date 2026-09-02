@@ -68,6 +68,7 @@ import {
   EMPTY_STOP_AFTER_TOOL_WORK_NUDGE,
   EMPTY_TURN_FALLBACK_TEXT,
   EMPTY_TURN_RETRY_NUDGE,
+  GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT,
   extractPlainTextChannelToolCallText,
   getPlainTextChannelToolCallKind,
   stripTrailingLeakedToolCall,
@@ -3539,7 +3540,7 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
   test('skip_response leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'nothing to add' })
       sessions[0]!.setAssistantText('Nothing actionable here.')
     }
@@ -3551,7 +3552,7 @@ describe('ChannelRouter reaction cleanup on deliberate silence', () => {
   test('an explicit NO_REPLY leaves no :eyes: on the triggering message', async () => {
     const dir = await tempDir()
     const { router, sessions, captured } = await setupSilentTurn(dir)
-    sessions[0]!.onPrompt = () => {
+    sessions[0]!.onPrompt = async () => {
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(KEY)
@@ -18828,5 +18829,320 @@ describe('ChannelRouter background-child await suppression', () => {
 
     expect(continuationRuns).toBe(0)
     expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
+  })
+})
+
+describe('ChannelRouter GitHub review-thread closeout obligation', () => {
+  const GITHUB_KEY: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:123', thread: '456' }
+  const closeoutInbound = (over: Partial<InboundMessage> = {}): InboundMessage =>
+    inbound({
+      ...GITHUB_KEY,
+      externalMessageId: '789',
+      text: 'I pushed the requested fix.',
+      replyToBotMessageId: '456',
+      githubReviewThreadCloseout: { workspace: 'acme/repo', prNumber: 123, rootCommentId: '456' },
+      ...over,
+    })
+
+  test('queues one correction for a skip with no running child, then posts one open-thread fallback', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'stand down' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('PR #123')
+    expect(sessions[0]!.prompts[1]).toContain('root comment 456')
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    expect(sent[0]?.thread).toBe('456')
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('honors a skip while a child started after the obligation is still running', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      newestRunningChildSubagentStartedAt: () => 1000,
+    })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting for reviewer' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toHaveLength(0)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('skipped_by_tool'))).toBe(true)
+  })
+
+  test('a completed or cancelled child does not defer the closeout correction', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { newestRunningChildSubagentStartedAt: () => null })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'child cancelled' })
+      } else {
+        await router.send({ ...GITHUB_KEY, text: 'This still needs manual review.' })
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+  })
+
+  test('a running child from before the obligation does not defer it', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, { newestRunningChildSubagentStartedAt: () => 999 })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'old child still running' })
+      } else {
+        await router.send({ ...GITHUB_KEY, text: 'This remains open pending manual review.' })
+      }
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+  })
+
+  test('intercepts NO_REPLY without a skip tool and preserves the obligation across the reminder-only retry', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('root comment 456')
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+  })
+
+  for (const resolveReviewThread of [true, false]) {
+    test(`an exact-thread channel_reply with resolve_review_thread:${resolveReviewThread} clears the obligation`, async () => {
+      const dir = await tempDir()
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      router.registerReviewStateResolver('github', async () => ({
+        ok: true,
+        selfBlocking: false,
+        selfBlockingReviewId: null,
+        approve: true,
+      }))
+      router.registerReviewThreadResolver('github', async () => ({ ok: true }))
+      const reply = createChannelReplyTool({ router, origin: GITHUB_KEY, sessionId: 'ses_fake_1' })
+
+      await router.route(closeoutInbound())
+      sessions[0]!.onPrompt = async () => {
+        const result = await reply.execute(
+          'reply-call',
+          {
+            text: resolveReviewThread
+              ? 'Verified the change; this concern is addressed.'
+              : 'This concern remains open.',
+            more_work_this_turn: false,
+            resolve_review_thread: resolveReviewThread,
+          },
+          undefined,
+          undefined,
+          {} as Parameters<typeof reply.execute>[4],
+        )
+        expect(result.details).toMatchObject({ ok: true })
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' })
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent).toHaveLength(1)
+      expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1') ?? false).toBe(false)
+    })
+  }
+
+  test('leaves non-GitHub, top-level GitHub, and human-rooted review traffic unchanged', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    const cases = [
+      { key: KEY, message: inbound({ text: 'ordinary skip' }) },
+      {
+        key: { ...GITHUB_KEY, thread: null },
+        message: closeoutInbound({
+          thread: null,
+          githubReviewThreadCloseout: undefined,
+          externalMessageId: 'top-level',
+        }),
+      },
+      {
+        key: GITHUB_KEY,
+        message: closeoutInbound({ githubReviewThreadCloseout: undefined, externalMessageId: 'human-root' }),
+      },
+    ] as const
+
+    for (const [index, item] of cases.entries()) {
+      await router.route(item.message)
+      const session = sessions[index]!
+      session.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: `ses_fake_${index + 1}`, reason: 'ordinary skip' })
+        session.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(item.key)
+    }
+
+    expect(sent).toHaveLength(0)
+    expect(sessions.map((session) => session.prompts.length)).toEqual([1, 1, 1])
+  })
+
+  test('a post-send skip remains recorded-after-send and does not queue a correction', async () => {
+    const dir = await tempDir()
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    let skipKind = ''
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ ...GITHUB_KEY, text: 'This remains open pending another change.' })
+      skipKind = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' }).kind
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(skipKind).toBe('recorded-after-send')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toHaveLength(1)
+  })
+
+  test('a peer-bot review-thread reply can stay silent when loop protection applies', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    for (let index = 0; index < 5; index++) {
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `peer-${index}`,
+          authorId: `peer-bot-${index}`,
+          authorName: `peer-bot-${index}`,
+          authorIsBot: true,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+    }
+
+    expect(sessions[0]!.prompts.at(-1)).toContain('Peer bots have engaged you')
+    expect(sent).toHaveLength(0)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+  })
+
+  test('a hard prompt throw after tool execution still runs the bounded closeout ladder', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.prompt = async (text) => {
+      sessions[0]!.prompts.push(text)
+      sessions[0]!.emit({ type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'read', args: {} })
+      throw new Error('internal prompt failure')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    expect(sent[0]?.thread).toBe('456')
+  })
+
+  test('a landed provider notice satisfies the send baseline without a second closeout post', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+
+    await router.route(closeoutInbound())
+    sessions[0]!.prompt = async (text) => {
+      sessions[0]!.prompts.push(text)
+      throw new Error('429 rate limit exceeded')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]?.thread).toBe('456')
+    expect(sent[0]?.text).toContain('rate-limited')
+    expect(sent[0]?.text).not.toBe(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
   })
 })

@@ -55,12 +55,22 @@ export type GithubReviewFollowupRound = {
   carrierThread: string | null
 }
 
+export type GithubReviewThreadCloseout = {
+  workspace: string
+  prNumber: number
+  rootCommentId: string
+}
+
 export type InboundMessage = {
   adapter: AdapterId
   workspace: string
   chat: string
   thread: string | null
   githubReviewRound?: GithubReviewFollowupRound
+  // Adapter-authoritative obligation created only for a non-self reply whose
+  // review-thread ROOT comment was authored by this agent. Kept separate from
+  // replyToBotMessageId, which describes only the immediate parent.
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout
   // Structural "this message lives in a thread room" signal, kept SEPARATE
   // from `thread`. `thread` is a reply-routing field whose meaning differs per
   // platform: Slack puts the thread ts here (so `thread !== null` ⇒ thread

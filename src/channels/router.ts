@@ -114,6 +114,7 @@ import type {
   HistoryCallback,
   InboundAttachment,
   GithubReviewFollowupRound,
+  GithubReviewThreadCloseout,
   InboundMessage,
   InboundReferenceContext,
   ListCallback,
@@ -419,6 +420,8 @@ export const STRANDED_TOOLUSE_CONTINUATION_NUDGE = [
 // drop so the human is never left staring at dead air after a degenerate turn.
 export const EMPTY_TURN_FALLBACK_TEXT =
   "⚠️ I got stuck putting together a reply and couldn't finish. Could you rephrase or try again?"
+export const GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT =
+  "I wasn't able to complete this follow-up. Leaving this thread open for manual review."
 // Distinct from EMPTY_TURN_RETRY_NUDGE: that one diagnoses budget exhaustion
 // ("ran out of output budget"), which is FALSE for a clean `stop` with empty
 // text. This nudge names the real failure — a turn that ended sending nothing
@@ -770,6 +773,7 @@ type QueuedInbound = {
   // prefix for those).
   ts: number
   githubReviewRound?: GithubReviewFollowupRound
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout
 }
 
 type ObservedInbound = {
@@ -878,6 +882,15 @@ type LiveSession = {
   resolvedNames: ResolvedChannelNames
   originRef: { current: SessionOrigin | undefined }
   githubReviewRound: GithubReviewFollowupRound | null
+  // A real-user reply to one of this agent's own review-thread roots must end
+  // with a reply on that exact thread. This spans reminder-only retry iterations.
+  githubReviewThreadCloseout:
+    | (GithubReviewThreadCloseout & {
+        sendCountAtStart: number
+        startedAt: number
+        correctionAttempts: number
+      })
+    | null
   // Round key of a close-out that arrived while the round was still pending
   // completion. Replayed once the round completes; see replayPendingRoundCloseouts.
   pendingGithubReviewRoundCloseout: string | null
@@ -1584,6 +1597,7 @@ export type ChannelRouter = {
     prNumber: number
     state: ReviewOutputState
   }) => { kind: 'stamped' | 'no-live-session' }
+  hasOutstandingGithubReviewThreadCloseout?: (sessionId: string) => boolean
   // Record that the agent invoked `skip_response` during the current turn
   // for the channel session identified by `parentSessionId`. The reason is
   // logged at INFO level inside `validateChannelTurn` (single log line per
@@ -2217,9 +2231,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // still run. Session scope would let one long-running child silence every
   // subsequent turn, and a wedged child would strand them with nothing to revisit
   // them after the backstop expires.
-  const isAwaitingBackgroundChild = (live: LiveSession, label: string): boolean => {
+  const isAwaitingBackgroundChild = (
+    live: LiveSession,
+    label: string,
+    startedAt = live.logicalTurnStartedAt,
+  ): boolean => {
     const childStartedAt = newestRunningChildSubagentStartedAt(live.sessionId)
-    if (childStartedAt === null || childStartedAt < live.logicalTurnStartedAt) return false
+    if (childStartedAt === null || childStartedAt < startedAt) return false
     return isPinnedByRunningChild(live.sessionId, live.keyId, label)
   }
 
@@ -2660,6 +2678,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         resolvedNames,
         originRef,
         githubReviewRound: restoredRound,
+        githubReviewThreadCloseout: null,
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
@@ -3393,6 +3412,59 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  const postGithubReviewThreadCloseoutFallback = async (live: LiveSession): Promise<void> => {
+    const obligation = live.githubReviewThreadCloseout
+    if (obligation === null) return
+    // Consume before sending so adapter failure cannot turn this one-shot
+    // fallback into a reminder/fallback loop.
+    live.githubReviewThreadCloseout = null
+    logger.warn(
+      `[channels] ${live.keyId} github_thread_closeout_fallback pr=${obligation.prNumber} root=${obligation.rootCommentId}`,
+    )
+    const result = await send(
+      {
+        adapter: 'github',
+        workspace: obligation.workspace,
+        chat: `pr:${obligation.prNumber}`,
+        thread: obligation.rootCommentId,
+        text: GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT,
+      },
+      { source: 'system', outputKind: 'meta' },
+    )
+    if (!result.ok) {
+      logger.warn(`[channels] ${live.keyId}: github review-thread closeout fallback send failed: ${result.error}`)
+    }
+  }
+
+  const enforceGithubReviewThreadCloseout = async (live: LiveSession): Promise<void> => {
+    const closeout = live.githubReviewThreadCloseout
+    if (
+      closeout === null ||
+      live.successfulChannelSends !== closeout.sendCountAtStart ||
+      isAwaitingBackgroundChild(live, 'github-thread-closeout', closeout.startedAt)
+    ) {
+      return
+    }
+    if (live.skippedTurn?.turnSeq === live.turnSeq) live.skippedTurn = null
+    if (closeout.correctionAttempts === 0) {
+      closeout.correctionAttempts++
+      logger.warn(
+        `[channels] ${live.keyId} github_thread_closeout_retry attempt=1/1 pr=${closeout.prNumber} root=${closeout.rootCommentId}`,
+      )
+      live.pendingSystemReminders.push(
+        retryReminder(
+          `<system-reminder>\nThis session still owes a close-out on GitHub PR #${closeout.prNumber}, ` +
+            `review thread root comment ${closeout.rootCommentId}. Your previous turn sent no reply to that thread. ` +
+            `Call channel_reply now with an explicit resolve_review_thread choice: true if the concern is addressed, ` +
+            `or false to leave it open with an explanation. Do not treat a PR-level verdict stand-down as satisfying ` +
+            `this thread-level obligation.\n</system-reminder>`,
+        ),
+      )
+      return
+    }
+    await postGithubReviewThreadCloseoutFallback(live)
+  }
+
   // Resolve a fallback STAGED by a willingness-ack exhaustion path, run AFTER
   // maybeContinueTodosChannel so the idle/todo continuation has already had its
   // chance to queue a re-prompt (the mechanism that self-recovers the promised
@@ -3849,6 +3921,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.emptyStopAfterToolWorkArmed = false
           live.willingnessNudges = 0
           live.logicalTurnStartedAt = now()
+          const stampedCloseout = batch.findLast((item) => item.githubReviewThreadCloseout !== undefined)
+          live.githubReviewThreadCloseout =
+            stampedCloseout?.githubReviewThreadCloseout !== undefined
+              ? {
+                  ...stampedCloseout.githubReviewThreadCloseout,
+                  sendCountAtStart: live.successfulChannelSends,
+                  startedAt: live.logicalTurnStartedAt,
+                  correctionAttempts: 0,
+                }
+              : null
           // A fresh batch supersedes a still-pending staged fallback. That staged
           // turn produced no usable reply, so it must not leave the PRIOR turn's
           // committed lastQuestionSignal behind — otherwise the new question would
@@ -4076,6 +4158,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sentReplyThisTurn && !live.promisedWorkOutstandingThisLogicalTurn,
             retryQueuedThisTurn,
           )
+          // Provider notices own the first terminal output opportunity. A notice
+          // that lands on the owed thread clears the obligation through send();
+          // a suppressed or failed notice leaves it intact for this bounded net.
+          await enforceGithubReviewThreadCloseout(live)
           await fireSessionTurnEnd(live)
         }
         await fireSessionIdle(live)
@@ -4609,6 +4695,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       isDm: event.isDm,
       ...(event.typingThread !== undefined ? { typingThread: event.typingThread } : {}),
       ...(event.githubReviewRound !== undefined ? { githubReviewRound: event.githubReviewRound } : {}),
+      ...(event.githubReviewThreadCloseout !== undefined
+        ? { githubReviewThreadCloseout: event.githubReviewThreadCloseout }
+        : {}),
       receivedAt: now(),
       ts: event.ts,
     })
@@ -5459,6 +5548,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
+      const closeout = live.githubReviewThreadCloseout
+      if (closeout !== null) {
+        const landedOnOwedThread =
+          msg.adapter === 'github' &&
+          msg.workspace === closeout.workspace &&
+          msg.chat === `pr:${closeout.prNumber}` &&
+          (msg.thread ?? null) === closeout.rootCommentId
+        if (landedOnOwedThread) {
+          live.githubReviewThreadCloseout = null
+        } else {
+          // successfulChannelSends is session-wide. Advance the baseline for an
+          // unrelated delivery so equality continues to mean no owed-thread send.
+          closeout.sendCountAtStart++
+        }
+      }
       // Promise fulfillment follows OUTPUT KIND, never source:
       //   (a) ordinary substantive tool output clears;
       //   (b) multilingual continuation-willingness/status output preserves;
@@ -6910,6 +7014,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         candidate.key.chat === chat &&
         candidate.key.thread === args.thread,
     )
+    if (live !== undefined) live.githubReviewThreadCloseout = null
     if (live?.githubReviewRound === null || live?.githubReviewRound === undefined) return
     const round = live.githubReviewRound
     if (!isGithubReviewRoundComplete(round)) {
@@ -6984,6 +7089,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'recorded', keyId: live.keyId }
     }
     return { kind: 'no-live-session' }
+  }
+
+  const hasOutstandingGithubReviewThreadCloseout = (sessionId: string): boolean => {
+    for (const live of liveSessions.values()) {
+      if (live.destroyed || live.sessionId !== sessionId) continue
+      const obligation = live.githubReviewThreadCloseout
+      return obligation !== null && live.successfulChannelSends === obligation.sendCountAtStart
+    }
+    return false
   }
 
   const clearSticky = (key: ChannelKey): { keyId: string; cleared: number } => {
@@ -7227,6 +7341,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     completeGithubReviewRound: completeRoundForVerifiedVerdict,
     finishGithubReviewRoundCloseout,
     noteGithubReviewOutput,
+    hasOutstandingGithubReviewThreadCloseout,
     markTurnSkipped,
     clearSticky,
     reserveRestartHandoff,
