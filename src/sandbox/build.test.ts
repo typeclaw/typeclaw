@@ -4,8 +4,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { buildSandboxedCommand } from './build'
+import { CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
 import { SandboxPolicyError } from './errors'
 import type { SandboxPolicy } from './policy'
+import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 function argvOf(command: string, policy?: SandboxPolicy): string[] {
   return buildSandboxedCommand(command, policy).argv
@@ -16,6 +18,10 @@ function argvOf(command: string, policy?: SandboxPolicy): string[] {
 function valueAfter(argv: string[], flag: string): string | undefined {
   const i = argv.indexOf(flag)
   return i === -1 ? undefined : argv[i + 1]
+}
+
+function maskRedirectFdsOf(commandString: string): string[] {
+  return [...commandString.matchAll(/(\d+)<\/dev\/null/g)].map((match) => match[1] as string)
 }
 
 function maskFdsOf(argv: string[]): [string, string][] {
@@ -305,6 +311,35 @@ describe('buildSandboxedCommand masks', () => {
   test('does NOT append the mask-fd redirect when only dirs are masked', () => {
     const { commandString } = buildSandboxedCommand('true', { masks: { dirs: ['/agent/workspace'] } })
     expect(commandString).not.toContain('3</dev/null')
+  })
+
+  // The fd numbering and the redirect list are produced by two separate
+  // expressions; if they ever drift apart, bwrap reads an fd the shell never
+  // opened and every sandboxed command dies EBADF. Pin them as one invariant
+  // at several mask counts rather than at one hard-coded arity.
+  test.each([1, 2, 3, 4, 8])('opens exactly the mask fds it binds, for %p masked file(s)', (count) => {
+    const files = Array.from({ length: count }, (_, i) => `/agent/secret-${i}`)
+
+    const { argv, commandString } = buildSandboxedCommand('true', { masks: { files } })
+    const opFds = maskFdsOf(argv).map(([fd]) => fd)
+
+    expect(opFds).toHaveLength(count)
+    expect(new Set(opFds).size).toBe(count)
+    expect(maskRedirectFdsOf(commandString)).toEqual(opFds)
+  })
+
+  // Guards the arity the runtime actually ships: adding a canonical secret
+  // file must not silently reintroduce a shared fd.
+  test('assigns a distinct fd to every canonical file the runtime masks', () => {
+    const files = [...CANONICAL_AGENT_SECRET_FILES, ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES].map((file) =>
+      join('/agent', file),
+    )
+
+    const { argv, commandString } = buildSandboxedCommand('true', { masks: { files } })
+    const opFds = maskFdsOf(argv).map(([fd]) => fd)
+
+    expect(new Set(opFds).size).toBe(files.length)
+    expect(maskRedirectFdsOf(commandString)).toEqual(opFds)
   })
 
   test('renders all masks AFTER the broad parent bind so the last op wins', () => {
