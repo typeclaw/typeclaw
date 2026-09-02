@@ -192,6 +192,8 @@ type AdapterEntry = {
   adapter: AnyAdapter
   credentialSignature: string
   disconnectedSinceMs: number | null
+  nextRecoveryRestartAtMs: number | null
+  recoveryRestartAttempts: number
   recoveryRestartQueued: boolean
 }
 
@@ -512,6 +514,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         adapter,
         credentialSignature: signature,
         disconnectedSinceMs: adapter.isConnected() ? null : recoveryNow(),
+        nextRecoveryRestartAtMs: null,
+        recoveryRestartAttempts: 0,
         recoveryRestartQueued: false,
       })
       return { status: 'started' }
@@ -722,6 +726,8 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     for (const [name, entry] of live) {
       if (entry.adapter.isConnected()) {
         entry.disconnectedSinceMs = null
+        entry.nextRecoveryRestartAtMs = null
+        entry.recoveryRestartAttempts = 0
         entry.recoveryRestartQueued = false
         continue
       }
@@ -731,7 +737,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         continue
       }
       const disconnectedForMs = now - entry.disconnectedSinceMs
-      if (disconnectedForMs < recoveryDisconnectedGraceMs || entry.recoveryRestartQueued) continue
+      const nextRestartAtMs = Math.max(
+        entry.disconnectedSinceMs + recoveryDisconnectedGraceMs,
+        entry.nextRecoveryRestartAtMs ?? Number.NEGATIVE_INFINITY,
+      )
+      if (now < nextRestartAtMs || entry.recoveryRestartQueued) continue
       entry.recoveryRestartQueued = true
       logger.warn(
         `[channels] adapter "${name}" disconnected for ${Math.round(disconnectedForMs)}ms; restarting adapter`,
@@ -756,6 +766,12 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
               return running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false
             })
             applyStartResult(name, latestCfg, result)
+            const replacement = live.get(name)
+            if (replacement !== undefined && !replacement.adapter.isConnected()) {
+              const attempts = entry.recoveryRestartAttempts + 1
+              replacement.recoveryRestartAttempts = attempts
+              replacement.nextRecoveryRestartAtMs = recoveryNow() + retryDelayMs(attempts)
+            }
           } catch (err) {
             const cfg = options.channelsConfigRef()[name]
             if (running && queuedEpoch === lifecycleEpoch && cfg !== undefined && cfg.enabled !== false) {

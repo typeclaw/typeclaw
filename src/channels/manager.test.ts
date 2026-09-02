@@ -294,6 +294,48 @@ describe('channel manager — connection recovery', () => {
 
     await mgr.stop()
   })
+
+  test('backs off repeated restarts when replacements remain disconnected', async () => {
+    cfg['discord-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock({ checkIntervalMs: 10, disconnectedGraceMs: 100, retryBaseMs: 200 })
+    const adapters = [makeFakeAdapter(), makeFakeAdapter(), makeFakeAdapter(), makeFakeAdapter()]
+    for (const adapter of adapters) {
+      adapter.start = async () => {
+        adapter.startCalls++
+        adapter.connected = false
+      }
+    }
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { DISCORD_BOT_TOKEN: 'token' },
+      createDiscordAdapter: () => adapters[constructions++]!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(101)
+    await flushManagerWork()
+    expect(constructions).toBe(2)
+
+    clock.advanceBy(194)
+    await flushManagerWork()
+    expect(constructions).toBe(2)
+    clock.advanceBy(1)
+    await flushManagerWork()
+    expect(constructions).toBe(3)
+
+    clock.advanceBy(394)
+    await flushManagerWork()
+    expect(constructions).toBe(3)
+    clock.advanceBy(1)
+    await flushManagerWork()
+    expect(constructions).toBe(4)
+
+    await mgr.stop()
+  })
+
   test('does not queue duplicate recovery restarts while the first restart is pending', async () => {
     cfg['discord-bot'] = enabledAdapterCfg()
     let now = 1_000

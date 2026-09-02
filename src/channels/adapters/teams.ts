@@ -160,6 +160,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
   let channelTeamMap = new Map<string, string>()
   let sentEchoes: SentEcho[] = []
   let started = false
+  let realtimeConnected = false
   let inflightInbounds = 0
   let stopWaiters: Array<() => void> = []
 
@@ -270,6 +271,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
     async start(): Promise<void> {
       if (started) return
       started = true
+      realtimeConnected = false
       try {
         const account = await (options.credentialsStore ?? null)?.getAccount()
         if (account === null || account === undefined) {
@@ -296,6 +298,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
         logger.info(`[teams] authenticated as ${self.displayName}, ${chatsById.size} chats`)
       } catch (err) {
         started = false
+        realtimeConnected = false
         self = null
         loadedAccount = null
         chatsById = new Map()
@@ -327,6 +330,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
       // just don't get proactively woken by inbound Teams messages.
       const degradeToRestOnly = (cause: Error): void => {
         if (listener !== activeListener) return
+        realtimeConnected = false
         listener?.stop()
         listener = null
         logger.warn(
@@ -336,10 +340,12 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
 
       listener.on('connected', () => {
         if (!isActive()) return
+        realtimeConnected = true
         logger.info('[teams] connected')
       })
       listener.on('disconnected', () => {
         if (!isActive()) return
+        realtimeConnected = false
         logger.warn('[teams] disconnected')
       })
       // A post-connect `error` for the unrecoverable id_token failure would
@@ -380,6 +386,7 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      realtimeConnected = false
       options.router.unregisterOutbound('teams', outboundCallback)
       options.router.unregisterSelfIdentity('teams', selfIdentityResolver)
       options.router.unregisterHistory('teams', historyCallback)
@@ -397,13 +404,8 @@ export function createTeamsAdapter(options: TeamsAdapterOptions): TeamsAdapter {
       sentEchoes = []
     },
 
-    // REST auth being live is what makes the adapter usable (send/read); the
-    // realtime listener is a best-effort add-on. Returning true here even in
-    // REST-only mode is deliberate: the channel manager restarts any adapter
-    // whose isConnected() is false, which would pointlessly churn a healthy
-    // REST-only Teams adapter that can never get a realtime listener.
     isConnected(): boolean {
-      return started && self !== null
+      return started && self !== null && realtimeConnected
     },
   }
 }

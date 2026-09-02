@@ -496,16 +496,17 @@ describe('createTeamsAdapter', () => {
     expect(r.routed[0]?.chat).toBe('chat:chat-9')
   })
 
-  test('stays usable (REST) even after a realtime disconnected event', async () => {
+  test('reports unhealthy while realtime is disconnected and recovers when it reconnects', async () => {
     const r = router()
     const listener = new FakeListener()
     const adapter = adapterWith({ r, listener, client: fakeClient().client })
 
     await adapter.start()
     expect(adapter.isConnected()).toBe(true)
-    // a realtime drop does not make the adapter unusable — send/read still work,
-    // so isConnected() stays true and the manager does not churn-restart it
     listener.emit('disconnected', undefined)
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', { endpointId: 'ep-2' })
     expect(adapter.isConnected()).toBe(true)
 
     await adapter.stop()
@@ -515,7 +516,8 @@ describe('createTeamsAdapter', () => {
     const r = router()
     const listener = new FakeListener()
     const log = logger()
-    const adapter = adapterWith({ r, listener, client: fakeClient().client, log })
+    const { client, sends } = fakeClient()
+    const adapter = adapterWith({ r, listener, client, log })
 
     // given the listener connected fine at start
     await adapter.start()
@@ -532,9 +534,11 @@ describe('createTeamsAdapter', () => {
     expect(listener.stopped).toBe(true)
     expect(log.lines.filter((l) => l.startsWith('error:')).length).toBe(errorsBefore)
     expect(log.lines.some((l) => l.includes('continuing REST-only'))).toBe(true)
-    // REST send/read remain usable, callbacks stay registered
-    expect(adapter.isConnected()).toBe(true)
+    // REST send/read remain registered, but realtime health is reported truthfully
+    expect(adapter.isConnected()).toBe(false)
     expect(r.unregistered).toEqual([])
+    await r.outboundCb!(outbound({ text: 'still available' }))
+    expect(sends).toEqual([{ chatId: 'chat-1', content: 'still available' }])
 
     await adapter.stop()
   })
@@ -580,8 +584,7 @@ describe('createTeamsAdapter', () => {
 
     // start() resolves (does not throw): REST send/read remain usable
     await adapter.start()
-    // isConnected() reflects REST usability, so the manager won't churn-restart it
-    expect(adapter.isConnected()).toBe(true)
+    expect(adapter.isConnected()).toBe(false)
     // the REST callbacks stay registered — only the listener is torn down
     expect(r.registered).toEqual(['outbound:teams', 'self:teams', 'history:teams', 'edit:teams'])
     expect(r.unregistered).toEqual([])
@@ -602,7 +605,7 @@ describe('createTeamsAdapter', () => {
     const adapter = adapterWith({ r, listener, client: fakeClient().client })
 
     await adapter.start()
-    expect(adapter.isConnected()).toBe(true)
+    expect(adapter.isConnected()).toBe(false)
     expect(r.unregistered).toEqual([])
     expect(listener.stopped).toBe(true)
 
@@ -621,7 +624,7 @@ describe('createTeamsAdapter', () => {
     const adapter = adapterWith({ r, listener, client: fakeClient().client })
 
     await adapter.start()
-    expect(adapter.isConnected()).toBe(true)
+    expect(adapter.isConnected()).toBe(false)
     expect(r.unregistered).toEqual([])
     expect(listener.stopped).toBe(true)
 
