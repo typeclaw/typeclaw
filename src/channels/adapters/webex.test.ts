@@ -16,6 +16,7 @@ import {
 } from './webex'
 import type { WebexInboundMessage } from './webex-classify'
 import { createWebexPrefetchLimiter } from './webex-prefetch-limiter'
+import { createWebexRecovery, createWebexRecoveryState } from './webex-recovery'
 
 const config = channelsSchema.parse({ webex: {} }).webex!
 
@@ -71,7 +72,7 @@ class FakeListener {
   }
 
   async start(): Promise<void> {
-    this.emit('connected', undefined)
+    this.emit('connected', connectedInfo())
   }
 
   stop(): void {
@@ -80,6 +81,19 @@ class FakeListener {
 
   emit(event: string, value: unknown): void {
     for (const handler of this.handlers.get(event) ?? []) handler(value)
+  }
+}
+
+function connectedInfo(overrides: { connected?: boolean; status?: string; webSocketOpen?: boolean } = {}) {
+  return {
+    connected: overrides.connected ?? true,
+    status: {
+      status: overrides.status ?? 'connected',
+      webSocketOpen: overrides.webSocketOpen ?? true,
+      kmsInitialized: true,
+      deviceRegistered: true,
+      reconnectAttempt: 0,
+    },
   }
 }
 
@@ -322,6 +336,11 @@ describe('createWebexAdapter', () => {
   test('message_created routes through classifyInbound', async () => {
     const r = router()
     const listener = new FakeListener()
+    const routed = Promise.withResolvers<void>()
+    r.route = async (msg: InboundMessage) => {
+      r.routed.push(msg)
+      routed.resolve()
+    }
     const adapter = createWebexAdapter({
       router: r,
       configRef: () => config,
@@ -342,6 +361,7 @@ describe('createWebexAdapter', () => {
 
     await adapter.start()
     listener.emit('message_created', inbound())
+    await routed.promise
     await adapter.stop()
 
     expect(r.routed).toHaveLength(1)
@@ -349,6 +369,76 @@ describe('createWebexAdapter', () => {
     expect(r.routed[0]?.isBotMention).toBe(true)
     expect(listener.stopped).toBe(true)
     expect(r.unregistered).toContain('outbound:webex')
+  })
+
+  test('tracks reconnecting socket truth, recovers a bounded gap, deduplicates live races, and ignores stale events', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const recoveredAt = '2026-01-01T00:00:15.000Z'
+    const now = Date.parse('2026-01-01T00:00:20.000Z')
+    const log = logger()
+    const listCalls: Array<[string, unknown]> = []
+    const routed = Promise.withResolvers<void>()
+    const messagesListed = Promise.withResolvers<void>()
+    r.route = async (msg: InboundMessage) => {
+      r.routed.push(msg)
+      routed.resolve()
+    }
+    const recovered = webexMessage({ ref: 'gap-message', created: recoveredAt, text: 'missed typeclaw' })
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: log,
+      recovery: { now: () => now, retryDelaysMs: [], delay: async () => {} },
+      selfAliasesRef: () => ['typeclaw'],
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          listSpaces: async (options: unknown) => {
+            listCalls.push(['spaces', options])
+            return [{ id: 'room-1', type: 'group', lastActivity: recoveredAt }]
+          },
+          listMessages: async (roomId: string, options: unknown) => {
+            listCalls.push([roomId, options])
+            messagesListed.resolve()
+            return [recovered]
+          },
+          listMemberships: async () => [],
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    await adapter.start()
+    listener.emit('reconnecting', 2)
+    expect(adapter.isConnected()).toBe(false)
+    expect(log.lines.some((line) => line.includes('reconnecting attempt=2'))).toBe(true)
+    listener.emit('connected', connectedInfo({ connected: false }))
+    listener.emit('connected', connectedInfo({ status: 'reconnecting' }))
+    listener.emit('connected', connectedInfo({ webSocketOpen: false }))
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', connectedInfo())
+    expect(adapter.isConnected()).toBe(true)
+    await messagesListed.promise
+    await routed.promise
+    listener.emit('message_created', inbound({ ref: 'gap-message', id: 'gap-message-id', created: recoveredAt }))
+    await adapter.stop()
+
+    expect(listCalls).toEqual([
+      ['spaces', { max: 100 }],
+      ['room-1', { max: 100 }],
+    ])
+    expect(r.routed.map((msg) => msg.externalMessageId)).toEqual(['gap-message'])
+
+    listener.emit('connected', connectedInfo())
+    listener.emit('message_created', inbound({ ref: 'stale-message' }))
+    await Promise.resolve()
+    expect(adapter.isConnected()).toBe(false)
+    expect(r.routed.map((msg) => msg.externalMessageId)).toEqual(['gap-message'])
   })
 
   test('inbound/routed logs print event refs', async () => {
@@ -393,6 +483,204 @@ describe('createWebexAdapter', () => {
     expect(inboundLine).toContain('id=99999999-8888-7777-6666-555555555555')
     expect(inboundLine).toContain('room=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
     expect(inboundLine).not.toContain('Y2lz')
+  })
+
+  test('does not route an inbound whose async enrichment finishes after stop starts', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const lookupStarted = Promise.withResolvers<void>()
+    const releaseLookup = Promise.withResolvers<void>()
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          getSpace: async () => {
+            lookupStarted.resolve()
+            await releaseLookup.promise
+            return { id: 'room-1', title: 'Room', type: 'group' }
+          },
+          listMemberships: async () => [],
+          listMessages: async () => [],
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    await adapter.start()
+    listener.emit('message_created', inbound())
+    await lookupStarted.promise
+    const stopping = adapter.stop()
+    releaseLookup.resolve()
+    await stopping
+
+    expect(r.routed).toEqual([])
+  })
+
+  test('commits an accepted router call before stop hands dedupe to a replacement', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const routeStarted = Promise.withResolvers<void>()
+    const releaseRoute = Promise.withResolvers<void>()
+    const state = createWebexRecoveryState()
+    r.route = async (msg: InboundMessage) => {
+      routeStarted.resolve()
+      await releaseRoute.promise
+      r.routed.push(msg)
+    }
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      recoveryState: state,
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          listMemberships: async () => [],
+          listMessages: async () => [],
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    await adapter.start()
+    listener.emit('message_created', inbound({ ref: 'accepted' }))
+    await routeStarted.promise
+    const stopping = adapter.stop()
+    releaseRoute.resolve()
+    await stopping
+
+    let duplicateHandled = false
+    const replacement = createWebexRecovery({
+      state,
+      client: { listSpaces: async () => [], listMessages: async () => [] },
+      handleMessage: async () => {
+        duplicateHandled = true
+        return 'committed' as const
+      },
+      isCurrent: () => true,
+      isConnected: () => true,
+      logger: { warn: () => {} },
+    })
+    await replacement.routeLive(inbound({ ref: 'accepted' }))
+
+    expect(r.routed.map((message) => message.externalMessageId)).toEqual(['accepted'])
+    expect(duplicateHandled).toBe(false)
+  })
+
+  test('startup rollback waits for accepted routing to finalize before rejecting', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const routeStarted = Promise.withResolvers<void>()
+    const releaseRoute = Promise.withResolvers<void>()
+    const listenerFailed = Promise.withResolvers<void>()
+    const state = createWebexRecoveryState()
+    r.route = async (msg: InboundMessage) => {
+      routeStarted.resolve()
+      await releaseRoute.promise
+      r.routed.push(msg)
+    }
+    listener.start = async () => {
+      listener.emit('connected', connectedInfo())
+      listener.emit('message_created', inbound({ ref: 'startup-accepted' }))
+      await routeStarted.promise
+      listenerFailed.resolve()
+      throw new Error('startup failed')
+    }
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      recoveryState: state,
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          listMemberships: async () => [],
+          listMessages: async () => [],
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    let rejected = false
+    const starting = adapter.start().catch((error: unknown) => {
+      rejected = true
+      throw error
+    })
+    await routeStarted.promise
+    await listenerFailed.promise
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+    expect(rejected).toBe(false)
+
+    releaseRoute.resolve()
+    await expect(starting).rejects.toThrow('startup failed')
+
+    let duplicateHandled = false
+    const replacement = createWebexRecovery({
+      state,
+      client: { listSpaces: async () => [], listMessages: async () => [] },
+      handleMessage: async () => {
+        duplicateHandled = true
+        return 'committed' as const
+      },
+      isCurrent: () => true,
+      isConnected: () => true,
+      logger: { warn: () => {} },
+    })
+    await replacement.routeLive(inbound({ ref: 'startup-accepted' }))
+
+    expect(r.routed.map((message) => message.externalMessageId)).toEqual(['startup-accepted'])
+    expect(duplicateHandled).toBe(false)
+  })
+
+  test('uses the authoritative direct-space type for recovered user messages', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const routed = Promise.withResolvers<void>()
+    r.route = async (msg: InboundMessage) => {
+      r.routed.push(msg)
+      routed.resolve()
+    }
+    const adapter = createWebexAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      recovery: { now: () => Date.parse('2026-01-01T00:00:20.000Z'), retryDelaysMs: [], delay: async () => {} },
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ id: 'self-blob', ref: 'self-1', emails: ['self@example.com'], displayName: 'Self' }),
+          listSpaces: async () => [{ id: 'room-1', type: 'direct', lastActivity: '2026-01-01T00:00:19.000Z' }],
+          listMessages: async () => [
+            webexMessage({ roomType: 'group', created: '2026-01-01T00:00:15.000Z', text: 'missed dm' }),
+          ],
+          listMemberships: async () => [],
+          sendMessage: async () => ({ id: 'sent' }),
+          uploadFile: async () => ({ id: 'uploaded' }),
+        }) as unknown as ReturnType<NonNullable<Parameters<typeof createWebexAdapter>[0]['createClient']>>,
+      createListener: () => listener as unknown as WebexListener,
+    })
+
+    await adapter.start()
+    listener.emit('reconnecting', 1)
+    listener.emit('connected', connectedInfo())
+    await routed.promise
+
+    expect(r.routed[0]?.workspace).toBe('@dm')
+    expect(r.routed[0]?.isDm).toBe(true)
+    await adapter.stop()
   })
 })
 
