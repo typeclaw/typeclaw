@@ -61,9 +61,11 @@ export function renderPrVerdictStandDownReminder(args: { prNumber: number; verdi
   return (
     `<system-reminder>\n` +
     `Another session in this agent has already posted a formal ${args.verdict} review for PR #${args.prNumber}. ` +
-    `Do not submit your own ${args.verdict} (or any redundant verdict) for this PR this turn unless new ` +
+    `This notice applies ONLY to formal PR-level verdicts. Do not submit your own ${args.verdict} (or any redundant ` +
+    `verdict) for this PR this turn unless new ` +
     `information genuinely invalidates that result (e.g. new commits, or a different verdict warranted by ` +
-    `fresh evidence). You may still reply to inline review comments / threads as normal.\n` +
+    `fresh evidence). It does NOT discharge this session's inline review-thread close-out: you must still reply to ` +
+    `the inline thread as normal, resolving it if addressed or leaving it open with an explanation.\n` +
     `</system-reminder>`
   )
 }

@@ -84,8 +84,9 @@ describe('renderPrVerdictStandDownReminder', () => {
     expect(text).toContain('<system-reminder>')
     expect(text).toContain('#42')
     expect(text).toContain('APPROVE')
-    // verdict-only carve-out: thread replies are still allowed
-    expect(text.toLowerCase()).toContain('inline')
+    expect(text).toContain('ONLY to formal PR-level verdicts')
+    expect(text).toContain("does NOT discharge this session's inline review-thread close-out")
+    expect(text).toContain('reply to the inline thread')
     // soft wording: a genuine new-evidence verdict is not suppressed
     expect(text.toLowerCase()).toContain('unless new information')
   })
