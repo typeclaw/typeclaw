@@ -3258,8 +3258,87 @@ describe('start (composition)', () => {
     }
   })
 
-  test('currentHostDaemon registers in-process and injects the hostd env triple without any socket RPC', async () => {
-    // given: a daemon-owned restart supplies its own httpPort + in-process registrar
+  test.each(['build', 'models'] as const)(
+    'refreshes hostd only after build and model provisioning when %s finishes first',
+    async (firstToFinish) => {
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      await writeTypeclawConfig(root)
+      const docker = fakeDockerExec({ imageExists: false, container: { exists: false } })
+      const buildGate = Promise.withResolvers<void>()
+      const buildStarted = Promise.withResolvers<void>()
+      const modelsGate = Promise.withResolvers<void>()
+      const buildFinished = Promise.withResolvers<void>()
+      const modelsStarted = Promise.withResolvers<void>()
+      const initialRegistration = Promise.withResolvers<void>()
+      const modelsFinished = Promise.withResolvers<void>()
+      const events: string[] = []
+      const registrations: HostDaemonRegisterPayload[] = []
+      const exec: DockerExec = async (args, options) => {
+        if (isBuildCall(args)) {
+          events.push('build-started')
+          buildStarted.resolve()
+          await buildGate.promise
+          events.push('build-finished')
+          buildFinished.resolve()
+        }
+        if (args[0] === 'run') events.push('docker-run')
+        return await docker.exec(args, options)
+      }
+
+      const startPromise = start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        cliEntry: '/placeholder/cli.ts',
+        reuseCurrentHostDaemon: true,
+        currentHostDaemon: {
+          httpPort: 49999,
+          register: async (payload) => {
+            registrations.push(payload)
+            events.push(registrations.length === 1 ? 'registration-before-work' : 'registration-at-launch')
+            if (registrations.length === 1) initialRegistration.resolve()
+            return { ok: true }
+          },
+          deregister: async () => {},
+        },
+        ensureDeps: noEnsureDeps,
+        ensureModels: async () => {
+          events.push('models-started')
+          modelsStarted.resolve()
+          await modelsGate.promise
+          events.push('models-ready')
+          modelsFinished.resolve()
+        },
+        verifyRunning: async () => ({ ok: true }),
+        archiveLogs: noArchiveLogs,
+        provisionGithubCliStore: noGithubCliProvision,
+        autoUpgrade: noAutoUpgrade,
+      })
+
+      await Promise.all([buildStarted.promise, modelsStarted.promise, initialRegistration.promise])
+      expect(registrations).toHaveLength(1)
+      const firstGate = firstToFinish === 'build' ? buildGate : modelsGate
+      const firstFinished = firstToFinish === 'build' ? buildFinished : modelsFinished
+      const secondGate = firstToFinish === 'build' ? modelsGate : buildGate
+      firstGate.resolve()
+      await firstFinished.promise
+      for (let pending = 0; pending < 5; pending += 1) await Promise.resolve()
+      expect(registrations).toHaveLength(1)
+
+      secondGate.resolve()
+      const result = await startPromise
+      expect(result.ok).toBe(true)
+      const launchRefresh = events.indexOf('registration-at-launch')
+      expect(launchRefresh).toBeGreaterThan(events.indexOf('build-finished'))
+      expect(launchRefresh).toBeGreaterThan(events.indexOf('models-ready'))
+      expect(events.slice(launchRefresh)).toEqual(['registration-at-launch', 'docker-run'])
+      expect(registrations).toHaveLength(2)
+    },
+  )
+
+  test('uses only replacement hostd tokens in the final docker run', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     await writeTypeclawConfig(root)
@@ -3271,7 +3350,7 @@ describe('start (composition)', () => {
       preferredHostPort: 8973,
       exec,
       allocatePort: deterministicAllocator,
-      cliEntry: '/nonexistent/cli.ts',
+      cliEntry: '/placeholder/cli.ts',
       reuseCurrentHostDaemon: true,
       currentHostDaemon: {
         httpPort: 49999,
@@ -3279,83 +3358,137 @@ describe('start (composition)', () => {
           registered.push(payload)
           return { ok: true }
         },
+        deregister: async () => {},
       },
       ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
       ...bypassVerify,
     })
 
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.hostd.state).toBe('registered')
-    // then: the container is registered in-process (not over a socket)
-    expect(registered).toHaveLength(1)
-    expect(registered[0]).toMatchObject({ containerName: basename(root), cwd: root, wsHostPort: 8973 })
-    // then: the env triple points at the daemon's own http port
-    expect(result.plan.runArgs).toContain('TYPECLAW_HOSTD_URL=http://host.docker.internal:49999')
-    expect(result.plan.runArgs).toContain(`TYPECLAW_HOSTD_TOKEN=${registered[0]!.restartToken}`)
-    expect(result.plan.runArgs).toContain(`TYPECLAW_HOSTD_BROKER_TOKEN=${registered[0]!.brokerToken}`)
+    expect(registered).toHaveLength(2)
+    const [staleRegistration, launchRegistration] = registered
+    expect(launchRegistration).toBeDefined()
+    expect(result.plan.runArgs).toContain(`TYPECLAW_HOSTD_TOKEN=${launchRegistration!.restartToken}`)
+    expect(result.plan.runArgs).toContain(`TYPECLAW_HOSTD_BROKER_TOKEN=${launchRegistration!.brokerToken}`)
+    expect(result.plan.runArgs).not.toContain(`TYPECLAW_HOSTD_TOKEN=${staleRegistration!.restartToken}`)
+    expect(result.plan.runArgs).not.toContain(`TYPECLAW_HOSTD_BROKER_TOKEN=${staleRegistration!.brokerToken}`)
   })
 
-  test('currentHostDaemon register failure still boots the container (degraded, never dead)', async () => {
-    // given: in-process registration fails — the daemon-owned restart must not strand the agent
+  test('aborts before docker run and removes the initial registration when the launch refresh cannot be planned', async () => {
+    const previousHome = process.env.TYPECLAW_HOME
+    const home = await mkdtemp(join(tmpdir(), 'typeclaw-launch-refresh-'))
+    let daemon: Daemon | null = null
+    try {
+      process.env.TYPECLAW_HOME = home
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      await writeTypeclawConfig(root)
+      daemon = await startDaemon({ version: 'test-version', gcIntervalMs: 1_000_000 })
+      const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        cliEntry: '/placeholder/cli.ts',
+        reuseCurrentHostDaemon: true,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ensureModels: async () => {
+          await writeFile(join(root, 'typeclaw.json'), '{ not-json')
+        },
+        verifyRunning: async () => ({ ok: true }),
+        archiveLogs: noArchiveLogs,
+        provisionGithubCliStore: noGithubCliProvision,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(calls.some((call) => call.args[0] === 'run')).toBe(false)
+      expect(daemon.registered()).not.toContain(basename(root))
+    } finally {
+      if (daemon) await daemon.stop().catch(() => {})
+      if (previousHome === undefined) delete process.env.TYPECLAW_HOME
+      else process.env.TYPECLAW_HOME = previousHome
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  test('launches without hostd control when the launch refresh is unavailable', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     await writeTypeclawConfig(root)
     const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let registrations = 0
+    const deregistrations: string[] = []
 
     const result = await start({
       cwd: root,
       preferredHostPort: 8973,
       exec,
       allocatePort: deterministicAllocator,
-      cliEntry: '/nonexistent/cli.ts',
-      reuseCurrentHostDaemon: true,
-      currentHostDaemon: {
-        httpPort: 49999,
-        register: async () => ({ ok: false, reason: 'daemon stopping' }),
-      },
-      ensureDeps: noEnsureDeps,
-      ...bypassVerify,
-    })
-
-    // then: the container still launches, but without the hostd env triple
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.hostd).toEqual({ state: 'unavailable', reason: 'daemon stopping' })
-    expect(calls.find((c) => c.args[0] === 'run')).toBeDefined()
-    expect(result.plan.runArgs.find((a) => a.startsWith('TYPECLAW_HOSTD_URL='))).toBeUndefined()
-  })
-
-  test('a throwing in-process registrar degrades to a booting container, never aborts the restart', async () => {
-    // given: the in-process registrar rejects (e.g. a throw from the shared registration path)
-    await writeDockerfile(root)
-    await writePackageJson(root, { typeclaw: '^0.1.0' })
-    await writeTypeclawConfig(root)
-    const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
-
-    const result = await start({
-      cwd: root,
-      preferredHostPort: 8973,
-      exec,
-      allocatePort: deterministicAllocator,
-      cliEntry: '/nonexistent/cli.ts',
+      cliEntry: '/placeholder/cli.ts',
       reuseCurrentHostDaemon: true,
       currentHostDaemon: {
         httpPort: 49999,
         register: async () => {
-          throw new Error('registry write failed')
+          registrations += 1
+          return registrations === 1 ? { ok: true } : { ok: false, reason: 'registration-unavailable' }
+        },
+        deregister: async (containerName) => {
+          deregistrations.push(containerName)
         },
       },
       ensureDeps: noEnsureDeps,
       ...bypassVerify,
     })
 
-    // then: the throw is normalized to a degraded boot, not an aborted start
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.hostd).toEqual({ state: 'unavailable', reason: 'registry write failed' })
-    expect(calls.find((c) => c.args[0] === 'run')).toBeDefined()
-    expect(result.plan.runArgs.find((a) => a.startsWith('TYPECLAW_HOSTD_URL='))).toBeUndefined()
+    expect(result.hostd).toEqual({ state: 'unavailable', reason: 'registration-unavailable' })
+    expect(calls.find((call) => call.args[0] === 'run')).toBeDefined()
+    expect(result.plan.runArgs.some((arg) => arg.includes('TYPECLAW_HOSTD_'))).toBe(false)
+    expect(deregistrations).toEqual([basename(root)])
+  })
+
+  test('launches without hostd control when the in-process registrar throws at the launch boundary', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root)
+    const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let registrations = 0
+    const deregistrations: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      cliEntry: '/placeholder/cli.ts',
+      reuseCurrentHostDaemon: true,
+      currentHostDaemon: {
+        httpPort: 49999,
+        register: async () => {
+          registrations += 1
+          if (registrations === 1) return { ok: true }
+          throw new Error('registration-unavailable')
+        },
+        deregister: async (containerName) => {
+          deregistrations.push(containerName)
+        },
+      },
+      ensureDeps: noEnsureDeps,
+      ...bypassVerify,
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.hostd).toEqual({ state: 'unavailable', reason: 'registration-unavailable' })
+    expect(calls.find((call) => call.args[0] === 'run')).toBeDefined()
+    expect(result.plan.runArgs.some((arg) => arg.includes('TYPECLAW_HOSTD_'))).toBe(false)
+    expect(deregistrations).toEqual([basename(root)])
   })
 
   test('forceBuild=false skips build entirely when image already exists', async () => {

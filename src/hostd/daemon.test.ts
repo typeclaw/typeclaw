@@ -336,7 +336,7 @@ describe('startDaemon', () => {
     expect(restartCalls[0]?.currentHostDaemon?.httpPort).toBeGreaterThan(0)
   })
 
-  test('populates the currentHostDaemon holder with an in-process registrar once booted', async () => {
+  test('populates the currentHostDaemon holder with in-process registration lifecycle callbacks', async () => {
     const holder = createCurrentHostDaemonHolder()
     daemon = await startDaemon({
       exec: fakeExec(),
@@ -344,7 +344,7 @@ describe('startDaemon', () => {
       currentHostDaemonHolder: holder,
     })
 
-    // then: the holder is populated and its registrar records a registration in-process
+    // then: the holder's callbacks mutate registration state in-process
     const current = await holder.ready()
     expect(current.httpPort).toBeGreaterThan(0)
     const reply = await current.register({
@@ -357,6 +357,9 @@ describe('startDaemon', () => {
     })
     expect(reply).toEqual({ ok: true })
     expect(daemon.registered()).toContain('coder')
+
+    await current.deregister('coder')
+    expect(daemon.registered()).not.toContain('coder')
   })
 
   test('restart RPC forwards build:true to the supervisor', async () => {

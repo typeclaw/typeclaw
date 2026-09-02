@@ -500,15 +500,20 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     return { ok: true, result }
   }
 
-  // Lets the supervisor's restart re-register the child in-process instead of
-  // over the socket. Awaits restore for the same no-mutation-before-restore
-  // invariant the socket dispatcher enforces before handleRegister.
+  // Lets the supervisor's restart update child registration lifecycle
+  // in-process instead of over the socket. Both callbacks await restore for
+  // the same no-mutation-before-restore invariant as the socket dispatcher.
   const registerCurrentChild = async (
     payload: HostDaemonRegisterPayload,
   ): Promise<{ ok: true } | { ok: false; reason: string }> => {
     await awaitRestored()
     const reply = await registerContainer(payload)
     return reply.ok ? { ok: true } : { ok: false, reason: reply.reason }
+  }
+
+  const deregisterCurrentChild = async (containerName: string): Promise<void> => {
+    await awaitRestored()
+    await handleDeregister({ containerName })
   }
 
   // Auth: only restart containers that registered with this daemon. The
@@ -531,7 +536,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
       containerName: req.containerName,
       cwd,
       build: req.build,
-      currentHostDaemon: { httpPort, register: registerCurrentChild },
+      currentHostDaemon: { httpPort, register: registerCurrentChild, deregister: deregisterCurrentChild },
     })
     if (!ack.ok) return ack
     const result: RestartResult = { containerName: req.containerName, scheduled: true }
@@ -790,7 +795,11 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   }
   httpPort = httpServer.port ?? 0
   log({ kind: 'daemon-http-listening', host: httpHostname, port: httpPort })
-  opts.currentHostDaemonHolder?.set({ httpPort, register: registerCurrentChild })
+  opts.currentHostDaemonHolder?.set({
+    httpPort,
+    register: registerCurrentChild,
+    deregister: deregisterCurrentChild,
+  })
 
   const sockets = new Set<NetSocket>()
   const listener = createServer((socket) => {
