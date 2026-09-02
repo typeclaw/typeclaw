@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { rmSync } from 'node:fs'
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -206,9 +207,10 @@ describe('runBackup', () => {
     const cwd = await makeRepo()
     await mkdir(join(cwd, 'sessions'))
     await writeFile(join(cwd, 'sessions', 'pre.jsonl'), '{}')
+    await mkdir(join(cwd, 'todo'))
 
     const firstStatus = '?? sessions/pre.jsonl\n M src/foo.ts\n'
-    const secondStatus = '?? sessions/pre.jsonl\n?? sessions/late.jsonl\n M src/foo.ts\n'
+    const secondStatus = '?? sessions/pre.jsonl\n?? sessions/late.jsonl\n?? todo/late.json\n M src/foo.ts\n'
     let statusCalls = 0
     let messagePicked = false
 
@@ -231,6 +233,7 @@ describe('runBackup', () => {
       pickCommitMessage: async () => {
         // when: simulate the late file appearing during message synthesis
         await writeFile(join(cwd, 'sessions', 'late.jsonl'), '{}')
+        await writeFile(join(cwd, 'todo', 'late.json'), '{}')
         messagePicked = true
         return 'chore: backup'
       },
@@ -252,6 +255,7 @@ describe('runBackup', () => {
     const lateAddPaths = addFCalls[1]?.args.slice(3) ?? []
     expect(lateAddPaths).toContain('sessions/late.jsonl')
     expect(lateAddPaths).toContain('sessions/pre.jsonl')
+    expect(lateAddPaths).not.toContain('todo/late.json')
 
     // and: there are exactly TWO status calls — one before staging, one after
     // pickCommitMessage returns. Asserting the count keeps a future "optimize"
@@ -531,19 +535,218 @@ describe('runBackup', () => {
     await runBackup({ cwd, pushToOrigin: true }, baseDeps(spawn, '   '))
     expect(captured).toBe('Backup')
   })
+  test('skips an ordinary untracked path that vanished before staging', async () => {
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult('?? gone.txt\0')
+      return okResult()
+    })
+
+    const result = await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))
+
+    expect(result).toEqual({ ok: true, kind: 'clean' })
+    expect(calls.some((call) => call.args[0] === 'add')).toBe(false)
+  })
+
+  test('retries a failed explicit add once after an initial untracked path vanishes without widening scope', async () => {
+    const cwd = await makeRepo()
+    await writeFile(join(cwd, 'transient.txt'), 'temporary')
+    let statuses = 0
+    let adds = 0
+    let promptStatus = ''
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') {
+        statuses += 1
+        return okResult(statuses === 1 ? '?? transient.txt\0 M tracked.txt\0' : ' M tracked.txt\0?? later.txt\0')
+      }
+
+      if (args[0] === 'add' && args[1] === '--') {
+        adds += 1
+        if (adds === 1) {
+          rmSync(join(cwd, 'transient.txt'))
+          return failResult('pathspec did not match')
+        }
+        return okResult()
+      }
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'diff' && args[2] === '--stat') return okResult()
+      if (args[0] === 'commit') return okResult()
+      return okResult()
+    })
+
+    const result = await runBackup(
+      { cwd, pushToOrigin: false },
+      {
+        gitSpawn: spawn,
+        pickCommitMessage: async ({ status }) => {
+          promptStatus = status
+          return 'chore: test'
+        },
+      },
+    )
+
+    expect(result).toEqual({ ok: true, kind: 'committed' })
+    const ordinaryAdds = calls.filter((call) => call.args[0] === 'add' && call.args[1] === '--')
+    expect(ordinaryAdds).toHaveLength(2)
+    expect(ordinaryAdds[1]?.args).toEqual(['add', '--', 'tracked.txt'])
+    expect(ordinaryAdds[1]?.args).not.toContain('later.txt')
+    expect(calls.filter((call) => call.args[0] === 'status').every((call) => call.args.includes('-z'))).toBe(true)
+    expect(promptStatus).not.toContain('\0')
+  })
+
+  test('keeps a dangling untracked symlink stageable while dropping a path that vanishes after the status snapshot', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-dangling-symlink-'))
+    const realGit = makeDefaultGitSpawn()
+    const runGit = async (args: string[]): Promise<GitSpawnResult> => {
+      const result = await realGit(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result
+    }
+
+    try {
+      await runGit(['init', '-q', '-b', 'main'])
+      await runGit(['config', 'user.name', 'Test'])
+      await runGit(['config', 'user.email', 'test@example.com'])
+      await writeFile(join(cwd, 'initial.txt'), 'initial\n')
+      await runGit(['add', 'initial.txt'])
+      await runGit(['commit', '-qm', 'initial'])
+      await symlink('missing-target', join(cwd, 'dangling-link'))
+      await writeFile(join(cwd, 'transient.txt'), 'temporary\n')
+
+      let removeBeforeFirstAdd = true
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        {
+          gitSpawn: async (args, opts) => {
+            if (removeBeforeFirstAdd && args[0] === 'add' && args[1] === '--') {
+              removeBeforeFirstAdd = false
+              await rm(join(cwd, 'transient.txt'))
+            }
+            return realGit(args, opts)
+          },
+          pickCommitMessage: async () => 'chore: preserve dangling symlink',
+        },
+      )
+
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = await runGit(['ls-tree', '-r', 'HEAD'])
+      expect(tree.stdout).toContain('120000 blob')
+      expect(tree.stdout).toContain('\tdangling-link\n')
+      expect(tree.stdout).not.toContain('transient.txt')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('stages both tracked rename endpoints from the original snapshot', async () => {
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult('R  renamed.txt\0original.txt\0')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'diff' && args[2] === '--stat') return okResult()
+      if (args[0] === 'commit') return okResult()
+      return okResult()
+    })
+
+    expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'renamed.txt', 'original.txt'])
+  })
+
+  test('stages a tracked deletion even when its path is absent', async () => {
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' D removed.txt\0')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'diff' && args[2] === '--stat') return okResult()
+      if (args[0] === 'commit') return okResult()
+      return okResult()
+    })
+
+    expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'removed.txt'])
+  })
+
+  test('stages a tracked force-path deletion through the ordinary snapshot', async () => {
+    const cwd = await makeRepo()
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' D sessions/removed.jsonl\0')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'diff' && args[2] === '--stat') return okResult()
+      if (args[0] === 'commit') return okResult()
+      return okResult()
+    })
+
+    expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({ ok: true, kind: 'committed' })
+    expect(calls.find((call) => call.args[0] === 'add')?.args).toEqual(['add', '--', 'sessions/removed.jsonl'])
+    expect(calls.some((call) => call.args[0] === 'add' && call.args[1] === '-f')).toBe(false)
+  })
+
+  test('surfaces an unchanged explicit-add failure without retrying', async () => {
+    const cwd = await makeRepo()
+    await writeFile(join(cwd, 'still-here.txt'), 'present')
+    let statuses = 0
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') {
+        statuses += 1
+        return okResult('?? still-here.txt\0')
+      }
+      if (args[0] === 'add') return failResult('permission denied')
+      return okResult()
+    })
+
+    const result = await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))
+
+    expect(result).toEqual({ ok: false, kind: 'commit-failed', reason: 'git add failed: permission denied' })
+    expect(statuses).toBe(2)
+    expect(calls.filter((call) => call.args[0] === 'add')).toHaveLength(1)
+  })
+
+  test('surfaces the retry failure after one reconciliation attempt', async () => {
+    const cwd = await makeRepo()
+    await writeFile(join(cwd, 'vanishing.txt'), 'present')
+    let statuses = 0
+    let adds = 0
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') {
+        statuses += 1
+        return okResult(statuses === 1 ? '?? vanishing.txt\0 M tracked.txt\0' : ' M tracked.txt\0')
+      }
+      if (args[0] === 'add') {
+        adds += 1
+        if (adds === 1) {
+          rmSync(join(cwd, 'vanishing.txt'))
+          return failResult('first failure')
+        }
+        return failResult('retry failure')
+      }
+      return okResult()
+    })
+
+    expect(await runBackup({ cwd, pushToOrigin: false }, baseDeps(spawn))).toEqual({
+      ok: false,
+      kind: 'commit-failed',
+      reason: 'git add failed: retry failure',
+    })
+    expect(calls.filter((call) => call.args[0] === 'add')).toHaveLength(2)
+  })
 })
 
 describe('parsePorcelain', () => {
-  test('parses standard modified/added lines', () => {
-    expect(parsePorcelain(' M src/foo.ts\n?? bar.ts\n')).toEqual(['src/foo.ts', 'bar.ts'])
+  test('classifies tracked and untracked NUL-delimited records', () => {
+    expect(parsePorcelain(' M src/foo.ts\0?? bar.ts\0')).toEqual([
+      { status: ' M', kind: 'tracked', paths: ['src/foo.ts'] },
+      { status: '??', kind: 'untracked', paths: ['bar.ts'] },
+    ])
   })
 
-  test('returns the destination on rename lines', () => {
-    expect(parsePorcelain('R  old/path -> new/path\n')).toEqual(['new/path'])
+  test('preserves literal rename endpoints without pathname quoting', () => {
+    expect(parsePorcelain('R  new name\nfile\0old name\nfile\0')).toEqual([
+      { status: 'R ', kind: 'tracked', paths: ['new name\nfile', 'old name\nfile'] },
+    ])
   })
 
-  test('skips empty and short lines', () => {
-    expect(parsePorcelain('\n  \nXY\n')).toEqual([])
+  test('skips empty and short records', () => {
+    expect(parsePorcelain('\0  \0XY\0')).toEqual([])
   })
 })
 

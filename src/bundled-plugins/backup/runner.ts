@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { lstatSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { hooklessGitArgs } from '@/git/hookless'
@@ -95,29 +95,33 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
   const repo = resolveAgentGit(cwd)
   if (!repo) return { ok: true, kind: 'no-repo' }
 
-  const status = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '--untracked-files=all'], {
+  const status = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
     cwd,
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   if (status.exitCode !== 0) return { ok: false, kind: 'aborted', reason: `git status failed: ${shortErr(status)}` }
-  const dirty = filterAgentOwned(parsePorcelain(status.stdout))
-  const force = filterForceAdd(parsePorcelain(status.stdout))
-  if (dirty.length === 0 && force.length === 0) return { ok: true, kind: 'clean' }
+  const snapshot = selectStagingSnapshot(parsePorcelain(status.stdout), cwd)
+  if (snapshot.paths.length === 0 && snapshot.forcePaths.length === 0) return { ok: true, kind: 'clean' }
 
-  if (dirty.length > 0) {
-    const add = await deps.gitSpawn([...repo.gitArgs, 'add', '--', ...dirty], { cwd, timeoutMs: COMMIT_TIMEOUT_MS })
-    if (add.exitCode !== 0) return { ok: false, kind: 'commit-failed', reason: `git add failed: ${shortErr(add)}` }
-  }
-  if (force.length > 0) {
-    const present = force.filter((p) => existsSync(join(cwd, p)))
-    if (present.length > 0) {
-      const addF = await deps.gitSpawn([...repo.gitArgs, 'add', '-f', '--', ...present], {
-        cwd,
-        timeoutMs: COMMIT_TIMEOUT_MS,
-      })
-      if (addF.exitCode !== 0) {
-        return { ok: false, kind: 'commit-failed', reason: `git add -f failed: ${shortErr(addF)}` }
+  if (snapshot.paths.length > 0) {
+    const add = await deps.gitSpawn([...repo.gitArgs, 'add', '--', ...snapshot.paths], {
+      cwd,
+      timeoutMs: COMMIT_TIMEOUT_MS,
+    })
+    if (add.exitCode !== 0) {
+      const retry = await retryAfterVanishedUntracked(cwd, deps, repo, snapshot)
+      if (!retry || retry.exitCode !== 0) {
+        return { ok: false, kind: 'commit-failed', reason: `git add failed: ${shortErr(retry ?? add)}` }
       }
+    }
+  }
+  if (snapshot.forcePaths.length > 0) {
+    const addF = await deps.gitSpawn([...repo.gitArgs, 'add', '-f', '--', ...snapshot.forcePaths], {
+      cwd,
+      timeoutMs: COMMIT_TIMEOUT_MS,
+    })
+    if (addF.exitCode !== 0) {
+      return { ok: false, kind: 'commit-failed', reason: `git add -f failed: ${shortErr(addF)}` }
     }
   }
 
@@ -132,7 +136,7 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   const message = await deps.pickCommitMessage({
-    status: status.stdout.slice(0, 4096),
+    status: status.stdout.replaceAll('\0', '\n').slice(0, 4096),
     diffstat: diffstat.stdout.slice(0, 4096),
   })
 
@@ -144,12 +148,12 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
   // one-cycle-behind churn. Re-status, filter to `sessions/` additions
   // only (don't accidentally stage user work that arrived during the
   // window), and force-add anything new.
-  const reStatus = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '--untracked-files=all'], {
+  const reStatus = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
     cwd,
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   if (reStatus.exitCode === 0) {
-    const lateForce = filterForceAdd(parsePorcelain(reStatus.stdout)).filter((p) => existsSync(join(cwd, p)))
+    const lateForce = selectForcePaths(parsePorcelain(reStatus.stdout), cwd, ['sessions/'])
     if (lateForce.length > 0) {
       const lateAdd = await deps.gitSpawn([...repo.gitArgs, 'add', '-f', '--', ...lateForce], {
         cwd,
@@ -372,23 +376,112 @@ function isNonFastForward(r: GitSpawnResult): boolean {
   return blob.includes('non-fast-forward') || blob.includes('updates were rejected')
 }
 
-export function parsePorcelain(stdout: string): string[] {
-  const out: string[] = []
-  for (const raw of stdout.split('\n')) {
+export type PorcelainEntry = {
+  status: string
+  kind: 'tracked' | 'untracked'
+  paths: readonly string[]
+}
+
+// `-z` makes paths literal rather than C-quoted. Rename/copy records carry the
+// destination followed by the source, and both are needed when staging a
+// snapshot that contains an endpoint which has since disappeared.
+export function parsePorcelain(stdout: string): PorcelainEntry[] {
+  const separator = stdout.includes('\0') ? '\0' : '\n'
+  const records = stdout.split(separator)
+  const entries: PorcelainEntry[] = []
+
+  for (let index = 0; index < records.length; index += 1) {
+    const raw = records[index] ?? ''
     if (raw.length < 4) continue
-    const rest = raw.slice(3)
-    const arrowIdx = rest.indexOf(' -> ')
-    out.push(arrowIdx === -1 ? rest : rest.slice(arrowIdx + 4))
+    const status = raw.slice(0, 2)
+    const path = raw.slice(3)
+    const renamedOrCopied = status.includes('R') || status.includes('C')
+    const source = renamedOrCopied && separator === '\0' ? records[++index] : undefined
+    const fallbackSource = renamedOrCopied && separator === '\n' ? path.split(' -> ')[0] : undefined
+    const destination = fallbackSource ? path.slice(fallbackSource.length + 4) : path
+    entries.push({
+      status,
+      kind: status === '??' ? 'untracked' : 'tracked',
+      paths: source ? [path, source] : fallbackSource ? [destination, fallbackSource] : [path],
+    })
   }
-  return out
+  return entries
 }
 
-function filterAgentOwned(paths: readonly string[]): string[] {
-  return paths.filter((p) => !RUNTIME_OWNED_PREFIXES.some((pre) => p.startsWith(pre)))
+type StagingSnapshot = {
+  paths: string[]
+  untrackedPaths: Set<string>
+  forcePaths: string[]
 }
 
-function filterForceAdd(paths: readonly string[]): string[] {
-  return paths.filter((p) => FORCE_ADD_PREFIXES.some((pre) => p.startsWith(pre)))
+function selectStagingSnapshot(entries: readonly PorcelainEntry[], cwd: string): StagingSnapshot {
+  const paths: string[] = []
+  const untrackedPaths = new Set<string>()
+  for (const entry of entries) {
+    for (const path of entry.paths) {
+      if (isAgentOwned(path)) continue
+      const forceAdded = FORCE_ADD_PREFIXES.some((prefix) => path.startsWith(prefix))
+      if (entry.kind === 'untracked') {
+        if (forceAdded || !hasDirectoryEntry(join(cwd, path))) continue
+        untrackedPaths.add(path)
+      }
+      paths.push(path)
+    }
+  }
+  return { paths: uniquePaths(paths), untrackedPaths, forcePaths: selectForcePaths(entries, cwd) }
+}
+
+async function retryAfterVanishedUntracked(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  repo: AgentGit,
+  snapshot: StagingSnapshot,
+): Promise<GitSpawnResult | undefined> {
+  const reread = await deps.gitSpawn([...repo.gitArgs, 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
+    cwd,
+    timeoutMs: COMMIT_TIMEOUT_MS,
+  })
+  if (reread.exitCode !== 0) return undefined
+
+  const reported = new Set(
+    parsePorcelain(reread.stdout)
+      .filter((entry) => entry.kind === 'untracked')
+      .flatMap((entry) => entry.paths),
+  )
+  const vanished = new Set(
+    [...snapshot.untrackedPaths].filter((path) => !hasDirectoryEntry(join(cwd, path)) && !reported.has(path)),
+  )
+  if (vanished.size === 0) return undefined
+
+  const retryPaths = snapshot.paths.filter((path) => !vanished.has(path))
+  if (retryPaths.length === 0) return { exitCode: 0, stdout: '', stderr: '', timedOut: false }
+  return deps.gitSpawn([...repo.gitArgs, 'add', '--', ...retryPaths], { cwd, timeoutMs: COMMIT_TIMEOUT_MS })
+}
+
+function selectForcePaths(
+  entries: readonly PorcelainEntry[],
+  cwd: string,
+  prefixes: readonly string[] = FORCE_ADD_PREFIXES,
+): string[] {
+  return uniquePaths(
+    entries.flatMap((entry) =>
+      entry.paths.filter(
+        (path) => prefixes.some((prefix) => path.startsWith(prefix)) && hasDirectoryEntry(join(cwd, path)),
+      ),
+    ),
+  )
+}
+
+function hasDirectoryEntry(path: string): boolean {
+  return lstatSync(path, { throwIfNoEntry: false }) !== undefined
+}
+
+function uniquePaths(paths: readonly string[]): string[] {
+  return [...new Set(paths)]
+}
+
+function isAgentOwned(path: string): boolean {
+  return RUNTIME_OWNED_PREFIXES.some((prefix) => path.startsWith(prefix))
 }
 
 function sanitizeCommitMessage(raw: string): string {
