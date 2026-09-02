@@ -407,6 +407,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               stream: options.stream,
               allowBackgroundFromSubagent: options.allowBackgroundFromSubagent,
               coalescer: options.subagentCoalescer,
+              channelRouter: options.channelRouter,
             }),
           ]
         : [
@@ -449,6 +450,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
               permissions: options.permissions,
               stream: options.stream,
               coalescer: options.subagentCoalescer,
+              channelRouter: options.channelRouter,
             }),
             ...buildRoleGrantTools({
               agentDir: options.plugins?.agentDir,
@@ -862,6 +864,7 @@ export function buildSubagentOrchestrationTools(opts: {
   stream: Stream | undefined
   allowBackgroundFromSubagent?: boolean
   coalescer?: SubagentCoalescer
+  channelRouter?: ChannelRouter
 }): ToolDefinition[] {
   if (
     opts.liveRegistry === undefined ||
@@ -896,6 +899,12 @@ export function buildSubagentOrchestrationTools(opts: {
       liveRegistry: opts.liveRegistry,
       getOrigin: opts.getOrigin,
       callerSessionId: opts.parentSessionId,
+      ...(opts.channelRouter !== undefined
+        ? {
+            hasOutstandingReviewThreadCloseout: (sessionId: string) =>
+              opts.channelRouter?.hasOutstandingGithubReviewThreadCloseout?.(sessionId) ?? false,
+          }
+        : {}),
       ...(opts.permissions ? { permissions: opts.permissions } : {}),
     }),
   ]

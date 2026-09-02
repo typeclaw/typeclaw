@@ -16,10 +16,11 @@ export type CreateSubagentCancelToolOptions = {
   getOrigin: () => SessionOrigin | undefined
   permissions?: PermissionService
   callerSessionId?: string
+  hasOutstandingReviewThreadCloseout?: (sessionId: string) => boolean
 }
 
 export function createSubagentCancelTool(options: CreateSubagentCancelToolOptions) {
-  const { liveRegistry, getOrigin, permissions, callerSessionId } = options
+  const { liveRegistry, getOrigin, permissions, callerSessionId, hasOutstandingReviewThreadCloseout } = options
 
   return defineTool({
     name: 'subagent_cancel',
@@ -71,6 +72,17 @@ export function createSubagentCancelTool(options: CreateSubagentCancelToolOption
         return errorResult(`abort failed: ${message}`)
       }
       live.releaseCoalesceKey?.()
+      const owesReviewThreadCloseout =
+        callerSessionId !== undefined && hasOutstandingReviewThreadCloseout?.(callerSessionId) === true
+      const hasOtherRunningChild =
+        callerSessionId !== undefined &&
+        liveRegistry
+          .list({ parentSessionId: callerSessionId })
+          .some((candidate) => candidate.taskId !== live.taskId && candidate.status === 'running')
+      const closeoutWarning =
+        owesReviewThreadCloseout && !hasOtherRunningChild
+          ? ' Warning: cancellation succeeded, but this session still owes its GitHub review thread a close-out. Reply now with an explicit resolve choice, or explain why you are leaving the thread open.'
+          : ''
       const details: SubagentCancelToolDetails = {
         ok: true,
         taskId: live.taskId,
@@ -81,7 +93,7 @@ export function createSubagentCancelTool(options: CreateSubagentCancelToolOption
         content: [
           {
             type: 'text' as const,
-            text: `${live.subagentName} (${live.taskId}) cancellation requested. It will stop on the next abort checkpoint.`,
+            text: `${live.subagentName} (${live.taskId}) cancellation requested. It will stop on the next abort checkpoint.${closeoutWarning}`,
           },
         ],
         details,
