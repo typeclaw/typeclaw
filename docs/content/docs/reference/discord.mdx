@@ -86,6 +86,14 @@ Discord chats fall into two internal workspace shapes:
 
 In role match rules, DMs are addressed by the canonical `dm` **bucket** scope, not the internal `@dm` workspace value: `discord:*` for everything, `discord:dm/*` for any DM, `discord:<guildId>` for one server, or `discord:<guildId>/<channelId>` for a concrete server channel. A concrete parent-channel scope also covers its resolved child threads; a scope naming a thread ID remains exact. See the [match-rule DSL](/docs/reference/match-rule-dsl).
 
+## Reconnect recovery
+
+The adapter keeps durable, account-scoped cursors for each channel and uses them to replay messages after a gateway reconnect or TypeClaw restart. Each recovery pass is bounded to 50 messages per channel, messages from the last 30 minutes, 20 channels, 100 messages total, and 20 seconds. Capped or unavailable recovery outcomes are written to the operator logs.
+
+These cursors live in the gitignored, local runtime state file `channels/discord-recovery.json`. The file survives process and container restarts in the same working tree, but it does not follow a Git clone or fresh checkout.
+
+The user-token SDK exposes only a bounded window of the latest channel history, not an `after` cursor. Messages beyond that window or older than the recovery limits may require manual history inspection. Recovery reduces reconnect gaps but does not guarantee exactly-once delivery across process crashes.
+
 ## Quirks
 
 - **User token, not a bot token**: outbound and REST calls use the raw session token with no `Bot ` prefix. There are no gateway intents to configure and no server invite step — the account already sees whatever servers and DMs it's a member of.
