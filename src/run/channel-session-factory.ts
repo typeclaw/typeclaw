@@ -89,6 +89,21 @@ function isValidSessionFileBasename(name: string): boolean {
   return name.endsWith('.jsonl')
 }
 
+function errorChainHasCode(error: unknown, expectedCode: string): boolean {
+  const seen = new Set<object>()
+  let current = error
+  while (typeof current === 'object' && current !== null && !seen.has(current)) {
+    seen.add(current)
+    try {
+      if ('code' in current && current.code === expectedCode) return true
+      current = 'cause' in current ? current.cause : undefined
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
 // The production wiring for channel-routed sessions. Channel inbounds arrive
 // at the router, the router calls this factory to get an AgentSession, and
 // the agent uses `channel_send` to reply. If `channelRouter` is missing here
@@ -103,14 +118,7 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
     const sessionDir = deps.sessionFactory.sessionDir()
     const sessionManager =
       existingSessionId !== undefined
-        ? tryReopenOrCreate(
-            deps.cwd,
-            sessionDir,
-            existingSessionId,
-            existingSessionFile,
-            deps.rehydrateCapOptions,
-            logger,
-          )
+        ? tryReopenOrCreate(deps.cwd, sessionDir, existingSessionFile, deps.rehydrateCapOptions, logger)
         : SessionManager.create(deps.cwd, sessionDir)
 
     const snap = deps.pluginRuntime.get()
@@ -175,21 +183,16 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
 function tryReopenOrCreate(
   cwd: string,
   sessionDir: string,
-  existingSessionId: string,
   existingSessionFile: string | undefined,
   capOptions: CapOptions | null,
   logger: FactoryLogger,
 ): SessionManager {
   if (existingSessionFile === undefined) {
-    logger.warn(
-      `[channels] session ${existingSessionId} has no sessionFile (v2 mapping not yet migrated); creating new`,
-    )
+    logger.warn('[channels] persisted session has no session file; creating new')
     return SessionManager.create(cwd, sessionDir)
   }
   if (!isValidSessionFileBasename(existingSessionFile)) {
-    logger.warn(
-      `[channels] session ${existingSessionId} has invalid sessionFile (${JSON.stringify(existingSessionFile)}); creating new`,
-    )
+    logger.warn('[channels] persisted session file is invalid; creating new')
     return SessionManager.create(cwd, sessionDir)
   }
   const path = join(sessionDir, existingSessionFile)
@@ -198,23 +201,27 @@ function tryReopenOrCreate(
       const stats = capJsonlFileInPlace(path, capOptions)
       if (stats.entriesMutated > 0) {
         logger.info(
-          `[channels] rehydrate-cap ${existingSessionFile}: entriesMutated=${stats.entriesMutated} imagesReplaced=${stats.imagesReplaced} textsTruncated=${stats.textsTruncated} bytesElided=${stats.bytesElided}`,
+          `[channels] rehydrate-cap complete: entriesMutated=${stats.entriesMutated} imagesReplaced=${stats.imagesReplaced} textsTruncated=${stats.textsTruncated} bytesElided=${stats.bytesElided}`,
         )
       }
     } catch (err) {
       // Capping is best-effort: if the rewrite fails, fall through to the
       // regular open path so the session still rehydrates uncapped rather
-      // than being killed by a transient FS error.
-      const reason = err instanceof Error ? err.message : String(err)
-      logger.warn(`[channels] rehydrate-cap failed for ${existingSessionFile}: ${reason}; continuing with open`)
+      // than being killed by a transient FS error. Missing files are expected
+      // during concurrent cleanup; open either creates a fresh transcript or
+      // reaches the fallback below.
+      if (!errorChainHasCode(err, 'ENOENT')) {
+        logger.warn('[channels] rehydrate-cap unavailable; continuing with open')
+      }
     }
   }
   try {
     return SessionManager.open(path)
   } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err)
     logger.warn(
-      `[channels] could not rehydrate session ${existingSessionId} from ${existingSessionFile}: ${reason}; creating new`,
+      errorChainHasCode(err, 'ENOENT')
+        ? '[channels] persisted session file unavailable; creating new'
+        : '[channels] persisted session rehydrate failed; creating new',
     )
     return SessionManager.create(cwd, sessionDir)
   }
