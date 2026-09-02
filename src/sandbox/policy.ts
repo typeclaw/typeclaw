@@ -60,8 +60,11 @@ export type SandboxProcessPolicy = {
 // bwrap primitive that masks a single FILE (--tmpfs is dir-only). --ro-bind-data
 // reads its empty content from a file descriptor, and the bash tool spawns with
 // stdio ["ignore","pipe","pipe"] — no inherited extra fds — so the rendered
-// commandString self-opens fd MASK_DATA_FD via a `<fd>< /dev/null` redirection
-// appended after `bash -c <command>`. Masks MUST render after the broad parent
+// commandString self-opens ONE fd PER masked file (counting up from
+// FIRST_MASK_DATA_FD) via `<fd></dev/null` redirections appended after
+// `bash -c <command>`. The fds cannot be shared: bwrap close()s each after
+// copying it, so a reused fd aborts the entire invocation with EBADF and kills
+// every sandboxed bash call. Masks MUST render after the broad parent
 // mounts: bwrap applies mount ops in command-line order and the last op on a
 // path wins, so a mask emitted before its parent bind would be re-exposed.
 export type SandboxMaskPolicy = {
