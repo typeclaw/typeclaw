@@ -1,12 +1,11 @@
-import type { WebexBotListenerEventMap } from 'agent-messenger/webexbot'
-
 import { matchesAnyAlias } from '@/channels/engagement'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
 import { splitWebexFiles } from './webex-format'
+import type { WebexInboundRecord } from './webex-recovery'
 
-export type WebexInboundMessage = WebexBotListenerEventMap['message_created'][0]
+export type WebexInboundMessage = WebexInboundRecord
 
 export type InboundDropReason = 'self_author' | 'empty_content' | 'pre_connect'
 

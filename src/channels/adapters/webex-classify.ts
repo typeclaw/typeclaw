@@ -1,13 +1,12 @@
 // WebexListenerEventMap requires agent-messenger/webex (PR #239); resolves via linked upstream.
-import type { WebexListenerEventMap } from 'agent-messenger/webex'
-
 import { matchesAnyAlias } from '@/channels/engagement'
 import type { ChannelAdapterConfig } from '@/channels/schema'
 import type { InboundMessage } from '@/channels/types'
 
 import { splitWebexFiles } from './webex-format'
+import type { WebexInboundRecord } from './webex-recovery'
 
-export type WebexInboundMessage = WebexListenerEventMap['message_created'][0]
+export type WebexInboundMessage = WebexInboundRecord
 
 export type InboundDropReason = 'self_author' | 'empty_content' | 'pre_connect'
 
