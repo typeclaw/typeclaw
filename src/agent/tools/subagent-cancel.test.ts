@@ -74,6 +74,45 @@ describe('createSubagentCancelTool', () => {
     expect(abortCount).toBe(1)
   })
 
+  test('warns after cancelling the only running child while a review-thread closeout is outstanding', async () => {
+    const liveRegistry = new LiveSubagentRegistry()
+    liveRegistry.register(makeLive({ parentSessionId: 'ses_parent', background: true }))
+    const tool = createSubagentCancelTool({
+      liveRegistry,
+      getOrigin: () => undefined,
+      callerSessionId: 'ses_parent',
+      hasOutstandingReviewThreadCloseout: () => true,
+    })
+
+    const result = await tool.execute('call_1', { task_id: 'bg_c1' }, undefined, undefined, ctx)
+    const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('')
+
+    expect(result.details).toMatchObject({ ok: true, alreadyDone: false })
+    expect(text).toContain('cancellation requested')
+    expect(text).toContain('still owes its GitHub review thread a close-out')
+    expect(text).toContain('leaving the thread open')
+  })
+
+  test('cancels without the closeout warning when another running child remains', async () => {
+    const liveRegistry = new LiveSubagentRegistry()
+    liveRegistry.register(makeLive({ parentSessionId: 'ses_parent', background: true }))
+    liveRegistry.register(
+      makeLive({ taskId: 'bg_c2', sessionId: 'ses_s2', parentSessionId: 'ses_parent', background: true }),
+    )
+    const tool = createSubagentCancelTool({
+      liveRegistry,
+      getOrigin: () => undefined,
+      callerSessionId: 'ses_parent',
+      hasOutstandingReviewThreadCloseout: () => true,
+    })
+
+    const result = await tool.execute('call_1', { task_id: 'bg_c1' }, undefined, undefined, ctx)
+    const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('')
+
+    expect(result.details).toMatchObject({ ok: true, alreadyDone: false })
+    expect(text).not.toContain('still owes')
+  })
+
   test('already-completed task → ok=true with alreadyDone=true, no abort call', async () => {
     const liveRegistry = new LiveSubagentRegistry()
     let abortCount = 0

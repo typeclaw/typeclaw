@@ -2,7 +2,7 @@ import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
 
 import { registerOrJoinReplyReviewRound } from '@/channels/github-review-verdict-coordinator'
 import type { GithubReviewOn } from '@/channels/schema'
-import type { GithubReviewFollowupRound, InboundMessage } from '@/channels/types'
+import type { GithubReviewFollowupRound, GithubReviewThreadCloseout, InboundMessage } from '@/channels/types'
 
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
@@ -572,6 +572,10 @@ export function classifyGithubInbound(
     const parent =
       parentId !== null && options?.reviewCommentParent?.parentId === parentId ? options.reviewCommentParent : null
     const commenter = readUser(comment.user)
+    const githubReviewThreadCloseout: GithubReviewThreadCloseout | undefined =
+      parent?.isSelf === true && commenter !== null && !isBotUser(commenter)
+        ? { workspace: base.workspace, prNumber: number, rootCommentId: String(root) }
+        : undefined
     const directedAtBot =
       parentId === null &&
       isSelfPr(readUser(pr.user), selfLogin, options?.authType ?? 'pat') &&
@@ -591,6 +595,7 @@ export function classifyGithubInbound(
         ...(directedAtBot ? { forceBotMention: true } : {}),
         replyToBotMessageId: parent?.isSelf === true ? String(parent.parentId) : null,
         replyToOtherMessageId: parent?.isSelf === false ? String(parent.parentId) : null,
+        ...(githubReviewThreadCloseout !== undefined ? { githubReviewThreadCloseout } : {}),
       },
     )
   }
@@ -785,6 +790,7 @@ type BuildInboundOptions = {
   suppressSticky?: boolean
   replyToBotMessageId?: string | null
   replyToOtherMessageId?: string | null
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout
   // Forces isBotMention=true with no @-handle in the body. A review (or
   // top-level review comment) on a PR the agent ITSELF authored is directed at
   // the bot — the inverse of review_requested — so it engages even though the
@@ -1009,9 +1015,12 @@ function buildInbound(
     ...(reactionTarget !== null ? { reactionRef: encodeGithubReactionRef(reactionTarget) } : {}),
     authorId: String(user.id),
     authorName: user.login,
-    authorIsBot: user.type === 'Bot',
+    authorIsBot: isBotUser(user),
     isBotMention,
     ...(options?.suppressSticky === true ? { suppressSticky: true } : {}),
+    ...(options?.githubReviewThreadCloseout !== undefined
+      ? { githubReviewThreadCloseout: options.githubReviewThreadCloseout }
+      : {}),
     replyToBotMessageId,
     replyToOtherMessageId,
     ts: typeof rawTs === 'string' ? Date.parse(rawTs) || 0 : 0,
@@ -1240,6 +1249,10 @@ function isSelfAuthor(author: GithubUser, selfId: string | null, selfLogin: stri
   if (selfId !== null && String(author.id) === selfId) return true
   if (selfLogin !== null && author.login === selfLogin) return true
   return false
+}
+
+function isBotUser(user: GithubUser): boolean {
+  return user.type === 'Bot'
 }
 
 // Whether the PR's OPENER is this agent. Distinct from isSelfAuthor (which

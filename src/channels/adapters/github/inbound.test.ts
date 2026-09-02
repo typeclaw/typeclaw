@@ -52,6 +52,11 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe('101')
       expect(msg?.replyToOtherMessageId).toBe(null)
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toEqual({
+        workspace: 'acme/project',
+        prNumber: 7,
+        rootCommentId: '101',
+      })
     })
 
     it('marks a reply to someone else review comment as explicit-only and reply-to-other', () => {
@@ -61,6 +66,20 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe(null)
       expect(msg?.replyToOtherMessageId).toBe('101')
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
+    })
+
+    it('does not stamp a closeout obligation on a peer-bot reply to the bot review comment', () => {
+      const payload = reviewCommentPayload()
+      ;(payload.comment as Record<string, unknown>).user = { login: 'peer-bot', id: 20, type: 'Bot' }
+
+      const msg = classifyGithubInbound('pull_request_review_comment', payload, 'typeclaw-bot', {
+        reviewCommentParent: { isSelf: true, parentId: 101 },
+      })
+
+      expect(msg?.authorIsBot).toBe(true)
+      expect(msg?.replyToBotMessageId).toBe('101')
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
     })
 
     it('marks a top-level review comment as explicit-only without reply fields', () => {
@@ -73,6 +92,7 @@ describe('classifyGithubInbound', () => {
       expect(msg?.replyToBotMessageId).toBe(null)
       expect(msg?.replyToOtherMessageId).toBe(null)
       expect(msg?.suppressSticky).toBe(true)
+      expect(msg?.githubReviewThreadCloseout).toBeUndefined()
     })
 
     it('preserves @mention detection on explicit-only review comments', () => {
@@ -1165,6 +1185,11 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
     expect(routed[0]?.replyToBotMessageId).toBe('101')
     expect(routed[0]?.replyToOtherMessageId).toBe(null)
     expect(routed[0]?.suppressSticky).toBe(true)
+    expect(routed[0]?.githubReviewThreadCloseout).toEqual({
+      workspace: 'acme/project',
+      prNumber: 7,
+      rootCommentId: '101',
+    })
   })
 
   it('routes review-comment replies to other authors with replyToOtherMessageId', async () => {
@@ -1177,6 +1202,7 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
     expect(routed[0]?.replyToBotMessageId).toBe(null)
     expect(routed[0]?.replyToOtherMessageId).toBe('101')
     expect(routed[0]?.suppressSticky).toBe(true)
+    expect(routed[0]?.githubReviewThreadCloseout).toBeUndefined()
   })
 })
 
