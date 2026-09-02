@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { buildSandboxedCommand } from './build'
 import { SandboxPolicyError } from './errors'
@@ -14,6 +16,14 @@ function argvOf(command: string, policy?: SandboxPolicy): string[] {
 function valueAfter(argv: string[], flag: string): string | undefined {
   const i = argv.indexOf(flag)
   return i === -1 ? undefined : argv[i + 1]
+}
+
+function maskFdsOf(argv: string[]): [string, string][] {
+  const pairs: [string, string][] = []
+  argv.forEach((token, i) => {
+    if (token === '--ro-bind-data') pairs.push([argv[i + 1] as string, argv[i + 2] as string])
+  })
+  return pairs
 }
 
 describe('buildSandboxedCommand base argv', () => {
@@ -272,6 +282,26 @@ describe('buildSandboxedCommand masks', () => {
     expect(commandString.endsWith('3</dev/null')).toBe(true)
   })
 
+  // bwrap consumes the fd for a --ro-bind-data op and then close()s it, so a
+  // second op naming the same fd dies "Can't write data to file <dest>: Bad
+  // file descriptor" and takes the WHOLE bash surface down with it.
+  test('gives every masked file its own fd, because bwrap closes each after use', () => {
+    const files = ['/agent/.env', '/agent/secrets.json', '/agent/auth.json']
+    const fds = maskFdsOf(argvOf('true', { masks: { files } }))
+    expect(fds).toEqual([
+      ['3', '/agent/.env'],
+      ['4', '/agent/secrets.json'],
+      ['5', '/agent/auth.json'],
+    ])
+  })
+
+  test('opens one /dev/null redirect per masked file so no mask fd is reused', () => {
+    const { commandString } = buildSandboxedCommand('true', {
+      masks: { files: ['/agent/.env', '/agent/secrets.json', '/agent/auth.json'] },
+    })
+    expect(commandString.endsWith('3</dev/null 4</dev/null 5</dev/null')).toBe(true)
+  })
+
   test('does NOT append the mask-fd redirect when only dirs are masked', () => {
     const { commandString } = buildSandboxedCommand('true', { masks: { dirs: ['/agent/workspace'] } })
     expect(commandString).not.toContain('3</dev/null')
@@ -292,6 +322,45 @@ describe('buildSandboxedCommand masks', () => {
   test('emits nothing when masks are empty', () => {
     const argv = argvOf('true', { masks: { dirs: [], files: [] } })
     expect(argv).not.toContain('--ro-bind-data')
+  })
+})
+
+// The argv assertions above pin the SHAPE; only a real bwrap proves the fds are
+// still open when it reads them. bwrap 0.8.0 tolerated a reused fd and 0.12.0
+// does not, so a shape-only suite cannot catch a base-image bump that changes
+// this. bwrap ships in the typeclaw container but not on the macOS dev host.
+const bwrapPresent = (() => {
+  try {
+    return Bun.spawnSync(['bwrap', '--version'], { stdout: 'ignore', stderr: 'ignore' }).success
+  } catch {
+    return false
+  }
+})()
+
+describe('buildSandboxedCommand masks under a real bwrap', () => {
+  test.skipIf(!bwrapPresent)('masks EVERY file when several are masked at once', async () => {
+    // given
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-mask-fd-'))
+    const files = ['.env', 'secrets.json', 'auth.json', 'incidents.json'].map((name) => join(dir, name))
+    await Promise.all(files.map((file) => writeFile(file, 'CANARY')))
+
+    // when
+    const { commandString } = buildSandboxedCommand(`cat ${files.join(' ')}`, {
+      mounts: [{ type: 'bind', source: dir, dest: dir }],
+      masks: { files },
+    })
+    const proc = Bun.spawn(['bash', '-c', commandString], { stdout: 'pipe', stderr: 'pipe' })
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+
+    // then
+    expect(stderr).not.toContain('Bad file descriptor')
+    expect(exitCode).toBe(0)
+    expect(stdout).not.toContain('CANARY')
+    await rm(dir, { recursive: true, force: true })
   })
 })
 

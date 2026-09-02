@@ -24,10 +24,22 @@ export type SandboxedCommand = {
   spawnEnv: Record<string, string>
 }
 
-// Fixed fd the rendered commandString opens to /dev/null for --ro-bind-data
+// First fd the rendered commandString opens to /dev/null for --ro-bind-data
 // file masks. 3 is the first fd above stdio; the bash tool's spawn does not
 // inherit it, so the redirect is part of the command string itself.
-const MASK_DATA_FD = 3
+//
+// Each masked file gets its OWN fd counting up from here. bwrap copies a
+// --ro-bind-data op's content out of the fd and then close()s it, so a second
+// op naming an already-consumed fd aborts the whole invocation with
+// "Can't write data to file <dest>: Bad file descriptor" — taking every
+// sandboxed bash call down, not just the mask. Upstream defines no reuse
+// semantics for the operand fd (bwrap.xml: "Copy from the file descriptor FD"),
+// and bubblewrap's own demo plus flatpak both allocate a distinct fd per op.
+const FIRST_MASK_DATA_FD = 3
+
+function maskDataFd(index: number): number {
+  return FIRST_MASK_DATA_FD + index
+}
 
 // Pure: no I/O, no bwrap availability probe (that is `ensureBwrapAvailable`'s
 // job). Given a bash command and a policy, returns the bwrap-wrapped argv plus
@@ -40,8 +52,9 @@ export function buildSandboxedCommand(command: string, policy: SandboxPolicy = {
     applyCommandFilter(command, policy.commandFilter)
   }
   const argv = buildArgv(command, policy)
-  const needsMaskFd = (policy.masks?.files?.length ?? 0) > 0
-  const commandString = needsMaskFd ? `${formatCommand(argv)} ${MASK_DATA_FD}</dev/null` : formatCommand(argv)
+  const maskRedirects = (policy.masks?.files ?? []).map((_, i) => `${maskDataFd(i)}</dev/null`)
+  const commandString =
+    maskRedirects.length > 0 ? `${formatCommand(argv)} ${maskRedirects.join(' ')}` : formatCommand(argv)
   return { argv, commandString, spawnEnv: resolveSpawnEnv(policy.env) }
 }
 
@@ -222,9 +235,9 @@ function appendMasks(argv: string[], policy: SandboxPolicy): void {
   for (const dir of policy.masks?.dirs ?? []) {
     argv.push('--tmpfs', dir)
   }
-  for (const file of policy.masks?.files ?? []) {
-    argv.push('--ro-bind-data', String(MASK_DATA_FD), file)
-  }
+  ;(policy.masks?.files ?? []).forEach((file, i) => {
+    argv.push('--ro-bind-data', String(maskDataFd(i)), file)
+  })
 }
 
 function appendWritable(argv: string[], policy: SandboxPolicy): void {
