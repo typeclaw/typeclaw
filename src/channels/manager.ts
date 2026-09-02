@@ -26,6 +26,7 @@ import { createTeamsAdapter, type TeamsAdapter } from './adapters/teams'
 import { createTelegramBotAdapter, type TelegramBotAdapter } from './adapters/telegram-bot'
 import { createWebexAdapter, type WebexAdapter } from './adapters/webex'
 import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bot'
+import { createWebexRecoveryState, type WebexRecoveryState } from './adapters/webex-recovery'
 import { describeError } from './describe-error'
 import type { GithubTokenBridge } from './github-token-bridge'
 import {
@@ -197,6 +198,9 @@ type AdapterEntry = {
   recoveryRestartQueued: boolean
 }
 
+type WebexAdapterId = Extract<AdapterId, 'webex' | 'webex-bot'>
+type WebexRecoveryStateEntry = { credentialSignature: string; state: WebexRecoveryState }
+
 type FailedAdapter = {
   kind: 'start-failed' | 'missing-credentials'
   attempts: number
@@ -276,6 +280,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const failed = new Map<AdapterId, FailedAdapter>()
   const failedInputSignatures = new WeakMap<FailedAdapter, string>()
   const perAdapterSerial = new Map<AdapterId, Promise<unknown>>()
+  const webexRecoveryStates = new Map<WebexAdapterId, WebexRecoveryStateEntry>()
   const recovery = options.connectionRecovery ?? {}
   const recoveryCheckIntervalMs = recovery.checkIntervalMs ?? 5_000
   const recoveryDisconnectedGraceMs = recovery.disconnectedGraceMs ?? 90_000
@@ -318,7 +323,19 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     return { signature: parts.join('|'), missing }
   }
 
-  const buildAdapter = (name: AdapterId, cfg: ChannelAdapterConfig): AnyAdapter | null => {
+  const recoveryStateFor = (name: WebexAdapterId, credentialSignature: string): WebexRecoveryState => {
+    const existing = webexRecoveryStates.get(name)
+    if (existing?.credentialSignature === credentialSignature) return existing.state
+    const state = createWebexRecoveryState()
+    webexRecoveryStates.set(name, { credentialSignature, state })
+    return state
+  }
+
+  const clearRecoveryState = (name: AdapterId): void => {
+    if (name === 'webex' || name === 'webex-bot') webexRecoveryStates.delete(name)
+  }
+
+  const buildAdapter = (name: AdapterId, cfg: ChannelAdapterConfig, credentialSignature: string): AnyAdapter | null => {
     if (name === 'discord-bot') {
       const token = env.DISCORD_BOT_TOKEN
       if (token === undefined || token.trim() === '') return null
@@ -413,6 +430,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
         credentialsStore,
+        recoveryState: recoveryStateFor('webex', credentialSignature),
       })
     }
     if (name === 'teams') {
@@ -459,6 +477,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         token,
         logger,
         selfAliasesRef: () => router.getSelfAliases(),
+        recoveryState: recoveryStateFor('webex-bot', credentialSignature),
       })
     }
     return null
@@ -489,6 +508,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     const credentials = buildCredentialSignature(name)
     const { signature, missing } = credentials
     if (missing.length > 0) {
+      clearRecoveryState(name)
       return {
         status: 'failed',
         kind: 'missing-credentials',
@@ -496,7 +516,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         inputSignature: buildFailedInputSignature(name, cfg, credentials),
       }
     }
-    const adapter = buildAdapter(name, cfg)
+    const adapter = buildAdapter(name, cfg, signature)
     if (adapter === null) {
       logger.error(`[channels] adapter "${name}" could not be constructed; skipping`)
       return { status: 'blocked' }
@@ -879,7 +899,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       // An unexpected throw leaves the manager half-built, so arming supervision
       // would retry against a state the caller is about to tear down.
       if (failure !== undefined) throw failure.reason
-      startRecoveryTimer()
+      if (running && startedEpoch === lifecycleEpoch) startRecoveryTimer()
     },
 
     async stop(): Promise<void> {
@@ -894,6 +914,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
       // currently-dead adapter has to be awaited too, and its `canCommit` will
       // have aborted it by the time this barrier runs.
       await Promise.all(ADAPTER_IDS.map((name) => runSerially(name, () => stopAdapter(name))))
+      webexRecoveryStates.clear()
       await router.stop()
     },
 
@@ -932,6 +953,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             await runSerially(name, () => stopAdapter(name))
             stopped.push(name)
           }
+          clearRecoveryState(name)
           continue
         }
         router.setAdapterConfigured(name, true)
@@ -954,6 +976,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             // operator explicitly removed, so stop the adapter instead of
             // waiting for a manual restart.
             if (current === undefined) {
+              clearRecoveryState(name)
               recordMissingCredentialFailure(name, latest, credentials)
               return null
             }
@@ -961,6 +984,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
               `[channels] adapter "${name}" missing credentials after reload (${missing.join(', ')}); stopping`,
             )
             if (!(await stopAdapter(name))) return null
+            clearRecoveryState(name)
             // Without this the adapter leaves `live` and never enters `failed`,
             // so supervision loses it entirely and restoring the credential
             // could not revive it without another manual reload.

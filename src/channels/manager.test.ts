@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import type { AgentSession } from '@/agent'
 import { createFileSecretsProvider } from '@/secrets/secrets-provider'
 
+import type { WebexRecoveryState } from './adapters/webex-recovery'
 import { createChannelManager } from './manager'
 import { defaultHistoryConfig, type ChannelAdapterConfig, type ChannelsConfig } from './schema'
 import type { ChannelKey, InboundMessage } from './types'
@@ -263,6 +264,116 @@ const flushManagerWork = async (): Promise<void> => {
 }
 
 describe('channel manager — connection recovery', () => {
+  test('carries Webex recovery state across watchdog replacement with unchanged credentials', async () => {
+    cfg['webex-bot'] = enabledAdapterCfg()
+    const clock = fakeRecoveryClock({ startMs: 1_000, checkIntervalMs: 10, disconnectedGraceMs: 100 })
+    const firstAdapter = makeFakeAdapter()
+    const secondAdapter = makeFakeAdapter()
+    const adapters = [firstAdapter, secondAdapter]
+    const states: WebexRecoveryState[] = []
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { WEBEX_BOT_TOKEN: 'same-token' },
+      createWebexBotAdapter: (adapterOptions) => {
+        if (adapterOptions.recoveryState === undefined) throw new Error('expected Webex recovery state')
+        states.push(adapterOptions.recoveryState)
+        return adapters.shift()!
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    firstAdapter.connected = false
+    clock.fire()
+    clock.advanceBy(101)
+    await flushManagerWork()
+
+    expect(states).toHaveLength(2)
+    expect(states[1]).toBe(states[0])
+    await mgr.stop()
+  })
+
+  test('uses fresh Webex recovery state after credential rotation', async () => {
+    cfg['webex-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = { WEBEX_BOT_TOKEN: 'old-token' }
+    const states: WebexRecoveryState[] = []
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createWebexBotAdapter: (adapterOptions) => {
+        if (adapterOptions.recoveryState === undefined) throw new Error('expected Webex recovery state')
+        states.push(adapterOptions.recoveryState)
+        return makeFakeAdapter()
+      },
+    })
+
+    await mgr.start()
+    env.WEBEX_BOT_TOKEN = 'new-token'
+    await mgr.reload({ applyCredentialRotation: 'webex-bot' })
+
+    expect(states).toHaveLength(2)
+    expect(states[1]).not.toBe(states[0])
+    await mgr.stop()
+  })
+
+  test('clears retained Webex state when credentials disappear while the adapter is already down', async () => {
+    cfg['webex-bot'] = enabledAdapterCfg()
+    const env: NodeJS.ProcessEnv = { WEBEX_BOT_TOKEN: 'token' }
+    const states: WebexRecoveryState[] = []
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env,
+      createWebexBotAdapter: (adapterOptions) => {
+        if (adapterOptions.recoveryState === undefined) throw new Error('expected Webex recovery state')
+        states.push(adapterOptions.recoveryState)
+        constructions++
+        return constructions === 2 ? makeStartFailingAdapter() : makeFakeAdapter()
+      },
+    })
+
+    await mgr.start()
+    await mgr.restartAdapter('webex-bot')
+    delete env.WEBEX_BOT_TOKEN
+    await mgr.reload()
+    env.WEBEX_BOT_TOKEN = 'token'
+    await mgr.reload()
+
+    expect(states).toHaveLength(3)
+    expect(states[1]).toBe(states[0])
+    expect(states[2]).not.toBe(states[0])
+    await mgr.stop()
+  })
+
+  test('clears Webex recovery state on disable and full manager stop', async () => {
+    cfg['webex-bot'] = enabledAdapterCfg()
+    const states: WebexRecoveryState[] = []
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { WEBEX_BOT_TOKEN: 'token' },
+      createWebexBotAdapter: (adapterOptions) => {
+        if (adapterOptions.recoveryState === undefined) throw new Error('expected Webex recovery state')
+        states.push(adapterOptions.recoveryState)
+        return makeFakeAdapter()
+      },
+    })
+
+    await mgr.start()
+    cfg['webex-bot'] = { ...enabledAdapterCfg(), enabled: false }
+    await mgr.reload()
+    cfg['webex-bot'] = enabledAdapterCfg()
+    await mgr.reload()
+    expect(states[1]).not.toBe(states[0])
+
+    await mgr.stop()
+    await mgr.start()
+    expect(states[2]).not.toBe(states[1])
+    await mgr.stop()
+  })
   test('restarts a live adapter that remains disconnected past the grace period', async () => {
     cfg['discord-bot'] = enabledAdapterCfg()
     let now = 1_000
@@ -1116,6 +1227,32 @@ describe('channel manager — restartAdapter serialization', () => {
     expect(events).toContain('slack:start:end')
     expect(events).toContain('telegram:start:end')
     await mgr.stop()
+  })
+
+  test('stop during adapter start prevents stale start from re-arming recovery supervision', async () => {
+    cfg['telegram-bot'] = enabledAdapterCfg()
+    const startGate = deferred()
+    const adapter = makeRecordingAdapter([], 'telegram', { start: startGate.promise })
+    const clock = fakeRecoveryClock()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: { TELEGRAM_BOT_TOKEN: 'token' },
+      createTelegramAdapter: () => adapter,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    const starting = mgr.start()
+    await Promise.resolve()
+    expect(adapter.startCalls).toBe(1)
+
+    const stopping = mgr.stop()
+    expect(clock.isArmed()).toBe(false)
+    startGate.resolve()
+    await Promise.all([starting, stopping])
+
+    expect(clock.isArmed()).toBe(false)
+    expect(clock.intervalRegistrations()).toBe(0)
   })
 
   test('start() preserves construction fail-fast and does not arm supervision', async () => {
