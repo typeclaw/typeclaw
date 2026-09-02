@@ -8,6 +8,7 @@ import {
   containerNameFromCwd,
   defaultDockerExec,
   type DockerExec,
+  isGenuineMissingContainer,
   parseContainerInspectOutput,
   sanitizeDockerStderr,
   waitForRemoval,
@@ -58,7 +59,7 @@ async function runStop({
       // `docker inspect` exits non-zero both when the container does not
       // exist AND when it exists but is in a transient state docker cannot
       // inspect (Removal In Progress, Dead, daemon hiccup). Discriminate by
-      if (inspect.stderr.toLowerCase().includes('no such container')) {
+      if (isGenuineMissingContainer(inspect.stderr)) {
         return { ok: true, containerName, running: false }
       }
       return {

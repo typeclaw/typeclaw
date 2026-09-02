@@ -282,6 +282,21 @@ describe('stop (composition)', () => {
     expect(calls.find((c) => c[0] === 'rm')).toBeUndefined()
   })
 
+  test('treats docker inspect "no such object" as an absent container', async () => {
+    const { exec, calls } = fakeDockerExec({
+      scenario: { exists: false },
+      inspectExitCode: 1,
+      inspectStderr: 'Error: No such object: anderson',
+    })
+
+    const result = await stop({ cwd: root, exec, archiveLogs })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.running).toBe(false)
+    expect(calls.some((call) => call[0] === 'stop' || call[0] === 'rm')).toBe(false)
+  })
+
   test('archives after graceful stop and before removal, targeting the inspected ID', async () => {
     const { exec, calls } = fakeDockerExec({ scenario: { exists: true, running: true } })
     const orderedArchive = async ({ containerId }: { containerId: string }) => {
