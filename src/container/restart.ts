@@ -6,6 +6,8 @@ export type RestartOptions = {
   cwd: string
   preferredHostPort: number
   forceBuild?: boolean
+  streamOutput?: boolean
+  onWarning?: (warning: string) => void
   cliEntry?: string
   reuseCurrentHostDaemon?: boolean
   currentHostDaemon?: CurrentHostDaemon
@@ -44,6 +46,8 @@ async function restartWithLease(
     cwd: options.cwd,
     preferredHostPort: options.preferredHostPort,
     forceBuild: options.forceBuild,
+    streamOutput: options.streamOutput,
+    onWarning: options.onWarning,
     cliEntry: options.cliEntry,
     reuseCurrentHostDaemon: options.reuseCurrentHostDaemon,
     currentHostDaemon: options.currentHostDaemon,

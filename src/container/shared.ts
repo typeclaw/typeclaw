@@ -20,6 +20,10 @@ export type DockerExecOptions = {
   // stay visible to the user while start() still inspects stderr to detect the
   // missing-credential-helper failure and decide whether to retry.
   captureStderr?: boolean
+  // Piped commands normally retain complete output. Long-running callers can
+  // still drain without retaining stdout and keep only stderr's diagnostic tail.
+  captureStdout?: boolean
+  maxCapturedStderrBytes?: number
 }
 
 export type DockerExec = (args: string[], options?: DockerExecOptions) => Promise<DockerExecResult>
@@ -83,9 +87,9 @@ export const defaultDockerExec: DockerExec = async (args, options) => {
       signal: options?.signal,
       env,
     })
-    const exitCode = await proc.exited
-    const stdout = await new Response(proc.stdout).text()
-    const stderr = await new Response(proc.stderr).text()
+    const stdoutPromise = readCapturedStream(proc.stdout, options?.captureStdout === false ? 0 : undefined)
+    const stderrPromise = readCapturedStream(proc.stderr, options?.maxCapturedStderrBytes)
+    const [exitCode, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise])
     return { exitCode, stdout, stderr }
   } catch (error) {
     if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
@@ -93,6 +97,29 @@ export const defaultDockerExec: DockerExec = async (args, options) => {
     }
     throw error
   }
+}
+
+export async function readCapturedStream(stream: ReadableStream<Uint8Array>, maxBytes?: number): Promise<string> {
+  if (maxBytes === undefined) return await new Response(stream).text()
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new RangeError('maxBytes must be a non-negative integer')
+
+  const reader = stream.getReader()
+  let tail = Buffer.alloc(0)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (maxBytes === 0) continue
+      const chunk = Buffer.from(value)
+      tail =
+        chunk.length >= maxBytes
+          ? chunk.subarray(chunk.length - maxBytes)
+          : Buffer.concat([tail, chunk]).subarray(-maxBytes)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return tail.toString('utf8')
 }
 
 // Streams a docker child's stdout straight to the parent terminal while teeing

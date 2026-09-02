@@ -20,6 +20,7 @@ import {
   isContainerNameConflict,
   isMissingDockerCredentialHelper,
   parseContainerInspectOutput,
+  readCapturedStream,
   resolveDockerBinary,
   sanitizeDockerConfigJson,
   sanitizeDockerStderr,
@@ -811,5 +812,32 @@ describe('spawnInheritTeeStderr', () => {
     expect(killed).toBe(true)
     expect(await exited).toBe(137)
     expect(stderr.locked).toBe(false)
+  })
+})
+
+describe('readCapturedStream', () => {
+  test('drains the stream while retaining only the requested tail', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('first-'))
+        controller.enqueue(new TextEncoder().encode('second'))
+        controller.close()
+      },
+    })
+
+    expect(await readCapturedStream(stream, 6)).toBe('second')
+    expect(stream.locked).toBe(false)
+  })
+
+  test('drains discarded output without retaining it', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('verbose build output'))
+        controller.close()
+      },
+    })
+
+    expect(await readCapturedStream(stream, 0)).toBe('')
+    expect(stream.locked).toBe(false)
   })
 })

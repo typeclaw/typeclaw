@@ -1,5 +1,5 @@
 import { validateConfig } from '@/config'
-import { resolveController } from '@/container'
+import { type Controller, resolveController } from '@/container'
 
 import { discoverAgents, type AgentEntry } from './discover'
 import type { AgentResult, StartSuccess } from './start'
@@ -20,25 +20,32 @@ export type ComposeRestartOptions = {
   onProgress?: (event: ComposeRestartEvent) => void
 }
 
+export type ComposeRestartDeps = {
+  restart?: Controller['restart']
+}
+
 export type ComposeRestartResult = {
   agents: AgentEntry[]
   results: AgentResult<RestartData>[]
 }
 
-export async function composeRestart({
-  rootCwd,
-  preferredHostPort,
-  forceBuild = false,
-  cliEntry,
-  onProgress,
-}: ComposeRestartOptions): Promise<ComposeRestartResult> {
+export async function composeRestart(
+  { rootCwd, preferredHostPort, forceBuild = false, cliEntry, onProgress }: ComposeRestartOptions,
+  { restart = (options) => resolveController().restart(options) }: ComposeRestartDeps = {},
+): Promise<ComposeRestartResult> {
   const agents = discoverAgents(rootCwd)
   const results = await Promise.all(
     agents.map(async (agent): Promise<AgentResult<RestartData>> => {
       onProgress?.({ kind: 'agent-start', name: agent.name })
-      const result = await runOne(agent.name, agent.cwd, preferredHostPort, forceBuild, cliEntry, () => {
-        onProgress?.({ kind: 'agent-stopped', name: agent.name })
-      })
+      const result = await runOne(
+        agent.name,
+        agent.cwd,
+        preferredHostPort,
+        forceBuild,
+        cliEntry,
+        () => onProgress?.({ kind: 'agent-stopped', name: agent.name }),
+        restart,
+      )
       onProgress?.({ kind: 'agent-done', name: agent.name, result })
       return result
     }),
@@ -53,26 +60,29 @@ async function runOne(
   forceBuild: boolean,
   cliEntry: string | undefined,
   onStopped: () => void,
+  restart: Controller['restart'],
 ): Promise<AgentResult<RestartData>> {
   const validated = validateConfig(cwd)
   if (!validated.ok) return { name, ok: false, reason: validated.reason }
+  const warnings = [...(validated.warnings ?? [])]
   try {
-    const controller = resolveController()
-    const restarted = await controller.restart({
+    const restarted = await restart({
       cwd,
       preferredHostPort,
       forceBuild,
       cliEntry,
       onStopped,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
     })
-    if (!restarted.ok) return { name, ok: false, reason: restarted.reason }
+    if (!restarted.ok) return { name, ok: false, reason: restarted.reason, warnings }
     return {
       name,
       ok: true,
       data: { stop: restarted.stop, start: restarted.start },
-      warnings: validated.warnings,
+      warnings,
     }
   } catch (error) {
-    return { name, ok: false, reason: error instanceof Error ? error.message : String(error) }
+    return { name, ok: false, reason: error instanceof Error ? error.message : String(error), warnings }
   }
 }

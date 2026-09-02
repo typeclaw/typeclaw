@@ -306,8 +306,11 @@ export const composeCommand = defineCommand({
 // Single clack spinner with a multi-line message body, one line per agent.
 // Concurrent clack spinners can't coexist: each one's render loop writes
 // cursor.to(0) + erase.down() to process.stdout, so they trample each other.
-// Multi-line redraw is safe — clack counts newlines in the previous message
-// and walks the cursor up before erasing (see @clack/prompts spinner.ts).
+// Multi-line redraw is safe while this board owns the terminal — clack counts
+// newlines in the previous message and walks the cursor up before erasing (see
+// @clack/prompts spinner.ts). Compose start/restart therefore capture process
+// output instead of letting child progress or warnings invalidate clack's
+// cursor position.
 type Board = {
   add: (s: ReturnType<typeof spinner>, name: string, state: string) => void
   set: (s: ReturnType<typeof spinner>, name: string, state: string) => void
@@ -356,7 +359,7 @@ function makeBoard(header: string): Board {
 }
 
 function formatStartDone<T extends { alreadyRunning?: boolean; hostPort: number }>(result: AgentResult<T>): string {
-  if (!result.ok) return `${c.red('✖')} ${c.red('failed:')} ${result.reason}`
+  if (!result.ok) return appendWarnings(`${c.red('✖')} ${c.red('failed:')} ${result.reason}`, result.warnings)
   const verb = result.data.alreadyRunning ? 'already running' : 'started'
   const head = `${c.green('✔')} ${verb} on host port ${c.cyan(String(result.data.hostPort))}`
   return appendWarnings(head, result.warnings)
@@ -369,7 +372,7 @@ function formatStopDone<T extends { running: boolean }>(result: AgentResult<T>):
 }
 
 function formatRestartDone<T extends { start: { hostPort: number } }>(result: AgentResult<T>): string {
-  if (!result.ok) return `${c.red('✖')} ${c.red('failed:')} ${result.reason}`
+  if (!result.ok) return appendWarnings(`${c.red('✖')} ${c.red('failed:')} ${result.reason}`, result.warnings)
   const head = `${c.green('✔')} restarted on host port ${c.cyan(String(result.data.start.hostPort))}`
   return appendWarnings(head, result.warnings)
 }

@@ -132,6 +132,10 @@ export type StartOptions = {
   cwd: string
   preferredHostPort: number
   forceBuild?: boolean
+  // A parent live renderer must be the terminal's only cursor owner. Compose
+  // disables process output so child progress and warnings cannot corrupt it.
+  streamOutput?: boolean
+  onWarning?: (warning: string) => void
   exec?: DockerExec
   // Test seam: allows tests to inject a deterministic port allocator. In
   // production we go through the real kernel via `findFreePort`.
@@ -242,6 +246,8 @@ async function runStart({
   cwd,
   preferredHostPort,
   forceBuild = false,
+  streamOutput = true,
+  onWarning,
   exec = defaultDockerExec,
   allocatePort = findFreePort,
   cliEntry,
@@ -327,7 +333,11 @@ async function runStart({
     }
 
     const githubCliDeniedRoots = resolveGithubCliDeniedRoots(cwd, await loadTypeclawConfig(cwd))
-    await refreshGithubCliStore(cwd, githubCliDeniedRoots, provisionGithubCliStoreForAgent)
+    const githubCliWarning = await refreshGithubCliStore(cwd, githubCliDeniedRoots, provisionGithubCliStoreForAgent)
+    if (githubCliWarning !== null) {
+      if (streamOutput) process.stderr.write(githubCliWarning)
+      else onWarning?.(githubCliWarning.trim())
+    }
 
     if (agentMessengerPolicy.migrate) {
       const agentMessengerMigration = await migrateAgentMessengerConfigDir(cwd)
@@ -551,16 +561,23 @@ async function runStart({
 
     let built = false
     if (plan.needsBuild) {
-      const buildOk = await runImageBuild({
+      const buildResult = await runImageBuild({
         exec,
         cwd,
         imageTag: plan.imageTag,
         buildContext: plan.buildContext,
         hasBuildx,
+        streamOutput,
       })
-      if (!buildOk) {
+      if (!buildResult.ok) {
         await cleanupHostDaemonRegistration(containerName, hostd)
-        return { ok: false, reason: 'docker build failed' }
+        const retryDetail = buildResult.credentialHelperRetried
+          ? ' The build was also retried without the configured Docker credential helper.'
+          : ''
+        const detail = streamOutput
+          ? ''
+          : ` (exit code ${buildResult.exitCode}). Run \`typeclaw start --build\` from this agent directory to view the full build output.${retryDetail}`
+        return { ok: false, reason: `docker build failed${detail}` }
       }
       built = true
     }
@@ -674,19 +691,19 @@ async function refreshGithubCliStore(
   agentDir: string,
   deniedRoots: readonly string[],
   provision: (options: ProvisionGithubCliStoreOptions) => GithubCliProvisionResult | Promise<GithubCliProvisionResult>,
-): Promise<void> {
+): Promise<string | null> {
   let refreshed = false
   try {
     refreshed = (await provision({ agentDir, deniedRoots })).ok
   } catch {
     refreshed = false
   }
-  if (refreshed) return
+  if (refreshed) return null
 
-  process.stderr.write(
+  return (
     'typeclaw: warning: Could not refresh GitHub CLI credentials from the host. ' +
-      'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
-      'then restart TypeClaw.\n',
+    'Keeping the previously persisted credential store. Run `gh auth login --hostname github.com` on the host, ' +
+    'then restart TypeClaw.\n'
   )
 }
 
@@ -1042,8 +1059,9 @@ async function runImageBuild(args: {
   imageTag: string
   buildContext: string
   hasBuildx: boolean
-}): Promise<boolean> {
-  const { exec, cwd, imageTag, buildContext, hasBuildx } = args
+  streamOutput: boolean
+}): Promise<{ ok: true } | { ok: false; exitCode: number; credentialHelperRetried: boolean }> {
+  const { exec, cwd, imageTag, buildContext, hasBuildx, streamOutput } = args
   const buildArgv = (frontend: 'buildx' | 'legacy'): string[] =>
     frontend === 'buildx'
       ? ['buildx', 'build', '--load', '-t', imageTag, buildContext]
@@ -1051,12 +1069,17 @@ async function runImageBuild(args: {
 
   let sanitizedConfig: SanitizedDockerConfig | null = null
   const attempt = async (frontend: 'buildx' | 'legacy'): Promise<DockerExecResult> =>
-    exec(buildArgv(frontend), { cwd, inheritStdio: true, captureStderr: true, env: sanitizedConfig?.env })
+    exec(buildArgv(frontend), {
+      cwd,
+      ...(streamOutput ? { inheritStdio: true, captureStderr: true } : {}),
+      ...(streamOutput ? {} : { captureStdout: false, maxCapturedStderrBytes: 32 * 1024 }),
+      env: sanitizedConfig?.env,
+    })
 
   try {
     let frontend: 'buildx' | 'legacy' = hasBuildx ? 'buildx' : 'legacy'
     let result = await attempt(frontend)
-    if (result.exitCode === 0) return true
+    if (result.exitCode === 0) return { ok: true }
 
     // Same-frontend retry: a broken credential helper aborts the pull before
     // the builder ever matters, so strip it and retry the identical build.
@@ -1064,7 +1087,7 @@ async function runImageBuild(args: {
       sanitizedConfig = await createSanitizedDockerConfig()
       if (sanitizedConfig) {
         result = await attempt(frontend)
-        if (result.exitCode === 0) return true
+        if (result.exitCode === 0) return { ok: true }
       }
     }
 
@@ -1075,23 +1098,23 @@ async function runImageBuild(args: {
       await refreshDockerfile(cwd, { buildKit: false })
       frontend = 'legacy'
       result = await attempt(frontend)
-      if (result.exitCode === 0) return true
+      if (result.exitCode === 0) return { ok: true }
       if (sanitizedConfig === null && isMissingDockerCredentialHelper(result.stderr)) {
         sanitizedConfig = await createSanitizedDockerConfig()
         if (sanitizedConfig) {
           result = await attempt(frontend)
-          if (result.exitCode === 0) return true
+          if (result.exitCode === 0) return { ok: true }
         }
       }
     }
 
-    if (sanitizedConfig !== null) {
-      process.stderr.write(
+    if (sanitizedConfig !== null && streamOutput) {
+      const guidance =
         'typeclaw: docker build still failed after retrying public image pulls without the configured ' +
-          'credential helper. Your ~/.docker/config.json credsStore/credHelpers may be broken.\n',
-      )
+        'credential helper. Your ~/.docker/config.json credsStore/credHelpers may be broken.'
+      process.stderr.write(`${guidance}\n`)
     }
-    return false
+    return { ok: false, exitCode: result.exitCode, credentialHelperRetried: sanitizedConfig !== null }
   } finally {
     await sanitizedConfig?.cleanup()
   }
