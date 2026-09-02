@@ -608,6 +608,135 @@ describe('webex lifecycle', () => {
     expect(log.lines).toContain('info:[webex-bot] authenticated as Typeey (b278882e-b28b-4cc4-b08b-4b08db7369db)')
   })
 
+  test('uses authoritative reconnecting health and recovers missed messages once across a live race', async () => {
+    const listener = new FakeListener()
+    const router = new FakeRouter()
+    const recoveredAt = '2026-01-01T00:00:15.000Z'
+    const now = Date.parse('2026-01-01T00:00:20.000Z')
+    const log = logger()
+    const calls: Array<[string, unknown]> = []
+    const messagesListed = Promise.withResolvers<void>()
+    const client = {
+      ...fakeClient(),
+      listSpaces: async (options: unknown) => {
+        calls.push(['spaces', options])
+        return [{ id: 'room-1', type: 'group', lastActivity: recoveredAt }]
+      },
+      listMessages: async (roomId: string, options: unknown) => {
+        calls.push([roomId, options])
+        messagesListed.resolve()
+        return [webexMessage({ ref: 'gap-message', created: recoveredAt, text: 'missed' })]
+      },
+    } as ReturnType<typeof fakeClient>
+    const adapter = createWebexBotAdapter({
+      router: router.value,
+      configRef: () => config,
+      token: 'token-1',
+      logger: log,
+      recovery: { now: () => now, retryDelaysMs: [], delay: async () => {} },
+      createClient: () => client,
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    listener.emit('reconnecting', 3)
+    expect(adapter.isConnected()).toBe(false)
+    expect(log.lines.some((line) => line.includes('reconnecting attempt=3'))).toBe(true)
+    listener.emit('connected', connectedInfo({ webSocketOpen: false }))
+    expect(adapter.isConnected()).toBe(false)
+
+    listener.emit('connected', connectedInfo())
+    await messagesListed.promise
+    await router.waitForRoutes(1)
+    listener.emit(
+      'message_created',
+      inbound({ ref: 'gap-message', id: 'gap-message-id', created: recoveredAt, mentionedPeopleRefs: ['bot-ref-1'] }),
+    )
+    await adapter.stop()
+
+    expect(calls).toEqual([
+      ['spaces', { max: 100 }],
+      ['room-1', { max: 100 }],
+    ])
+    expect(router.routes.map((message) => message.externalMessageId)).toEqual(['gap-message'])
+  })
+
+  test('logs recovery failure without unregistering REST callbacks', async () => {
+    const listener = new FakeListener()
+    const router = new FakeRouter()
+    const log = logger()
+    const failureLogged = Promise.withResolvers<void>()
+    const recoveryLogger: WebexBotAdapterLogger = {
+      info: log.info,
+      warn: (line) => {
+        log.warn(line)
+        if (line.includes('recovery unavailable')) failureLogged.resolve()
+      },
+      error: log.error,
+    }
+    const adapter = createWebexBotAdapter({
+      router: router.value,
+      configRef: () => config,
+      token: 'token-1',
+      logger: recoveryLogger,
+      recovery: { now: () => Date.parse('2026-01-01T00:00:20.000Z'), retryDelaysMs: [], delay: async () => {} },
+      createClient: () =>
+        ({
+          ...fakeClient(),
+          listSpaces: async () => Promise.reject(new Error('recovery unavailable')),
+        }) as ReturnType<typeof fakeClient>,
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    listener.emit('disconnected', 'network')
+    listener.emit('connected', connectedInfo())
+    await failureLogged.promise
+
+    expect(log.lines.some((line) => line.includes('recovery unavailable'))).toBe(true)
+    expect(router.unregistered).toEqual([])
+    expect(adapter.isConnected()).toBe(true)
+    await adapter.stop()
+  })
+
+  test('does not route an inbound whose async enrichment finishes after stop starts', async () => {
+    const listener = new FakeListener()
+    const router = new FakeRouter()
+    const lookupStarted = Promise.withResolvers<void>()
+    const releaseLookup = Promise.withResolvers<void>()
+    const client = fakeClient()
+    client.getSpace = async () => {
+      lookupStarted.resolve()
+      await releaseLookup.promise
+      return {
+        id: 'room-blob-1',
+        title: 'Room',
+        type: 'group',
+        isLocked: false,
+        lastActivity: '',
+        created: '',
+        creatorId: '',
+      }
+    }
+    const adapter = createWebexBotAdapter({
+      router: router.value,
+      configRef: () => config,
+      token: 'token-1',
+      logger: logger(),
+      createClient: () => client,
+      createListener: () => listener.value,
+    })
+
+    await adapter.start()
+    listener.emit('message_created', inbound({ mentionedPeopleRefs: ['bot-ref-1'] }))
+    await lookupStarted.promise
+    const stopping = adapter.stop()
+    releaseLookup.resolve()
+    await stopping
+
+    expect(router.routes).toEqual([])
+  })
+
   test('rolls back registrations when listener start fails', async () => {
     const listener = new FakeListener({ failStart: true })
     const router = new FakeRouter()
@@ -661,13 +790,26 @@ class FakeListener {
 
   async start(): Promise<void> {
     if (this.options.failStart) throw new Error('start failed')
-    this.emit('connected', { connected: true, status: 'connected' })
+    this.emit('connected', connectedInfo())
   }
 
   async stop(): Promise<void> {}
 
   emit(event: string, payload: unknown): void {
     for (const handler of this.handlers.get(event) ?? []) handler(payload)
+  }
+}
+
+function connectedInfo(overrides: { connected?: boolean; status?: string; webSocketOpen?: boolean } = {}) {
+  return {
+    connected: overrides.connected ?? true,
+    status: {
+      status: overrides.status ?? 'connected',
+      webSocketOpen: overrides.webSocketOpen ?? true,
+      kmsInitialized: true,
+      deviceRegistered: true,
+      reconnectAttempt: 0,
+    },
   }
 }
 

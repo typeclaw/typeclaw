@@ -41,6 +41,14 @@ import { enrichWebexMessageReference } from './webex-bot-reference'
 import { createWebexEditMessageCallback } from './webex-edit'
 import { resolveWebexBodyText, splitWebexFiles } from './webex-format'
 import { createWebexPrefetchLimiter, isWebexRateLimitError, type WebexPrefetchLimiter } from './webex-prefetch-limiter'
+import {
+  createWebexRecovery,
+  isAuthoritativeWebexConnection,
+  type WebexInboundHandleOutcome,
+  type WebexRecovery,
+  type WebexRecoveryState,
+  type WebexRecoveryTuning,
+} from './webex-recovery'
 
 export type WebexBotAdapterLogger = {
   info: (msg: string) => void
@@ -70,6 +78,8 @@ export type WebexBotAdapterOptions = {
   createListener?: WebexBotListenerFactory
   listenerOptions?: Omit<WebexBotListenerOptions, 'ignoreSelfMessages'>
   selfAliasesRef?: () => readonly string[]
+  recovery?: WebexRecoveryTuning
+  recoveryState?: WebexRecoveryState
 }
 
 export type WebexBotAdapter = {
@@ -291,6 +301,7 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
   const client = createClient()
   const fetchImpl = options.fetchImpl ?? fetch
   let listener: WebexBotListener | null = null
+  let activeRecovery: WebexRecovery | null = null
   let botPerson: WebexPerson | null = null
   let connected = false
   let started = false
@@ -309,7 +320,13 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
     return label === null || label === chat ? `room=${chat}` : `room=${label}(${chat})`
   }
 
-  const historyCallback = createWebexHistoryCallback({ client, logger, botPersonIdRef: () => botPerson?.ref ?? null })
+  const limiter = createWebexPrefetchLimiter({ concurrency: 1 })
+  const historyCallback = createWebexHistoryCallback({
+    client,
+    logger,
+    botPersonIdRef: () => botPerson?.ref ?? null,
+    limiter,
+  })
   const membershipResolver = createWebexMembershipResolver({
     client,
     logger,
@@ -320,7 +337,10 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
   const fetchAttachmentCallback = createFetchAttachmentCallback({ token: options.token, logger, fetchImpl })
   const editMessageCallback = createWebexEditMessageCallback({ adapter: 'webex-bot', client })
 
-  const handleMessage = async (event: WebexInboundMessage): Promise<void> => {
+  const handleMessage = async (
+    event: WebexInboundMessage,
+    isCurrent: () => boolean,
+  ): Promise<WebexInboundHandleOutcome> => {
     inflightInbounds++
     const botSnapshot = botPerson
     try {
@@ -337,7 +357,7 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       )
       if (verdict.kind === 'drop') {
         logger.info(`[webex-bot] dropped id=${event.ref} reason=${verdict.reason}${dropHint(verdict.reason)}`)
-        return
+        return 'committed'
       }
       const payload = await enrichWebexMessageReference({
         client,
@@ -345,12 +365,15 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
         parentRef: event.parentRef,
         botPersonId: botSnapshot?.ref ?? null,
       })
+      if (!isCurrent()) return 'retryable'
       logger.info(
         `[webex-bot] routed id=${event.ref} ${tag} mention=${payload.isBotMention} reply=${payload.replyToBotMessageId !== null}`,
       )
       await options.router.route(payload)
+      return 'committed'
     } catch (err) {
       logger.error(`[webex-bot] handleInbound failed: ${describeError(err)}`)
+      return 'retryable'
     } finally {
       inflightInbounds--
       if (inflightInbounds === 0 && stopWaiters.length > 0) {
@@ -377,23 +400,52 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       }
 
       listener = createListener(client, { ...options.listenerOptions, ignoreSelfMessages: true })
+      const currentListener = listener
+      const isCurrentListener = (): boolean => started && listener === currentListener
+      const recovery = createWebexRecovery({
+        ...options.recovery,
+        state: options.recoveryState,
+        client,
+        handleMessage: (event) => handleMessage(event, isCurrentListener),
+        isCurrent: isCurrentListener,
+        isConnected: () => connected,
+        logger,
+        limiter,
+        groupMessagesMentionSelfRef: () => botPerson?.ref ?? null,
+        logPrefix: 'webex-bot',
+      })
+      activeRecovery = recovery
       let listenerConnected = false
       let listenerStartupError: Error | null = null
-      listener.on('connected', () => {
+      currentListener.on('connected', (info: WebexBotListenerEventMap['connected'][0]) => {
+        if (!isCurrentListener()) return
+        const authoritative = isAuthoritativeWebexConnection(info)
+        connected = authoritative
+        if (!authoritative) return
         listenerConnected = true
-        connected = true
+        void recovery.recover()
       })
-      listener.on('disconnected', (reason) => {
+      currentListener.on('disconnected', (reason) => {
+        if (!isCurrentListener()) return
         connected = false
+        recovery.markDisconnected()
         logger.warn(`[webex-bot] disconnected: ${reason}`)
       })
-      listener.on('error', (err) => {
+      currentListener.on('reconnecting', (attempt) => {
+        if (!isCurrentListener()) return
+        connected = false
+        recovery.markDisconnected()
+        logger.warn(`[webex-bot] reconnecting attempt=${attempt}`)
+      })
+      currentListener.on('error', (err) => {
+        if (!isCurrentListener()) return
         const error = err instanceof Error ? err : new Error(describeError(err))
         if (!listenerConnected && listenerStartupError === null) listenerStartupError = error
         logger.error(`[webex-bot] listener error: ${describeError(err)}`)
       })
-      listener.on('message_created', (event: WebexBotListenerEventMap['message_created'][0]) => {
-        void handleMessage(event)
+      currentListener.on('message_created', (event: WebexBotListenerEventMap['message_created'][0]) => {
+        if (!isCurrentListener()) return
+        void recovery.routeLive(event)
       })
 
       options.router.registerOutbound('webex-bot', outboundCallback)
@@ -404,7 +456,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
       options.router.registerMembership('webex-bot', membershipResolver)
       options.router.registerEditMessage('webex-bot', editMessageCallback)
 
-      const rollbackStart = (reason: string, cause: Error): never => {
+      const rollbackStart = async (reason: string, cause: Error): Promise<never> => {
+        recovery.stop()
         options.router.unregisterOutbound('webex-bot', outboundCallback)
         options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
         options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
@@ -417,17 +470,19 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
         botPerson = null
         connected = false
         started = false
+        await recovery.finishStop()
+        if (activeRecovery === recovery) activeRecovery = null
         logger.error(`[webex-bot] ${reason}: ${describeError(cause)}`)
         throw cause
       }
 
       try {
-        await listener.start()
+        await currentListener.start()
       } catch (err) {
-        rollbackStart('listener start threw', err instanceof Error ? err : new Error(describeError(err)))
+        await rollbackStart('listener start threw', err instanceof Error ? err : new Error(describeError(err)))
       }
       if (!listenerConnected) {
-        rollbackStart(
+        await rollbackStart(
           'listener start failed silently',
           listenerStartupError ?? new Error('listener.start() returned without emitting connected'),
         )
@@ -437,6 +492,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
     async stop(): Promise<void> {
       if (!started) return
       started = false
+      const stoppingRecovery = activeRecovery
+      stoppingRecovery?.stop()
       options.router.unregisterOutbound('webex-bot', outboundCallback)
       options.router.unregisterChannelNameResolver('webex-bot', channelResolver)
       options.router.unregisterSelfIdentity('webex-bot', selfIdentityResolver)
@@ -452,6 +509,8 @@ export function createWebexBotAdapter(options: WebexBotAdapterOptions): WebexBot
           stopWaiters.push(resolve)
         })
       }
+      await stoppingRecovery?.finishStop()
+      if (activeRecovery === stoppingRecovery) activeRecovery = null
       botPerson = null
     },
 
