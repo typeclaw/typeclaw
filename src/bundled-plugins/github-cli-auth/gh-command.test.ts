@@ -311,7 +311,25 @@ describe('analyzeGhCommand', () => {
   it('blocks a repo-targeting subcommand with no repo specified', () => {
     const result = analyzeGhCommand('gh pr view 12')
     expect(result.kind).toBe('block')
-    if (result.kind === 'block') expect(result.reason).toContain('-R')
+    if (result.kind === 'block') {
+      expect(result.code).toBe('missing-repo')
+      expect(result.reason).toContain('owner/repo')
+    }
+  })
+
+  it('does not blame a multi-owner App when the repo is simply undeterminable', () => {
+    const result = analyzeGhCommand('gh repo list acme --limit 100')
+    expect(result.kind).toBe('block')
+    if (result.kind === 'block') {
+      expect(result.code).toBe('missing-repo')
+      expect(result.reason).not.toContain('multiple owners')
+    }
+  })
+
+  it('still blames multiple owners when the command really spans owners', () => {
+    const result = analyzeGhCommand('gh api /repos/acme/widgets/compare/main...attacker:branch')
+    expect(result.kind).toBe('block')
+    if (result.kind === 'block') expect(result.reason).toContain('more than one owner')
   })
 
   it('blocks gh pr create without a repo', () => {
@@ -1030,6 +1048,58 @@ describe('canInjectPatIntoPassThroughGh', () => {
   it('rejects shell-active backslashes outside single quotes', () => {
     expect(canInjectPatIntoPassThroughGh('gh api /user \\--input /proc/self/environ')).toBe(false)
     expect(canInjectPatIntoPassThroughGh('gh api /user --jq "gsub(\\"\\n\\"; \\"\\")"')).toBe(false)
+  })
+})
+
+describe('gh in a shell reserved-word command position', () => {
+  // The incident shape. The invariant is that it BLOCKS at all: it previously
+  // reached pass-through and ran bare `gh`, which emitted gh's stock "run
+  // `gh auth login`" advice — guidance the agent cannot act on and which names
+  // nothing about TypeClaw. The specific code varies ( `[ ... ]` test brackets
+  // trip the pathname-expansion gate before the composition gate).
+  it('blocks a repo-targeting gh inside `if ...; then ... fi` instead of passing it through', () => {
+    const result = analyzeGhCommand(
+      'mkdir -p /tmp/repos && if [ ! -d /tmp/repos/acme/widgets/.git ]; then ' +
+        'gh repo view acme/widgets --json defaultBranchRef; fi',
+    )
+    expect(result.kind).toBe('block')
+  })
+
+  it('reports a bracket-free `then` compound as a composition block', () => {
+    const result = analyzeGhCommand('if true; then gh label list -R acme/widgets; fi')
+    expect(result.kind).toBe('block')
+    if (result.kind === 'block') expect(result.code).toBe('composition')
+  })
+
+  it('blocks a repo-targeting gh after `do` and after `else`', () => {
+    for (const command of [
+      'for r in a; do gh label list -R acme/widgets; done',
+      'if false; then true; else gh label list -R acme/widgets; fi',
+    ]) {
+      const result = analyzeGhCommand(command)
+      expect(result.kind).toBe('block')
+      if (result.kind === 'block') expect(result.code).toBe('composition')
+    }
+  })
+
+  it('does NOT treat `then`/`do` as a boundary when they are ordinary arguments', () => {
+    expect(analyzeGhCommand('echo then gh').kind).toBe('pass-through')
+    expect(analyzeGhCommand('echo do gh').kind).toBe('pass-through')
+  })
+
+  it('does NOT treat a quoted `then gh` string as an invocation', () => {
+    expect(analyzeGhCommand('echo "; then gh label list"').kind).toBe('pass-through')
+  })
+
+  it('keeps a standalone bare gh injectable (the reserved-word rule must not over-block)', () => {
+    expect(analyzeGhCommand('gh label list -R acme/widgets')).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+    })
+  })
+
+  it('leaves a shell construct with no gh invocation alone', () => {
+    expect(analyzeGhCommand('if [ -d /tmp/x ]; then rg pattern /tmp/x; fi').kind).toBe('pass-through')
   })
 })
 

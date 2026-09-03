@@ -21,11 +21,15 @@ export type GhCommandDecision =
   // (REST, non-`api` subcommands) leave the command unchanged and omit it.
   | { kind: 'inject'; repoSlug: string; rewrittenCommand?: string }
 
+// Reached whenever no EFFECTIVE DESTINATION repo can be determined — which is not
+// the same as "argv has no slug": `gh label clone owner/repo` names a literal SOURCE
+// slug and still lands here because the destination is what a token would be scoped
+// to. The message must not assert a multi-owner App (MULTI_OWNER_REASON below covers
+// that, and a single-owner App hitting this text reports a cause that is simply false).
 const MISSING_REPO_REASON =
-  'This GitHub App spans multiple owners, so `gh` has no single correct token. ' +
-  'Re-run as a single bare command with a LITERAL repo: `gh <cmd> -R owner/repo` ' +
-  '(or `gh api /repos/owner/repo/...`) so the right installation token can be injected. ' +
-  'The repo must be a concrete `owner/repo` slug, not a shell variable.'
+  'TypeClaw could not determine the effective destination repository for this `gh` command, ' +
+  'so it cannot mint a scoped installation token. Re-run as a single bare command that names a ' +
+  'LITERAL `owner/repo` slug TypeClaw can read from argv — not a shell variable.'
 
 const NON_LITERAL_REPO_REASON =
   'The `-R/--repo` value is not a literal `owner/repo` slug TypeClaw can verify. ' +
@@ -1484,12 +1488,22 @@ function findGhInvocations(tokens: readonly string[]): number[] {
   return starts
 }
 
+// bash treats `then`/`else`/`do` as reserved words ONLY in command position, and each
+// opens a fresh command position after it. Recognizing them is what makes
+// `if ...; then gh ...; fi` reach the composition gate — without it findGhInvocations
+// sees no invocation at all and the whole command silently passes through
+// unauthenticated, which is neither the documented policy nor a usable failure.
+// The recursion is what keeps `echo then gh` from registering: there, `then` is a
+// plain argument (not preceded by a boundary), so it opens nothing.
+const RESERVED_COMMAND_OPENERS = new Set(['then', 'else', 'do'])
+
 function isCommandBoundaryBefore(tokens: readonly string[], index: number): boolean {
   let cursor = index - 1
   while (cursor >= 0) {
     const prev = tokens[cursor]
     if (prev === undefined) return false
     if (prev === '&&' || prev === '||' || prev === '|' || prev === ';' || prev === '\n') return true
+    if (RESERVED_COMMAND_OPENERS.has(prev)) return isCommandBoundaryBefore(tokens, cursor)
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(prev)) {
       cursor -= 1
       continue

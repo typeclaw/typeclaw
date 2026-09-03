@@ -42,6 +42,35 @@ import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
 import { commitReviewIfSucceeded, dismissalMutationSucceeded, noteReviewCommand } from './review-recorder'
 import { classifyGhToken, shouldMintAppToken } from './token-class'
 
+const REPO_LIST_RE = /\bgh\s+repo\s+list\b/
+const GH_API_RE = /\bgh\s+api\b/
+const GH_REPO_VIEW_RE = /\bgh\s+repo\s+view\b/
+
+// `gh api` rejects `-R`, and `gh repo view` takes a positional slug — so the
+// blanket "-R owner/repo" advice is unrunnable for exactly the commands an agent
+// reaches for when exploring an unfamiliar repo. A denial that suggests a command
+// which cannot parse burns a turn and teaches the agent the repo is unreachable.
+function ghRewriteExample(command: string, slug: string): string {
+  if (GH_API_RE.test(command)) return `\`gh api /repos/${slug}/...\``
+  if (GH_REPO_VIEW_RE.test(command)) return `\`gh repo view ${slug}\``
+  return `\`gh <cmd> -R ${slug}\``
+}
+
+// The shapes an agent reaches for when it wants to READ SOURCE. None is brokerable:
+// `repo clone` is absent from SAFE_GH_OPERATIONS, and archive/search endpoints can
+// write or exfiltrate. Brokered `git clone` IS supported for any allowlisted repo, so
+// name it — otherwise the agent concludes the source is unreachable and says so.
+const SOURCE_READ_RE = /\bgh\s+repo\s+clone\b|\bgh\s+search\s+code\b|\/(?:tarball|zipball|contents)\b/
+
+function sourceReadRecovery(command: string, slug: string): string {
+  if (!SOURCE_READ_RE.test(command)) return ''
+  return (
+    ` To read this repository's source, clone it as its own standalone command:` +
+    ` \`git clone --depth 1 https://github.com/${slug}.git <dir>\` — TypeClaw brokers that clone for any` +
+    ' repo in `channels.github.repos[]`. Inspect the working copy with a separate command afterwards.'
+  )
+}
+
 export default definePlugin({
   plugin: async (ctx) => {
     const resolveTokenForRepo = ctx.github.resolveTokenForRepo
@@ -224,15 +253,25 @@ export default definePlugin({
     // exact single-bare rewrite so the agent recovers in one step instead of
     // guessing. Composition blocks get a split-the-script instruction. The
     // returned text is appended to the block reason (synchronous, always seen).
-    const buildGhBlockGuidance = (code: string, fallbackRepo: string | undefined): string => {
+    const buildGhBlockGuidance = (code: string, fallbackRepo: string | undefined, command: string): string => {
       const slug = fallbackRepo ?? 'owner/repo'
+      const example = ghRewriteExample(command, slug)
+      const sourceRead = sourceReadRecovery(command, slug)
       if (code === 'composition') {
         return (
-          ` Run each gh as its own single bare command, e.g. \`gh label edit <name> -R ${slug} --name ...\` —` +
-          ' not inside a function, `if`/`then`, `&&`, `;`, or `$(...)`.'
+          ` Run each gh as its own single bare command, e.g. ${example} —` +
+          ' not inside a function, `if`/`then`, `&&`, `;`, or `$(...)`.' +
+          sourceRead
         )
       }
-      return ` For example: \`gh <cmd> -R ${slug}\` as a single bare command.`
+      if (REPO_LIST_RE.test(command)) {
+        return (
+          ' `gh repo list` targets an owner rather than one repository, so there is no per-repo' +
+          ` rewrite that can mint a token. Name a concrete repo instead, e.g. \`gh repo view ${slug}\`.` +
+          sourceRead
+        )
+      }
+      return ` For example: ${example} as a single bare command.` + sourceRead
     }
 
     // 'fall-through' means "not a repo-targeting gh command" so the caller can
@@ -273,7 +312,7 @@ export default definePlugin({
           reason:
             decision.code === 'credential-display'
               ? decision.reason
-              : decision.reason + buildGhBlockGuidance(decision.code, fallbackRepo),
+              : decision.reason + buildGhBlockGuidance(decision.code, fallbackRepo, command),
         }
       }
 

@@ -350,6 +350,43 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
+  test('block guidance is command-aware: suggests a runnable rewrite per gh subcommand', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(async () => ({ kind: 'token', token: 'ghs_minted' }), true)
+
+    const reasonFor = async (command: string): Promise<string> => {
+      const result = await hook(bashEvent(command), hookCtx)
+      expect(result).toMatchObject({ block: true })
+      return (result as { reason: string }).reason
+    }
+
+    // `gh repo view` takes a positional slug and errors on `-R`; suggesting `-R`
+    // here is what previously cost the agent a turn on "unknown shorthand flag".
+    const repoView = await reasonFor('gh repo view')
+    expect(repoView).toContain('gh repo view owner/repo')
+    expect(repoView).not.toContain('-R')
+
+    expect(await reasonFor('gh api /repos/acme/widgets/tarball --output /tmp/w.tgz')).toContain(
+      'gh api /repos/owner/repo/...',
+    )
+    expect(await reasonFor('gh repo list acme')).toContain('targets an owner rather than one repository')
+  })
+
+  test('source-read denials name the brokered git clone instead of leaving the agent stuck', async () => {
+    delete process.env.GH_TOKEN
+    const hook = await hookFor(async () => ({ kind: 'token', token: 'ghs_minted' }), true)
+
+    for (const command of [
+      'gh repo clone acme/widgets /tmp/widgets',
+      "gh search code 'reward' --repo acme/widgets",
+      'gh api /repos/acme/widgets/tarball --output /tmp/w.tgz',
+    ]) {
+      const result = await hook(bashEvent(command), hookCtx)
+      expect(result).toMatchObject({ block: true })
+      expect((result as { reason: string }).reason).toContain('git clone --depth 1 https://github.com/')
+    }
+  })
+
   test('App auth: blocks when the bridge is unavailable', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(unavailableResolver)
