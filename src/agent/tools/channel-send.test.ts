@@ -8,7 +8,10 @@ import { createChannelSendTool } from './channel-send'
 
 function fakeRouter(
   handler: (msg: OutboundMessage) => Promise<SendResult>,
-  options: { consecutiveCount?: number } = {},
+  options: {
+    consecutiveCount?: number
+    finishGithubReviewThreadCloseout?: ChannelRouter['finishGithubReviewThreadCloseout']
+  } = {},
 ): ChannelRouter {
   return {
     route: async () => {},
@@ -71,6 +74,9 @@ function fakeRouter(
     executeCommand: async () => ({ kind: 'no-live-session' }),
     injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
+    ...(options.finishGithubReviewThreadCloseout !== undefined
+      ? { finishGithubReviewThreadCloseout: options.finishGithubReviewThreadCloseout }
+      : {}),
     noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
     markTurnSkipped: () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
@@ -777,6 +783,33 @@ describe('createChannelSendTool', () => {
 
       expect(calls).toHaveLength(1)
       expect(result.details).toEqual({ ok: true })
+    })
+
+    test('records an explicit false only after its exact-thread send succeeds', async () => {
+      const decisions: string[] = []
+      const success = createChannelSendTool({
+        router: fakeRouter(async () => ({ ok: true }), {
+          finishGithubReviewThreadCloseout: ({ decision }) => decisions.push(decision),
+        }),
+      })
+      const failure = createChannelSendTool({
+        router: fakeRouter(async () => ({ ok: false, error: 'send failed' }), {
+          finishGithubReviewThreadCloseout: ({ decision }) => decisions.push(decision),
+        }),
+      })
+      const params = {
+        adapter: 'github' as const,
+        workspace: 'acme/widgets',
+        chat: 'pr:585',
+        thread: 'RC_kwABC',
+        text: 'This remains open for a concrete reason.',
+        resolve_review_thread: false,
+      }
+
+      await runTool(success, params)
+      await runTool(failure, params)
+
+      expect(decisions).toEqual(['left-open'])
     })
 
     test('exempts an attachments-only github review-thread send (no text to acknowledge)', async () => {

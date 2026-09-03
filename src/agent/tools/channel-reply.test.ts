@@ -24,7 +24,7 @@ function fakeRouter(
     qualifyingWorkObserved?: boolean
     resolveReviewThread?: ChannelRouter['resolveReviewThread']
     getReviewState?: ChannelRouter['getReviewState']
-    finishGithubReviewRoundCloseout?: ChannelRouter['finishGithubReviewRoundCloseout']
+    finishGithubReviewThreadCloseout?: ChannelRouter['finishGithubReviewThreadCloseout']
   } = {},
 ): ChannelRouter {
   return {
@@ -91,8 +91,8 @@ function fakeRouter(
     executeCommand: async () => ({ kind: 'no-live-session' }),
     injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    ...(options.finishGithubReviewRoundCloseout !== undefined
-      ? { finishGithubReviewRoundCloseout: options.finishGithubReviewRoundCloseout }
+    ...(options.finishGithubReviewThreadCloseout !== undefined
+      ? { finishGithubReviewThreadCloseout: options.finishGithubReviewThreadCloseout }
       : {}),
     noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
     markTurnSkipped: () => ({ kind: 'no-live-session' }),
@@ -1092,6 +1092,27 @@ describe('channel_reply resolve_review_thread', () => {
     expect(resolveCalled).toBe(false)
     expect(sent).toBe(1)
   })
+
+  test('records an explicit false only after its exact-thread reply succeeds', async () => {
+    const decisions: string[] = []
+    const success = createChannelReplyTool({
+      router: fakeRouter(async () => ({ ok: true }), {
+        finishGithubReviewThreadCloseout: ({ decision }) => decisions.push(decision),
+      }),
+      origin: githubThreadOrigin,
+    })
+    const failure = createChannelReplyTool({
+      router: fakeRouter(async () => ({ ok: false, error: 'send failed' }), {
+        finishGithubReviewThreadCloseout: ({ decision }) => decisions.push(decision),
+      }),
+      origin: githubThreadOrigin,
+    })
+
+    await runTool(success, { text: 'This remains open for a concrete reason.', resolve_review_thread: false })
+    await runTool(failure, { text: 'This remains open for a concrete reason.', resolve_review_thread: false })
+
+    expect(decisions).toEqual(['left-open'])
+  })
 })
 
 describe('channel_reply resolve_review_thread required-choice enforcement', () => {
@@ -1131,7 +1152,7 @@ describe('channel_reply resolve_review_thread required-choice enforcement', () =
     expect(result.details).toEqual({ ok: true })
   })
 
-  test('exempts a mid-turn status reply (more_work_this_turn:true) from the required choice', async () => {
+  test('exempts a mid-turn status reply (more_work_this_turn:true) when it makes no close-out choice', async () => {
     const calls: OutboundMessage[] = []
     const tool = createChannelReplyTool({
       router: fakeRouter(async (msg) => {
@@ -1146,6 +1167,29 @@ describe('channel_reply resolve_review_thread required-choice enforcement', () =
     expect(calls).toHaveLength(1)
     expect(result.details).toEqual({ ok: true, more_work_this_turn: true })
   })
+
+  for (const resolveReviewThread of [true, false]) {
+    test(`rejects resolve_review_thread:${resolveReviewThread} on a mid-turn status reply`, async () => {
+      const calls: OutboundMessage[] = []
+      const tool = createChannelReplyTool({
+        router: fakeRouter(async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        }),
+        origin: githubThreadOrigin,
+      })
+
+      const result = await runTool(tool, {
+        text: 'Still checking.',
+        more_work_this_turn: true,
+        resolve_review_thread: resolveReviewThread,
+      })
+
+      expect(calls).toHaveLength(0)
+      expect(result.details).toMatchObject({ ok: false })
+      expect((result.details as { error: string }).error).toContain('more_work_this_turn')
+    })
+  }
 
   test('exempts an attachments-only github review-thread reply (no text to acknowledge)', async () => {
     const calls: OutboundMessage[] = []
@@ -1291,7 +1335,8 @@ describe('channel_reply re-review stranding guard', () => {
             order.push('resolve')
             return { ok: true }
           },
-          finishGithubReviewRoundCloseout: () => {
+          finishGithubReviewThreadCloseout: ({ decision }) => {
+            expect(decision).toBe('resolved')
             order.push('finish')
           },
         },

@@ -157,6 +157,17 @@ export function createChannelReplyTool({
         }
       }
 
+      if (keepTurnAlive && params.resolve_review_thread !== undefined) {
+        const error =
+          '`resolve_review_thread` is a terminal close-out decision and cannot be combined with ' +
+          '`more_work_this_turn: true`. Send a status without the decision, then close out the thread in a terminal reply.'
+        logger.warn(formatChannelToolFailure('channel_reply', error))
+        return {
+          content: [{ type: 'text' as const, text: `channel_reply denied: ${error}` }],
+          details: { ok: false, error },
+        }
+      }
+
       // Required-choice guard: a terminal github review-thread text reply must
       // make an explicit resolve_review_thread choice. The model kept silently
       // omitting the flag after acknowledging a fix, leaving the thread open;
@@ -252,11 +263,12 @@ export function createChannelReplyTool({
           }
         }
         if (resolve.kind === 'already-resolved') {
-          router.finishGithubReviewRoundCloseout?.({
+          router.finishGithubReviewThreadCloseout?.({
             sessionId,
             workspace: origin.workspace,
             prNumber: parseGithubPrNumber(origin.chat),
             thread: origin.thread,
+            decision: 'resolved',
           })
           return {
             content: [{ type: 'text' as const, text: alreadyResolvedHint(origin.thread) }],
@@ -269,11 +281,12 @@ export function createChannelReplyTool({
         if (resolve.kind === 'no-match') {
           resolveMissNotice = resolveMissHint(origin.thread)
         } else {
-          router.finishGithubReviewRoundCloseout?.({
+          router.finishGithubReviewThreadCloseout?.({
             sessionId,
             workspace: origin.workspace,
             prNumber: parseGithubPrNumber(origin.chat),
             thread: origin.thread,
+            decision: 'resolved',
           })
         }
       }
@@ -294,6 +307,21 @@ export function createChannelReplyTool({
             `${origin.adapter}:${origin.workspace}/${origin.chat}: ${result.error}`,
           ),
         )
+      }
+      if (
+        result.ok &&
+        params.resolve_review_thread === false &&
+        origin.adapter === 'github' &&
+        origin.thread !== null &&
+        /^pr:\d+$/.test(origin.chat)
+      ) {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId,
+          workspace: origin.workspace,
+          prNumber: parseGithubPrNumber(origin.chat),
+          thread: origin.thread,
+          decision: 'left-open',
+        })
       }
       // `more_work_this_turn` is read by the router's terminal hook (installChannelReplyTerminalHook),
       // not by this tool — it suppresses the post-reply abort so a multi-step turn

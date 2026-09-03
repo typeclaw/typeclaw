@@ -62,6 +62,7 @@ import {
   githubReviewRoundPersistence,
   hasGithubReviewRoundDismissalAttempt,
   isGithubReviewRoundComplete,
+  isGithubReviewRoundPending,
   promoteGithubReviewRound,
   registerGithubReviewRound,
   restoreGithubReviewRound,
@@ -886,11 +887,12 @@ type LiveSession = {
   // with a reply on that exact thread. This spans reminder-only retry iterations.
   githubReviewThreadCloseout:
     | (GithubReviewThreadCloseout & {
-        sendCountAtStart: number
         startedAt: number
         correctionAttempts: number
+        deferred: boolean
       })
     | null
+  githubReviewThreadCloseoutDecisionTurn: number | null
   // Round key of a close-out that arrived while the round was still pending
   // completion. Replayed once the round completes; see replayPendingRoundCloseouts.
   pendingGithubReviewRoundCloseout: string | null
@@ -1585,11 +1587,12 @@ export type ChannelRouter = {
     verdict: ReviewRoundOutcome
     sessionId: string
   }) => Promise<{ kind: 'completed' | 'no-round' }>
-  finishGithubReviewRoundCloseout?: (args: {
+  finishGithubReviewThreadCloseout?: (args: {
     sessionId: string
     workspace: string
     prNumber: number
     thread: string | null
+    decision: 'resolved' | 'left-open'
   }) => void
   noteGithubReviewOutput: (args: {
     sessionId: string
@@ -2059,7 +2062,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       void _removed
       mappings[idx] = rest
     } else {
-      const state = githubReviewRoundPersistence(round)
+      const state = githubReviewRoundPersistence(round, now)
       if (state === null) {
         const { githubReviewRound: _expired, ...rest } = record
         void _expired
@@ -2069,6 +2072,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
     }
     void persist()
+  }
+
+  const persistGithubReviewThreadCloseout = (live: LiveSession, closeout: GithubReviewThreadCloseout | null): void => {
+    if (mappings === null) return
+    const idx = mappings.findIndex(
+      (record) =>
+        record.adapter === live.key.adapter &&
+        record.workspace === live.key.workspace &&
+        record.chat === live.key.chat &&
+        (record.thread ?? null) === (live.key.thread ?? null),
+    )
+    if (idx < 0) return
+    const record = mappings[idx]!
+    if (closeout === null) {
+      const { githubReviewThreadCloseout: _removed, ...rest } = record
+      void _removed
+      mappings[idx] = rest
+    } else {
+      mappings[idx] = { ...record, githubReviewThreadCloseout: { ...closeout, deferred: true } }
+    }
+    void persist()
+  }
+
+  const clearGithubReviewThreadCloseout = (live: LiveSession): void => {
+    live.githubReviewThreadCloseout = null
+    persistGithubReviewThreadCloseout(live, null)
   }
 
   const createForChannel: CreateSessionForChannel =
@@ -2465,6 +2494,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               thread: prev.thread,
               participants: prev.participants,
               lastInboundAt: 0,
+              ...(prev.githubReviewThreadCloseout !== undefined && prev.githubReviewRound !== undefined
+                ? { githubReviewRound: prev.githubReviewRound }
+                : {}),
+              ...(prev.githubReviewThreadCloseout !== undefined
+                ? { githubReviewThreadCloseout: prev.githubReviewThreadCloseout }
+                : {}),
             }
             await persist()
           }
@@ -2511,6 +2546,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           participants: record.participants,
           lastInboundAt: 0,
           ...(record.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
+          ...(record.githubReviewThreadCloseout !== undefined
+            ? { githubReviewThreadCloseout: record.githubReviewThreadCloseout }
+            : {}),
         }
         if (mappings) {
           const idx = mappings.findIndex(
@@ -2539,13 +2577,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           sessionFile: resumeTarget.sessionFile,
           participants: (record?.participants ?? []) as ChannelParticipant[],
           lastInboundAt: now(),
+          ...(record?.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
+          ...(record?.githubReviewThreadCloseout !== undefined
+            ? { githubReviewThreadCloseout: record.githubReviewThreadCloseout }
+            : {}),
         }
       }
+      const restoredDeferredCloseout = resolvedRecord?.githubReviewThreadCloseout ?? null
       let restoredRound: GithubReviewFollowupRound | null = null
       let restoredRoundStatus: 'pending' | 'completed' | null = null
       if (resolvedRecord?.githubReviewRound !== undefined) {
         if (
-          await validateGithubReviewRound(resolvedRecord.githubReviewRound, resolvedRecord.githubReviewRound.createdAt)
+          await validateGithubReviewRound(
+            resolvedRecord.githubReviewRound,
+            resolvedRecord.githubReviewRound.createdAt,
+            now,
+          )
         ) {
           restoredRoundStatus = resolvedRecord.githubReviewRound.status
           restoredRound = restoreGithubReviewRound(
@@ -2555,6 +2602,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             resolvedRecord.githubReviewRound.dismissalAttempted === true,
             resolvedRecord.githubReviewRound.requestChangesAttempted === true,
             resolvedRecord.githubReviewRound.createdAt,
+            now,
           )
         } else {
           logger.info(
@@ -2635,10 +2683,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         participants,
         ...(restoredRound !== null && restoredRoundStatus !== null
           ? (() => {
-              const state = githubReviewRoundPersistence(restoredRound)
+              const state = githubReviewRoundPersistence(restoredRound, now)
               return state === null ? {} : { githubReviewRound: { ...restoredRound, ...state } }
             })()
           : {}),
+        ...(restoredDeferredCloseout !== null ? { githubReviewThreadCloseout: restoredDeferredCloseout } : {}),
       }
       if (mappings) {
         const idx = mappings.findIndex(
@@ -2678,7 +2727,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         resolvedNames,
         originRef,
         githubReviewRound: restoredRound,
-        githubReviewThreadCloseout: null,
+        githubReviewThreadCloseout:
+          restoredDeferredCloseout === null
+            ? null
+            : {
+                ...restoredDeferredCloseout,
+                startedAt: now(),
+                correctionAttempts: 0,
+                deferred: true,
+              },
+        githubReviewThreadCloseoutDecisionTurn: null,
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
@@ -3417,7 +3475,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (obligation === null) return
     // Consume before sending so adapter failure cannot turn this one-shot
     // fallback into a reminder/fallback loop.
-    live.githubReviewThreadCloseout = null
+    clearGithubReviewThreadCloseout(live)
     logger.warn(
       `[channels] ${live.keyId} github_thread_closeout_fallback pr=${obligation.prNumber} root=${obligation.rootCommentId}`,
     )
@@ -3436,13 +3494,42 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  const deferredPendingReviewRound = (live: LiveSession): GithubReviewFollowupRound | null => {
+    const round = live.githubReviewRound
+    if (round === null) return null
+    if (round.carrierThread === live.key.thread) return null
+    return isGithubReviewRoundPending(round, now) ? round : null
+  }
+
+  const isReviewStateUnknownDeferralActive = (closeout: GithubReviewThreadCloseout): boolean =>
+    closeout.deferUntil?.kind === 'review-state-unknown' && closeout.deferUntil.expiresAt > now()
+
   const enforceGithubReviewThreadCloseout = async (live: LiveSession): Promise<void> => {
     const closeout = live.githubReviewThreadCloseout
-    if (
-      closeout === null ||
-      live.successfulChannelSends !== closeout.sendCountAtStart ||
-      isAwaitingBackgroundChild(live, 'github-thread-closeout', closeout.startedAt)
-    ) {
+    if (closeout === null || isAwaitingBackgroundChild(live, 'github-thread-closeout', closeout.startedAt)) {
+      return
+    }
+    if (isReviewStateUnknownDeferralActive(closeout)) {
+      if (!closeout.deferred) {
+        closeout.deferred = true
+        persistGithubReviewThreadCloseout(live, closeout)
+      }
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} reason=review_state_unknown expires_at=${closeout.deferUntil?.expiresAt}`,
+      )
+      return
+    }
+    const deferredRound = deferredPendingReviewRound(live)
+    if (deferredRound !== null) {
+      if (!closeout.deferred) {
+        closeout.deferred = true
+        persistGithubReviewThreadCloseout(live, closeout)
+      }
+      // Preserve the anti-strand obligation while the elected carrier acts, but
+      // do not convert a legitimate wait into participant-facing process noise.
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} round=${deferredRound.roundId}`,
+      )
       return
     }
     if (live.skippedTurn?.turnSeq === live.turnSeq) live.skippedTurn = null
@@ -3456,8 +3543,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `<system-reminder>\nThis session still owes a close-out on GitHub PR #${closeout.prNumber}, ` +
             `review thread root comment ${closeout.rootCommentId}. Your previous turn sent no reply to that thread. ` +
             `Call channel_reply now with an explicit resolve_review_thread choice: true if the concern is addressed, ` +
-            `or false to leave it open with an explanation. Do not treat a PR-level verdict stand-down as satisfying ` +
-            `this thread-level obligation.\n</system-reminder>`,
+            `or false to leave it open with the specific technical reason. Send exactly ONE participant-facing ` +
+            `close-out message with no narration about internal review rounds, carriers, sessions, verdict registration, ` +
+            `or sticky review state. Do not treat a PR-level verdict stand-down as satisfying this thread-level obligation.\n</system-reminder>`,
         ),
       )
       return
@@ -3577,8 +3665,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const failoverGithubReviewRound = async (live: LiveSession): Promise<void> => {
     const round = live.githubReviewRound
-    if (round === null || isGithubReviewRoundComplete(round)) return
-    if (hasGithubReviewRoundDismissalAttempt(round)) {
+    if (round === null || isGithubReviewRoundComplete(round, now)) return
+    if (hasGithubReviewRoundDismissalAttempt(round, now)) {
       const key = githubReviewRoundKey(round)
       for (const sibling of liveSessions.values()) {
         if (sibling.githubReviewRound !== null && githubReviewRoundKey(sibling.githubReviewRound) === key) {
@@ -3604,10 +3692,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         candidate.key.thread !== round.carrierThread,
     )
     const waiter = candidates
-      .filter((candidate) => canPromoteGithubReviewRoundTo(round, candidate.key.thread))
+      .filter((candidate) => canPromoteGithubReviewRoundTo(round, candidate.key.thread, now))
       .sort((a, b) => a.keyId.localeCompare(b.keyId))[0]
     if (waiter === undefined) {
-      const state = githubReviewRoundPersistence(round)
+      const state = githubReviewRoundPersistence(round, now)
       if (candidates.length === 0) {
         logger.warn(
           `[channels] github review round failover found no live waiter pr=${round.workspace}#${round.prNumber} head=${round.headSha} carrier=${round.carrierThread ?? 'root'}; retry the review after the round expires`,
@@ -3620,7 +3708,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return
     }
 
-    const promoted = promoteGithubReviewRound(round, waiter.key.thread)
+    const promoted = promoteGithubReviewRound(round, waiter.key.thread, now)
     if (promoted === null) return
     for (const sibling of liveSessions.values()) {
       if (
@@ -3898,7 +3986,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.currentTurnReactionRef = batch[batch.length - 1]!.reactionRef ?? null
           const trigger = batch[batch.length - 1]!
           if (trigger.githubReviewRound !== undefined) {
-            live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound)
+            live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound, now(), now)
           }
           live.currentTurnExplicitlyAddressed =
             trigger.isDm || trigger.isBotMention || trigger.replyToBotMessageId !== null
@@ -3922,15 +4010,31 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.willingnessNudges = 0
           live.logicalTurnStartedAt = now()
           const stampedCloseout = batch.findLast((item) => item.githubReviewThreadCloseout !== undefined)
+          const deferredCloseout =
+            stampedCloseout?.githubReviewThreadCloseout === undefined &&
+            live.githubReviewThreadCloseout !== null &&
+            live.githubReviewThreadCloseout.deferred
+              ? live.githubReviewThreadCloseout
+              : null
           live.githubReviewThreadCloseout =
             stampedCloseout?.githubReviewThreadCloseout !== undefined
               ? {
                   ...stampedCloseout.githubReviewThreadCloseout,
-                  sendCountAtStart: live.successfulChannelSends,
                   startedAt: live.logicalTurnStartedAt,
                   correctionAttempts: 0,
+                  deferred: false,
                 }
-              : null
+              : deferredCloseout === null
+                ? null
+                : {
+                    ...deferredCloseout,
+                    startedAt: live.logicalTurnStartedAt,
+                    correctionAttempts: 0,
+                  }
+          if (stampedCloseout?.githubReviewThreadCloseout !== undefined) {
+            persistGithubReviewThreadCloseout(live, null)
+          }
+          live.githubReviewThreadCloseoutDecisionTurn = null
           // A fresh batch supersedes a still-pending staged fallback. That staged
           // turn produced no usable reply, so it must not leave the PRIOR turn's
           // committed lastQuestionSignal behind — otherwise the new question would
@@ -4702,7 +4806,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ts: event.ts,
     })
     if (event.githubReviewRound !== undefined) {
-      live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound)
+      live.githubReviewRound = registerGithubReviewRound(event.githubReviewRound, now(), now)
       persistGithubReviewRound(live, live.githubReviewRound)
     }
     // Make the typing anchor live BEFORE startTypingHeartbeat fires (route()
@@ -5548,21 +5652,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
-      const closeout = live.githubReviewThreadCloseout
-      if (closeout !== null) {
-        const landedOnOwedThread =
-          msg.adapter === 'github' &&
-          msg.workspace === closeout.workspace &&
-          msg.chat === `pr:${closeout.prNumber}` &&
-          (msg.thread ?? null) === closeout.rootCommentId
-        if (landedOnOwedThread) {
-          live.githubReviewThreadCloseout = null
-        } else {
-          // successfulChannelSends is session-wide. Advance the baseline for an
-          // unrelated delivery so equality continues to mean no owed-thread send.
-          closeout.sendCountAtStart++
-        }
-      }
       // Promise fulfillment follows OUTPUT KIND, never source:
       //   (a) ordinary substantive tool output clears;
       //   (b) multilingual continuation-willingness/status output preserves;
@@ -5645,6 +5734,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const record = live.lastTerminalReplyCompletion
     live.lastTerminalReplyCompletion = null
     if (record === null || record.turnSeq !== live.turnSeq) return
+    if (live.githubReviewThreadCloseout !== null || live.githubReviewThreadCloseoutDecisionTurn === live.turnSeq) {
+      return
+    }
     if (live.willingnessNudges >= MAX_WILLINGNESS_NUDGES) return
     if (live.promptQueue.length > 0) return
     if (record.text === undefined) return
@@ -5831,6 +5923,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (
         live.promptQueue.length === 0 &&
         live.currentTurnAuthorId !== null &&
+        live.githubReviewThreadCloseout === null &&
+        live.githubReviewThreadCloseoutDecisionTurn !== live.turnSeq &&
         live.continueReplyTurn?.turnSeq === live.turnSeq &&
         live.continueReplyTurn.sendCount === live.successfulChannelSends &&
         isFreshEmptyStopAfterSend(live) &&
@@ -5871,7 +5965,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // batch — so injecting a stale recovery nudge would prepend it to a live user
       // message. Skip the nudge AND the fallback in that case and let the trailing
       // recovery below run; the queued inbound supersedes this turn's silence.
-      if (live.promptQueue.length === 0 && live.currentTurnAuthorId !== null && isEmptyStopAfterWillingnessAck(live)) {
+      if (
+        live.promptQueue.length === 0 &&
+        live.currentTurnAuthorId !== null &&
+        live.githubReviewThreadCloseout === null &&
+        live.githubReviewThreadCloseoutDecisionTurn !== live.turnSeq &&
+        isEmptyStopAfterWillingnessAck(live)
+      ) {
         if (live.willingnessNudges < MAX_WILLINGNESS_NUDGES) {
           live.willingnessNudges++
           logger.warn(
@@ -6387,6 +6487,29 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const runIdleGc = async (): Promise<void> => {
     await expirePendingReloadHandoffs()
+    for (const live of liveSessions.values()) {
+      const closeout = live.githubReviewThreadCloseout
+      const round = live.githubReviewRound
+      if (live.destroyed || closeout === null) continue
+      const unknownStateExpired =
+        closeout.deferUntil?.kind === 'review-state-unknown' && closeout.deferUntil.expiresAt <= now()
+      if (round === null && !unknownStateExpired) continue
+      if (round?.carrierThread === live.key.thread) continue
+      if (live.draining || live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) continue
+      if (deferredPendingReviewRound(live) !== null) continue
+      if (isAwaitingBackgroundChild(live, 'github-thread-closeout-release', closeout.startedAt)) continue
+      const reason =
+        round === null
+          ? 'review_state_unknown_expired'
+          : isGithubReviewRoundComplete(round, now)
+            ? 'round_completed'
+            : 'round_expired'
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_released pr=${closeout.prNumber} root=${closeout.rootCommentId}${round === null ? '' : ` round=${round.roundId}`} reason=${reason}`,
+      )
+      await enforceGithubReviewThreadCloseout(live)
+      if (!live.draining && live.pendingSystemReminders.length > 0) void drain(live)
+    }
     const t = now()
     const victims: LiveSession[] = []
     for (const live of liveSessions.values()) {
@@ -6908,7 +7031,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
     const round = publisher?.githubReviewRound ?? persistedPublisher?.githubReviewRound
     if (round === null || round === undefined) {
-      const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber)
+      const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber, now)
       if (resetRound !== null) persistMatchingGithubReviewRound(resetRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: no publisher session with round state session=${args.sessionId}`,
@@ -6916,7 +7039,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'no-round' }
     }
 
-    const activeRound = registerGithubReviewRound(round)
+    const activeRound = registerGithubReviewRound(round, now(), now)
     if (activeRound === null) {
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: round expired`,
@@ -6925,22 +7048,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     const publisherThread = publisher?.key.thread ?? persistedPublisher?.thread ?? null
     if (activeRound.carrierThread !== publisherThread) {
-      resetGithubReviewRoundCompletion(activeRound)
+      resetGithubReviewRoundCompletion(activeRound, now)
       persistMatchingGithubReviewRound(activeRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: publisher thread=${publisherThread ?? 'root'} is not carrier=${activeRound.carrierThread ?? 'root'}`,
       )
       return { kind: 'no-round' }
     }
-    if (!(await validateGithubReviewRound(activeRound))) {
-      resetGithubReviewRoundCompletion(activeRound)
+    if (!(await validateGithubReviewRound(activeRound, undefined, now))) {
+      resetGithubReviewRoundCompletion(activeRound, now)
       persistMatchingGithubReviewRound(activeRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: head mismatch or unavailable expected=${activeRound.headSha}`,
       )
       return { kind: 'no-round' }
     }
-    completeGithubReviewRound(activeRound)
+    completeGithubReviewRound(activeRound, now)
     const key = githubReviewRoundKey(round)
     for (const live of liveSessions.values()) {
       if (live.githubReviewRound === null || githubReviewRoundKey(live.githubReviewRound) !== key) continue
@@ -6962,7 +7085,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const persistMatchingGithubReviewRound = (round: GithubReviewFollowupRound): void => {
     if (mappings === null) return
     const key = githubReviewRoundKey(round)
-    const state = githubReviewRoundPersistence(round)
+    const state = githubReviewRoundPersistence(round, now)
     let changed = false
     for (const [idx, record] of mappings.entries()) {
       if (record.githubReviewRound === undefined) continue
@@ -6980,7 +7103,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   // A close-out can land while completion is still awaiting head validation, so
-  // `finishGithubReviewRoundCloseout` sees a pending round and returns without
+  // `finishGithubReviewThreadCloseout` sees a pending round and returns without
   // clearing. Nothing else retries it, which would strand round metadata on the
   // session and reject its later verdicts — so the close-out is recorded and
   // replayed here once the round actually completes.
@@ -6989,20 +7112,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const live of liveSessions.values()) {
       if (live.pendingGithubReviewRoundCloseout !== key) continue
       live.pendingGithubReviewRoundCloseout = null
-      finishGithubReviewRoundCloseout({
+      finishGithubReviewThreadCloseout({
         sessionId: live.sessionId,
         workspace: live.key.workspace,
         prNumber: Number(live.key.chat.slice('pr:'.length)),
         thread: live.key.thread ?? null,
+        decision: 'resolved',
       })
     }
   }
 
-  const finishGithubReviewRoundCloseout = (args: {
+  const finishGithubReviewThreadCloseout = (args: {
     sessionId: string
     workspace: string
     prNumber: number
     thread: string | null
+    decision: 'resolved' | 'left-open'
   }): void => {
     const chat = `pr:${args.prNumber}`
     const live = Array.from(liveSessions.values()).find(
@@ -7014,10 +7139,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         candidate.key.chat === chat &&
         candidate.key.thread === args.thread,
     )
-    if (live !== undefined) live.githubReviewThreadCloseout = null
+    if (live !== undefined) {
+      live.githubReviewThreadCloseoutDecisionTurn = live.turnSeq
+      clearGithubReviewThreadCloseout(live)
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_decided decision=${args.decision} turn=${live.turnSeq}`,
+      )
+    }
     if (live?.githubReviewRound === null || live?.githubReviewRound === undefined) return
     const round = live.githubReviewRound
-    if (!isGithubReviewRoundComplete(round)) {
+    if (!isGithubReviewRoundComplete(round, now)) {
       live.pendingGithubReviewRoundCloseout = githubReviewRoundKey(round)
       return
     }
@@ -7094,8 +7225,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const hasOutstandingGithubReviewThreadCloseout = (sessionId: string): boolean => {
     for (const live of liveSessions.values()) {
       if (live.destroyed || live.sessionId !== sessionId) continue
-      const obligation = live.githubReviewThreadCloseout
-      return obligation !== null && live.successfulChannelSends === obligation.sendCountAtStart
+      return live.githubReviewThreadCloseout !== null
     }
     return false
   }
@@ -7339,7 +7469,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     injectSubagentCompletionReminder,
     injectPrVerdictActivity,
     completeGithubReviewRound: completeRoundForVerifiedVerdict,
-    finishGithubReviewRoundCloseout,
+    finishGithubReviewThreadCloseout,
     noteGithubReviewOutput,
     hasOutstandingGithubReviewThreadCloseout,
     markTurnSkipped,

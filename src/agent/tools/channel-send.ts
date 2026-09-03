@@ -272,11 +272,12 @@ export function createChannelSendTool({
           }
         }
         if (resolve.kind === 'already-resolved') {
-          router.finishGithubReviewRoundCloseout?.({
+          router.finishGithubReviewThreadCloseout?.({
             sessionId,
             workspace: params.workspace,
             prNumber: parseGithubPrNumber(params.chat),
             thread: params.thread ?? null,
+            decision: 'resolved',
           })
           return {
             content: [{ type: 'text' as const, text: alreadyResolvedHint(params.thread ?? null) }],
@@ -293,11 +294,12 @@ export function createChannelSendTool({
           resolveMissNotice = resolveMissHint(params.thread ?? null)
         } else {
           recordResolvedThreadFromSend(sessionId, params.workspace, params.chat, params.thread ?? null)
-          router.finishGithubReviewRoundCloseout?.({
+          router.finishGithubReviewThreadCloseout?.({
             sessionId,
             workspace: params.workspace,
             prNumber: parseGithubPrNumber(params.chat),
             thread: params.thread ?? null,
+            decision: 'resolved',
           })
         }
       }
@@ -318,6 +320,21 @@ export function createChannelSendTool({
             `${params.adapter}:${params.workspace}/${params.chat}: ${result.error}`,
           ),
         )
+      }
+      if (
+        result.ok &&
+        params.resolve_review_thread === false &&
+        adapter === 'github' &&
+        params.thread != null &&
+        /^pr:\d+$/.test(params.chat)
+      ) {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId,
+          workspace: params.workspace,
+          prNumber: parseGithubPrNumber(params.chat),
+          thread: params.thread ?? null,
+          decision: 'left-open',
+        })
       }
       const details: { ok: boolean; error?: string; messageId?: string; messageIds?: readonly string[] } = result.ok
         ? {
