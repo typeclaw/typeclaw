@@ -91,7 +91,16 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # seccomp=unconfined does not cover AppArmor. Agent containers already run
 # unconfined so bwrap can create namespaces, so this matches the runtime the gate
 # is meant to certify rather than relaxing it — the mask assertions are unchanged.
-run_args=(--rm --pull=always --security-opt seccomp=unconfined --security-opt apparmor=unconfined)
+# NET_ADMIN because --unshare-all creates a network namespace and bwrap then
+# brings up its loopback; where the runner denies the unprivileged user namespace
+# that would otherwise confer it, that RTM_NEWADDR fails "Operation not
+# permitted". This grants the verifier container what the rendered command needs
+# to run at all. The bwrap argv is untouched, so the mirrored shape still stands.
+run_args=(
+  --rm --pull=always
+  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+  --cap-add NET_ADMIN
+)
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi
