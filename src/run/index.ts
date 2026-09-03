@@ -504,6 +504,7 @@ async function startAgentRuntime(
         .list({ parentSessionId: sessionId })
         .filter((child) => child.status === 'running' && child.background === true)
         .map((child) => child.subagentName),
+    cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()
       return formatChannelReloadSummary(results)

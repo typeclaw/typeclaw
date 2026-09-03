@@ -52,10 +52,12 @@ import {
   type EngagementDecision,
 } from './engagement'
 import { checkFalseReceipt } from './github-false-receipt'
+import { githubReviewerWorkKey } from './github-repo'
 import { evaluateRereviewGuard } from './github-rereview-guard'
 import { resetReviewTurn, type ReviewOutputState, type ReviewRoundOutcome } from './github-review-turn-ledger'
 import {
   canPromoteGithubReviewRoundTo,
+  abortGithubReviewStateForPr,
   completeGithubReviewRound,
   forgetGithubReviewRound,
   githubReviewRoundKey,
@@ -1581,6 +1583,14 @@ export type ChannelRouter = {
     verdict: ReviewRoundOutcome
     sessionId: string
   }) => { kind: 'delivered'; count: number }
+  abortGithubPrTurn?: (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ) => Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  >
   completeGithubReviewRound?: (args: {
     workspace: string
     prNumber: number
@@ -1827,6 +1837,10 @@ export type CreateChannelRouterOptions = {
   // work in the resume greeting. Background-only: a foreground child returns its
   // result inline, so it is not orphaned by the bounce. Omitted means none.
   listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+  cancelRunningSubagentsByWorkKey?: (
+    workKey: string,
+    reason: string,
+  ) => Promise<{ matched: number; cancelled: number; failures: number }>
 }
 
 export type RestartCommandContext = {
@@ -1959,7 +1973,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       handler: async ({ live }) => {
         // requiresLiveSession:true guarantees the dispatch layer resolved a
         // session before running this handler, so `live` is non-null here.
-        await stopCurrentChannelTurn(live!)
+        await stopCurrentChannelTurn(live!, 'user_stop')
         return { reply: 'Stopped the current turn.' }
       },
     },
@@ -3765,11 +3779,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  const stopCurrentChannelTurn = async (live: LiveSession): Promise<void> => {
+  const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
     live.userStoppedTurnSeq = live.turnSeq
     live.lastTerminalReplyCompletion = null
     live.pendingTerminalReplyStop = null
-    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'user_stop' }
+    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
     if (live.debounceTimer) clearTimeout(live.debounceTimer)
     live.debounceTimer = null
     live.firstUnprocessedAt = 0
@@ -3784,15 +3798,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       stopReason: 'aborted',
     })
     await stopTypingHeartbeat(live)
+    let aborted = true
     try {
       await live.session.abort()
-      logger.info(
-        `[channels] ${live.keyId}: command /stop aborted current turn site=user_stop session=${live.sessionId} reason=user_stop`,
-      )
+      if (reason === 'user_stop') {
+        logger.info(
+          `[channels] ${live.keyId}: command /stop aborted current turn site=user_stop session=${live.sessionId} reason=user_stop`,
+        )
+      } else {
+        logger.info(
+          `[channels] ${live.keyId}: github PR turn aborted site=github_pr_abort session=${live.sessionId} reason=${JSON.stringify(reason)}`,
+        )
+      }
     } catch (err) {
-      logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
+      aborted = false
+      if (reason === 'user_stop') {
+        logger.warn(`[channels] ${live.keyId}: command /stop abort failed: ${describeError(err)}`)
+      } else {
+        logger.warn(
+          `[channels] ${live.keyId}: github PR turn abort failed reason=${JSON.stringify(reason)}: ${describeError(err)}`,
+        )
+      }
     }
     await awaitLatestTodoOutcomeWrite(live)
+    return aborted
   }
 
   // ensureLive() installs a session BEFORE the engage/observe decision, so a
@@ -3802,6 +3831,69 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // stopCurrentChannelTurn cancels: in-flight drain, queued prompts, reminders.
   const hasStoppableWork = (live: LiveSession): boolean =>
     live.draining || live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0
+
+  const abortGithubPrTurn = async (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ): Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  > => {
+    const chat = `pr:${prNumber}`
+    const matchesPr = (live: LiveSession): boolean =>
+      !live.destroyed && live.key.adapter === 'github' && live.key.workspace === workspace && live.key.chat === chat
+    const allPrSessions = Array.from(liveSessions.values()).filter(matchesPr)
+    const stoppableSessions = allPrSessions.filter(hasStoppableWork)
+
+    abortGithubReviewStateForPr(workspace, prNumber)
+    for (const live of allPrSessions) {
+      live.githubReviewRound = null
+      live.pendingGithubReviewRoundCloseout = null
+    }
+
+    const subagentAbort = (
+      options.cancelRunningSubagentsByWorkKey?.(githubReviewerWorkKey(workspace, prNumber), reason) ??
+      Promise.resolve({ matched: 0, cancelled: 0, failures: 0 })
+    ).catch((err) => {
+      logger.warn(
+        `[channels] github reviewer abort failed pr=${workspace}#${prNumber} reason=${JSON.stringify(reason)}: ${describeError(err)}`,
+      )
+      return { matched: 0, cancelled: 0, failures: 1 }
+    })
+    const sessionAborts = Promise.all(stoppableSessions.map((live) => stopCurrentChannelTurn(live, reason)))
+    const persistedRoundClear = (async (): Promise<void> => {
+      await ensureLoaded()
+      if (mappings === null) return
+      let changed = false
+      for (const [index, record] of mappings.entries()) {
+        if (record.adapter !== 'github' || record.workspace !== workspace || record.chat !== chat) continue
+        if (record.githubReviewRound === undefined) continue
+        const { githubReviewRound: _removed, ...rest } = record
+        void _removed
+        mappings[index] = rest
+        changed = true
+      }
+      if (changed) await persist()
+    })().catch((err) => {
+      logger.warn(`[channels] github review round clear failed pr=${workspace}#${prNumber}: ${describeError(err)}`)
+    })
+
+    const [sessionResults, subagentResult] = await Promise.all([sessionAborts, subagentAbort, persistedRoundClear])
+    const abortFailures = sessionResults.filter((succeeded) => !succeeded).length + subagentResult.failures
+    logger.info(
+      `[channels] github PR abort pr=${workspace}#${prNumber} sessions=${stoppableSessions.length} ` +
+        `reviewers=${subagentResult.matched} failures=${abortFailures} reason=${JSON.stringify(reason)}`,
+    )
+    return stoppableSessions.length === 0 && subagentResult.matched === 0
+      ? { kind: 'no-live-session' }
+      : {
+          kind: 'aborted',
+          matchedSessions: stoppableSessions.length,
+          matchedReviewers: subagentResult.matched,
+          abortFailures,
+        }
+  }
 
   const hasPendingContinueReply = (live: LiveSession): boolean => {
     const progressReply = live.continueReplyTurn
@@ -7468,6 +7560,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     getSelfAliases: computeSelfAliases,
     injectSubagentCompletionReminder,
     injectPrVerdictActivity,
+    abortGithubPrTurn,
     completeGithubReviewRound: completeRoundForVerifiedVerdict,
     finishGithubReviewThreadCloseout,
     noteGithubReviewOutput,
