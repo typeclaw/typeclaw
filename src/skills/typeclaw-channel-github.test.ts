@@ -28,4 +28,12 @@ describe('typeclaw-channel-github PR review instructions', () => {
     expect(lower).toContain('do not re-review the diff')
     expect(lower).toContain('proportional')
   })
+
+  test('keeps non-carriers silent while waiting and forbids public process narration', () => {
+    const lower = skill.toLowerCase()
+    expect(lower).toContain('no process narration')
+    expect(lower).toContain('stay silent')
+    expect(lower).toContain('skip_response')
+    expect(lower).toContain('one participant-facing message')
+  })
 })
