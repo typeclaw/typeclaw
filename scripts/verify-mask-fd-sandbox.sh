@@ -29,10 +29,28 @@ set -euo pipefail
 
 IMAGE="${1:-}"
 PLATFORM="${2:-}"
+# production | diagnostic. They answer DIFFERENT questions and the release runs
+# both, because one lane alone is misleading in each direction:
+#   production  - can bwrap run at all under the flags an agent container gets?
+#                 Authoritative. A failure here means the model bash surface is
+#                 dead on this host, which is the outage this gate exists to stop.
+#   diagnostic  - is the --ro-bind-data mask/fd contract still honoured by the
+#                 shipped bwrap? Runs with AppArmor lifted so it can reach the
+#                 masks even where host policy blocks bwrap outright. It can
+#                 NEVER authorize a release on its own; it only distinguishes
+#                 "the mask argv regressed" from "this host forbids bwrap".
+MODE="${3:-production}"
 if [ -z "$IMAGE" ]; then
   version="$(node -p "require('./package.json').version" 2>/dev/null || echo latest)"
   IMAGE="ghcr.io/typeclaw/typeclaw-base:${version}"
 fi
+case "$MODE" in
+  production | diagnostic) ;;
+  *)
+    echo "unknown mode: $MODE (expected 'production' or 'diagnostic')" >&2
+    exit 2
+    ;;
+esac
 
 # Mirrors CANONICAL_AGENT_SECRET_FILES + CANONICAL_AGENT_RUNTIME_PRIVATE_FILES.
 # The count is what matters here (one fd per mask); keep in sync if that grows.
@@ -44,9 +62,13 @@ for f in env secrets.json auth.json incidents.json; do printf CANARY > "$d/$f"; 
 
 # The argv shape mirrors buildArgv()/appendMasks() in src/sandbox/build.ts:
 # masks render after the broad parent bind, and the rendered commandString
-# self-opens one /dev/null fd per masked file. Keep in sync if that changes.
+# self-opens one /dev/null fd per masked file. `--share-net` is part of that
+# shape — production sets network:'inherit' (src/agent/plugin-tools.ts), which
+# build.ts turns into --share-net, so omitting it made bwrap bring up a loopback
+# production never asks it to and failed for a reason production cannot hit.
+# Keep in sync if that changes.
 set +e
-out="$(bwrap --unshare-all \
+out="$(bwrap --unshare-all --share-net \
       --new-session --die-with-parent --clearenv \
       --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp --setenv LANG C.UTF-8 \
       --ro-bind /usr /usr --ro-bind /etc /etc --dev /dev --tmpfs /tmp \
@@ -84,21 +106,26 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # no QEMU registered that dies on exec format, failing the release for a reason
 # that has nothing to do with bwrap. Re-resolving the tag here keeps the check
 # honest on both the classic and containerd image stores.
-# --privileged so `bwrap --unshare-all` can actually build its namespaces here.
-# The runners restrict namespace creation in layers, and each one aborts the
-# invocation before a single mask is evaluated — so the step fails for reasons
-# that say nothing about the contract under test: docker-default AppArmor denies
-# the opening mount(NULL, "/", MS_SLAVE|MS_REC) ("Failed to make / slave"), and
-# the loopback bring-up in the new netns fails RTM_NEWADDR "Operation not
-# permitted" even with seccomp and AppArmor unconfined and NET_ADMIN added,
-# because the restriction is on the user namespace that would confer it.
+# seccomp=unconfined is what agent containers actually get (`runArgs` in
+# src/container/start.ts:888-899), so it is the baseline in BOTH modes. Only the
+# diagnostic mode lifts AppArmor, and only to keep the mask assertions reachable
+# on a host whose policy forbids bwrap outright — never to authorize a release.
 #
-# This is scaffolding for a throwaway container running a known image inside the
-# release pipeline, NOT a runtime capability grant — agent containers get
-# seccomp=unconfined and nothing more. What the gate certifies is unchanged: the
-# bwrap argv still mirrors buildArgv()/appendMasks(), and MASK_BWRAP_FAILED,
-# MASK_LEAKED and MASK_CONTRACT_OK all still fail the release on a real break.
-run_args=(--rm --pull=always --privileged)
+# Measured on an ubuntu-24.04 runner against the 0.48.10 image: docker-default
+# AppArmor denies bwrap's opening mount(NULL, "/", MS_SLAVE|MS_REC), so the
+# production lane fails there today. That failure is the gate working, not the
+# gate misconfigured — it is reporting that the model bash surface is dead on
+# such a host. Fix it in src/container/start.ts, never by widening these flags.
+#
+# Still not matched, and deliberately not faked: production drops to the host
+# UID and clears capabilities in the entrypoint shim (src/init/dockerfile.ts)
+# before the runtime starts. Closing that gap is follow-up; do not claim full
+# parity until it is closed. Anything beyond these flags (NET_ADMIN,
+# --privileged) was measured to be unnecessary — do not add it back.
+run_args=(--rm --pull=always --security-opt seccomp=unconfined)
+if [ "$MODE" = diagnostic ]; then
+  run_args+=(--security-opt apparmor=unconfined)
+fi
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi
