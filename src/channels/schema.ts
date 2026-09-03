@@ -185,6 +185,7 @@ export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [
   'discussion_comment.created',
   'issues.opened',
   'pull_request.opened',
+  'pull_request.converted_to_draft',
   'pull_request.ready_for_review',
   'pull_request.review_requested',
   'pull_request.review_request_removed',
@@ -234,6 +235,22 @@ const GITHUB_EVENT_ALLOWLIST_V3 = [
   'discussion.created',
   'pull_request_review.submitted',
 ] as const
+//   - v4: added synchronize (the default just before converted_to_draft was
+//     added). Snapshotted here so configs seeded with the pre-draft-abort
+//     default unfreeze and re-track the new default.
+const GITHUB_EVENT_ALLOWLIST_V4 = [
+  'issue_comment.created',
+  'pull_request_review_comment.created',
+  'discussion_comment.created',
+  'issues.opened',
+  'pull_request.opened',
+  'pull_request.ready_for_review',
+  'pull_request.review_requested',
+  'pull_request.review_request_removed',
+  'pull_request.synchronize',
+  'discussion.created',
+  'pull_request_review.submitted',
+] as const
 
 // Every event-allowlist that `channel add` / `init` has ever seeded verbatim
 // into typeclaw.json, oldest first, current default last. The legacy-shape
@@ -246,6 +263,7 @@ export const SEEDED_GITHUB_EVENT_ALLOWLISTS: readonly (readonly string[])[] = [
   GITHUB_EVENT_ALLOWLIST_V1,
   GITHUB_EVENT_ALLOWLIST_V2,
   GITHUB_EVENT_ALLOWLIST_V3,
+  GITHUB_EVENT_ALLOWLIST_V4,
   DEFAULT_GITHUB_EVENT_ALLOWLIST,
 ]
 

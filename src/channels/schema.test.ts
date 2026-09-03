@@ -139,6 +139,7 @@ describe('channelsSchema', () => {
     const parsed = channelsSchema.parse({ github: { repos: ['owner/repo'] } })
     expect(parsed.github?.eventAllowlist).toEqual([...DEFAULT_GITHUB_EVENT_ALLOWLIST])
     expect(parsed.github?.eventAllowlist).toContain('pull_request.synchronize')
+    expect(parsed.github?.eventAllowlist).toContain('pull_request.converted_to_draft')
   })
 })
 

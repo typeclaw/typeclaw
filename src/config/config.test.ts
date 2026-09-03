@@ -1445,11 +1445,25 @@ describe('migrateLegacyConfigShape', () => {
     'discussion.created',
     'pull_request_review.submitted',
   ]
+  const GITHUB_ALLOWLIST_V4 = [
+    'issue_comment.created',
+    'pull_request_review_comment.created',
+    'discussion_comment.created',
+    'issues.opened',
+    'pull_request.opened',
+    'pull_request.ready_for_review',
+    'pull_request.review_requested',
+    'pull_request.review_request_removed',
+    'pull_request.synchronize',
+    'discussion.created',
+    'pull_request_review.submitted',
+  ]
 
   test.each([
     ['v1 (0.5.1–0.10.0, 7 events)', GITHUB_ALLOWLIST_V1],
     ['v2 (0.11.0+, 9 events)', GITHUB_ALLOWLIST_V2],
     ['v3 (pre-synchronize, 10 events)', GITHUB_ALLOWLIST_V3],
+    ['v4 (pre-converted-to-draft, 11 events)', GITHUB_ALLOWLIST_V4],
   ])('strips an older seeded github eventAllowlist: %s', (_label, seeded) => {
     const result = migrateLegacyConfigShape({
       models: { default: VALID_MODEL },
@@ -1462,14 +1476,24 @@ describe('migrateLegacyConfigShape', () => {
   })
 
   test('preserves a customized list even when it derives from an older seeded default', () => {
-    const customizedFromV1 = [...GITHUB_ALLOWLIST_V1, 'release.published']
+    const customizedFromV4 = [...GITHUB_ALLOWLIST_V4, 'release.published']
     const result = migrateLegacyConfigShape({
       models: { default: VALID_MODEL },
-      channels: { github: { eventAllowlist: customizedFromV1 } },
+      channels: { github: { eventAllowlist: customizedFromV4 } },
     })
     expect(result.changed).toBe(false)
     const channels = (result.json as Record<string, unknown>).channels as Record<string, Record<string, unknown>>
-    expect(channels.github?.eventAllowlist).toEqual(customizedFromV1)
+    expect(channels.github?.eventAllowlist).toEqual(customizedFromV4)
+  })
+
+  test('an exact v4 seeded list re-tracks the converted-to-draft default after migration', () => {
+    const result = migrateLegacyConfigShape({
+      models: { default: VALID_MODEL },
+      channels: { github: { eventAllowlist: [...GITHUB_ALLOWLIST_V4] } },
+    })
+
+    expect(result.changed).toBe(true)
+    expect(configSchema.parse(result.json).channels.github?.eventAllowlist).toContain('pull_request.converted_to_draft')
   })
 
   test('preserves a user-customized github eventAllowlist (any deviation from a seeded default)', () => {
