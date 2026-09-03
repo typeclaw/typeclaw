@@ -298,8 +298,56 @@ function parseMintableTarget(subcommand: RemoteSubcommand, args: readonly string
   if (subcommand === 'push') return parseMintablePush(args)
   if (subcommand === 'fetch') return parseMintableFetch(args)
   if (subcommand === 'pull') return parseSimpleRemote(args, false)
-  if (subcommand === 'clone') return parseExplicitUrl(args, 2)
+  if (subcommand === 'clone') return parseCloneTarget(args)
   return parseExplicitUrl(args, Number.POSITIVE_INFINITY)
+}
+
+// Value-less clone flags that cannot redirect the fetch to another repo/host, run a
+// command, or read/write a path outside the destination. Deliberately EXCLUDES
+// --recurse-submodules (fetches other repos with the token live), --upload-pack and
+// -c/--config (command execution / url.insteadOf rewriting), and --template,
+// --reference, --separate-git-dir (arbitrary path read/write).
+const SAFE_CLONE_FLAGS = new Set([
+  '-q',
+  '--quiet',
+  '--progress',
+  '-n',
+  '--no-checkout',
+  '--single-branch',
+  '--no-single-branch',
+  '--no-tags',
+  '--bare',
+  '--sparse',
+])
+
+// Clone flags that consume the NEXT argv word as their value.
+const SAFE_CLONE_VALUE_FLAGS = new Set(['--depth', '-b', '--branch'])
+
+// `--flag=value` forms whose value is inert (a count, ref, date, or filter spec).
+const SAFE_CLONE_INLINE_PREFIXES = ['--depth=', '--branch=', '--filter=', '--shallow-since=', '--shallow-exclude=']
+
+// git clone's URL is a POSITIONAL, so the previous fixed-index parse rejected every
+// flagged clone — `--depth 1`, the most common shape in code-analysis workflows, got
+// no credential and failed on a private repo with git's opaque "could not read
+// Username". Skipping a conservative flag allowlist finds the same positional while
+// any unrecognized flag still falls through to no-credential (fails safe).
+function parseCloneTarget(args: readonly string[]): TargetSpec | null {
+  const positionals: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string
+    if (SAFE_CLONE_FLAGS.has(arg)) continue
+    if (SAFE_CLONE_VALUE_FLAGS.has(arg)) {
+      const value = args[++i]
+      if (value === undefined || !isOptionValue(value)) return null
+      continue
+    }
+    if (SAFE_CLONE_INLINE_PREFIXES.some((prefix) => arg.startsWith(prefix))) continue
+    if (!isOptionValue(arg)) return null
+    positionals.push(arg)
+  }
+  if (positionals.length === 0 || positionals.length > 2) return null
+  const url = positionals[0] as string
+  return looksLikeUrl(url) ? { kind: 'single', value: url, forPush: false } : null
 }
 
 function parseMintablePush(args: readonly string[]): TargetSpec | null {
@@ -798,7 +846,10 @@ function analyzeCloneThenInspect(command: string): GitCommandDecision | null {
   const parsed = parseStrictCloneHead(split.head)
   if (parsed === null) return isNonGithubCloneHead(split.head) ? { kind: 'pass-through' } : null
 
-  const canonicalHead = `/usr/bin/git clone ${posixSingleQuote(parsed.url)} ${posixSingleQuote(parsed.destination)}`
+  const flagPart = parsed.flags.map(posixSingleQuote).join(' ')
+  const canonicalHead =
+    `/usr/bin/git clone ${flagPart === '' ? '' : `${flagPart} `}` +
+    `${posixSingleQuote(parsed.url)} ${posixSingleQuote(parsed.destination)}`
   return {
     kind: 'inject',
     repoSlug: parsed.repoSlug,
@@ -811,19 +862,53 @@ function tailContainsGitInvocation(tail: string): boolean {
   return extractEvidenceGitSegments(tail).length > 0
 }
 
-type StrictCloneHead = { repoSlug: string; url: string; destination: string }
+type StrictCloneHead = { repoSlug: string; url: string; destination: string; flags: string[] }
 
-const STRICT_CLONE_HEAD_RE =
-  /^[ \t]*git[ \t]+clone[ \t]+(https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?)[ \t]+([A-Za-z0-9._/-]+)[ \t]*$/
+const STRICT_CLONE_URL_RE = /^(https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?)$/
+const STRICT_CLONE_DESTINATION_RE = /^[A-Za-z0-9._/-]+$/
+const SAFE_CLONE_FLAG_VALUE_RE = /^[A-Za-z0-9._:@/-]+$/
 
+// The executed head is REBUILT from these parts rather than passed through, so the
+// grammar stays tiny even though it now admits flags: every accepted token comes from
+// the SAFE_CLONE_* allowlists, every value is charset-constrained, and each is
+// re-emitted single-quoted. Without this a plain `git clone --depth 1 <url> <dir> &&
+// <inspect>` — the natural code-analysis command — blocks outright.
 function parseStrictCloneHead(head: string): StrictCloneHead | null {
-  const match = STRICT_CLONE_HEAD_RE.exec(head)
+  const words = tokenizeStandalone(head)
+  if (words === null || words[0] !== 'git' || words[1] !== 'clone') return null
+
+  const flags: string[] = []
+  const positionals: string[] = []
+  for (let i = 2; i < words.length; i++) {
+    const word = words[i] as string
+    if (SAFE_CLONE_FLAGS.has(word)) {
+      flags.push(word)
+      continue
+    }
+    if (SAFE_CLONE_VALUE_FLAGS.has(word)) {
+      const value = words[++i]
+      if (value === undefined || !SAFE_CLONE_FLAG_VALUE_RE.test(value)) return null
+      flags.push(word, value)
+      continue
+    }
+    const prefix = SAFE_CLONE_INLINE_PREFIXES.find((candidate) => word.startsWith(candidate))
+    if (prefix !== undefined) {
+      if (!SAFE_CLONE_FLAG_VALUE_RE.test(word.slice(prefix.length))) return null
+      flags.push(word)
+      continue
+    }
+    if (word.startsWith('-')) return null
+    positionals.push(word)
+  }
+
+  if (positionals.length !== 2) return null
+  const [rawUrl, destination] = positionals as [string, string]
+  const match = STRICT_CLONE_URL_RE.exec(rawUrl)
   if (match === null) return null
-  const url = match[1] as string
   const repoSlug = match[2] as string
-  const destination = match[3] as string
+  if (!STRICT_CLONE_DESTINATION_RE.test(destination)) return null
   if (destination.startsWith('-') || repoSlug.startsWith('/') || repoSlug.endsWith('/')) return null
-  return { repoSlug, url, destination }
+  return { repoSlug, url: match[1] as string, destination, flags }
 }
 
 function isNonGithubCloneHead(head: string): boolean {
