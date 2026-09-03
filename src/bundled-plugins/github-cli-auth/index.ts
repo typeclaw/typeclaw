@@ -229,6 +229,7 @@ export default definePlugin({
     configureReviewVerdictCoordinator({
       resolveEffectiveApproval,
       resolveHeadSha: createGithubHeadShaResolver({ resolveToken }),
+      logger: ctx.logger,
     })
     const verdictGuard = createSharedReviewVerdictGuard()
     const pendingDismissals = new Map<string, { workspace: string; prNumber: number }>()

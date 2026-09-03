@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   __recentLandedRecordCountForTest,
   __resetReviewVerdictGuardForTest,
+  abortGithubReviewStateForPr,
   configureReviewVerdictCoordinator,
   completeGithubReviewRound,
   canPromoteGithubReviewRoundTo,
@@ -396,6 +397,62 @@ describe('review verdict idempotency guard', () => {
     const next = registerOrJoinReplyReviewRound(input)
 
     expect(next.roundId).not.toBe(first.roundId)
+  })
+
+  test('aborting a PR permits a fresh round while fencing publication until the old call settles', async () => {
+    const g = makeGuard()
+    const first = registerOrJoinReplyReviewRound({
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '101',
+      generateRoundId: () => 'before-draft',
+    })
+    expect(
+      await g.guard({
+        callId: 'drafted-call',
+        workspace: WS,
+        prNumber: 60,
+        verdict: 'REQUEST_CHANGES',
+        round: first,
+        thread: '101',
+      }),
+    ).toBeNull()
+
+    expect(abortGithubReviewStateForPr(WS, 60)).toEqual({ releasedReservations: 1, deletedRounds: 1 })
+
+    const fresh = registerOrJoinReplyReviewRound({
+      workspace: WS,
+      prNumber: 60,
+      headSha: ROUND.headSha,
+      blockingReviewId: 7001,
+      thread: '202',
+      generateRoundId: () => 'after-ready',
+    })
+    expect(fresh.roundId).toBe('after-ready')
+    expect(fresh.carrierThread).toBe('202')
+    const fenced = await g.guard({
+      callId: 'ready-again-call',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'REQUEST_CHANGES',
+      round: fresh,
+      thread: '202',
+    })
+    expect(fenced).toMatchObject({ block: true, kind: 'concurrent', reason: expect.stringContaining('settling') })
+
+    await g.release({ callId: 'drafted-call', outcome: 'failed' })
+    expect(
+      await g.guard({
+        callId: 'ready-after-settle',
+        workspace: WS,
+        prNumber: 60,
+        verdict: 'REQUEST_CHANGES',
+        round: fresh,
+        thread: '202',
+      }),
+    ).toBeNull()
   })
 
   test('restores attempted carriers so failover does not retry them after restart', () => {
@@ -1031,6 +1088,45 @@ describe('review verdict idempotency guard', () => {
     const dup = await g.guard({ callId: 'a1', workspace: WS, prNumber: 43, verdict: 'APPROVE' })
     // then: the lag shield blocks it — the gap the backstop was meant to close
     expect(dup?.block).toBe(true)
+  })
+
+  test('aborting local review state preserves a recently landed remote verdict', async () => {
+    const g = makeShaGuard('sha-abc')
+    await g.guard({ callId: 'landed-before-draft', workspace: WS, prNumber: 46, verdict: 'APPROVE' })
+    await g.release({ callId: 'landed-before-draft', outcome: 'formal-landed' })
+    expect(__recentLandedRecordCountForTest()).toBe(1)
+
+    abortGithubReviewStateForPr(WS, 46)
+
+    expect(__recentLandedRecordCountForTest()).toBe(1)
+    const duplicate = await g.guard({ callId: 'after-draft', workspace: WS, prNumber: 46, verdict: 'APPROVE' })
+    expect(duplicate).toMatchObject({ block: true, kind: 'duplicate', duplicateSource: 'recent' })
+  })
+
+  test('an abandoned pending-publication fence lapses after the recent-landing TTL and logs the PR', async () => {
+    let clock = 1_000
+    const warnings: string[] = []
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => 'sha-abc',
+      now: () => clock,
+      logger: { warn: (message) => warnings.push(message) },
+    })
+    await g.guard({ callId: 'abandoned-before-draft', workspace: WS, prNumber: 47, verdict: 'APPROVE' })
+    abortGithubReviewStateForPr(WS, 47, () => clock)
+
+    clock += LAG_WINDOW_MS
+    const afterExpiry = await g.guard({
+      callId: 'after-fence-expiry',
+      workspace: WS,
+      prNumber: 47,
+      verdict: 'APPROVE',
+    })
+
+    expect(afterExpiry).toBeNull()
+    expect(warnings).toEqual([
+      expect.stringContaining('pending review publication fence lapsed without release pr=acme/widgets#47'),
+    ])
   })
 
   test('noteLandedReview respects head SHA: a re-review on a new head is still allowed', async () => {
