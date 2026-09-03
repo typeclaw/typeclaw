@@ -10,6 +10,7 @@ import {
   guardGithubReviewRoundDismissal,
   githubReviewRoundKey,
   isGithubReviewRoundComplete,
+  isGithubReviewRoundPending,
   REPLY_REVIEW_ROUND_TTL_MS,
   releaseGithubReviewRoundDismissal,
   registerGithubReviewRound,
@@ -480,6 +481,21 @@ describe('review verdict idempotency guard', () => {
       thread: '101',
     })
     expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+  })
+
+  test('reports only an unexpired pending round as pending', () => {
+    let clock = 1_000
+    const round = { ...ROUND, kind: 'reply', roundId: 'pending-state' } as const
+    registerGithubReviewRound(round, clock, () => clock)
+
+    expect(isGithubReviewRoundPending(round, () => clock)).toBe(true)
+    completeGithubReviewRound(round)
+    expect(isGithubReviewRoundPending(round, () => clock)).toBe(false)
+
+    const expired = { ...round, roundId: 'expired-state' }
+    registerGithubReviewRound(expired, clock, () => clock)
+    clock += REPLY_REVIEW_ROUND_TTL_MS
+    expect(isGithubReviewRoundPending(expired, () => clock)).toBe(false)
   })
 
   test('blocks a second verdict while the first is still in flight (concurrent sessions, same container)', async () => {
