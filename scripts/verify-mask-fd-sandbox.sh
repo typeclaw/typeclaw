@@ -84,7 +84,14 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # no QEMU registered that dies on exec format, failing the release for a reason
 # that has nothing to do with bwrap. Re-resolving the tag here keeps the check
 # honest on both the classic and containerd image stores.
-run_args=(--rm --pull=always --security-opt seccomp=unconfined)
+# apparmor=unconfined alongside seccomp: bwrap's first act is
+# `mount(NULL, "/", MS_SLAVE|MS_REC)`, which Docker's docker-default AppArmor
+# profile denies on an AppArmor-enabled host (the GitHub Ubuntu runners), failing
+# with "Failed to make / slave: Permission denied" before any mask is evaluated.
+# seccomp=unconfined does not cover AppArmor. Agent containers already run
+# unconfined so bwrap can create namespaces, so this matches the runtime the gate
+# is meant to certify rather than relaxing it — the mask assertions are unchanged.
+run_args=(--rm --pull=always --security-opt seccomp=unconfined --security-opt apparmor=unconfined)
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi
