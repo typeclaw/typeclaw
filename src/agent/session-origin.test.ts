@@ -203,6 +203,8 @@ describe('renderSessionOrigin', () => {
     expect(out).toContain('APPROVE')
     expect(out).toMatch(/never post it twice|visible duplicate/i)
     expect(out).toMatch(/skip_response/)
+    expect(out).toMatch(/Never post your own coordination state/i)
+    expect(out).toMatch(/PR\s+participant needs/i)
   })
 
   test('github PR review-round carrier is told to run one whole-PR re-review and post the verdict', () => {
@@ -246,6 +248,10 @@ describe('renderSessionOrigin', () => {
 
     expect(out).toMatch(/This session is not the review-round carrier/i)
     expect(out).toMatch(/Do not spawn a reviewer, review, or publish findings/i)
+    expect(out).toMatch(/correct action is silence/i)
+    expect(out).toMatch(/skip_response/i)
+    expect(out).toMatch(/waiting for the verdict.*defect/i)
+    expect(out).toMatch(/one message/i)
     expect(out).toMatch(/close out only this thread/i)
   })
 
