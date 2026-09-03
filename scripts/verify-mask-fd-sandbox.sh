@@ -84,21 +84,13 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # no QEMU registered that dies on exec format, failing the release for a reason
 # that has nothing to do with bwrap. Re-resolving the tag here keeps the check
 # honest on both the classic and containerd image stores.
-# --privileged so `bwrap --unshare-all` can actually build its namespaces here.
-# The runners restrict namespace creation in layers, and each one aborts the
-# invocation before a single mask is evaluated — so the step fails for reasons
-# that say nothing about the contract under test: docker-default AppArmor denies
-# the opening mount(NULL, "/", MS_SLAVE|MS_REC) ("Failed to make / slave"), and
-# the loopback bring-up in the new netns fails RTM_NEWADDR "Operation not
-# permitted" even with seccomp and AppArmor unconfined and NET_ADMIN added,
-# because the restriction is on the user namespace that would confer it.
-#
-# This is scaffolding for a throwaway container running a known image inside the
-# release pipeline, NOT a runtime capability grant — agent containers get
-# seccomp=unconfined and nothing more. What the gate certifies is unchanged: the
-# bwrap argv still mirrors buildArgv()/appendMasks(), and MASK_BWRAP_FAILED,
-# MASK_LEAKED and MASK_CONTRACT_OK all still fail the release on a real break.
-run_args=(--rm --pull=always --privileged)
+# seccomp=unconfined and NOTHING ELSE, because that is exactly what agent
+# containers get (`runArgs` in src/container/start.ts). A verifier running with
+# more privilege than production can pass on a bwrap that would fail in a real
+# agent container, which is the one thing this gate must never do. If bwrap
+# cannot build its namespaces under these flags on some host, that host is the
+# wrong place to run the check — do not widen this to make a runner go green.
+run_args=(--rm --pull=always --security-opt seccomp=unconfined)
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi
