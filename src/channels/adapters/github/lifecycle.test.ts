@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { generateKeyPairSync } from 'node:crypto'
+import { createHmac, generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -57,6 +57,20 @@ function recordingLogger(): {
   }
 }
 
+function signedWebhookRequest(payload: Record<string, unknown>, event: string, delivery: string): Request {
+  const body = JSON.stringify(payload)
+  const signature = `sha256=${createHmac('sha256', 'wh-secret').update(body).digest('hex')}`
+  return new Request('https://example.com/github', {
+    method: 'POST',
+    headers: {
+      'x-hub-signature-256': signature,
+      'x-github-event': event,
+      'x-github-delivery': delivery,
+    },
+    body,
+  })
+}
+
 function patSecrets(): GithubSecretsBlock {
   return {
     auth: { type: 'pat', token: { value: 'ghp_test' } },
@@ -97,6 +111,71 @@ function freshRouter(): ChannelRouter {
 }
 
 describe('createGithubAdapter lifecycle', () => {
+  test('wires draft control to the router and skips an unavailable cooldown store', async () => {
+    const router = freshRouter()
+    const abortSeen = Promise.withResolvers<void>()
+    const cooldownSkipSeen = Promise.withResolvers<void>()
+    const aborts: Array<{ workspace: string; prNumber: number; reason: string }> = []
+    router.abortGithubPrTurn = async (workspace, prNumber, reason) => {
+      aborts.push({ workspace, prNumber, reason })
+      abortSeen.resolve()
+      return { kind: 'no-live-session' }
+    }
+    const messages: string[] = []
+    const logger = {
+      info: (message: string) => {
+        messages.push(message)
+        if (message.includes('cooldown clear skipped') && message.includes('store not initialized')) {
+          cooldownSkipSeen.resolve()
+        }
+      },
+      warn: (message: string) => messages.push(message),
+      error: (message: string) => messages.push(message),
+    }
+    let webhookHandler: ((request: Request) => Promise<Response>) | undefined
+    const config = githubConfig([], null)
+    config.eventAllowlist = ['pull_request.converted_to_draft']
+    const { fetch: fetchImpl } = fakeFetchRecording(({ url, method }) => {
+      if (url.endsWith('/user') && method === 'GET') return Response.json({ login: 'bot', id: 1 })
+      return new Response('unexpected', { status: 500 })
+    })
+    const adapter = createGithubAdapter({
+      router,
+      configRef: () => config,
+      secrets: patSecrets(),
+      agentDir: '/tmp/agent',
+      logger,
+      fetchImpl,
+      httpListenImpl: (_port, handler) => {
+        webhookHandler = handler
+        return { stop: async () => {} }
+      },
+      tokenRefreshIntervalMs: 0,
+      reconcileIntervalMs: 0,
+    })
+
+    await adapter.start()
+    if (webhookHandler === undefined) throw new Error('webhook handler was not registered')
+    const response = await webhookHandler(
+      signedWebhookRequest(
+        {
+          action: 'converted_to_draft',
+          repository: { name: 'widgets', owner: { login: 'acme' } },
+          pull_request: { number: 7, id: 700, draft: true },
+          sender: { login: 'alice', id: 10, type: 'User' },
+        },
+        'pull_request',
+        'draft-control',
+      ),
+    )
+    await Promise.all([abortSeen.promise, cooldownSkipSeen.promise])
+
+    expect(response.status).toBe(200)
+    expect(aborts).toEqual([{ workspace: 'acme/widgets', prNumber: 7, reason: 'pull request converted to draft' }])
+    expect(messages.some((message) => message.includes('no-live-session'))).toBe(true)
+    await adapter.stop()
+  })
+
   test('start() registers a webhook for every configured repo', async () => {
     const created: Array<{ repo: string; hookId: number }> = []
     const { fetch: fetchImpl, calls } = fakeFetchRecording(({ url, method }) => {
