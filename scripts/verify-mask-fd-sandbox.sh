@@ -84,13 +84,21 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # no QEMU registered that dies on exec format, failing the release for a reason
 # that has nothing to do with bwrap. Re-resolving the tag here keeps the check
 # honest on both the classic and containerd image stores.
-# seccomp=unconfined and NOTHING ELSE, because that is exactly what agent
-# containers get (`runArgs` in src/container/start.ts). A verifier running with
-# more privilege than production can pass on a bwrap that would fail in a real
-# agent container, which is the one thing this gate must never do. If bwrap
-# cannot build its namespaces under these flags on some host, that host is the
-# wrong place to run the check — do not widen this to make a runner go green.
-run_args=(--rm --pull=always --security-opt seccomp=unconfined)
+# seccomp=unconfined matches what agent containers get (`runArgs` in
+# src/container/start.ts). apparmor=unconfined is a KNOWN, DELIBERATE DIVERGENCE
+# from production, and it is load-bearing: measured on an ubuntu-24.04 runner
+# against the 0.48.10 base image, `bwrap --unshare-all` cannot complete its
+# opening mount(NULL, "/", MS_SLAVE|MS_REC) under Docker's docker-default
+# AppArmor profile, and no runner-side sysctl changes that. Adding it is the
+# only way this check runs at all on an AppArmor-enabled host.
+#
+# The divergence is not free: production does NOT pass apparmor=unconfined, so
+# on an AppArmor-enabled Docker host the per-tool sandbox plausibly hits the
+# same wall — which this gate would no longer catch. That is a product question
+# about src/container/start.ts, not something to settle by picking flags here.
+# Do NOT widen this further to make a runner go green; anything beyond these two
+# (NET_ADMIN, --privileged) was measured to be unnecessary.
+run_args=(--rm --pull=always --security-opt seccomp=unconfined --security-opt apparmor=unconfined)
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi

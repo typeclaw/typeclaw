@@ -325,18 +325,17 @@ jobs:
           docker pull --platform linux/arm64 "$IMAGE"
           docker buildx imagetools inspect "${REGISTRY_IMAGE}:latest"
 
-      # bwrap builds its sandbox from an unprivileged user namespace, and Ubuntu
-      # 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which denies
-      # that. Without the userns bwrap holds none of the capabilities the setup
-      # needs, so it aborts before evaluating a single mask — first on
-      # mount(NULL, "/", MS_SLAVE|MS_REC) ("Failed to make / slave"), then on the
-      # loopback bring-up ("RTM_NEWADDR: Operation not permitted"). Both are the
-      # same missing userns, and neither says anything about the mask contract.
+      # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, so
+      # bwrap cannot open the user namespace it builds the sandbox from and ends
+      # up without CAP_NET_ADMIN for the loopback bring-up in its new netns
+      # ("RTM_NEWADDR: Operation not permitted"). Clearing the sysctl is what
+      # fixes that, and it is a runner setting rather than a change to the
+      # container under test.
       #
-      # This is deliberately fixed on the RUNNER, not by loosening the container
-      # the check runs in: that container must keep matching production's
-      # `--security-opt seccomp=unconfined` exactly, or the gate can pass on a
-      # bwrap that would fail in a real agent container.
+      # It is only half the story: measured on this runner, the opening mount is
+      # denied by docker-default AppArmor regardless of this sysctl, which is
+      # why the verifier also passes apparmor=unconfined. See the flag comment
+      # in scripts/verify-mask-fd-sandbox.sh for that divergence and its cost.
       - name: Allow unprivileged user namespaces for bwrap
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
