@@ -325,18 +325,18 @@ jobs:
           docker pull --platform linux/arm64 "$IMAGE"
           docker buildx imagetools inspect "${REGISTRY_IMAGE}:latest"
 
-      # Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, so
-      # bwrap cannot open the user namespace it builds the sandbox from and ends
-      # up without CAP_NET_ADMIN for the loopback bring-up in its new netns
-      # ("RTM_NEWADDR: Operation not permitted"). Clearing the sysctl is what
-      # fixes that, and it is a runner setting rather than a change to the
-      # container under test.
+      # Only the DIAGNOSTIC lane needs this. Ubuntu 24.04 ships
+      # kernel.apparmor_restrict_unprivileged_userns=1, and a process that has
+      # been made AppArmor-unconfined is subject to that restriction, so the
+      # diagnostic container cannot open the user namespace bwrap builds the
+      # sandbox from ("setting up uid map: Permission denied"). Measured on this
+      # runner; it is unrelated to --share-net, which the verifier now also sets.
       #
-      # It is only half the story: measured on this runner, the opening mount is
-      # denied by docker-default AppArmor regardless of this sysctl, which is
-      # why the verifier also passes apparmor=unconfined. See the flag comment
-      # in scripts/verify-mask-fd-sandbox.sh for that divergence and its cost.
-      - name: Allow unprivileged user namespaces for bwrap
+      # It does nothing for the production lane: under docker-default AppArmor
+      # the userns is permitted and the opening mount is denied instead, so that
+      # lane fails at mount regardless of this sysctl. Do not read a green
+      # diagnostic lane as evidence the production lane can pass.
+      - name: Allow unprivileged user namespaces for the diagnostic lane
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Verify the sandbox file-mask contract against the shipped bwrap
@@ -358,10 +358,27 @@ jobs:
         # pulled last (arm64). Running that unqualified here would exec a
         # foreign-arch binary with no QEMU registered and fail the release on
         # exec format instead of on bwrap.
+        #
+        # Two lanes, both required, because either one alone misleads. The
+        # diagnostic lane lifts AppArmor so the mask assertions stay reachable
+        # even where host policy forbids bwrap; it answers "did the mask argv
+        # regress?". The production lane uses the flags an agent container
+        # actually gets and answers "can bwrap run at all here?". Running the
+        # diagnostic first means a production-lane failure is already
+        # attributable: masks OK + production dead == host policy, not the argv.
         env:
           VERSION: ${{ needs.checks.outputs.version }}
           PLATFORM: linux/${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
-        run: scripts/verify-mask-fd-sandbox.sh "${REGISTRY_IMAGE}:${VERSION}" "${PLATFORM}"
+        run: scripts/verify-mask-fd-sandbox.sh "${REGISTRY_IMAGE}:${VERSION}" "${PLATFORM}" diagnostic
+
+      # Authoritative. A failure here is NOT a CI misconfiguration to be flagged
+      # away — it means model bash is dead under the flags agent containers run
+      # with, which is the outage this whole gate exists to prevent shipping.
+      - name: Verify bwrap runs under production container flags
+        env:
+          VERSION: ${{ needs.checks.outputs.version }}
+          PLATFORM: linux/${{ runner.arch == 'ARM64' && 'arm64' || 'amd64' }}
+        run: scripts/verify-mask-fd-sandbox.sh "${REGISTRY_IMAGE}:${VERSION}" "${PLATFORM}" production
 
   # ─────────────────────────── release ───────────────────────────
   # The irreversible publish path, gated on a verified multi-arch base image.
