@@ -84,23 +84,21 @@ echo "Image: $IMAGE${PLATFORM:+ ($PLATFORM)}"
 # no QEMU registered that dies on exec format, failing the release for a reason
 # that has nothing to do with bwrap. Re-resolving the tag here keeps the check
 # honest on both the classic and containerd image stores.
-# apparmor=unconfined alongside seccomp: bwrap's first act is
-# `mount(NULL, "/", MS_SLAVE|MS_REC)`, which Docker's docker-default AppArmor
-# profile denies on an AppArmor-enabled host (the GitHub Ubuntu runners), failing
-# with "Failed to make / slave: Permission denied" before any mask is evaluated.
-# seccomp=unconfined does not cover AppArmor. Agent containers already run
-# unconfined so bwrap can create namespaces, so this matches the runtime the gate
-# is meant to certify rather than relaxing it — the mask assertions are unchanged.
-# NET_ADMIN because --unshare-all creates a network namespace and bwrap then
-# brings up its loopback; where the runner denies the unprivileged user namespace
-# that would otherwise confer it, that RTM_NEWADDR fails "Operation not
-# permitted". This grants the verifier container what the rendered command needs
-# to run at all. The bwrap argv is untouched, so the mirrored shape still stands.
-run_args=(
-  --rm --pull=always
-  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-  --cap-add NET_ADMIN
-)
+# --privileged so `bwrap --unshare-all` can actually build its namespaces here.
+# The runners restrict namespace creation in layers, and each one aborts the
+# invocation before a single mask is evaluated — so the step fails for reasons
+# that say nothing about the contract under test: docker-default AppArmor denies
+# the opening mount(NULL, "/", MS_SLAVE|MS_REC) ("Failed to make / slave"), and
+# the loopback bring-up in the new netns fails RTM_NEWADDR "Operation not
+# permitted" even with seccomp and AppArmor unconfined and NET_ADMIN added,
+# because the restriction is on the user namespace that would confer it.
+#
+# This is scaffolding for a throwaway container running a known image inside the
+# release pipeline, NOT a runtime capability grant — agent containers get
+# seccomp=unconfined and nothing more. What the gate certifies is unchanged: the
+# bwrap argv still mirrors buildArgv()/appendMasks(), and MASK_BWRAP_FAILED,
+# MASK_LEAKED and MASK_CONTRACT_OK all still fail the release on a real break.
+run_args=(--rm --pull=always --privileged)
 if [ -n "$PLATFORM" ]; then
   run_args+=(--platform "$PLATFORM")
 fi
