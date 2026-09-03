@@ -255,6 +255,151 @@ describe('LiveSubagentRegistry', () => {
     expect(reg.recordCapturedFinalMessageIfRunning('bg_t1', '<review>late</review>')).toBe(false)
     expect(reg.getCapturedFinalMessage('bg_t1')).toBe('<review>safe</review>')
   })
+
+  test('cancelRunningByWorkKey cancels matching roots and all running descendants by session ancestry', async () => {
+    const reg = new LiveSubagentRegistry()
+    const released: string[] = []
+    const aborted: string[] = []
+    const workKey = 'reviewer:github:acme/widgets#42'
+    const register = (overrides: Partial<LiveSubagent>): void => {
+      const taskId = overrides.taskId ?? 'missing-task'
+      reg.register(
+        makeLive({
+          ...overrides,
+          taskId,
+          releaseCoalesceKey: () => released.push(taskId),
+          abort: async () => {
+            expect(reg.get(taskId)?.status).toBe('failed')
+            expect(released).toContain(taskId)
+            aborted.push(taskId)
+          },
+        }),
+      )
+    }
+    register({ taskId: 'bg_root', sessionId: 'ses_root', workKey })
+    register({ taskId: 'bg_child', sessionId: 'ses_child', parentSessionId: 'ses_root' })
+    register({ taskId: 'bg_grandchild', sessionId: 'ses_grandchild', parentSessionId: 'ses_child' })
+
+    const result = await reg.cancelRunningByWorkKey(workKey, 'pull request converted to draft')
+
+    expect(result).toEqual({ matched: 3, cancelled: 3, failures: 0 })
+    expect(aborted.sort()).toEqual(['bg_child', 'bg_grandchild', 'bg_root'])
+    expect(released.sort()).toEqual(['bg_child', 'bg_grandchild', 'bg_root'])
+    expect(reg.list().every((entry) => entry.completion?.error?.includes('pull request converted to draft'))).toBe(true)
+  })
+
+  test('cancelRunningByWorkKey follows ancestry through a terminal intermediate without cancelling unrelated PRs', async () => {
+    const reg = new LiveSubagentRegistry()
+    const aborted: string[] = []
+    const abort = (taskId: string) => async (): Promise<void> => {
+      aborted.push(taskId)
+    }
+    reg.register(
+      makeLive({
+        taskId: 'bg_target',
+        sessionId: 'ses_target',
+        workKey: 'reviewer:github:acme/widgets#42',
+        abort: abort('bg_target'),
+      }),
+    )
+    reg.register(
+      makeLive({
+        taskId: 'bg_finished_child',
+        sessionId: 'ses_finished_child',
+        parentSessionId: 'ses_target',
+        status: 'completed',
+        completion: { ok: true, durationMs: 5 },
+        abort: abort('bg_finished_child'),
+      }),
+    )
+    reg.register(
+      makeLive({
+        taskId: 'bg_nested_running',
+        sessionId: 'ses_nested_running',
+        parentSessionId: 'ses_finished_child',
+        abort: abort('bg_nested_running'),
+      }),
+    )
+    reg.register(
+      makeLive({
+        taskId: 'bg_other_pr',
+        sessionId: 'ses_other_pr',
+        workKey: 'reviewer:github:acme/widgets#43',
+        abort: abort('bg_other_pr'),
+      }),
+    )
+    reg.register(
+      makeLive({
+        taskId: 'bg_other_repo',
+        sessionId: 'ses_other_repo',
+        workKey: 'reviewer:github:acme/gadgets#42',
+        abort: abort('bg_other_repo'),
+      }),
+    )
+
+    const result = await reg.cancelRunningByWorkKey(
+      'reviewer:github:acme/widgets#42',
+      'pull request converted to draft',
+    )
+
+    expect(result).toEqual({ matched: 2, cancelled: 2, failures: 0 })
+    expect(aborted.sort()).toEqual(['bg_nested_running', 'bg_target'])
+    expect(reg.get('bg_finished_child')?.status).toBe('completed')
+    expect(reg.get('bg_other_pr')?.status).toBe('running')
+    expect(reg.get('bg_other_repo')?.status).toBe('running')
+  })
+
+  test('cancelRunningByWorkKey settlement wins over a late real completion', async () => {
+    const reg = new LiveSubagentRegistry()
+    reg.register(makeLive({ workKey: 'reviewer:github:acme/widgets#42' }))
+
+    await reg.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft')
+    const lateWon = reg.recordCompletionIfRunning('bg_t1', {
+      ok: true,
+      finalMessage: 'late review result',
+      durationMs: 200,
+    })
+
+    expect(lateWon).toBe(false)
+    expect(reg.get('bg_t1')?.completion).toEqual({
+      ok: false,
+      error: expect.stringContaining('pull request converted to draft'),
+      durationMs: expect.any(Number),
+    })
+  })
+
+  test('cancelRunningByWorkKey counts an abort failure and continues cancelling siblings', async () => {
+    const reg = new LiveSubagentRegistry()
+    const aborted: string[] = []
+    const workKey = 'reviewer:github:acme/widgets#42'
+    reg.register(
+      makeLive({
+        taskId: 'bg_throwing',
+        sessionId: 'ses_throwing',
+        workKey,
+        abort: async () => {
+          throw new Error('abort transport failed')
+        },
+      }),
+    )
+    reg.register(
+      makeLive({
+        taskId: 'bg_sibling',
+        sessionId: 'ses_sibling',
+        workKey,
+        abort: async () => {
+          aborted.push('bg_sibling')
+        },
+      }),
+    )
+
+    const result = await reg.cancelRunningByWorkKey(workKey, 'pull request converted to draft')
+
+    expect(result).toEqual({ matched: 2, cancelled: 1, failures: 1 })
+    expect(aborted).toEqual(['bg_sibling'])
+    expect(reg.get('bg_throwing')?.status).toBe('failed')
+    expect(reg.get('bg_sibling')?.status).toBe('failed')
+  })
 })
 
 describe('snapshot.statusSummary rendering', () => {
