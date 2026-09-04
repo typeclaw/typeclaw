@@ -52,20 +52,24 @@ export function renderPrVerdictStandDownReminder(args: { prNumber: number; verdi
   if (args.verdict === 'DISMISSED') {
     return (
       `<system-reminder>\n` +
-      `The designated carrier verified that its blocking review for PR #${args.prNumber} is DISMISSED. ` +
-      `Do not submit another formal verdict for this follow-up round. Close out this session's addressed ` +
-      `review thread as normal; leave it open if its concern remains unresolved.\n` +
+      `The blocking review for PR #${args.prNumber} is verified as DISMISSED. Do not submit another formal verdict ` +
+      `unless fresh evidence warrants one. This does not discharge the inline review-thread obligation: send exactly ` +
+      `one participant-facing close-out, resolving with a short substantive acknowledgement if addressed or leaving ` +
+      `it open with the specific technical reason it remains. Do not describe review rounds, carriers, sessions, ` +
+      `verdict registration, or sticky review state.\n` +
       `</system-reminder>`
     )
   }
   return (
     `<system-reminder>\n` +
-    `Another session in this agent has already posted a formal ${args.verdict} review for PR #${args.prNumber}. ` +
+    `A formal ${args.verdict} review has already landed for PR #${args.prNumber}. ` +
     `This notice applies ONLY to formal PR-level verdicts. Do not submit your own ${args.verdict} (or any redundant ` +
     `verdict) for this PR this turn unless new ` +
     `information genuinely invalidates that result (e.g. new commits, or a different verdict warranted by ` +
-    `fresh evidence). It does NOT discharge this session's inline review-thread close-out: you must still reply to ` +
-    `the inline thread as normal, resolving it if addressed or leaving it open with an explanation.\n` +
+    `fresh evidence). It does NOT discharge the inline review-thread obligation: send exactly one participant-facing ` +
+    `close-out, resolving with a short substantive acknowledgement if addressed or leaving it open with the specific ` +
+    `technical reason it remains. Do not describe review rounds, carriers, sessions, verdict registration, or sticky ` +
+    `review state.\n` +
     `</system-reminder>`
   )
 }

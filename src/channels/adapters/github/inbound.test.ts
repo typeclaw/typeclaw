@@ -1185,7 +1185,7 @@ describe('createGithubWebhookHandler — review comment parent lookup', () => {
     expect(routed[0]?.replyToBotMessageId).toBe('101')
     expect(routed[0]?.replyToOtherMessageId).toBe(null)
     expect(routed[0]?.suppressSticky).toBe(true)
-    expect(routed[0]?.githubReviewThreadCloseout).toEqual({
+    expect(routed[0]?.githubReviewThreadCloseout).toMatchObject({
       workspace: 'acme/project',
       prNumber: 7,
       rootCommentId: '101',
@@ -1211,6 +1211,7 @@ describe('createGithubWebhookHandler — reply review rounds', () => {
     routed: InboundMessage[]
     fetchImpl: typeof fetch
     generateReviewRoundId?: () => string
+    now?: () => number
   }): (req: Request) => Promise<Response> {
     return createGithubWebhookHandler({
       webhookSecret: 'secret',
@@ -1221,6 +1222,7 @@ describe('createGithubWebhookHandler — reply review rounds', () => {
       authToken: async () => 'tok',
       fetchImpl: input.fetchImpl,
       generateReviewRoundId: input.generateReviewRoundId,
+      now: input.now,
       logger,
       route: (message) => input.routed.push(message),
     })
@@ -1420,10 +1422,14 @@ describe('createGithubWebhookHandler — reply review rounds', () => {
     await expectQualifyingControlToArm('reply-round-missing-review-id-control')
   })
 
-  it('fails open and routes the reply without a round when review-state lookup fails', async () => {
+  it('routes a lookup failure with a bounded unknown-state close-out deferral', async () => {
     __resetReviewVerdictGuardForTest()
     const routed: InboundMessage[] = []
-    const handler = replyRoundHandler({ routed, fetchImpl: replyRoundFetch({ reviewState: 'failed' }) })
+    const handler = replyRoundHandler({
+      routed,
+      fetchImpl: replyRoundFetch({ reviewState: 'failed' }),
+      now: () => 10_000,
+    })
 
     const response = await handler(
       signedRequest(
@@ -1437,6 +1443,10 @@ describe('createGithubWebhookHandler — reply review rounds', () => {
     expect(routed).toHaveLength(1)
     expect(routed[0]?.thread).toBe('101')
     expect(routed[0]?.githubReviewRound).toBeUndefined()
+    expect(routed[0]?.githubReviewThreadCloseout?.deferUntil).toEqual({
+      kind: 'review-state-unknown',
+      expiresAt: 130_000,
+    })
     await expectQualifyingControlToArm('reply-round-failed-state-control')
   })
 })

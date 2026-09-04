@@ -275,8 +275,9 @@ export function restoreGithubReviewRound(
   dismissalAttempted = false,
   requestChangesAttempted = false,
   createdAt = Date.now(),
+  now: () => number = Date.now,
 ): GithubReviewFollowupRound | null {
-  const registered = registerGithubReviewRound(round, createdAt)
+  const registered = registerGithubReviewRound(round, createdAt, now)
   if (registered === null) return null
   const key = githubReviewRoundKey(registered)
   // Restoration is monotonic: a persisted `pending` record must never overwrite
@@ -285,7 +286,7 @@ export function restoreGithubReviewRound(
   // it regress would re-arm failover and permit a second blocking review.
   // Expiry still wins — `activeReviewRoundState` drops the state first, so an
   // expired round is never resurrected by a late restore.
-  const existing = activeReviewRoundState(key)
+  const existing = activeReviewRoundState(key, now)
   if (existing !== undefined && existing.status === 'completed' && status === 'pending') return registered
   reviewRounds.set(key, {
     round: registered,
@@ -298,14 +299,17 @@ export function restoreGithubReviewRound(
   return registered
 }
 
-export function githubReviewRoundPersistence(round: GithubReviewFollowupRound): {
+export function githubReviewRoundPersistence(
+  round: GithubReviewFollowupRound,
+  now: () => number = Date.now,
+): {
   status: ReviewRoundState['status']
   createdAt: number
   attemptedCarriers: (string | null)[]
   dismissalAttempted?: true
   requestChangesAttempted?: true
 } | null {
-  const state = activeReviewRoundState(githubReviewRoundKey(round))
+  const state = activeReviewRoundState(githubReviewRoundKey(round), now)
   if (state === undefined) return null
   return {
     status: state.status,
@@ -320,13 +324,13 @@ export function forgetGithubReviewRound(round: GithubReviewFollowupRound): void 
   reviewRounds.delete(githubReviewRoundKey(round))
 }
 
-export function completeGithubReviewRound(round: GithubReviewFollowupRound): void {
+export function completeGithubReviewRound(round: GithubReviewFollowupRound, now: () => number = Date.now): void {
   const key = githubReviewRoundKey(round)
-  let current = activeReviewRoundState(key)
+  let current = activeReviewRoundState(key, now)
   if (current === undefined) {
-    const registered = registerGithubReviewRound(round)
+    const registered = registerGithubReviewRound(round, now(), now)
     if (registered === null) return
-    current = activeReviewRoundState(key)
+    current = activeReviewRoundState(key, now)
     if (current === undefined) return
   }
   reviewRounds.set(key, {
@@ -339,16 +343,24 @@ export function completeGithubReviewRound(round: GithubReviewFollowupRound): voi
   })
 }
 
-export function isGithubReviewRoundComplete(round: GithubReviewFollowupRound): boolean {
-  return activeReviewRoundState(githubReviewRoundKey(round))?.status === 'completed'
+export function isGithubReviewRoundComplete(round: GithubReviewFollowupRound, now: () => number = Date.now): boolean {
+  return activeReviewRoundState(githubReviewRoundKey(round), now)?.status === 'completed'
+}
+
+// This deliberately asks activeReviewRoundState instead of negating completion:
+// lazy TTL expiry removes abandoned rounds, so an expired round is NOT pending and
+// the close-out guard resumes before silence can strand its review thread forever.
+export function isGithubReviewRoundPending(round: GithubReviewFollowupRound, now: () => number = Date.now): boolean {
+  return activeReviewRoundState(githubReviewRoundKey(round), now)?.status === 'pending'
 }
 
 export function promoteGithubReviewRound(
   round: GithubReviewFollowupRound,
   carrierThread: string | null,
+  now: () => number = Date.now,
 ): GithubReviewFollowupRound | null {
   const key = githubReviewRoundKey(round)
-  const current = activeReviewRoundState(key)
+  const current = activeReviewRoundState(key, now)
   if (current === undefined || current.status === 'completed') return null
   const active = current.round
   if (active.carrierThread !== round.carrierThread) return null
@@ -367,16 +379,21 @@ export function promoteGithubReviewRound(
   return promoted
 }
 
-export function canPromoteGithubReviewRoundTo(round: GithubReviewFollowupRound, thread: string | null): boolean {
-  const current = activeReviewRoundState(githubReviewRoundKey(round))
+export function canPromoteGithubReviewRoundTo(
+  round: GithubReviewFollowupRound,
+  thread: string | null,
+  now: () => number = Date.now,
+): boolean {
+  const current = activeReviewRoundState(githubReviewRoundKey(round), now)
   return current !== undefined && current.status !== 'completed' && !current.attemptedCarriers.has(thread)
 }
 
 export async function validateGithubReviewRound(
   round: GithubReviewFollowupRound,
   createdAt?: number,
+  now: () => number = Date.now,
 ): Promise<boolean> {
-  if (createdAt !== undefined && Date.now() - createdAt >= reviewRoundTtlMs(round)) return false
+  if (createdAt !== undefined && now() - createdAt >= reviewRoundTtlMs(round)) return false
   if (expiredReviewRoundKeys.has(githubReviewRoundKey(round))) return false
   const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
   return currentHead !== null && currentHead === round.headSha
@@ -431,12 +448,15 @@ export function releaseGithubReviewRoundDismissal(callId: string, attempted = tr
   releaseReservation(callId, reservation)
 }
 
-export function hasGithubReviewRoundDismissalAttempt(round: GithubReviewFollowupRound): boolean {
-  return activeReviewRoundState(githubReviewRoundKey(round))?.dismissalAttempted === true
+export function hasGithubReviewRoundDismissalAttempt(
+  round: GithubReviewFollowupRound,
+  now: () => number = Date.now,
+): boolean {
+  return activeReviewRoundState(githubReviewRoundKey(round), now)?.dismissalAttempted === true
 }
 
-export function resetGithubReviewRoundCompletion(round: GithubReviewFollowupRound): void {
-  const state = activeReviewRoundState(githubReviewRoundKey(round))
+export function resetGithubReviewRoundCompletion(round: GithubReviewFollowupRound, now: () => number = Date.now): void {
+  const state = activeReviewRoundState(githubReviewRoundKey(round), now)
   if (state === undefined || state.status === 'completed') return
   // A verified mutation may outlive its publishing session or hit a transient
   // head read before the observer can record completion. Release operation
@@ -449,8 +469,9 @@ export function resetGithubReviewRoundCompletion(round: GithubReviewFollowupRoun
 export function resetGithubReviewRoundCompletionForPr(
   workspace: string,
   prNumber: number,
+  now: () => number = Date.now,
 ): GithubReviewFollowupRound | null {
-  expireReviewRounds()
+  expireReviewRounds(now)
   const state = Array.from(reviewRounds.values()).find(
     (candidate) =>
       candidate.status === 'pending' &&
@@ -458,7 +479,7 @@ export function resetGithubReviewRoundCompletionForPr(
       candidate.round.prNumber === prNumber,
   )
   if (state === undefined) return null
-  resetGithubReviewRoundCompletion(state.round)
+  resetGithubReviewRoundCompletion(state.round, now)
   return state.round
 }
 

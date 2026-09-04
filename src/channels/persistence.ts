@@ -6,7 +6,7 @@ import type { ChannelParticipant } from '@/agent/session-origin'
 import { toRef } from './adapters/webex-id-ref'
 import { describeError } from './describe-error'
 import type { AdapterId } from './schema'
-import type { ChannelKey, GithubReviewFollowupRound } from './types'
+import type { ChannelKey, GithubReviewFollowupRound, GithubReviewThreadCloseout } from './types'
 
 const FILE_VERSION = 7
 
@@ -36,6 +36,7 @@ export type ChannelSessionRecord = {
     dismissalAttempted?: true
     requestChangesAttempted?: true
   }
+  githubReviewThreadCloseout?: GithubReviewThreadCloseout & { deferred: true }
 }
 
 type FileV4 = {
@@ -246,7 +247,32 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.sessionFile === undefined || typeof r.sessionFile === 'string') &&
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
     Array.isArray(r.participants) &&
-    (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r))
+    (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r)) &&
+    (r.githubReviewThreadCloseout === undefined || isValidGithubReviewThreadCloseout(r.githubReviewThreadCloseout, r))
+  )
+}
+
+function isValidGithubReviewThreadCloseout(value: unknown, record: Record<string, unknown>): boolean {
+  if (!isObject(value)) return false
+  const deferUntil = value.deferUntil
+  return (
+    record.adapter === 'github' &&
+    typeof value.workspace === 'string' &&
+    value.workspace === record.workspace &&
+    typeof value.prNumber === 'number' &&
+    Number.isInteger(value.prNumber) &&
+    value.prNumber > 0 &&
+    record.chat === `pr:${value.prNumber}` &&
+    typeof value.rootCommentId === 'string' &&
+    value.rootCommentId.length > 0 &&
+    value.rootCommentId === record.thread &&
+    (deferUntil === undefined ||
+      (isObject(deferUntil) &&
+        deferUntil.kind === 'review-state-unknown' &&
+        typeof deferUntil.expiresAt === 'number' &&
+        Number.isFinite(deferUntil.expiresAt) &&
+        deferUntil.expiresAt >= 0)) &&
+    value.deferred === true
   )
 }
 

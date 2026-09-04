@@ -59,6 +59,7 @@ export type GithubReviewThreadCloseout = {
   workspace: string
   prNumber: number
   rootCommentId: string
+  deferUntil?: { kind: 'review-state-unknown'; expiresAt: number }
 }
 
 export type InboundMessage = {

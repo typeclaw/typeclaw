@@ -52,6 +52,7 @@ import {
   configureReviewVerdictCoordinator,
   guardGithubReviewRoundDismissal,
   isGithubReviewRoundComplete,
+  REPLY_REVIEW_ROUND_TTL_MS,
   releaseGithubReviewRoundDismissal,
   REVIEW_ROUND_TTL_MS,
 } from './github-review-verdict-coordinator'
@@ -17752,7 +17753,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
       resolveHeadSha: async () => 'sha-new',
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
 
     await router.route(inbound({ ...key, externalMessageId: 'reopen', text: 'new inbound after restart' }))
 
@@ -17781,7 +17782,7 @@ describe('GitHub review follow-up round composition', () => {
           headSha: 'sha-round',
           carrierThread: '101',
           status: 'pending',
-          createdAt: Date.now() - REVIEW_ROUND_TTL_MS - 1,
+          createdAt: Date.now() - REVIEW_ROUND_TTL_MS * 2,
           attemptedCarriers: ['101'],
         },
       },
@@ -17790,7 +17791,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
       resolveHeadSha: async () => 'sha-round',
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
 
     await router.route(inbound({ ...key, externalMessageId: 'reopen-expired', text: 'new inbound after restart' }))
 
@@ -17811,7 +17812,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
       resolveHeadSha: async () => 'sha-round',
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -17895,7 +17896,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => currentHead,
     })
     const logs: string[] = []
-    const { router } = makeRouter(dir, { logs })
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -17953,7 +17954,7 @@ describe('GitHub review follow-up round composition', () => {
         return 'sha-round'
       },
     })
-    const { router } = makeRouter(dir)
+    const { router } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -17974,11 +17975,12 @@ describe('GitHub review follow-up round composition', () => {
     })
 
     // when: the model closes the thread out before that validation returns
-    router.finishGithubReviewRoundCloseout?.({
+    router.finishGithubReviewThreadCloseout?.({
       sessionId: 'ses_fake_1',
       workspace: 'acme/widgets',
       prNumber: 7,
       thread: '101',
+      decision: 'resolved',
     })
     expect(router.__testing!.githubReviewRoundFor(key)).not.toBeNull()
 
@@ -18003,7 +18005,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveHeadSha: async () => 'sha-round',
     })
     const logs: string[] = []
-    const { router } = makeRouter(dir, { logs })
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -18061,6 +18063,7 @@ describe('GitHub review follow-up round composition', () => {
     const logs: string[] = []
     const { router, sessions } = makeRouter(dir, {
       logs,
+      nowRef: { value: Date.now() },
       saveChannelSessions: async (_agentDir, records) => {
         saved.push(structuredClone(records))
       },
@@ -18156,11 +18159,12 @@ describe('GitHub review follow-up round composition', () => {
           })
           if (result.ok) {
             acknowledgements += 1
-            router.finishGithubReviewRoundCloseout?.({
+            router.finishGithubReviewThreadCloseout?.({
               sessionId: 'ses_fake_2',
               workspace: 'acme/widgets',
               prNumber: 7,
               thread: '202',
+              decision: 'resolved',
             })
           }
           router.injectPrVerdictActivity({
@@ -18180,11 +18184,12 @@ describe('GitHub review follow-up round composition', () => {
           })
           if (result.ok) {
             acknowledgements += 1
-            router.finishGithubReviewRoundCloseout?.({
+            router.finishGithubReviewThreadCloseout?.({
               sessionId: 'ses_fake_1',
               workspace: 'acme/widgets',
               prNumber: 7,
               thread: '101',
+              decision: 'resolved',
             })
           }
         }
@@ -18222,7 +18227,7 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     const logs: string[] = []
-    const { router, sessions } = makeRouter(dir, { logs })
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -18248,7 +18253,7 @@ describe('GitHub review follow-up round composition', () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
     const logs: string[] = []
-    const { router, sessions } = makeRouter(dir, { logs })
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -18280,7 +18285,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'DISMISSED' }),
       resolveHeadSha: async () => 'sha-dismissed',
     })
-    const { router, sessions } = makeRouter(dir)
+    const { router, sessions } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -18335,11 +18340,12 @@ describe('GitHub review follow-up round composition', () => {
           rootCommentId: key.thread,
         }),
       ).toMatchObject({ ok: true })
-      router.finishGithubReviewRoundCloseout?.({
+      router.finishGithubReviewThreadCloseout?.({
         sessionId,
         workspace: key.workspace,
         prNumber: 7,
         thread: key.thread,
+        decision: 'resolved',
       })
     }
     await router.stop()
@@ -18356,7 +18362,7 @@ describe('GitHub review follow-up round composition', () => {
       resolveEffectiveApproval: async () => ({ ok: true, effective: 'CHANGES_REQUESTED' }),
       resolveHeadSha: async () => 'sha-pending',
     })
-    const { router, sessions } = makeRouter(dir)
+    const { router, sessions } = makeRouter(dir, { nowRef: { value: Date.now() } })
     const round = {
       kind: 'push',
       roundId: 'test-round',
@@ -18844,6 +18850,459 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
       ...over,
     })
 
+  const replyRound = {
+    kind: 'reply',
+    roundId: 'reply-round',
+    workspace: 'acme/repo',
+    prNumber: 123,
+    headSha: 'sha-round',
+    carrierThread: 'carrier-thread',
+  } as const
+
+  const carrierKey: ChannelKey = { ...GITHUB_KEY, thread: 'carrier-thread' }
+
+  async function routePendingRoundSiblings(
+    router: ChannelRouter,
+    sessions: FakeSession[],
+  ): Promise<{ carrier: FakeSession; sibling: FakeSession }> {
+    await router.route(
+      closeoutInbound({
+        ...carrierKey,
+        externalMessageId: 'carrier-inbound',
+        githubReviewRound: replyRound,
+        githubReviewThreadCloseout: undefined,
+      }),
+    )
+    await router.route(closeoutInbound({ externalMessageId: 'sibling-inbound', githubReviewRound: replyRound }))
+    return { carrier: sessions[0]!, sibling: sessions[1]! }
+  }
+
+  test('silently defers a pending reply-round non-carrier without consuming its correction', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(1)
+    expect(sent).toEqual([])
+    expect(router.__testing!.pendingReminderCount(GITHUB_KEY)).toBe(0)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_deferred'))).toHaveLength(1)
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+    expect(logs.some((line) => line.includes('willingness_nudge'))).toBe(false)
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(true)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('does not defer the designated carrier close-out', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(closeoutInbound({ ...carrierKey, githubReviewRound: replyRound }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+
+    await router.__testing!.flushDebounce(carrierKey)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('wakes a deferred sibling once on round completion for one exact-thread close-out', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => replyRound.headSha,
+    })
+    const sent: OutboundMessage[] = []
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = async (text) => {
+      if (text.includes('formal APPROVE review')) {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId: 'ses_fake_2',
+          workspace: GITHUB_KEY.workspace,
+          prNumber: 123,
+          thread: GITHUB_KEY.thread,
+          decision: 'resolved',
+        })
+        await router.send({ ...GITHUB_KEY, text: 'Verified — this concern is addressed.' })
+      } else {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      }
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'completed' })
+    expect(
+      router.injectPrVerdictActivity({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'delivered', count: 1 })
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]).toMatchObject({ thread: '456', text: 'Verified — this concern is addressed.' })
+    expect(logs.some((line) => line.includes('github_thread_closeout_released'))).toBe(false)
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(false)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases a completed round through the periodic sweep when verdict activity never arrives', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => replyRound.headSha,
+    })
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+      }),
+    ).toEqual({ kind: 'completed' })
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('reason=round_completed'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('releases an abandoned pending round through the periodic sweep and preserves the fallback net', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const nowRef = { value: Date.now() }
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sent).toEqual([])
+
+    nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('preserves a deferred close-out across an unrelated unstamped batch only', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const { sibling } = await routePendingRoundSiblings(router, sessions)
+    sibling.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+      sibling.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    await router.route(
+      closeoutInbound({
+        externalMessageId: 'unrelated-inbound',
+        text: 'One more unrelated note.',
+        githubReviewRound: undefined,
+        githubReviewThreadCloseout: undefined,
+      }),
+    )
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sibling.prompts).toHaveLength(2)
+    expect(sent).toEqual([])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_2')).toBe(true)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_deferred'))).toHaveLength(2)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`preserves a deferred close-out across an unstamped batch after its round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const { sibling } = await routePendingRoundSiblings(router, sessions)
+      sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+        sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+      }
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `unstamped-after-${release}`,
+          text: 'An unrelated follow-up.',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const activeSibling = release === 'expired' ? sessions.at(-1)! : sibling
+      activeSibling.onPrompt = () => {
+        router.markTurnSkipped({
+          parentSessionId: release === 'expired' ? 'ses_fake_3' : 'ses_fake_2',
+          reason: 'no close-out',
+        })
+        activeSibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(
+        router.hasOutstandingGithubReviewThreadCloseout?.(release === 'expired' ? 'ses_fake_3' : 'ses_fake_2'),
+      ).toBe(false)
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`restores a deferred close-out after teardown and releases it when the round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const initial = await routePendingRoundSiblings(router, sessions)
+      initial.sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+        initial.sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+      await router.tearDownAllLive()
+
+      await router.route(
+        closeoutInbound({
+          ...carrierKey,
+          externalMessageId: 'rehydrate-carrier',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      await router.route(
+        closeoutInbound({
+          externalMessageId: 'rehydrate-sibling',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const rehydratedSibling = sessions[3]!
+      rehydratedSibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'no close-out' })
+        rehydratedSibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+      expect(sent).toEqual([])
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS * 2
+      }
+      await router.__testing!.runIdleGc()
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(
+        (await loadChannelSessions(dir)).find((record) => record.thread === GITHUB_KEY.thread)
+          ?.githubReviewThreadCloseout,
+      ).toBeUndefined()
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
+  for (const release of ['completed', 'expired'] as const) {
+    test(`keeps a deferred close-out silent through live stale rollover until the round ${release}`, async () => {
+      __resetReviewVerdictGuardForTest()
+      const dir = await tempDir()
+      const nowRef = { value: Date.now() }
+      configureReviewVerdictCoordinator({
+        resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+        resolveHeadSha: async () => replyRound.headSha,
+      })
+      const logs: string[] = []
+      const sent: OutboundMessage[] = []
+      const { router, sessions } = makeRouter(dir, { logs, nowRef })
+      router.registerOutbound('github', async (message) => {
+        sent.push(message)
+        return { ok: true }
+      })
+      const initial = await routePendingRoundSiblings(router, sessions)
+      initial.sibling.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
+        initial.sibling.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      nowRef.value += SESSION_GRACE_HARD_TTL_MS + 1
+      await router.route(
+        closeoutInbound({
+          externalMessageId: `live-rollover-${release}`,
+          text: 'An unrelated follow-up before the review finishes.',
+          githubReviewRound: undefined,
+          githubReviewThreadCloseout: undefined,
+        }),
+      )
+      const successor = sessions[2]!
+      successor.onPrompt = () => {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_3', reason: 'waiting for carrier' })
+        successor.setAssistantText('NO_REPLY')
+      }
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent).toEqual([])
+      expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+      expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_3')).toBe(true)
+
+      if (release === 'completed') {
+        expect(
+          await router.completeGithubReviewRound?.({
+            workspace: replyRound.workspace,
+            prNumber: replyRound.prNumber,
+            verdict: 'APPROVE',
+            sessionId: 'ses_fake_1',
+          }),
+        ).toEqual({ kind: 'completed' })
+      } else {
+        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS
+      }
+      await router.__testing!.runIdleGc()
+      await router.__testing!.flushDebounce(GITHUB_KEY)
+
+      expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+      expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+      expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+      expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_3')).toBe(false)
+      __resetReviewVerdictGuardForTest()
+      await router.stop()
+    })
+  }
+
   test('queues one correction for a skip with no running child, then posts one open-thread fallback', async () => {
     const dir = await tempDir()
     const logs: string[] = []
@@ -19042,7 +19501,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     expect(sessions.map((session) => session.prompts.length)).toEqual([1, 1, 1])
   })
 
-  test('a post-send skip remains recorded-after-send and does not queue a correction', async () => {
+  test('a generic post-send skip retains the obligation and queues one decision correction', async () => {
     const dir = await tempDir()
     const sent: OutboundMessage[] = []
     const { router, sessions } = makeRouter(dir)
@@ -19054,15 +19513,144 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
 
     await router.route(closeoutInbound())
     sessions[0]!.onPrompt = async () => {
-      await router.send({ ...GITHUB_KEY, text: 'This remains open pending another change.' })
+      if (sessions[0]!.prompts.length === 1) {
+        await router.send({ ...GITHUB_KEY, text: 'I am checking this now.' })
+      } else {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId: 'ses_fake_1',
+          workspace: GITHUB_KEY.workspace,
+          prNumber: 123,
+          thread: GITHUB_KEY.thread,
+          decision: 'left-open',
+        })
+        await router.send({ ...GITHUB_KEY, text: 'This remains open pending another change.' })
+      }
       skipKind = router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'done' }).kind
       sessions[0]!.setAssistantText('NO_REPLY')
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
 
     expect(skipKind).toBe('recorded-after-send')
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.map((message) => message.text)).toEqual([
+      'I am checking this now.',
+      'This remains open pending another change.',
+    ])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1')).toBe(false)
+  })
+
+  test('suppresses Korean willingness nudges while the exact-thread close-out remains outstanding', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('github', async () => ({ ok: true }))
+
+    await router.route(closeoutInbound())
+    sessions[0]!.onPrompt = async () => {
+      if (sessions[0]!.prompts.length === 1) {
+        await router.send({ ...GITHUB_KEY, text: '확인해볼게요.' })
+        emptyStopAfterToolWork(sessions[0]!)
+      } else {
+        router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'test correction' })
+        sessions[0]!.setAssistantText('NO_REPLY')
+      }
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts[1]).toContain('resolve_review_thread')
+    expect(sessions[0]!.prompts[1]).not.toContain(WILLINGNESS_NUDGE)
+    expect(sessions[0]!.prompts[1]).not.toContain(SEND_WILLINGNESS_NUDGE)
+    expect(logs.some((line) => line.includes('willingness_nudge'))).toBe(false)
+  })
+
+  test('defers unknown reply review state until its persisted deadline expires', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 10_000 }
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(
+      closeoutInbound({
+        githubReviewThreadCloseout: {
+          workspace: 'acme/repo',
+          prNumber: 123,
+          rootCommentId: '456',
+          deferUntil: { kind: 'review-state-unknown', expiresAt: 130_000 },
+        },
+      }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
     expect(sessions[0]!.prompts).toHaveLength(1)
-    expect(sent).toHaveLength(1)
+    expect(sent).toEqual([])
+    expect((await loadChannelSessions(dir))[0]?.githubReviewThreadCloseout?.deferUntil).toEqual({
+      kind: 'review-state-unknown',
+      expiresAt: 130_000,
+    })
+
+    nowRef.value = 129_999
+    await router.__testing!.runIdleGc()
+    expect(router.__testing!.pendingReminderCount(GITHUB_KEY)).toBe(0)
+
+    nowRef.value = 130_000
+    await router.__testing!.runIdleGc()
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+  })
+
+  test('lets a later authoritative inbound replace an unknown-state deferral', async () => {
+    const dir = await tempDir()
+    const nowRef = { value: 10_000 }
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(
+      closeoutInbound({
+        externalMessageId: 'unknown-state',
+        githubReviewThreadCloseout: {
+          workspace: 'acme/repo',
+          prNumber: 123,
+          rootCommentId: '456',
+          deferUntil: { kind: 'review-state-unknown', expiresAt: 130_000 },
+        },
+      }),
+    )
+    sessions[0]!.onPrompt = () => {
+      router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'unknown review state' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    await router.route(closeoutInbound({ externalMessageId: 'authoritative-clear' }))
+    sessions[0]!.onPrompt = async () => {
+      router.finishGithubReviewThreadCloseout?.({
+        sessionId: 'ses_fake_1',
+        workspace: GITHUB_KEY.workspace,
+        prNumber: 123,
+        thread: GITHUB_KEY.thread,
+        decision: 'left-open',
+      })
+      await router.send({ ...GITHUB_KEY, text: 'This remains open for a concrete reason.' })
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.map((message) => message.text)).toEqual(['This remains open for a concrete reason.'])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1')).toBe(false)
   })
 
   test('a peer-bot review-thread reply can stay silent when loop protection applies', async () => {
@@ -19120,7 +19708,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     expect(sent[0]?.thread).toBe('456')
   })
 
-  test('a landed provider notice satisfies the send baseline without a second closeout post', async () => {
+  test('provider notices do not discharge the exact-thread close-out decision', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: OutboundMessage[] = []
@@ -19137,12 +19725,13 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     }
     await router.__testing!.flushDebounce(GITHUB_KEY)
 
-    expect(sessions[0]!.prompts).toHaveLength(1)
-    expect(sent).toHaveLength(1)
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent.length).toBeGreaterThanOrEqual(2)
     expect(sent[0]?.thread).toBe('456')
     expect(sent[0]?.text).toContain('rate-limited')
     expect(sent[0]?.text).not.toBe(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
-    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
-    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+    expect(sent.map((message) => message.text)).toContain(GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
   })
 })

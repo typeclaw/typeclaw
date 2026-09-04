@@ -52,7 +52,15 @@ export type GithubWebhookHandlerOptions = {
   sleepImpl?: (ms: number) => Promise<void>
   fetchImpl?: typeof fetch
   generateReviewRoundId?: () => string
+  now?: () => number
 }
+
+export const GITHUB_REVIEW_STATE_UNKNOWN_TTL_MS = 2 * 60_000
+
+type ReplyReviewRoundResolution =
+  | { kind: 'round'; round: GithubReviewFollowupRound }
+  | { kind: 'clear' }
+  | { kind: 'unknown'; expiresAt: number }
 
 export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
@@ -142,12 +150,20 @@ export async function processVerifiedGithubDelivery(
   })
   if (classified === null) return
 
-  options.route(
-    withApprovalPolicy(
-      replyReviewRound === null ? classified : { ...classified, githubReviewRound: replyReviewRound },
-      options.allowApprove?.() ?? true,
-    ),
-  )
+  const routed =
+    replyReviewRound?.kind === 'round'
+      ? { ...classified, githubReviewRound: replyReviewRound.round }
+      : replyReviewRound?.kind === 'unknown' && classified.githubReviewThreadCloseout !== undefined
+        ? {
+            ...classified,
+            githubReviewThreadCloseout: {
+              ...classified.githubReviewThreadCloseout,
+              deferUntil: { kind: 'review-state-unknown' as const, expiresAt: replyReviewRound.expiresAt },
+            },
+          }
+        : classified
+
+  options.route(withApprovalPolicy(routed, options.allowApprove?.() ?? true))
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -1141,17 +1157,21 @@ async function resolveReplyReviewRound(
   selfLogin: string | null,
   parent: ReviewCommentParent | null,
   options: GithubWebhookHandlerOptions,
-): Promise<GithubReviewFollowupRound | null> {
-  if (event !== 'pull_request_review_comment' || parent?.isSelf !== true || selfLogin === null) return null
+): Promise<ReplyReviewRoundResolution | null> {
+  if (event !== 'pull_request_review_comment' || parent?.isSelf !== true) return null
   const comment = readRecord(payload.comment)
   const parentId = readNumber(comment, 'in_reply_to_id')
   if (parentId === null || parent.parentId !== parentId) return null
+  const expiresAt = (options.now ?? Date.now)() + GITHUB_REVIEW_STATE_UNKNOWN_TTL_MS
+  if (selfLogin === null) return { kind: 'unknown', expiresAt }
   const repository = readRepository(payload)
   const pr = readRecord(payload.pull_request)
   const prNumber = readNumber(pr, 'number')
   const headSha = readString(readRecord(pr?.head), 'sha')
   const authToken = options.authToken
-  if (repository === null || prNumber === null || headSha === null || authToken === undefined) return null
+  if (repository === null || prNumber === null || headSha === null || authToken === undefined) {
+    return { kind: 'unknown', expiresAt }
+  }
 
   const target = `${repository.owner}/${repository.name}#${prNumber}`
   try {
@@ -1166,20 +1186,25 @@ async function resolveReplyReviewRound(
     })
     if (!blocking.ok) {
       options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${blocking.error}`)
-      return null
+      return { kind: 'unknown', expiresAt }
     }
-    if (!blocking.selfBlocking || blocking.selfBlockingReviewId === null) return null
-    return registerOrJoinReplyReviewRound({
-      workspace: `${repository.owner}/${repository.name}`,
-      prNumber,
-      headSha,
-      blockingReviewId: blocking.selfBlockingReviewId,
-      thread: String(parentId),
-      generateRoundId: options.generateReviewRoundId ?? randomUUID,
-    })
+    if (!blocking.selfBlocking) return { kind: 'clear' }
+    if (blocking.selfBlockingReviewId === null) return { kind: 'unknown', expiresAt }
+    return {
+      kind: 'round',
+      round: registerOrJoinReplyReviewRound({
+        workspace: `${repository.owner}/${repository.name}`,
+        prNumber,
+        headSha,
+        blockingReviewId: blocking.selfBlockingReviewId,
+        thread: String(parentId),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+        generateRoundId: options.generateReviewRoundId ?? randomUUID,
+      }),
+    }
   } catch (err) {
     options.logger.warn(`[github] reply review-state lookup failed for ${target}: ${describeError(err)}`)
-    return null
+    return { kind: 'unknown', expiresAt }
   }
 }
 
