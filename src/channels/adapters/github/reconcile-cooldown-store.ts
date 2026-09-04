@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { describeError } from '../../describe-error'
+import { canonicalGithubRepo } from '../../github-repo'
 
 // Durable per-PR replay cooldown for the open-PR reconcile pass.
 //
@@ -66,7 +67,7 @@ export function reconcileCooldownPath(agentDir: string): string {
 }
 
 function markerKey(repo: string, prId: number): string {
-  return `${repo}#${prId}`
+  return `${canonicalGithubRepo(repo)}#${prId}`
 }
 
 export type ReconcileCooldownStore = {
@@ -74,6 +75,7 @@ export type ReconcileCooldownStore = {
   // Flush BEFORE routing the synthetic inbound: a crash between marking and
   // session creation must not re-trigger a replay on the next restart.
   markReplayed: (repo: string, prId: number, now: number) => Promise<void>
+  clear: (repo: string, prId: number) => Promise<void>
   prune: (repo: string, openPrIds: ReadonlySet<number>, now: number) => Promise<void>
 }
 
@@ -113,6 +115,18 @@ export async function loadReconcileCooldownStore(
       } catch (err) {
         if (previous === undefined) markers.delete(key)
         else markers.set(key, previous)
+        throw err
+      }
+    },
+    async clear(repo, prId): Promise<void> {
+      const key = markerKey(repo, prId)
+      const previous = markers.get(key)
+      if (previous === undefined) return
+      markers.delete(key)
+      try {
+        await flush()
+      } catch (err) {
+        markers.set(key, previous)
         throw err
       }
     },

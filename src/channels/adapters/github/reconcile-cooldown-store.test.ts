@@ -58,6 +58,20 @@ describe('ReconcileCooldownStore', () => {
     expect(store.isCoolingDown('acme/widgets', 701, 1_000, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(false)
   })
 
+  test('clear removes only the target PR marker and persists the removal', async () => {
+    const store = await loadReconcileCooldownStore(agentDir, silentLogger)
+    await store.markReplayed('acme/widgets', 700, 1_000)
+    await store.markReplayed('acme/widgets', 701, 1_000)
+    await store.markReplayed('acme/other', 700, 1_000)
+
+    await store.clear('acme/widgets', 700)
+
+    const reloaded = await loadReconcileCooldownStore(agentDir, silentLogger)
+    expect(reloaded.isCoolingDown('acme/widgets', 700, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(false)
+    expect(reloaded.isCoolingDown('acme/widgets', 701, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(true)
+    expect(reloaded.isCoolingDown('acme/other', 700, 1_001, DEFAULT_RECONCILE_COOLDOWN_MS)).toBe(true)
+  })
+
   test('prune drops markers for PRs no longer open in that repo', async () => {
     const store = await loadReconcileCooldownStore(agentDir, silentLogger)
     await store.markReplayed('acme/widgets', 700, 1_000)

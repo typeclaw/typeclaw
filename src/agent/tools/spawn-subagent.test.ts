@@ -928,6 +928,216 @@ describe('createSpawnSubagentTool — concurrency', () => {
     await new Promise((resolve) => setImmediate(resolve))
   })
 
+  test('stamps a canonical PR-wide work key only on reviewer jobs with validated identity', async () => {
+    let releaseReviewer: () => void = () => {}
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = () =>
+      new Promise<void>((resolve) => {
+        releaseReviewer = resolve
+      })
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry: { ...registry, ...makeRegistry() },
+      liveRegistry,
+      createSessionForSubagent: async (_subagent, options) =>
+        options?.name === 'reviewer' ? reviewerSession : stubSession(),
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: (() => {
+        let task = 0
+        return () => `bg_work${++task}`
+      })(),
+    })
+
+    await tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'Acme/Widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+    await tool.execute('call_explorer', { subagent_type: 'explorer', prompt: 'inspect it' }, undefined, undefined, ctx)
+
+    expect(liveRegistry.get('bg_work1')?.workKey).toBe('reviewer:github:acme/widgets#42')
+    expect(liveRegistry.get('bg_work2')?.workKey).toBeUndefined()
+
+    releaseReviewer()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('aborting a parent AgentSession alone leaves its background reviewer running', async () => {
+    let releaseReviewer: () => void = () => {}
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = () =>
+      new Promise<void>((resolve) => {
+        releaseReviewer = resolve
+      })
+    const parentSession = stubSession()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => reviewerSession,
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => 'bg_reviewer',
+    })
+
+    await tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'acme/widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await parentSession.abort()
+
+    expect(parentSession.abortCount.n).toBe(1)
+    expect(reviewerSession.abortCount.n).toBe(0)
+    expect(liveRegistry.get('bg_reviewer')?.status).toBe('running')
+
+    releaseReviewer()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('cancels a reviewer when its subagent session is still being created', async () => {
+    const sessionCreationStarted = Promise.withResolvers<void>()
+    const finishSessionCreation = Promise.withResolvers<AgentSession>()
+    const reviewerSession = stubSession()
+    const liveRegistry = new LiveSubagentRegistry()
+    const { registry } = reviewerRegistry()
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionCreationStarted.resolve()
+        return finishSessionCreation.promise
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => 'bg_pending_reviewer',
+    })
+    const pendingSpawn = tool.execute(
+      'call_reviewer',
+      {
+        subagent_type: 'reviewer',
+        prompt: 'review it',
+        review_identity: {
+          repo: 'acme/widgets',
+          pull_request: 42,
+          head_sha: 'a'.repeat(40),
+          base_sha: 'b'.repeat(40),
+          review_kind: 'review',
+        },
+      },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await sessionCreationStarted.promise
+    expect(
+      await liveRegistry.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft'),
+    ).toEqual({ matched: 0, cancelled: 0, failures: 0 })
+    finishSessionCreation.resolve(reviewerSession)
+    const result = await pendingSpawn
+
+    expect(result.details).toMatchObject({ ok: false, error: expect.stringContaining('cancelled') })
+    expect(reviewerSession.abortCount.n).toBe(1)
+    expect(liveRegistry.get('bg_pending_reviewer')).toBeUndefined()
+  })
+
+  test('keeps a pending reviewer observable and coalesced when its delayed abort fails', async () => {
+    const sessionCreationStarted = Promise.withResolvers<void>()
+    const finishSessionCreation = Promise.withResolvers<AgentSession>()
+    const finishPrompt = Promise.withResolvers<void>()
+    const reviewerSession = stubSession()
+    reviewerSession.prompt = async () => finishPrompt.promise
+    reviewerSession.abort = async () => {
+      reviewerSession.abortCount.n += 1
+      throw new Error('provider refused abort')
+    }
+    const liveRegistry = new LiveSubagentRegistry()
+    const coalescer = new SubagentCoalescer()
+    const { registry } = reviewerRegistry()
+    let task = 0
+    const tool = createSpawnSubagentTool({
+      registry,
+      liveRegistry,
+      createSessionForSubagent: async () => {
+        sessionCreationStarted.resolve()
+        return finishSessionCreation.promise
+      },
+      agentDir: '/agent',
+      parentSessionId: 'ses_parent',
+      getOrigin: () => ({ kind: 'tui', sessionId: 'ses_parent' }),
+      generateTaskId: () => `bg_pending_abort${++task}`,
+      coalescer,
+    })
+    const review_identity = {
+      repo: 'acme/widgets',
+      pull_request: 42,
+      head_sha: 'a'.repeat(40),
+      base_sha: 'b'.repeat(40),
+      review_kind: 'review' as const,
+    }
+    const pendingSpawn = tool.execute(
+      'call_reviewer',
+      { subagent_type: 'reviewer', prompt: 'review it', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    await sessionCreationStarted.promise
+    await liveRegistry.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft')
+    finishSessionCreation.resolve(reviewerSession)
+    const failedCancellation = await pendingSpawn
+    const duplicate = await tool.execute(
+      'call_duplicate',
+      { subagent_type: 'reviewer', prompt: 'review it again', review_identity },
+      undefined,
+      undefined,
+      ctx,
+    )
+
+    expect(failedCancellation.details).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('provider refused abort'),
+    })
+    expect(liveRegistry.get('bg_pending_abort1')?.status).toBe('running')
+    expect(duplicate.details).toMatchObject({ ok: false, error: expect.stringContaining('already in progress') })
+
+    finishPrompt.resolve()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
   test('shares reviewer coalescing across spawn-tool and stream dispatch paths', async () => {
     const stream = createStream()
     const coalescer = new SubagentCoalescer()

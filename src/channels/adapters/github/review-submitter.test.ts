@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import type { SubmitReviewRequest } from '@/channels/types'
 
-import { createGithubReviewSubmitter } from './review-submitter'
+import * as githubReviewSubmitter from './review-submitter'
 
 type SeenPost = { event: string; body: string; commit_id: string; comments: unknown[] }
 
@@ -65,7 +65,7 @@ function request(overrides: Partial<SubmitReviewRequest> = {}): SubmitReviewRequ
 }
 
 function submitter(fetchImpl: typeof fetch, allowApprove = true) {
-  return createGithubReviewSubmitter({
+  return githubReviewSubmitter.createGithubReviewSubmitter({
     token: async () => 'example-token',
     allowApprove: () => allowApprove,
     fetchImpl,
@@ -183,6 +183,64 @@ describe('github review submitter', () => {
     const seen: SeenPost[] = []
     await submitter(fakeGithub({ seen }), true)(request({ event: 'APPROVE' }))
     expect(seen[0]?.event).toBe('APPROVE')
+  })
+
+  test('denies a submission when its PR generation is invalidated before POST dispatch', async () => {
+    const filesRequested = Promise.withResolvers<void>()
+    const releaseFiles = Promise.withResolvers<void>()
+    let postCount = 0
+    const baseFetch = fakeGithub({ seen: [] })
+    const fetchImpl = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input)
+        if ((init?.method ?? 'GET') === 'GET' && url.endsWith('/pulls/7/files?per_page=100')) {
+          filesRequested.resolve()
+          await releaseFiles.promise
+        }
+        if (init?.method === 'POST' && url.endsWith('/pulls/7/reviews')) postCount++
+        return baseFetch(input, init)
+      },
+      { preconnect: () => {} },
+    ) as typeof fetch
+
+    const pending = submitter(fetchImpl)(request())
+    await filesRequested.promise
+    githubReviewSubmitter.invalidateGithubReviewSubmission('acme/widgets', 7)
+    releaseFiles.resolve()
+
+    expect(await pending).toEqual({
+      ok: false,
+      error: 'PR converted to draft; review submission cancelled',
+      code: 'transient',
+    })
+    expect(postCount).toBe(0)
+  })
+
+  test('lets an already-dispatched submission finish verification after invalidation', async () => {
+    const postDispatched = Promise.withResolvers<void>()
+    const releasePost = Promise.withResolvers<void>()
+    let verificationReads = 0
+    const baseFetch = fakeGithub({ seen: [] })
+    const fetchImpl = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = String(input)
+        if (init?.method === 'POST' && url.endsWith('/pulls/7/reviews')) {
+          postDispatched.resolve()
+          await releasePost.promise
+        }
+        if ((init?.method ?? 'GET') === 'GET' && url.endsWith('/pulls/7/reviews/123')) verificationReads++
+        return baseFetch(input, init)
+      },
+      { preconnect: () => {} },
+    ) as typeof fetch
+
+    const pending = submitter(fetchImpl)(request())
+    await postDispatched.promise
+    githubReviewSubmitter.invalidateGithubReviewSubmission('acme/widgets', 7)
+    releasePost.resolve()
+
+    expect(await pending).toEqual({ ok: true, reviewId: 123, state: 'COMMENTED' })
+    expect(verificationReads).toBe(1)
   })
 
   test('classifies a rejected post and validates targets before mutation', async () => {

@@ -19,6 +19,7 @@ export type LiveSubagent = {
   sessionId: string
   subagentName: string
   parentSessionId?: string
+  workKey?: string
   // Role that resolved at spawn time, captured for the provenance cap on
   // subagent_output/subagent_cancel. Absent when no permission service was
   // active at spawn, in which case the cap fails closed.
@@ -33,6 +34,11 @@ export type LiveSubagent = {
   completion?: SubagentCompletion
   abort: () => Promise<void>
   releaseCoalesceKey?: () => void
+}
+
+export type PendingWorkKeyRegistration = {
+  readonly workKey: string
+  cancelled: boolean
 }
 
 export const MAX_EVENTS_PER_SUBAGENT = 100
@@ -112,6 +118,7 @@ export class LiveSubagentRegistry {
   private readonly entries = new Map<string, LiveSubagent>()
   private readonly events = new Map<string, SubagentProgressEvent[]>()
   private readonly capturedFinalMessages = new Map<string, string>()
+  private readonly pendingWorkKeyRegistrations = new Map<string, Set<PendingWorkKeyRegistration>>()
 
   register(live: LiveSubagent): void {
     if (this.entries.has(live.taskId)) {
@@ -119,6 +126,28 @@ export class LiveSubagentRegistry {
     }
     this.entries.set(live.taskId, live)
     this.events.set(live.taskId, [{ kind: 'started', ts: live.startedAt }])
+  }
+
+  beginWorkKeyRegistration(workKey: string): PendingWorkKeyRegistration {
+    const registration: PendingWorkKeyRegistration = { workKey, cancelled: false }
+    const pending = this.pendingWorkKeyRegistrations.get(workKey) ?? new Set<PendingWorkKeyRegistration>()
+    pending.add(registration)
+    this.pendingWorkKeyRegistrations.set(workKey, pending)
+    return registration
+  }
+
+  abandonWorkKeyRegistration(registration: PendingWorkKeyRegistration): void {
+    this.removePendingWorkKeyRegistration(registration)
+  }
+
+  registerIfWorkKeyActive(live: LiveSubagent, registration: PendingWorkKeyRegistration): boolean {
+    this.removePendingWorkKeyRegistration(registration)
+    if (live.workKey !== registration.workKey) {
+      throw new Error(`task ${live.taskId} work key changed before registration`)
+    }
+    if (registration.cancelled) return false
+    this.register(live)
+    return true
   }
 
   unregister(taskId: string): void {
@@ -189,6 +218,52 @@ export class LiveSubagentRegistry {
     return true
   }
 
+  async cancelRunningByWorkKey(
+    workKey: string,
+    reason: string,
+  ): Promise<{ matched: number; cancelled: number; failures: number }> {
+    const pending = this.pendingWorkKeyRegistrations.get(workKey)
+    if (pending !== undefined) {
+      for (const registration of pending) registration.cancelled = true
+      this.pendingWorkKeyRegistrations.delete(workKey)
+    }
+    const all = Array.from(this.entries.values())
+    const roots = all.filter((entry) => entry.status === 'running' && entry.workKey === workKey)
+    if (roots.length === 0) return { matched: 0, cancelled: 0, failures: 0 }
+
+    const rootsBySessionId = new Set(roots.map((entry) => entry.sessionId))
+    const entriesBySessionId = new Map(all.map((entry) => [entry.sessionId, entry]))
+    const rootTaskIds = new Set(roots.map((entry) => entry.taskId))
+    const matched = all.filter(
+      (entry) =>
+        entry.status === 'running' &&
+        (rootTaskIds.has(entry.taskId) || isDescendantOfAny(entry, rootsBySessionId, entriesBySessionId)),
+    )
+
+    const settledAt = Date.now()
+    for (const entry of matched) {
+      this.recordCompletionIfRunning(entry.taskId, {
+        ok: false,
+        error: `cancelled: ${reason}`,
+        durationMs: Math.max(0, settledAt - entry.startedAt),
+      })
+    }
+    for (const entry of matched) entry.releaseCoalesceKey?.()
+
+    const outcomes = await Promise.all(
+      matched.map(async (entry): Promise<boolean> => {
+        try {
+          await entry.abort()
+          return true
+        } catch {
+          return false
+        }
+      }),
+    )
+    const cancelled = outcomes.filter(Boolean).length
+    return { matched: matched.length, cancelled, failures: matched.length - cancelled }
+  }
+
   snapshot(taskId: string, now: number = Date.now()): StatusSnapshot | undefined {
     const entry = this.entries.get(taskId)
     if (entry === undefined) return undefined
@@ -215,7 +290,30 @@ export class LiveSubagentRegistry {
     this.entries.clear()
     this.events.clear()
     this.capturedFinalMessages.clear()
+    this.pendingWorkKeyRegistrations.clear()
   }
+
+  private removePendingWorkKeyRegistration(registration: PendingWorkKeyRegistration): void {
+    const pending = this.pendingWorkKeyRegistrations.get(registration.workKey)
+    if (pending === undefined) return
+    pending.delete(registration)
+    if (pending.size === 0) this.pendingWorkKeyRegistrations.delete(registration.workKey)
+  }
+}
+
+function isDescendantOfAny(
+  entry: LiveSubagent,
+  rootSessionIds: ReadonlySet<string>,
+  entriesBySessionId: ReadonlyMap<string, LiveSubagent>,
+): boolean {
+  let parentSessionId = entry.parentSessionId
+  const visited = new Set<string>()
+  while (parentSessionId !== undefined && !visited.has(parentSessionId)) {
+    if (rootSessionIds.has(parentSessionId)) return true
+    visited.add(parentSessionId)
+    parentSessionId = entriesBySessionId.get(parentSessionId)?.parentSessionId
+  }
+  return false
 }
 
 function renderStatusSummary(

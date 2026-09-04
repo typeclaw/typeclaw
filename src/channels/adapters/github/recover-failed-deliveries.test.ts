@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { createDeliveryDedup } from './dedup'
+import { processVerifiedGithubDelivery, type GithubWebhookHandlerOptions } from './inbound'
 import {
   createRecoveredGuidLog,
   recoverFailedGithubDeliveries,
@@ -18,7 +19,7 @@ type DeliveryFixture = {
   payload?: Record<string, unknown>
 }
 
-type Routed = { event: string; delivery: string; payload: Record<string, unknown> }
+type Routed = { event: string; delivery: string; payload: Record<string, unknown>; recovered: true }
 
 const NOW = Date.parse('2026-06-16T12:00:00Z')
 
@@ -102,8 +103,182 @@ describe('recoverFailedGithubDeliveries', () => {
 
     const result = await recoverFailedGithubDeliveries(baseOptions({ routed, fetchImpl }))
 
-    expect(routed).toEqual([{ event: 'issue_comment', delivery: 'g-1', payload: { action: 'created' } }])
+    expect(routed).toEqual([
+      { event: 'issue_comment', delivery: 'g-1', payload: { action: 'created' }, recovered: true },
+    ])
     expect(result.recovered).toBe(1)
+  })
+
+  test('recovered draft delivery aborts review work when the pull request is still draft', async () => {
+    const routed: Routed[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const aborts: Array<{ workspace: string; prNumber: number }> = []
+    const handlerOptions: GithubWebhookHandlerOptions = {
+      webhookSecret: 'unused-by-recovery',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber) => {
+        aborts.push({ workspace, prNumber })
+        return { kind: 'aborted', matchedSessions: 1, matchedReviewers: 1, abortFailures: 0 }
+      },
+      authToken: async () => 'tok',
+      fetchImpl: Object.assign(async () => Response.json({ draft: true }), { preconnect: () => {} }) as typeof fetch,
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      route: () => {
+        throw new Error('draft recovery must not route a conversational inbound')
+      },
+    }
+    const { fetch: fetchImpl } = fakeDeliveriesApi({
+      byHook: {
+        1: [
+          {
+            id: 12,
+            guid: 'g-draft',
+            event: 'pull_request',
+            statusCode: 502,
+            payload: {
+              action: 'converted_to_draft',
+              repository: { name: 'widgets', owner: { login: 'acme' } },
+              pull_request: { number: 17, id: 1700, draft: true },
+              sender: { login: 'alice', id: 10, type: 'User' },
+            },
+          },
+        ],
+      },
+    })
+
+    const result = await recoverFailedGithubDeliveries(
+      baseOptions({
+        routed,
+        fetchImpl,
+        process: (input) => processVerifiedGithubDelivery(handlerOptions, input),
+      }),
+    )
+    await tasks[0]?.()
+
+    expect(result.recovered).toBe(1)
+    expect(aborts).toEqual([{ workspace: 'acme/widgets', prNumber: 17 }])
+  })
+
+  test('recovered stale draft delivery does not abort review work when the pull request is ready again', async () => {
+    const routed: Routed[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const aborts: Array<{ workspace: string; prNumber: number }> = []
+    const handlerOptions: GithubWebhookHandlerOptions = {
+      webhookSecret: 'unused-by-recovery',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber) => {
+        aborts.push({ workspace, prNumber })
+        return { kind: 'aborted', matchedSessions: 1, matchedReviewers: 1, abortFailures: 0 }
+      },
+      authToken: async () => 'tok',
+      fetchImpl: Object.assign(async () => Response.json({ draft: false }), { preconnect: () => {} }) as typeof fetch,
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      route: () => {
+        throw new Error('draft recovery must not route a conversational inbound')
+      },
+    }
+    const { fetch: fetchImpl } = fakeDeliveriesApi({
+      byHook: {
+        1: [
+          {
+            id: 13,
+            guid: 'g-stale-draft',
+            event: 'pull_request',
+            statusCode: 502,
+            payload: {
+              action: 'converted_to_draft',
+              repository: { name: 'widgets', owner: { login: 'acme' } },
+              pull_request: { number: 17, id: 1700, draft: true },
+              sender: { login: 'alice', id: 10, type: 'User' },
+            },
+          },
+        ],
+      },
+    })
+
+    const result = await recoverFailedGithubDeliveries(
+      baseOptions({
+        routed,
+        fetchImpl,
+        process: (input) => processVerifiedGithubDelivery(handlerOptions, input),
+      }),
+    )
+
+    expect(result.recovered).toBe(1)
+    expect(tasks).toHaveLength(0)
+    expect(aborts).toEqual([])
+  })
+
+  test('retries recovered draft freshness after an indeterminate pull request lookup', async () => {
+    const routed: Routed[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const aborts: Array<{ workspace: string; prNumber: number }> = []
+    let draftReads = 0
+    const handlerOptions: GithubWebhookHandlerOptions = {
+      webhookSecret: 'unused-by-recovery',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber) => {
+        aborts.push({ workspace, prNumber })
+        return { kind: 'aborted', matchedSessions: 1, matchedReviewers: 1, abortFailures: 0 }
+      },
+      authToken: async () => 'tok',
+      fetchImpl: Object.assign(
+        async () => {
+          draftReads += 1
+          return draftReads === 1 ? new Response('unavailable', { status: 503 }) : Response.json({ draft: true })
+        },
+        { preconnect: () => {} },
+      ) as typeof fetch,
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      route: () => {
+        throw new Error('draft recovery must not route a conversational inbound')
+      },
+    }
+    const { fetch: fetchImpl } = fakeDeliveriesApi({
+      byHook: {
+        1: [
+          {
+            id: 14,
+            guid: 'g-draft-retry',
+            event: 'pull_request',
+            statusCode: 502,
+            payload: {
+              action: 'converted_to_draft',
+              repository: { name: 'widgets', owner: { login: 'acme' } },
+              pull_request: { number: 17, id: 1700, draft: true },
+              sender: { login: 'alice', id: 10, type: 'User' },
+            },
+          },
+        ],
+      },
+    })
+    const recoveredLog = createRecoveredGuidLog(LOOKBACK_MS, () => NOW)
+    const options = baseOptions({
+      routed,
+      fetchImpl,
+      recoveredLog,
+      alreadySeen: (guid) => handlerOptions.dedup.has(guid),
+      process: (input) => processVerifiedGithubDelivery(handlerOptions, input),
+    })
+
+    expect(await recoverFailedGithubDeliveries(options)).toEqual({ recovered: 0, scanned: 0 })
+    expect(await recoverFailedGithubDeliveries(options)).toEqual({ recovered: 1, scanned: 1 })
+    await tasks[0]?.()
+
+    expect(draftReads).toBe(2)
+    expect(aborts).toEqual([{ workspace: 'acme/widgets', prNumber: 17 }])
   })
 
   test('does not re-route the same guid across sweeps (durable recoveredLog)', async () => {

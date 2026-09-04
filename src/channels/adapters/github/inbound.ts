@@ -12,6 +12,7 @@ import { createBoundedMap, type BoundedMap, type DeliveryDedup } from './dedup'
 import { isGithubEventAllowed } from './event-allowlist'
 import { encodeGithubReactionRef, type GithubReactionTarget } from './reactions'
 import { fetchSelfReviewBlocking } from './review-state'
+import { invalidateGithubReviewSubmission } from './review-submitter'
 import { listUnresolvedSelfReviewThreads, type UnresolvedSelfReviewThread } from './review-thread-resolver'
 
 export type GithubInboundLogger = { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void }
@@ -53,6 +54,15 @@ export type GithubWebhookHandlerOptions = {
   fetchImpl?: typeof fetch
   generateReviewRoundId?: () => string
   now?: () => number
+  abortGithubPrTurn?: (
+    workspace: string,
+    prNumber: number,
+    reason: string,
+  ) => Promise<
+    | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+    | { kind: 'no-live-session' }
+  >
+  clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
 }
 
 export const GITHUB_REVIEW_STATE_UNKNOWN_TTL_MS = 2 * 60_000
@@ -93,19 +103,35 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
 // the live handler verifies the body; the sweep trusts the authenticated API.
 export async function processVerifiedGithubDelivery(
   options: GithubWebhookHandlerOptions,
-  input: { event: string; delivery: string; payload: Record<string, unknown> },
+  input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
 ): Promise<void> {
   const { event, delivery, payload } = input
   const action = readString(payload, 'action')
+  const eventAllowed = isGithubEventAllowed(options.allowlist(), event, action)
+  let staleRecoveredDraft = false
+  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'converted_to_draft') {
+    const repository = readRepository(payload)
+    const prNumber = readNumber(readRecord(payload.pull_request), 'number')
+    if (repository !== null && prNumber !== null) {
+      staleRecoveredDraft = !(await recoveredPullRequestIsStillDraft(
+        options,
+        repository,
+        prNumber,
+        `${repository.owner}/${repository.name}`,
+      ))
+    }
+  }
   const isSynchronize = event === 'pull_request' && action === 'synchronize'
   if (!isSynchronize && delivery !== '') {
     if (options.dedup.has(delivery)) {
       options.logger.info(`[github] duplicate delivery ignored id=${delivery}`)
       return
     }
-    // Reserve the delivery id synchronously, BEFORE the awaits below, so a live
-    // webhook and the recovery sweep can never both clear the dedup gate for the
-    // same event and route it twice. Synchronize uses its own synchronous,
+    // Reserve the delivery id synchronously before routing awaits so a live
+    // webhook and the recovery sweep can never both route the same event. A
+    // recovered draft's retryable freshness read is the sole earlier await; a
+    // concurrent live delivery reserves here first and wins this dedup check.
+    // Synchronize uses its own synchronous,
     // releasable head-SHA reservation so a failed redelivery can retry. JS is
     // single-threaded: nothing else runs between this has-check and add, so the
     // reservation is atomic. The awaits and classify that follow are all
@@ -113,7 +139,24 @@ export async function processVerifiedGithubDelivery(
     options.dedup.add(delivery)
   }
 
-  if (!isGithubEventAllowed(options.allowlist(), event, action)) return
+  if (!eventAllowed || staleRecoveredDraft) return
+
+  // This control event must run before the self-author drop: a maintainer can
+  // draft the bot's PR, and the bot can draft its own PR. Either action must
+  // still stop review work instead of silently leaving the reviewer running.
+  if (event === 'pull_request' && action === 'converted_to_draft') {
+    const repository = readRepository(payload)
+    const pr = readRecord(payload.pull_request)
+    const prNumber = readNumber(pr, 'number')
+    if (repository === null || prNumber === null) {
+      options.logger.warn('[github] draft abort skipped: delivery missing repository or pull request number')
+      return
+    }
+    const workspace = `${repository.owner}/${repository.name}`
+    invalidateGithubReviewSubmission(workspace, prNumber)
+    scheduleDraftAbort({ workspace, prNumber, prId: readNumber(pr, 'id'), options })
+    return
+  }
 
   const selfId = options.selfId()
   const selfLogin = options.selfLogin()
@@ -252,6 +295,108 @@ function maybeScheduleDecoyReviewerDrop(input: {
 
 function defaultScheduleBackgroundTask(task: () => Promise<void>): void {
   void task().catch(() => {})
+}
+
+async function recoveredPullRequestIsStillDraft(
+  options: GithubWebhookHandlerOptions,
+  repository: { owner: string; name: string },
+  prNumber: number,
+  workspace: string,
+): Promise<boolean> {
+  if (options.authToken === undefined) {
+    throw new Error(`recovered draft freshness check unavailable for ${workspace}#${prNumber}: auth unavailable`)
+  }
+  try {
+    const token = await options.authToken({ repoSlug: workspace })
+    const response = await (options.fetchImpl ?? fetch)(
+      `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}`,
+      { headers: githubJsonHeaders(token) },
+    )
+    if (!response.ok) {
+      throw new Error(`pull request fetch returned ${response.status}`)
+    }
+    const current = readRecord(await response.json().catch(() => null))
+    const draft = readBoolean(current, 'draft')
+    if (draft === null) {
+      throw new Error('pull request response missing draft state')
+    }
+    if (!draft) {
+      options.logger.info(`[github] recovered draft abort skipped for ${workspace}#${prNumber}: pull request is ready`)
+    }
+    return draft
+  } catch (err) {
+    throw new Error(`recovered draft freshness check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
+  }
+}
+
+function scheduleDraftAbort(input: {
+  workspace: string
+  prNumber: number
+  prId: number | null
+  options: GithubWebhookHandlerOptions
+}): void {
+  const { workspace, prNumber, prId, options } = input
+  const target = `${workspace}#${prNumber}`
+  const schedule = options.scheduleBackgroundTask ?? defaultScheduleBackgroundTask
+  schedule(async () => {
+    const abortPromise = runGithubPrAbort(options, workspace, prNumber, target)
+    const cooldownPromise = clearDraftReconcileCooldown(options, workspace, prId, target)
+    const [outcome] = await Promise.all([abortPromise, cooldownPromise])
+    if (outcome === null) return
+    if (outcome.kind === 'no-live-session') {
+      options.logger.info(`[github] draft abort ${target}: no-live-session`)
+      return
+    }
+    options.logger.info(
+      `[github] draft abort ${target}: sessions=${outcome.matchedSessions} reviewers=${outcome.matchedReviewers} failures=${outcome.abortFailures}`,
+    )
+  })
+}
+
+async function runGithubPrAbort(
+  options: GithubWebhookHandlerOptions,
+  workspace: string,
+  prNumber: number,
+  target: string,
+): Promise<
+  | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+  | { kind: 'no-live-session' }
+  | null
+> {
+  if (options.abortGithubPrTurn === undefined) {
+    options.logger.info(`[github] draft abort unavailable for ${target}: router callback not registered`)
+    return null
+  }
+  try {
+    return await options.abortGithubPrTurn(workspace, prNumber, 'pull request converted to draft')
+  } catch (err) {
+    options.logger.warn(`[github] draft abort failed for ${target}: ${describeError(err)}`)
+    return null
+  }
+}
+
+async function clearDraftReconcileCooldown(
+  options: GithubWebhookHandlerOptions,
+  workspace: string,
+  prId: number | null,
+  target: string,
+): Promise<void> {
+  if (prId === null) {
+    options.logger.warn(`[github] draft reconcile cooldown clear skipped for ${target}: pull request id missing`)
+    return
+  }
+  if (options.clearReconcileCooldown === undefined) {
+    options.logger.info(`[github] draft reconcile cooldown clear skipped for ${target}: store not initialized`)
+    return
+  }
+  try {
+    const outcome = await options.clearReconcileCooldown(workspace, prId)
+    if (outcome === 'not-initialized') {
+      options.logger.info(`[github] draft reconcile cooldown clear skipped for ${target}: store not initialized`)
+    }
+  } catch (err) {
+    options.logger.warn(`[github] draft reconcile cooldown clear failed for ${target}: ${describeError(err)}`)
+  }
 }
 
 const MAX_REVIEW_FOLLOWUP_ATTEMPTS = 3

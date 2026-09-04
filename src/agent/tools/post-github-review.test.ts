@@ -8,6 +8,7 @@ import {
 } from '@/channels/github-review-turn-ledger'
 import {
   __resetReviewVerdictGuardForTest,
+  abortGithubReviewStateForPr,
   configureReviewVerdictCoordinator,
 } from '@/channels/github-review-verdict-coordinator'
 import { createChannelRouter } from '@/channels/router'
@@ -514,6 +515,60 @@ describe('post_github_review', () => {
     const second = await run(secondTool, { event: 'APPROVE', body: 'follow-up' })
 
     expect(second.details).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('already holds a standing APPROVED review'),
+    })
+    expect(submissions).toBe(1)
+  })
+
+  test('blocks an unknown-head retry before and after an aborted dispatched review verifies', async () => {
+    const resolvedHeads: Array<string | null> = ['sha-1', null, 'sha-1', 'sha-1']
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'NONE' }),
+      resolveHeadSha: async () => resolvedHeads.shift() ?? null,
+    })
+    const channelRouter = router()
+    const dispatched = Promise.withResolvers<void>()
+    const finishVerification = Promise.withResolvers<void>()
+    let submissions = 0
+    channelRouter.registerReviewSubmitter('github', async () => {
+      submissions += 1
+      dispatched.resolve()
+      await finishVerification.promise
+      return { ok: true, reviewId: 53, state: 'APPROVED' }
+    })
+    const first = run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'APPROVE',
+      body: 'first',
+    })
+
+    await dispatched.promise
+    abortGithubReviewStateForPr(githubOrigin.workspace, 7)
+
+    const beforeSettlement = await run(
+      createPostGithubReviewTool({
+        router: channelRouter,
+        origin: githubOrigin,
+        sessionId: 'concurrent-session',
+      }),
+      { event: 'APPROVE', body: 'retry before verification' },
+    )
+    expect(beforeSettlement.details).toMatchObject({ ok: false, error: expect.stringContaining('settling') })
+    expect(submissions).toBe(1)
+
+    finishVerification.resolve()
+    expect((await first).details).toMatchObject({ ok: true })
+
+    const afterSettlement = await run(
+      createPostGithubReviewTool({
+        router: channelRouter,
+        origin: githubOrigin,
+        sessionId: 'after-settlement-session',
+      }),
+      { event: 'APPROVE', body: 'retry after verification' },
+    )
+
+    expect(afterSettlement.details).toMatchObject({
       ok: false,
       error: expect.stringContaining('already holds a standing APPROVED review'),
     })

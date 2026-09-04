@@ -1,3 +1,4 @@
+import { githubReviewerWorkKey } from '@/channels/github-repo'
 import type {
   ReviewFinding,
   ReviewSubmitter,
@@ -8,8 +9,20 @@ import type {
 
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
+import { createBoundedMap } from './dedup'
 
 const MAX_HEAD_STABILITY_ATTEMPTS = 3
+
+// Bounded because a long-lived container accumulates one entry per drafted PR
+// forever otherwise. Eviction is fail-safe: a submission that captured a bumped
+// generation sees the evicted key read back as 0, mismatches, and is denied —
+// eviction can only cancel a submission, never resurrect a cancelled one.
+const reviewSubmissionGenerations = createBoundedMap<string, number>()
+
+export function invalidateGithubReviewSubmission(workspace: string, prNumber: number): void {
+  const key = githubReviewerWorkKey(workspace, prNumber)
+  reviewSubmissionGenerations.set(key, currentReviewSubmissionGeneration(workspace, prNumber) + 1)
+}
 
 export function createGithubReviewSubmitter(deps: {
   token: (context?: GithubAuthContext) => Promise<string>
@@ -27,6 +40,7 @@ export function createGithubReviewSubmitter(deps: {
         code: 'transient',
       }
     }
+    const submissionGeneration = currentReviewSubmissionGeneration(req.workspace, target.prNumber)
 
     const token = await deps.token({ repoSlug: `${target.owner}/${target.repo}` })
     const stable = await fetchStableAnchors(fetchImpl, token, target)
@@ -35,6 +49,16 @@ export function createGithubReviewSubmitter(deps: {
     const { inline, reanchored } = partitionComments(req.comments, stable.anchors)
     const downgraded = req.event === 'APPROVE' && !deps.allowApprove()
     const event = downgraded ? 'COMMENT' : req.event
+    if (currentReviewSubmissionGeneration(req.workspace, target.prNumber) !== submissionGeneration) {
+      return {
+        ok: false,
+        error: 'PR converted to draft; review submission cancelled',
+        code: 'transient',
+      }
+    }
+    // Once this call dispatches fetch(), GitHub may already have accepted the
+    // review. Let posting, verification, and accounting settle after that
+    // boundary; cancelling mid-flight would leave duplicate/state ambiguity.
     const posted = await postReview(fetchImpl, token, target, {
       event,
       body: appendReanchored(req.body, reanchored),
@@ -52,6 +76,10 @@ export function createGithubReviewSubmitter(deps: {
       ...(reanchored.length > 0 ? { reanchored } : {}),
     }
   }
+}
+
+function currentReviewSubmissionGeneration(workspace: string, prNumber: number): number {
+  return reviewSubmissionGenerations.get(githubReviewerWorkKey(workspace, prNumber)) ?? 0
 }
 
 async function fetchStableAnchors(

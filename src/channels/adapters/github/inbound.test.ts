@@ -1151,6 +1151,184 @@ describe('createGithubWebhookHandler', () => {
   })
 })
 
+describe('createGithubWebhookHandler — pull_request.converted_to_draft control', () => {
+  type AbortCall = { workspace: string; prNumber: number; reason: string }
+  type CooldownClear = { workspace: string; prId: number }
+
+  function draftHandler(input: {
+    allowlist?: () => readonly string[]
+    selfId?: string | null
+    selfLogin?: string | null
+    abortCalls: AbortCall[]
+    cooldownClears?: CooldownClear[]
+    routed: InboundMessage[]
+    tasks: Array<() => Promise<void>>
+    info?: string[]
+    abortResult?:
+      | { kind: 'aborted'; matchedSessions: number; matchedReviewers: number; abortFailures: number }
+      | { kind: 'no-live-session' }
+  }): (req: Request) => Promise<Response> {
+    return createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: input.allowlist ?? (() => ['pull_request.converted_to_draft']),
+      selfId: () => input.selfId ?? '99',
+      selfLogin: () => input.selfLogin ?? 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber, reason) => {
+        input.abortCalls.push({ workspace, prNumber, reason })
+        return input.abortResult ?? { kind: 'aborted', matchedSessions: 2, matchedReviewers: 1, abortFailures: 0 }
+      },
+      clearReconcileCooldown: async (workspace, prId) => {
+        input.cooldownClears?.push({ workspace, prId })
+        return 'cleared'
+      },
+      scheduleBackgroundTask: (task) => {
+        input.tasks.push(task)
+      },
+      logger: { info: (message) => input.info?.push(message), warn: () => {}, error: () => {} },
+      route: (message) => {
+        input.routed.push(message)
+      },
+    })
+  }
+
+  it('is allowlist-gated, deduplicated, and never routes a conversational inbound', async () => {
+    const abortCalls: AbortCall[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    let allowed = false
+    const handler = draftHandler({
+      abortCalls,
+      routed,
+      tasks,
+      allowlist: () => (allowed ? ['pull_request.converted_to_draft'] : []),
+    })
+    const body = JSON.stringify(convertedToDraftPayload())
+
+    await handler(signedRequest(body, 'pull_request', 'draft-excluded'))
+    allowed = true
+    await handler(signedRequest(body, 'pull_request', 'draft-admitted'))
+    await handler(signedRequest(body, 'pull_request', 'draft-admitted'))
+
+    expect(tasks).toHaveLength(1)
+    await tasks[0]?.()
+    expect(abortCalls).toHaveLength(1)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('aborts the exact repo and PR, clears its cooldown marker, and logs outcome counts', async () => {
+    const abortCalls: AbortCall[] = []
+    const cooldownClears: CooldownClear[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const info: string[] = []
+    const handler = draftHandler({ abortCalls, cooldownClears, routed, tasks, info })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(convertedToDraftPayload({ owner: 'Acme', name: 'Widgets', prNumber: 1, prId: 101 })),
+        'pull_request',
+        'draft-target',
+      ),
+    )
+    await tasks[0]?.()
+
+    expect(abortCalls).toEqual([{ workspace: 'Acme/Widgets', prNumber: 1, reason: 'pull request converted to draft' }])
+    expect(cooldownClears).toEqual([{ workspace: 'Acme/Widgets', prId: 101 }])
+    expect(
+      info.some(
+        (message) => message.includes('Acme/Widgets#1') && message.includes('sessions=2 reviewers=1 failures=0'),
+      ),
+    ).toBe(true)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('still aborts when the draft transition is self-authored', async () => {
+    const abortCalls: AbortCall[] = []
+    const routed: InboundMessage[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = draftHandler({ abortCalls, routed, tasks })
+    const payload = convertedToDraftPayload()
+    payload.sender = { login: 'typeclaw-bot', id: 99, type: 'Bot' }
+
+    await handler(signedRequest(JSON.stringify(payload), 'pull_request', 'draft-self-authored'))
+    await tasks[0]?.()
+
+    expect(abortCalls).toHaveLength(1)
+    expect(routed).toHaveLength(0)
+  })
+
+  it('targets neither another PR nor another repository', async () => {
+    const active = new Set(['acme/project#1', 'acme/project#2', 'acme/other#1'])
+    const tasks: Array<() => Promise<void>> = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      abortGithubPrTurn: async (workspace, prNumber) => {
+        active.delete(`${workspace}#${prNumber}`)
+        return { kind: 'aborted', matchedSessions: 1, matchedReviewers: 0, abortFailures: 0 }
+      },
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger,
+      route: () => {},
+    })
+
+    await handler(
+      signedRequest(
+        JSON.stringify(convertedToDraftPayload({ owner: 'acme', name: 'project', prNumber: 1 })),
+        'pull_request',
+        'draft-scope',
+      ),
+    )
+    await tasks[0]?.()
+
+    expect([...active]).toEqual(['acme/project#2', 'acme/other#1'])
+  })
+
+  it('logs no-live-session distinctly when there was no running review', async () => {
+    const info: string[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = draftHandler({
+      abortCalls: [],
+      routed: [],
+      tasks,
+      info,
+      abortResult: { kind: 'no-live-session' },
+    })
+
+    await handler(signedRequest(JSON.stringify(convertedToDraftPayload()), 'pull_request', 'draft-idle'))
+    await tasks[0]?.()
+
+    expect(info.some((message) => message.includes('acme/project#7') && message.includes('no-live-session'))).toBe(true)
+  })
+
+  it('logs and skips when abort wiring and the cooldown store are unavailable', async () => {
+    const info: string[] = []
+    const tasks: Array<() => Promise<void>> = []
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => ['pull_request.converted_to_draft'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      scheduleBackgroundTask: (task) => tasks.push(task),
+      logger: { info: (message) => info.push(message), warn: () => {}, error: () => {} },
+      route: () => {},
+    })
+
+    await handler(signedRequest(JSON.stringify(convertedToDraftPayload()), 'pull_request', 'draft-unwired'))
+    await tasks[0]?.()
+
+    expect(info.some((message) => message.includes('abort unavailable'))).toBe(true)
+    expect(
+      info.some((message) => message.includes('cooldown clear skipped') && message.includes('not initialized')),
+    ).toBe(true)
+  })
+})
+
 describe('createGithubWebhookHandler — review comment parent lookup', () => {
   function handlerWithParentLookup(
     routed: InboundMessage[],
@@ -2663,6 +2841,22 @@ function readyForReviewPayload(options: { updatedAt?: string; draft?: boolean } 
     repository: repo(),
     pull_request,
     sender: { login: 'alice', id: 10, type: 'User' },
+  }
+}
+
+function convertedToDraftPayload(
+  options: { owner?: string; name?: string; prNumber?: number; prId?: number } = {},
+): Record<string, unknown> {
+  return {
+    action: 'converted_to_draft',
+    repository: { name: options.name ?? 'project', owner: { login: options.owner ?? 'acme' } },
+    pull_request: {
+      number: options.prNumber ?? 7,
+      id: options.prId ?? 700,
+      draft: true,
+      user: user(),
+    },
+    sender: user(),
   }
 }
 

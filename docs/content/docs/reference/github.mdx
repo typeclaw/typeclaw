@@ -81,7 +81,7 @@ These extend the [shared base config](/docs/reference/channel-adapters) for `cha
 | ---------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
 | `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
-| `eventAllowlist` | string[]                                  | (11 defaults)        | Events that trigger the adapter                                                                                  |
+| `eventAllowlist` | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
 | `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start                                                               |
 | `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
 | `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
@@ -94,6 +94,7 @@ pull_request_review_comment.created
 discussion_comment.created
 issues.opened
 pull_request.opened
+pull_request.converted_to_draft
 pull_request.ready_for_review
 pull_request.review_requested
 pull_request.review_request_removed
@@ -124,6 +125,12 @@ Reviews fire on the event named in `review.on` (default `review_requested`).
 - **PAT mode**: the bot is requested by its GitHub login.
 - **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer.
 - Team-reviewer requests are honored when the bot is a member of the requested team.
+
+### Draft transitions
+
+Converting a PR to draft immediately stops its in-progress review turn, cancels its reviewer subagent, and clears pending review rounds. A later `ready_for_review` starts a fresh review.
+
+Custom `eventAllowlist` values must include `pull_request.converted_to_draft` to enable this behavior. If the allowlist currently contains no `pull_request.*` entry, restart after adding it so TypeClaw re-registers the hook's coarse `pull_request` event.
 
 ### Push re-review
 

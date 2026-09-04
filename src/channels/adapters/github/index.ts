@@ -6,6 +6,7 @@ import { resolveSecret } from '@/secrets/resolve'
 import type { GithubSecretsBlock } from '@/secrets/schema'
 
 import { describeError } from '../../describe-error'
+import { canonicalGithubRepo } from '../../github-repo'
 import { buildAuthStrategy, type GithubAuthContext } from './auth'
 import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
@@ -130,6 +131,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let tokenRefreshTimer: { clear: () => void } | null = null
   let deliveryRecoveryTimer: { clear: () => void } | null = null
   let reconcileTimer: { clear: () => void } | null = null
+  let reconcileCooldownStore: ReconcileCooldownStore | null = null
   let unregisterTokenBridge: (() => void) | null = null
   const workspaceByChat = new Map<string, string>()
   const setIntervalFn =
@@ -224,6 +226,12 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     fetchImpl,
     logger,
     route: routeInbound,
+    abortGithubPrTurn: options.router.abortGithubPrTurn,
+    clearReconcileCooldown: async (workspace, prId) => {
+      if (reconcileCooldownStore === null) return 'not-initialized'
+      await reconcileCooldownStore.clear(workspace, prId)
+      return 'cleared'
+    },
   }
   const handler = createGithubWebhookHandler(handlerOptions)
 
@@ -297,8 +305,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         // the parser, because this adapter is the authority that owns repos[].
         unregisterTokenBridge = options.githubTokenBridge.registerResolver(
           (repoSlug) => {
-            const allowed = new Set((options.configRef().repos ?? []).map(canonicalRepoSlug))
-            if (!allowed.has(canonicalRepoSlug(repoSlug))) {
+            const allowed = new Set((options.configRef().repos ?? []).map(canonicalGithubRepo))
+            if (!allowed.has(canonicalGithubRepo(repoSlug))) {
               throw new Error(
                 `repo \`${repoSlug}\` is not in this agent's configured \`channels.github.repos[]\`; ` +
                   'refusing to mint a GitHub App token for it. Target a configured repo, ' +
@@ -370,8 +378,9 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       // so the many restarts a churning tunnel causes don't re-review the same
       // PRs; the periodic tick below retries genuinely-missed PRs after the
       // cooldown without needing a restart.
-      const reconcileCooldownStore =
+      const loadedReconcileCooldownStore =
         repos.length > 0 ? await loadReconcileCooldownStore(options.agentDir, logger) : null
+      reconcileCooldownStore = loadedReconcileCooldownStore
       // Resolve review.on per call, not from the captured startup cfg: review.on
       // is live-reloadable, so a periodic tick must honor a change to `off`
       // (reconcileOpenPrs short-circuits on `off`) instead of scanning forever.
@@ -390,11 +399,11 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         }).catch((err: unknown) => {
           logger.warn(`[github] reconcile pass failed: ${describeError(err)}`)
         })
-      if (reconcileCooldownStore !== null) {
-        await runReconcile(reconcileCooldownStore)
+      if (loadedReconcileCooldownStore !== null) {
+        await runReconcile(loadedReconcileCooldownStore)
         const reconcileIntervalMs = options.reconcileIntervalMs ?? DEFAULT_RECONCILE_INTERVAL_MS
         if (reconcileIntervalMs > 0) {
-          reconcileTimer = setIntervalFn(() => void runReconcile(reconcileCooldownStore), reconcileIntervalMs)
+          reconcileTimer = setIntervalFn(() => void runReconcile(loadedReconcileCooldownStore), reconcileIntervalMs)
         }
       }
       // Periodically recover inbound deliveries that failed at the tunnel and
@@ -479,6 +488,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       server = null
       selfId = null
       selfLogin = null
+      reconcileCooldownStore = null
     },
     isConnected(): boolean {
       return started && selfLogin !== null
@@ -606,18 +616,6 @@ function logDeregistrationOutcome(
     else if (h.action === 'missing') logger.info(`[github] webhook ${h.hookId} on ${h.repo} already gone`)
     else logger.warn(`[github] webhook detach failed for ${h.repo}#${h.hookId}: ${h.error ?? 'unknown error'}`)
   }
-}
-
-// Canonical form for repos[] allowlist comparison so the gate can't be bypassed
-// by case, a trailing slash, or a `.git` suffix (GitHub treats owner/name
-// case-insensitively). Applied identically to both configured repos[] and the
-// runtime slug before exact Set membership.
-function canonicalRepoSlug(repo: string): string {
-  return repo
-    .trim()
-    .replace(/\/+$/, '')
-    .replace(/\.git$/i, '')
-    .toLowerCase()
 }
 
 function defaultSleep(ms: number): Promise<void> {

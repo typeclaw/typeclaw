@@ -25,6 +25,7 @@ export type EffectiveApprovalResolver = (target: {
 // differs from the pre-submit head) is recorded as the uncertainty sentinel so a
 // push-during-review still blocks a same-verdict duplicate for the lag window.
 export type HeadShaResolver = (target: { workspace: string; prNumber: number }) => Promise<string | null>
+type ReviewVerdictCoordinatorLogger = { warn: (message: string) => void }
 
 export type ApproveBlock = {
   block: true
@@ -67,6 +68,7 @@ export type ApproveIdempotencyGuard = ReviewVerdictGuard
 
 let processEffectiveResolver: EffectiveApprovalResolver = async () => ({ ok: false })
 let processHeadShaResolver: HeadShaResolver = async () => null
+let processLogger: ReviewVerdictCoordinatorLogger = console
 
 // Installs the auth-bearing resolvers used by every auth-neutral review surface
 // in this process. The bash interceptor and post_github_review each create a
@@ -75,15 +77,18 @@ let processHeadShaResolver: HeadShaResolver = async () => null
 export function configureReviewVerdictCoordinator(deps: {
   resolveEffectiveApproval: EffectiveApprovalResolver
   resolveHeadSha: HeadShaResolver
+  logger?: ReviewVerdictCoordinatorLogger
 }): void {
   processEffectiveResolver = deps.resolveEffectiveApproval
   processHeadShaResolver = deps.resolveHeadSha
+  processLogger = deps.logger ?? console
 }
 
 export function createSharedReviewVerdictGuard(): ReviewVerdictGuard {
   return createApproveIdempotencyGuard({
     resolveEffectiveApproval: (target) => processEffectiveResolver(target),
     resolveHeadSha: (target) => processHeadShaResolver(target),
+    logger: processLogger,
   })
 }
 
@@ -105,6 +110,10 @@ function duplicateReason(verdict: ReviewVerdict): string {
 const CONCURRENT_REASON =
   'Another session in this agent is already submitting a formal review verdict for this pull request. ' +
   'Only one verdict may land per PR — do not submit a second review; the in-flight one will post.'
+
+const PENDING_PUBLICATION_REASON =
+  'A previous review submission for this pull request is still settling after the PR was converted to draft. ' +
+  'Do not submit another verdict until its publication outcome is known.'
 
 const ROUND_INELIGIBLE_REASON =
   'This review follow-up round assigned the formal verdict to another sibling thread session. ' +
@@ -155,7 +164,7 @@ export const REPLY_REVIEW_ROUND_TTL_MS = 30 * 60_000
 // and a new-push head all bypass it, so a genuine re-review is never stranded. 5min
 // stays well under the lease TTL and short enough that a deliberate human-driven
 // re-approval of the identical commit is the only thing it can delay.
-const RECENT_LANDED_TTL_MS = 5 * 60_000
+export const RECENT_LANDED_TTL_MS = 5 * 60_000
 const COMPLETED_REPLY_REVIEW_ROUND_GRACE_MS = 5 * 60_000
 
 type Reservation = {
@@ -185,6 +194,9 @@ type LandedVerdict = { verdict: ReviewVerdict; headSha: string | null; landedAt:
 // three sessions each landed an APPROVE on the same PR within ten seconds.
 const inFlightByPr = new Map<string, Reservation>()
 const reservationByCall = new Map<string, Reservation>()
+const abortedReservationByCall = new Map<string, Reservation>()
+type PendingPublication = { callId: string; reservation: Reservation; fencedAt: number }
+const pendingPublicationsByPr = new Map<string, Map<number, PendingPublication>>()
 const recentLandedByPr = new Map<string, LandedVerdict>()
 type ReviewRoundState = {
   round: GithubReviewFollowupRound
@@ -483,8 +495,53 @@ export function resetGithubReviewRoundCompletionForPr(
   return state.round
 }
 
+export function abortGithubReviewStateForPr(
+  workspace: string,
+  prNumber: number,
+  now: () => number = Date.now,
+): { releasedReservations: number; deletedRounds: number } {
+  const key = prKey(workspace, prNumber)
+  const reservations = new Set<Reservation>()
+  const matchingCalls: Array<[string, Reservation]> = []
+  const held = inFlightByPr.get(key)
+  if (held !== undefined) reservations.add(held)
+  for (const entry of reservationByCall) {
+    const [callId, reservation] = entry
+    if (reservation.workspace !== workspace || reservation.prNumber !== prNumber) continue
+    reservations.add(reservation)
+    matchingCalls.push([callId, reservation])
+  }
+  for (const reservation of reservations) resetRoundAttempt(reservation)
+  for (const [callId, reservation] of matchingCalls) {
+    reservationByCall.delete(callId)
+    // Release active ownership now, but retain a decisive call's accounting
+    // record because a POST already past dispatch may still verify afterward.
+    if (reservation.verdict !== 'DISMISSED') {
+      abortedReservationByCall.set(callId, reservation)
+      addPendingPublication(callId, reservation, now())
+    }
+  }
+  inFlightByPr.delete(key)
+
+  let deletedRounds = 0
+  for (const [roundKey, state] of reviewRounds) {
+    if (state.status !== 'pending') continue
+    if (state.round.workspace !== workspace || state.round.prNumber !== prNumber) continue
+    reviewRounds.delete(roundKey)
+    deletedRounds++
+  }
+  for (const [generationKey, generation] of replyReviewRoundGenerations) {
+    if (generation.round.workspace !== workspace || generation.round.prNumber !== prNumber) continue
+    replyReviewRoundGenerations.delete(generationKey)
+  }
+
+  // A draft abort abandons local work, not output already observed on GitHub.
+  // Keeping recentLandedByPr prevents a later ready event from duplicating it.
+  return { releasedReservations: reservations.size, deletedRounds }
+}
+
 // Makes a formal `gh ... event=APPROVE|REQUEST_CHANGES` idempotent per PR across
-// turns, sessions, and (in-process) concurrent fan-out. Three layers, in order:
+// turns, sessions, and (in-process) concurrent fan-out. Four layers, in order:
 //
 //   1. A process-wide in-flight lease keyed by `workspace#prNumber`, held from
 //      tool.before through tool.after. While one verdict is mid-flight, every
@@ -493,14 +550,19 @@ export function resetGithubReviewRoundCompletionForPr(
 //      closure-local Set could not provide: separate plugin instances meant
 //      separate Sets, so concurrent sessions never saw each other.
 //
-//   2. The authoritative GitHub effective-state read, consulted AFTER the lease.
+//   2. A pending-publication fence retained when a draft abort releases the live
+//      lease. It blocks only a same-head publication while the already-dispatched
+//      call settles; round state remains deleted and independently registrable.
+//      The fence expires after RECENT_LANDED_TTL_MS and logs before failing open.
+//
+//   3. The authoritative GitHub effective-state read, consulted AFTER the lease.
 //      It is the SOLE source of truth for a standing verdict and for supersession:
 //      a later CHANGES_REQUESTED/DISMISSED demotes an earlier APPROVED, so a
 //      genuine re-verdict is allowed (the 35287f99 invariant — never block a
 //      re-verdict on stale LOCAL memory). A standing same verdict blocks; DISMISSED
 //      and the opposite decisive verdict pass. Reads fail OPEN.
 //
-//   3. A read-after-write-lag shield, consulted ONLY when layer 2 returns a raw
+//   4. A read-after-write-lag shield, consulted ONLY when layer 3 returns a raw
 //      NONE. The lease (layer 1) covers two OVERLAPPING in-flight commands, but a
 //      second engagement turn ~10s later starts after the first's lease released,
 //      and GitHub's reviews list still lags the write (reports NONE). A short-lived
@@ -514,21 +576,24 @@ export function resetGithubReviewRoundCompletionForPr(
 //      NONE, a real DISMISSED/CHANGES_REQUESTED already allowed the re-verdict at
 //      layer 2, so this cannot re-strand a supersession.
 //
-// The lease is released only in release() (tool.after) or on a terminal block,
-// never after the remote read — releasing early reopens the TOCTOU the lease
-// exists to close. Release is keyed by a per-call token so a late/stale
-// tool.after for a superseded reservation cannot drop a newer session's lease.
+// Outside a draft abort, the lease is released only in release() (tool.after) or
+// on a terminal block, never after the remote read. A draft abort replaces it with
+// the bounded pending-publication fence above. Cleanup is keyed by a per-call
+// token so a late/stale tool.after cannot drop a newer session's state.
 export function createApproveIdempotencyGuard(deps: {
   resolveEffectiveApproval: EffectiveApprovalResolver
   resolveHeadSha?: HeadShaResolver
   now?: () => number
+  logger?: ReviewVerdictCoordinatorLogger
 }): ReviewVerdictGuard {
   const now = deps.now ?? Date.now
+  const logger = deps.logger ?? processLogger
 
   return {
     async guard(args): Promise<ApproveBlock | null> {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
       expireRecentLanded(now)
+      expirePendingPublications(now, logger)
       const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver, now)
       if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
@@ -565,6 +630,12 @@ export function createApproveIdempotencyGuard(deps: {
       // widen the reserve-before-await race the lease closes above.
       const headSha = (await deps.resolveHeadSha?.({ workspace: args.workspace, prNumber: args.prNumber })) ?? null
       reservation.headSha = headSha
+
+      if (hasPendingPublicationOnHead(key, headSha, now, logger)) {
+        resetRoundRequestChangesAttempt(reservation)
+        releaseReservation(args.callId, reservation)
+        return { block: true, kind: 'concurrent', reason: PENDING_PUBLICATION_REASON }
+      }
 
       // Layer 2: GitHub is the authoritative, sole source of truth for a standing
       // verdict. A standing same verdict is a real duplicate except for the one
@@ -633,7 +704,7 @@ export function createApproveIdempotencyGuard(deps: {
     },
 
     async release(args): Promise<void> {
-      const reservation = reservationByCall.get(args.callId)
+      const reservation = reservationByCall.get(args.callId) ?? abortedReservationByCall.get(args.callId)
       if (reservation === undefined) return
       try {
         // A FORMAL review's pre-submit head can go stale: if the PR head advanced
@@ -756,9 +827,56 @@ function recentlyLandedSame(key: string, verdict: ReviewVerdict, headSha: string
 // newer session) must not yank the live session's lease.
 function releaseReservation(callId: string, reservation: Reservation): void {
   reservationByCall.delete(callId)
+  abortedReservationByCall.delete(callId)
+  removePendingPublication(reservation)
   const current = inFlightByPr.get(reservation.key)
   if (current !== undefined && current.token === reservation.token) {
     inFlightByPr.delete(reservation.key)
+  }
+}
+
+function addPendingPublication(callId: string, reservation: Reservation, fencedAt: number): void {
+  const pending = pendingPublicationsByPr.get(reservation.key) ?? new Map<number, PendingPublication>()
+  pending.set(reservation.token, { callId, reservation, fencedAt })
+  pendingPublicationsByPr.set(reservation.key, pending)
+}
+
+function hasPendingPublicationOnHead(
+  key: string,
+  headSha: string | null,
+  now: () => number,
+  logger: ReviewVerdictCoordinatorLogger,
+): boolean {
+  expirePendingPublications(now, logger)
+  const pending = pendingPublicationsByPr.get(key)
+  if (pending === undefined) return false
+  for (const publication of pending.values()) {
+    if (headSha === null || publication.reservation.headSha === null || publication.reservation.headSha === headSha) {
+      return true
+    }
+  }
+  return false
+}
+
+function removePendingPublication(reservation: Reservation): void {
+  const pending = pendingPublicationsByPr.get(reservation.key)
+  if (pending === undefined) return
+  pending.delete(reservation.token)
+  if (pending.size === 0) pendingPublicationsByPr.delete(reservation.key)
+}
+
+function expirePendingPublications(now: () => number, logger: ReviewVerdictCoordinatorLogger): void {
+  const currentTime = now()
+  for (const [key, pending] of pendingPublicationsByPr) {
+    for (const [token, publication] of pending) {
+      if (currentTime - publication.fencedAt < RECENT_LANDED_TTL_MS) continue
+      pending.delete(token)
+      abortedReservationByCall.delete(publication.callId)
+      logger.warn(
+        `[github] pending review publication fence lapsed without release pr=${publication.reservation.workspace}#${publication.reservation.prNumber}`,
+      )
+    }
+    if (pending.size === 0) pendingPublicationsByPr.delete(key)
   }
 }
 
@@ -766,6 +884,14 @@ function resetRoundRequestChangesAttempt(reservation: Reservation): void {
   if (reservation.verdict !== 'REQUEST_CHANGES' || reservation.roundKey === undefined) return
   const state = activeReviewRoundState(reservation.roundKey)
   if (state !== undefined && state.status === 'pending') state.requestChangesAttempted = false
+}
+
+function resetRoundAttempt(reservation: Reservation): void {
+  if (reservation.roundKey === undefined) return
+  const state = activeReviewRoundState(reservation.roundKey)
+  if (state === undefined || state.status !== 'pending') return
+  if (reservation.verdict === 'DISMISSED') state.dismissalAttempted = false
+  if (reservation.verdict === 'REQUEST_CHANGES') state.requestChangesAttempted = false
 }
 
 function prKey(workspace: string, prNumber: number): string {
@@ -807,6 +933,8 @@ export function __recentLandedRecordCountForTest(): number {
 export function __resetReviewVerdictGuardForTest(): void {
   inFlightByPr.clear()
   reservationByCall.clear()
+  abortedReservationByCall.clear()
+  pendingPublicationsByPr.clear()
   recentLandedByPr.clear()
   reviewRounds = new Map<string, ReviewRoundState>()
   expiredReviewRoundKeys = new Set<string>()
@@ -814,4 +942,5 @@ export function __resetReviewVerdictGuardForTest(): void {
   tokenSeq = 0
   processEffectiveResolver = async () => ({ ok: false })
   processHeadShaResolver = async () => null
+  processLogger = console
 }

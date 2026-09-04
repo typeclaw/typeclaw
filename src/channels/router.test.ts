@@ -21,6 +21,7 @@ import {
 import type { SessionEntry } from '@mariozechner/pi-coding-agent'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
+import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import {
   consumeRestartHandoff,
   peekRestartHandoff,
@@ -514,6 +515,7 @@ function makeRouter(
     saveChannelSessions?: (agentDir: string, sessions: readonly ChannelSessionRecord[]) => Promise<void>
     newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
     listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
+    cancelRunningSubagentsByWorkKey?: CreateChannelRouterOptions['cancelRunningSubagentsByWorkKey']
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
     onSessionCreated?: (session: FakeSession) => void
@@ -545,6 +547,9 @@ function makeRouter(
       : {}),
     ...(options.listRunningBackgroundSubagentNames !== undefined
       ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
+      : {}),
+    ...(options.cancelRunningSubagentsByWorkKey !== undefined
+      ? { cancelRunningSubagentsByWorkKey: options.cancelRunningSubagentsByWorkKey }
       : {}),
     ...(options.runIdleContinuation !== undefined ? { runIdleContinuation: options.runIdleContinuation } : {}),
     ...(options.recordTurnOutcome !== undefined ? { recordTurnOutcome: options.recordTurnOutcome } : {}),
@@ -8762,6 +8767,166 @@ describe('ChannelRouter stop', () => {
   })
 })
 
+describe('ChannelRouter GitHub PR abort', () => {
+  test('stops every active thread session for exactly one PR and clears its live and persisted round state', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const subagents = new LiveSubagentRegistry()
+    let reviewerAborts = 0
+    subagents.register({
+      taskId: 'bg_reviewer',
+      sessionId: 'ses_reviewer',
+      subagentName: 'reviewer',
+      parentSessionId: 'ses_fake_1',
+      workKey: 'reviewer:github:acme/widgets#42',
+      startedAt: 1_000,
+      status: 'running',
+      abort: async () => {
+        reviewerAborts++
+      },
+    })
+    const { router, sessions } = makeRouter(dir, {
+      cancelRunningSubagentsByWorkKey: (workKey, reason) => subagents.cancelRunningByWorkKey(workKey, reason),
+    })
+    const targetRound = {
+      kind: 'push',
+      roundId: 'target-round',
+      workspace: 'acme/widgets',
+      prNumber: 42,
+      headSha: 'target-head',
+      carrierThread: null,
+    } as const
+    const otherRound = {
+      ...targetRound,
+      roundId: 'other-round',
+      prNumber: 43,
+      headSha: 'other-head',
+    } as const
+    const keys: ChannelKey[] = [
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: 'review:101' },
+      { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:43', thread: null },
+      { adapter: 'github', workspace: 'acme/gadgets', chat: 'pr:42', thread: null },
+      { adapter: 'slack-bot', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+    ]
+    for (const [index, key] of keys.entries()) {
+      await router.route(
+        inbound({
+          ...key,
+          externalMessageId: `abort-${index}`,
+          ...(key.adapter === 'github' && key.workspace === 'acme/widgets' && key.chat === 'pr:42'
+            ? { githubReviewRound: targetRound }
+            : {}),
+          ...(key.adapter === 'github' && key.workspace === 'acme/widgets' && key.chat === 'pr:43'
+            ? { githubReviewRound: otherRound }
+            : {}),
+        }),
+      )
+    }
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 2, matchedReviewers: 1, abortFailures: 0 })
+    expect(sessions.map((session) => session.aborted)).toEqual([1, 1, 0, 0, 0])
+    expect(reviewerAborts).toBe(1)
+    expect(subagents.get('bg_reviewer')?.status).toBe('failed')
+    expect(router.__testing!.githubReviewRoundFor(keys[0]!)).toBeNull()
+    expect(router.__testing!.githubReviewRoundFor(keys[1]!)).toBeNull()
+    expect(router.__testing!.githubReviewRoundFor(keys[2]!)).toEqual(otherRound)
+    const persisted = await loadChannelSessions(dir)
+    expect(
+      persisted
+        .filter(
+          (record) => record.adapter === 'github' && record.workspace === 'acme/widgets' && record.chat === 'pr:42',
+        )
+        .every((record) => record.githubReviewRound === undefined),
+    ).toBe(true)
+    expect(
+      persisted.find(
+        (record) => record.adapter === 'github' && record.workspace === 'acme/widgets' && record.chat === 'pr:43',
+      )?.githubReviewRound,
+    ).toMatchObject(otherRound)
+
+    await router.stop()
+    __resetReviewVerdictGuardForTest()
+  })
+
+  test('counts a failed session abort without preventing sibling sessions from stopping', async () => {
+    const dir = await tempDir()
+    let created = 0
+    const { router, sessions } = makeRouter(dir, {
+      onSessionCreated: (session) => {
+        created++
+        if (created !== 1) return
+        session.abort = async () => {
+          session.aborted++
+          throw new Error('session abort failed')
+        }
+      },
+    })
+    await router.route(
+      inbound({ adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null, externalMessageId: 'a' }),
+    )
+    await router.route(
+      inbound({
+        adapter: 'github',
+        workspace: 'acme/widgets',
+        chat: 'pr:42',
+        thread: 'review:101',
+        externalMessageId: 'b',
+      }),
+    )
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 2, matchedReviewers: 0, abortFailures: 1 })
+    expect(sessions.map((session) => session.aborted)).toEqual([1, 1])
+    await router.stop()
+  })
+
+  test('returns no-live-session when no active work matches the PR', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    expect(await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')).toEqual({
+      kind: 'no-live-session',
+    })
+
+    await router.stop()
+  })
+
+  test('reports an abort when only a background reviewer remains after its parent turn ends', async () => {
+    const dir = await tempDir()
+    const subagents = new LiveSubagentRegistry()
+    let reviewerAborts = 0
+    subagents.register({
+      taskId: 'bg_idle_parent_reviewer',
+      sessionId: 'ses_idle_parent_reviewer',
+      subagentName: 'reviewer',
+      parentSessionId: 'ses_fake_1',
+      workKey: 'reviewer:github:acme/widgets#42',
+      startedAt: 1_000,
+      status: 'running',
+      abort: async () => {
+        reviewerAborts++
+      },
+    })
+    const { router, sessions } = makeRouter(dir, {
+      cancelRunningSubagentsByWorkKey: (workKey, reason) => subagents.cancelRunningByWorkKey(workKey, reason),
+    })
+    const key: ChannelKey = { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null }
+    await router.route(inbound({ ...key, externalMessageId: 'review-start' }))
+    await router.__testing!.flushDebounce(key)
+
+    const result = await router.abortGithubPrTurn!('acme/widgets', 42, 'pull request converted to draft')
+
+    expect(result).toEqual({ kind: 'aborted', matchedSessions: 0, matchedReviewers: 1, abortFailures: 0 })
+    expect(reviewerAborts).toBe(1)
+    expect(sessions[0]!.aborted).toBe(0)
+    await router.stop()
+  })
+})
+
 describe('ChannelRouter typing heartbeat interval', () => {
   test('adapters default to TYPING_HEARTBEAT_MS when no override is registered', async () => {
     const dir = await tempDir()
@@ -8840,9 +9005,9 @@ describe('ChannelRouter commands', () => {
     await draining
 
     const abortLog = logs.find((m) => m.includes('site=user_stop'))
-    expect(abortLog).toBeDefined()
-    expect(abortLog).toContain('session=ses_fake_1')
-    expect(abortLog).toContain('reason=user_stop')
+    expect(abortLog).toBe(
+      'info:[channels] discord-bot:g1:c1:: command /stop aborted current turn site=user_stop session=ses_fake_1 reason=user_stop',
+    )
   })
 
   test('/stop supersedes terminal-reply provenance before the aborted outcome is captured', async () => {

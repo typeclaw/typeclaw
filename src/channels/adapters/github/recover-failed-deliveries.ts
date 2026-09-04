@@ -54,7 +54,12 @@ export type RecoverFailedDeliveriesOptions = {
   // The shared processVerifiedGithubDelivery, bound to the adapter's handler
   // options. `delivery` is the GUID; the core dedups, filters by allowlist,
   // drops self-authored, and routes exactly as the live path does.
-  process: (input: { event: string; delivery: string; payload: Record<string, unknown> }) => Promise<void>
+  process: (input: {
+    event: string
+    delivery: string
+    payload: Record<string, unknown>
+    recovered: true
+  }) => Promise<void>
   // Fast-path skip backed by the LIVE delivery dedup (shared with the webhook
   // handler): a guid here was just routed live (or reserved by `process` on
   // entry), so skip it. Best-effort only — it is a 1000-entry LRU and may evict
@@ -145,7 +150,7 @@ async function recoverHook(
 
     const payload = await fetchDeliveryPayload(fetchImpl, token, target, hook.hookId, delivery.id)
     if (payload === null) continue
-    await options.process({ event: delivery.event, delivery: guid, payload })
+    await options.process({ event: delivery.event, delivery: guid, payload, recovered: true })
     // Record AFTER process resolves: an unexpected throw leaves the guid
     // unrecorded so the next sweep retries it. A no-op classify still records
     // (process returned), so a non-routable failed delivery is not refetched.
