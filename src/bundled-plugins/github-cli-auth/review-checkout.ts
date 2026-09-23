@@ -80,7 +80,15 @@ export async function prepareReviewerCheckout(options: {
       ],
       { env: baseEnv },
     )
-    return { path: checkout, repoSlug: options.repoSlug, headSha: options.headSha.toLocaleLowerCase() }
+    // The checkout lives in the session's `/tmp` backing dir, but the model only
+    // ever sees that dir AS `/tmp` (bwrap binds it there; file tools re-map
+    // `/tmp/*` into it). Returning the backing path would be re-mapped a second
+    // time and never resolve, so hand back the model-facing path.
+    return {
+      path: path.posix.join('/tmp', path.basename(checkout)),
+      repoSlug: options.repoSlug,
+      headSha: options.headSha.toLocaleLowerCase(),
+    }
   } catch (error) {
     await rm(checkout, { recursive: true, force: true }).catch(() => {})
     throw error

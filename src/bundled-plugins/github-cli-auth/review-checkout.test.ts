@@ -33,7 +33,12 @@ describe('prepareReviewerCheckout', () => {
       },
     })
 
-    expect(receipt.path).toStartWith(path.join(SESSION_TMP_ROOT, sessionId, 'review-checkout-'))
+    expect(receipt.path).toMatch(/^\/tmp\/review-checkout-[^/]+$/)
+    expect(calls[0]?.args).toEqual([
+      'init',
+      '--quiet',
+      path.join(SESSION_TMP_ROOT, sessionId, path.posix.basename(receipt.path)),
+    ])
     expect(calls).toHaveLength(3)
     expect(calls.flatMap((call) => call.args).join(' ')).not.toContain('ghs_secret')
     expect(calls[1]?.env.TYPECLAW_GIT_TOKEN).toBe('ghs_secret')
