@@ -50,12 +50,25 @@ describe('analyzeGhCommand', () => {
 
   it('blocks unquoted pathname expansion before credential injection but permits quoted literals', () => {
     for (const command of ['gh auth status -?', 'gh auth status -*', 'gh auth status -[t]']) {
-      expect(analyzeGhCommand(command)).toMatchObject({ kind: 'block', code: 'credential-exposure' })
+      expect(analyzeGhCommand(command)).toMatchObject({ kind: 'block', code: 'pathname-expansion' })
     }
 
     for (const command of ["gh auth status '-?'", 'gh auth status "-*"', "gh auth status '-[x]'"]) {
       expect(analyzeGhCommand(command)).toEqual({ kind: 'pass-through' })
     }
+  })
+
+  it('tells the model to quote an unquoted query string instead of calling it unsupported', () => {
+    const sha = '0123456789abcdef0123456789abcdef01234567'
+
+    const blocked = analyzeGhCommand(`gh api /repos/acme/widgets/contents/docs?ref=${sha}`)
+
+    expect(blocked).toMatchObject({ kind: 'block', code: 'pathname-expansion' })
+    expect(blocked.kind === 'block' ? blocked.reason : '').toContain('Quote the argument')
+    expect(analyzeGhCommand(`gh api '/repos/acme/widgets/contents/docs?ref=${sha}'`)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+    })
   })
 
   it('blocks executable credential-confused-deputy attacks before token injection', () => {

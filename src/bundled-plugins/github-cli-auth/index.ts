@@ -311,7 +311,7 @@ export default definePlugin({
         return {
           block: true,
           reason:
-            decision.code === 'credential-display'
+            decision.code === 'credential-display' || decision.code === 'pathname-expansion'
               ? decision.reason
               : decision.reason + buildGhBlockGuidance(decision.code, fallbackRepo, command),
         }

@@ -250,6 +250,18 @@ describe('github-cli-auth plugin', () => {
     expect(resolverCalled).toBe(false)
   })
 
+  test('an unquoted gh api query string is blocked with quoting guidance, not the unsupported-command hint', async () => {
+    const hook = await hookFor(async () => ({ kind: 'token', token: 'ghs_minted' }), true)
+
+    const result = await hook(bashEvent('gh api /repos/acme/widgets/contents/docs?ref=main'), hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    const reason = result !== undefined && 'reason' in result ? String(result.reason) : ''
+    expect(reason).toContain("gh api '/repos/owner/repo/contents/path?ref=<sha>'")
+    expect(reason).not.toContain('credential-safe allowlist')
+    expect(reason).not.toContain('as a single bare command')
+  })
+
   test('GitHub-origin fallback blocks local-git PR operations before minting', async () => {
     delete process.env.GH_TOKEN
     let resolverCalled = false

@@ -11,6 +11,7 @@ export type GhBlockCode =
   | 'repo-selector-conflict'
   | 'credential-display'
   | 'credential-exposure'
+  | 'pathname-expansion'
 
 export type GhCommandDecision =
   | { kind: 'pass-through' }
@@ -58,6 +59,11 @@ const CREDENTIAL_DISPLAY_REASON =
   'GitHub authentication management and token-display commands are unavailable to model-driven bash. ' +
   'In particular, `gh auth token` and `gh auth status --show-token` would print the command-scoped credential. ' +
   'Use host-side authentication setup or a redacted diagnostic instead.'
+
+const PATHNAME_EXPANSION_REASON =
+  'An unquoted `*`, `?`, or `[` in a gh command is a shell pathname pattern: the shell could expand it into ' +
+  'different arguments than the ones TypeClaw authorized, so no credential is minted for it. ' +
+  "Quote the argument that contains it, e.g. `gh api '/repos/owner/repo/contents/path?ref=<sha>'`."
 
 const CREDENTIAL_EXPOSURE_REASON =
   'This gh command is not in TypeClaw’s credential-safe allowlist. Model-driven gh receives a command-scoped credential only for operations whose argv cannot read arbitrary files, render process environment values, upload arbitrary files, select another host, or start extensions. Use a supported direct gh operation, a first-class TypeClaw tool, or run this command host-side.'
@@ -194,7 +200,7 @@ export function analyzeGhCommand(command: string, fallbackRepo?: string): GhComm
   const ghStarts = findGhInvocations(tokens)
   if (ghStarts.length === 0) return { kind: 'pass-through' }
   if (containsUnquotedPathnameExpansion(command)) {
-    return { kind: 'block', code: 'credential-exposure', reason: CREDENTIAL_EXPOSURE_REASON }
+    return { kind: 'block', code: 'pathname-expansion', reason: PATHNAME_EXPANSION_REASON }
   }
 
   for (let i = 0; i < ghStarts.length; i++) {
