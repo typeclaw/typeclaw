@@ -15,8 +15,33 @@ const { isAbsolute, join, relative, resolve } = posix
 // anything into the project surface.
 export const SESSION_TMP_ROOT = '/tmp/typeclaw-session'
 
+// A subagent tree shares one scratch dir: its top-level subagent's. Runtime-
+// owned scratch (a reviewer checkout) is handed to child subagents by `/tmp`
+// path, and a child with its own `/tmp` cannot resolve it. The scope is anchored
+// BELOW the spawning channel/TUI/cron session on purpose: that session persists
+// across turns and speakers, so subagent artifacts must never land in its
+// scratch. Unrelated sessions stay isolated. Each entry is resolved to its
+// anchor at registration, so releasing an intermediate parent never re-routes a
+// still-running grandchild.
+const subagentTmpScopes = new Map<string, { scope: string; refs: number }>()
+
 export function sessionTmpDir(sessionId: string): string {
-  return join(SESSION_TMP_ROOT, sessionId)
+  return join(SESSION_TMP_ROOT, subagentTmpScopes.get(sessionId)?.scope ?? sessionId)
+}
+
+export function enterSubagentTmpScope(sessionId: string, parentSessionId: string): () => void {
+  const existing = subagentTmpScopes.get(sessionId)
+  const scope = existing?.scope ?? subagentTmpScopes.get(parentSessionId)?.scope ?? sessionId
+  subagentTmpScopes.set(sessionId, { scope, refs: (existing?.refs ?? 0) + 1 })
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const entry = subagentTmpScopes.get(sessionId)
+    if (entry === undefined) return
+    if (entry.refs <= 1) subagentTmpScopes.delete(sessionId)
+    else entry.refs -= 1
+  }
 }
 
 export async function ensureSessionTmpDir(sessionId: string): Promise<string> {

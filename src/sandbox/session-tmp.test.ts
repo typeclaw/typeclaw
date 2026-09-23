@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { isUnderTmp, mapVirtualTmpPath, SESSION_TMP_ROOT, sessionTmpDir } from './session-tmp'
+import { enterSubagentTmpScope, isUnderTmp, mapVirtualTmpPath, SESSION_TMP_ROOT, sessionTmpDir } from './session-tmp'
 
 describe('session-tmp path mapping', () => {
   test('sessionTmpDir namespaces by session id under the shared root', () => {
@@ -41,5 +41,57 @@ describe('session-tmp path mapping', () => {
     expect(isUnderTmp('/agent', '/tmp/x')).toBe(true)
     expect(isUnderTmp('/agent', '/tmp')).toBe(true)
     expect(isUnderTmp('/agent', 'workspace/x')).toBe(false)
+  })
+})
+
+describe('session-tmp subagent scope', () => {
+  test('a subagent tree shares its top-level subagent scratch, never the spawning session scratch', () => {
+    const releaseReviewer = enterSubagentTmpScope('tree-reviewer', 'tree-channel')
+    const releaseExplorer = enterSubagentTmpScope('tree-explorer', 'tree-reviewer')
+
+    expect(sessionTmpDir('tree-channel')).toBe(`${SESSION_TMP_ROOT}/tree-channel`)
+    expect(sessionTmpDir('tree-reviewer')).toBe(`${SESSION_TMP_ROOT}/tree-reviewer`)
+    expect(mapVirtualTmpPath('/agent', 'tree-explorer', '/tmp/review-checkout-x/a.md')).toBe(
+      `${SESSION_TMP_ROOT}/tree-reviewer/review-checkout-x/a.md`,
+    )
+    expect(sessionTmpDir('tree-unrelated')).toBe(`${SESSION_TMP_ROOT}/tree-unrelated`)
+
+    releaseExplorer()
+    releaseReviewer()
+  })
+
+  test('sibling top-level subagents of one session do not share scratch', () => {
+    const releaseFirst = enterSubagentTmpScope('sib-a', 'sib-channel')
+    const releaseSecond = enterSubagentTmpScope('sib-b', 'sib-channel')
+
+    expect(sessionTmpDir('sib-a')).not.toBe(sessionTmpDir('sib-b'))
+
+    releaseFirst()
+    releaseSecond()
+  })
+
+  test('a descendant keeps the anchor scratch after its intermediate parent is released', () => {
+    const releaseReviewer = enterSubagentTmpScope('keep-reviewer', 'keep-channel')
+    const releaseChild = enterSubagentTmpScope('keep-child', 'keep-reviewer')
+    const releaseGrandchild = enterSubagentTmpScope('keep-grandchild', 'keep-child')
+
+    releaseChild()
+
+    expect(sessionTmpDir('keep-grandchild')).toBe(`${SESSION_TMP_ROOT}/keep-reviewer`)
+    releaseGrandchild()
+    releaseReviewer()
+    expect(sessionTmpDir('keep-grandchild')).toBe(`${SESSION_TMP_ROOT}/keep-grandchild`)
+  })
+
+  test('an entry stays until every registration for the session is released', () => {
+    const releaseReviewer = enterSubagentTmpScope('ref-reviewer', 'ref-channel')
+    const first = enterSubagentTmpScope('ref-child', 'ref-reviewer')
+    const second = enterSubagentTmpScope('ref-child', 'ref-reviewer')
+
+    first()
+    expect(sessionTmpDir('ref-child')).toBe(`${SESSION_TMP_ROOT}/ref-reviewer`)
+    second()
+    expect(sessionTmpDir('ref-child')).toBe(`${SESSION_TMP_ROOT}/ref-child`)
+    releaseReviewer()
   })
 })
