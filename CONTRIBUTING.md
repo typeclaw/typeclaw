@@ -6,7 +6,7 @@ Thanks for considering a contribution. This file covers the mechanics of working
 
 - **Bun** ≥ 1.1 (CI pins 1.4.0; 1.3.x and 1.4.x both work locally)
 - **Docker** or **OrbStack** — TypeClaw runs every agent in a container, so you need a working Docker daemon to exercise `typeclaw start`, `tui`, `logs`, `reload`, etc.
-- **Git** ≥ 2.40 — worktrees are how most maintainers juggle branches here
+- **Git** ≥ 2.40 — worktrees are how most maintainers juggle branches here. Put them under the gitignored `.worktrees/` at the repo root (`git worktree add .worktrees/<name> -b <branch>`), and run `bun install` inside each one — a fresh worktree has no `node_modules`.
 
 Nothing else. No global toolchain, no Node, no Python.
 
