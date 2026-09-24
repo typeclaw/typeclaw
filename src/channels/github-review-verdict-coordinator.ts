@@ -119,6 +119,16 @@ const ROUND_INELIGIBLE_REASON =
   'This review follow-up round assigned the formal verdict to another sibling thread session. ' +
   'Do not submit a formal verdict from this session; wait for the designated sibling verdict activity, then close out only this thread.'
 
+const ROUND_HEAD_UNVERIFIED_REASON =
+  "Could not verify this pull request's current head commit on GitHub, so the review round's verdict was not submitted. " +
+  'You are still the designated carrier for this round. Retry the same verdict once shortly. ' +
+  'If it fails again, stop retrying: the head read may be failing persistently (missing credentials or a denied or malformed GitHub API response), ' +
+  'so report that the PR head could not be verified and ask the operator to check GitHub credentials and API access.'
+
+const ROUND_HEAD_MOVED_REASON =
+  'The pull request head moved past the commit this review round covers, so a verdict from this round would describe stale code. ' +
+  'Do not submit it; the new push starts its own review round.'
+
 // The standing verdict a fresh attempt would duplicate. APPROVE duplicates a
 // standing APPROVED; REQUEST_CHANGES duplicates a standing CHANGES_REQUESTED.
 function duplicatesStanding(verdict: ReviewVerdict, effective: EffectiveVerdict): boolean {
@@ -594,7 +604,7 @@ export function createApproveIdempotencyGuard(deps: {
       if (args.verdict !== 'APPROVE' && args.verdict !== 'REQUEST_CHANGES') return null
       expireRecentLanded(now)
       expirePendingPublications(now, logger)
-      const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver, now)
+      const blocked = await evaluateRoundEligibility(args, deps.resolveHeadSha ?? processHeadShaResolver, now, logger)
       if (blocked !== null) return blocked
       const key = prKey(args.workspace, args.prNumber)
 
@@ -766,6 +776,7 @@ async function evaluateRoundEligibility(
   },
   resolveHeadSha: HeadShaResolver,
   now: () => number = Date.now,
+  logger: ReviewVerdictCoordinatorLogger = processLogger,
 ): Promise<ApproveBlock | null> {
   expireReviewRounds(now)
   const pendingRoundForPr = Array.from(reviewRounds.values()).find(
@@ -800,8 +811,20 @@ async function evaluateRoundEligibility(
     workspace: activeRound.workspace,
     prNumber: activeRound.prNumber,
   })
-  if (currentRoundHead === null || currentRoundHead !== activeRound.headSha) {
-    return { block: true, kind: 'round-ineligible', reason: ROUND_INELIGIBLE_REASON }
+  // This session IS the carrier here, so the sibling-carrier reason would be a
+  // lie that tells the model to stand down and strands the round. Name the
+  // actual cause instead: an unverified head (one retry, then diagnostics) or a moved head.
+  if (currentRoundHead === null) {
+    logger.warn(
+      `[github] review round head read failed pr=${activeRound.workspace}#${activeRound.prNumber} round=${activeRound.roundId} carrier=${activeRound.carrierThread ?? 'root'}`,
+    )
+    return { block: true, kind: 'round-ineligible', reason: ROUND_HEAD_UNVERIFIED_REASON }
+  }
+  if (currentRoundHead !== activeRound.headSha) {
+    logger.warn(
+      `[github] review round head moved pr=${activeRound.workspace}#${activeRound.prNumber} round=${activeRound.roundId} round_head=${activeRound.headSha} current_head=${currentRoundHead}`,
+    )
+    return { block: true, kind: 'round-ineligible', reason: ROUND_HEAD_MOVED_REASON }
   }
   registerGithubReviewRound(activeRound, now())
   return null
