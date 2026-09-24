@@ -4400,10 +4400,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (!isAwaitingBackgroundChild(live, 'staged-fallback')) {
           await resolveStagedFallback(live)
         }
+        // A carrier waiting on its own reviewer child has not ended without a
+        // verdict: the child's completion reminder is the turn that posts it.
+        // Failing over now hands the round to a sibling, which then denies the
+        // carrier's verdict and runs a duplicate review. Session-scoped, not
+        // turn-scoped: a later silent inbound on the carrier thread must not
+        // release the round while that reviewer is still running.
         const logicalTurnStillOpen =
           live.pendingSystemReminders.length > 0 ||
           live.stagedFallbackCause !== null ||
-          live.promisedWorkOutstandingThisLogicalTurn
+          live.promisedWorkOutstandingThisLogicalTurn ||
+          isPinnedByRunningChild(live.sessionId, live.keyId, 'github-review-failover')
         if (!logicalTurnStillOpen) await failoverGithubReviewRound(live)
         live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
         if (live.currentTurnAuthorId !== null) {
