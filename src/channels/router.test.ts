@@ -19120,6 +19120,91 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     await router.stop()
   })
 
+  test('defers the fallback while a subagent completion reminder is queued for the next turn', async () => {
+    // given: a close-out whose one correction retry is spent on a turn that
+    //   spawned a reviewer, and the reviewer completes before that turn ends
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(closeoutInbound())
+    const session = sessions[0]!
+    session.onPrompt = async (text) => {
+      if (text.includes('Subagent `reviewer`')) {
+        router.finishGithubReviewThreadCloseout?.({
+          sessionId: 'ses_fake_1',
+          workspace: GITHUB_KEY.workspace,
+          prNumber: 123,
+          thread: GITHUB_KEY.thread,
+          decision: 'resolved',
+        })
+        await router.send({ ...GITHUB_KEY, text: 'Verified — this concern is addressed.' })
+        session.setAssistantText('NO_REPLY')
+        return
+      }
+      if (text.includes('still owes a close-out')) {
+        router.injectSubagentCompletionReminder({
+          parentSessionId: 'ses_fake_1',
+          subagent: 'reviewer',
+          taskId: 'bg_review',
+          ok: true,
+          durationMs: 1_000,
+        })
+      }
+      session.setAssistantText('NO_REPLY')
+    }
+
+    // when
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    // then: the completion turn lands the real close-out, no canned fallback
+    expect(session.prompts).toHaveLength(3)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+    expect(sent.map((message) => message.text)).toEqual(['Verified — this concern is addressed.'])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('still posts the fallback after the queued reminder turn also ends silent', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const { router, sessions } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    await router.route(closeoutInbound())
+    const session = sessions[0]!
+    session.onPrompt = (text) => {
+      if (text.includes('still owes a close-out')) {
+        router.injectSubagentCompletionReminder({
+          parentSessionId: 'ses_fake_1',
+          subagent: 'reviewer',
+          taskId: 'bg_review',
+          ok: true,
+          durationMs: 1_000,
+        })
+      }
+      session.setAssistantText('NO_REPLY')
+    }
+
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    expect(session.prompts).toHaveLength(3)
+    expect(logs.filter((line) => line.includes('github_thread_closeout_fallback'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('wakes a deferred sibling once on round completion for one exact-thread close-out', async () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
