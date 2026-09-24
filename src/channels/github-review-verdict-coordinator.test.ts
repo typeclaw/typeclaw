@@ -87,6 +87,56 @@ describe('review verdict idempotency guard', () => {
     expect(headReads).toBe(0)
   })
 
+  test('keeps the carrier eligible to retry after an unverified round head read', async () => {
+    // given: the carrier of a pending round, whose first head read fails
+    const warnings: string[] = []
+    registerGithubReviewRound(ROUND)
+    const heads: (string | null)[] = [null, ROUND.headSha]
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => (heads.length > 0 ? heads.shift()! : ROUND.headSha),
+      logger: { warn: (message) => warnings.push(message) },
+    })
+    const attempt = (callId: string) =>
+      g.guard({ callId, workspace: WS, prNumber: 60, verdict: 'APPROVE', round: ROUND, thread: '101' })
+
+    // when
+    const first = await attempt('carrier-head-unverified')
+    const retry = await attempt('carrier-head-retry')
+
+    // then: the denial names the real cause, and the same carrier's retry passes
+    expect(first).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(first?.reason).toContain('still the designated carrier')
+    expect(first?.reason).toContain('check GitHub credentials')
+    expect(first?.reason).not.toContain('another sibling')
+    expect(warnings.some((line) => line.includes('review round head read failed'))).toBe(true)
+    expect(retry).toBeNull()
+  })
+
+  test('names a moved head instead of a sibling carrier', async () => {
+    const warnings: string[] = []
+    registerGithubReviewRound(ROUND)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-newer',
+      logger: { warn: (message) => warnings.push(message) },
+    })
+
+    const decision = await g.guard({
+      callId: 'carrier-head-moved',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: ROUND,
+      thread: '101',
+    })
+
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(decision?.reason).toContain('head moved')
+    expect(decision?.reason).not.toContain('another sibling')
+    expect(warnings.some((line) => line.includes('current_head=sha-newer'))).toBe(true)
+  })
+
   test('rejects a non-carrier dismissal before the authoritative head read', async () => {
     let headReads = 0
     configureReviewVerdictCoordinator({
