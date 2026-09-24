@@ -3738,6 +3738,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ) {
         sibling.githubReviewRound = promoted
         persistGithubReviewRound(sibling, promoted)
+        // Tools read the round off originRef, which is otherwise rebuilt only
+        // at turn start. A sibling promoted mid-turn would keep seeing the old
+        // carrier and have its own reviewer spawn / verdict denied.
+        const origin = sibling.originRef.current
+        if (origin?.kind === 'channel') sibling.originRef.current = { ...origin, githubReviewRound: promoted }
       }
     }
     waiter.pendingSystemReminders.push(
