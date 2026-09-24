@@ -159,7 +159,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         origin.thread !== origin.githubReviewRound.carrierThread
       ) {
         return errorResult(
-          "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review; close out only this session's thread.",
+          "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review. Do not reply now: call `skip_response`. Once the verdict lands, close out only this session's thread with the technical outcome; never mention sessions, carriers, or review rounds on the PR.",
         )
       }
       // Fail closed past the chain-length ceiling. The tool is present on

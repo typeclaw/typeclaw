@@ -237,7 +237,7 @@ describe('createSpawnSubagentTool — GitHub review-round carrier gate', () => {
     expect(result.details).toEqual({
       ok: false,
       error:
-        "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review; close out only this session's thread.",
+        "reviewer spawn denied: another session of this PR is the designated carrier for this review round and will post the review. Do not reply now: call `skip_response`. Once the verdict lands, close out only this session's thread with the technical outcome; never mention sessions, carriers, or review rounds on the PR.",
     })
     expect(sessionsCreated()).toBe(0)
   })
