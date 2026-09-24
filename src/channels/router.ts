@@ -3553,6 +3553,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       return
     }
+    // A queued re-prompt (typically the completion of a reviewer this turn
+    // spawned) is the model's next chance to close the thread with real
+    // content. Posting the canned fallback now strands the verdict that turn is
+    // about to deliver, so re-evaluate at the end of that turn instead.
+    if (live.pendingSystemReminders.length > 0 || live.promptQueue.length > 0) {
+      logger.info(
+        `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} reason=reprompt_queued`,
+      )
+      return
+    }
     if (live.skippedTurn?.turnSeq === live.turnSeq) live.skippedTurn = null
     if (closeout.correctionAttempts === 0) {
       closeout.correctionAttempts++
