@@ -1,5 +1,5 @@
-import { Type } from '@mariozechner/pi-ai'
-import { defineTool } from '@mariozechner/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
+import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import { recordReview, recordReviewOutput, type ReviewVerdict } from '@/channels/github-review-turn-ledger'
 import { createSharedReviewVerdictGuard, type ReviewVerdictGuard } from '@/channels/github-review-verdict-coordinator'

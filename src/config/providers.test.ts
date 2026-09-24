@@ -1,5 +1,18 @@
 import { describe, expect, test } from 'bun:test'
 
+import { clampThinkingLevel, getSupportedThinkingLevels, normalizeContext } from '@earendil-works/pi-ai'
+import type {
+  Api,
+  KnownApi,
+  Model,
+  ModelThinkingLevel,
+  SimpleStreamOptions,
+  StreamFunction,
+} from '@earendil-works/pi-ai'
+import { streamSimple as streamCodexResponses } from '@earendil-works/pi-ai/api/openai-codex-responses'
+import { streamSimple as streamResponses } from '@earendil-works/pi-ai/api/openai-responses'
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
+
 import {
   defaultThinkingLevelForRef,
   isKnownModelRef,
@@ -18,6 +31,30 @@ import {
   vendorForProviderId,
 } from './providers'
 
+// Builds the request a session at `level` sends, through the real transport,
+// and stops before any network I/O. Like pi-agent-core (agent.js:305), `off`
+// becomes an omitted `reasoning` option.
+async function captureRequest<TApi extends Api>(
+  stream: StreamFunction<TApi, SimpleStreamOptions>,
+  model: Model<TApi>,
+  apiKey: string,
+  level: ModelThinkingLevel,
+): Promise<Record<string, unknown> | undefined> {
+  let payload: Record<string, unknown> | undefined
+  const events = stream(model, normalizeContext({ messages: [{ role: 'user', content: 'ping', timestamp: 0 }] }), {
+    apiKey,
+    reasoning: level === 'off' ? undefined : level,
+    onPayload: (params) => {
+      payload = params as Record<string, unknown>
+      throw new Error('captured')
+    },
+  })
+  for await (const _event of events) {
+    if (payload !== undefined) break
+  }
+  return payload
+}
+
 describe('KNOWN_PROVIDERS', () => {
   test('every provider model carries a baseUrl that matches the outer provider baseUrl', () => {
     for (const [providerId, provider] of Object.entries(KNOWN_PROVIDERS)) {
@@ -31,6 +68,58 @@ describe('KNOWN_PROVIDERS', () => {
     for (const [providerId, provider] of Object.entries(KNOWN_PROVIDERS)) {
       for (const [modelId, model] of Object.entries(provider.models)) {
         expect(model.provider, `${providerId}/${modelId} provider drift`).toBe(providerId)
+      }
+    }
+  })
+
+  // pi 0.87 reads these records' request shape only from catalog metadata:
+  // Anthropic adaptive thinking (0.73 inferred it from the id) and the Responses
+  // effort maps. Drift here is a provider 400 or a silently wrong effort.
+  // Records outside this list keep their 0.73 wire behavior (pi still detects
+  // their compat from the baseUrl) and are intentionally not pinned to upstream.
+  test('catalog-dependent records match pi-ai compat and thinking maps', () => {
+    const catalogAligned = [
+      'anthropic/claude-sonnet-4-6',
+      'anthropic/claude-opus-4-7',
+      'anthropic/claude-opus-4-8',
+      'anthropic/claude-sonnet-5',
+      'anthropic/claude-opus-5-5',
+      'anthropic/claude-fable-5',
+      'openai/gpt-6-sol',
+      'openai/gpt-6-luna',
+      'openai-codex/gpt-6-sol',
+      'openai-codex/gpt-6-luna',
+      'xai/grok-4.7',
+      'xai/grok-4.3',
+    ]
+    const checked: string[] = []
+    for (const [providerId, provider] of Object.entries(KNOWN_PROVIDERS)) {
+      for (const [modelId, model] of Object.entries(provider.models)) {
+        const ref = `${providerId}/${modelId}`
+        if (!catalogAligned.includes(ref)) continue
+        checked.push(ref)
+        const builtin: Model<KnownApi> | undefined = getBuiltinModel(providerId as never, modelId as never)
+        expect(builtin, `${ref} in pi-ai catalog`).toBeDefined()
+        const upstreamCompat: Record<string, unknown> = { ...builtin?.compat }
+        delete upstreamCompat.allowedFallbackModels
+        expect(model.api, `${ref} API drift`).toBe(builtin?.api)
+        expect('compat' in model ? model.compat : {}, `${ref} compat drift`).toEqual(upstreamCompat)
+        expect('thinkingLevelMap' in model ? model.thinkingLevelMap : undefined, `${ref} thinking map drift`).toEqual(
+          builtin?.thinkingLevelMap,
+        )
+      }
+    }
+    expect(checked.sort()).toEqual([...catalogAligned].sort())
+  })
+
+  // Anthropic server-side fallback (`compat.allowedFallbackModels`) makes pi
+  // send `fallbacks`, so a refused request is answered and billed by another
+  // model. No curated record may opt into that silently.
+  test('no curated record enables server-side model fallback', () => {
+    for (const [providerId, provider] of Object.entries(KNOWN_PROVIDERS)) {
+      for (const [modelId, model] of Object.entries(provider.models)) {
+        const compat = 'compat' in model ? model.compat : undefined
+        expect(compat !== undefined && 'allowedFallbackModels' in compat, `${providerId}/${modelId}`).toBe(false)
       }
     }
   })
@@ -357,10 +446,16 @@ describe('KNOWN_PROVIDERS', () => {
     expect(supportsOAuth(xai)).toBe(true)
   })
 
-  test('every xai model uses the openai-completions api (x.ai is OpenAI-compatible)', () => {
-    for (const [modelId, model] of Object.entries(KNOWN_PROVIDERS.xai.models)) {
-      expect(model.api, `xai/${modelId} api drift`).toBe('openai-completions')
+  test('keeps un-cataloged xai snapshot models on the established Completions transport', () => {
+    expect(KNOWN_PROVIDERS.xai.models['grok-4.7'].api).toBe('openai-responses')
+    expect(KNOWN_PROVIDERS.xai.models['grok-4.3'].api).toBe('openai-responses')
+    for (const id of ['grok-4.20-0309-reasoning', 'grok-4.20-0309-non-reasoning', 'grok-build-0.1'] as const) {
+      expect(KNOWN_PROVIDERS.xai.models[id].api).toBe('openai-completions')
     }
+  })
+
+  test('uses pi-ai’s 30K Grok 4.3 output cap', () => {
+    expect(KNOWN_PROVIDERS.xai.models['grok-4.3'].maxTokens).toBe(30000)
   })
 
   test('opengateway is a single api-key provider on the OpenAI-compatible gateway endpoint', () => {
@@ -567,6 +662,20 @@ describe('listKnownModelRefs', () => {
     expect(refs).toContain('zai-coding/glm-5.1')
   })
 
+  test('includes GPT-6 Sol and Luna for API-key and Codex OAuth routing', () => {
+    const refs = listKnownModelRefs()
+    const expected = [
+      ['openai/gpt-6-sol', 'openai'],
+      ['openai/gpt-6-luna', 'openai'],
+      ['openai-codex/gpt-6-sol', 'openai-codex'],
+      ['openai-codex/gpt-6-luna', 'openai-codex'],
+    ] as const
+    for (const [ref, providerId] of expected) {
+      expect(refs).toContain(ref)
+      expect(providerForModelRef(ref)).toBe(providerId)
+    }
+  })
+
   test('includes minimax model refs', () => {
     const refs = listKnownModelRefs()
     expect(refs).toContain('minimax/MiniMax-M3')
@@ -605,6 +714,65 @@ describe('listKnownModelRefs', () => {
     expect(refs).toContain('anthropic/claude-fable-5')
   })
 
+  test('maps Opus 5.5 to its supported adaptive efforts and never to disabled thinking', () => {
+    const model = KNOWN_PROVIDERS.anthropic.models['claude-opus-5-5']
+    expect(clampThinkingLevel(model, 'off')).not.toBe('off')
+    expect(getSupportedThinkingLevels(model)).toContain('max')
+    expect(clampThinkingLevel(model, 'max')).toBe('max')
+  })
+
+  test('sends every offered GPT-6 effort on the wire, off as none, through max', async () => {
+    for (const model of [KNOWN_PROVIDERS.openai.models['gpt-6-sol'], KNOWN_PROVIDERS.openai.models['gpt-6-luna']]) {
+      expect(getSupportedThinkingLevels(model)).toContain('off')
+      expect(getSupportedThinkingLevels(model)).not.toContain('minimal')
+      expect(getSupportedThinkingLevels(model)).toContain('max')
+      expect(clampThinkingLevel(model, 'minimal')).toBe('low')
+      expect(clampThinkingLevel(model, 'max')).toBe('max')
+      for (const level of getSupportedThinkingLevels(model)) {
+        const payload = await captureRequest(streamResponses, model, 'sk-test', level)
+        expect(payload?.reasoning).toMatchObject({ effort: level === 'off' ? 'none' : level })
+      }
+    }
+    for (const model of [
+      KNOWN_PROVIDERS['openai-codex'].models['gpt-6-sol'],
+      KNOWN_PROVIDERS['openai-codex'].models['gpt-6-luna'],
+    ]) {
+      expect(model.thinkingLevelMap?.minimal).toBe('low')
+      expect(model.thinkingLevelMap?.max).toBe('max')
+    }
+  })
+
+  // pi 0.87's Codex transport sends `off` as effort none (pi 0.73.1 dropped
+  // the field and ran the backend default), so every level reaches the wire.
+  test('sends every Codex GPT-6 level as an explicit reasoning effort', async () => {
+    const claims = { 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-test' } }
+    const apiKey = `e30.${btoa(JSON.stringify(claims))}.sig`
+    for (const id of ['gpt-6-sol', 'gpt-6-luna'] as const) {
+      const model = KNOWN_PROVIDERS['openai-codex'].models[id]
+      expect(getSupportedThinkingLevels(model)).toContain('off')
+      for (const level of getSupportedThinkingLevels(model)) {
+        const payload = await captureRequest(streamCodexResponses, model, apiKey, level)
+        expect(payload?.model).toBe(id)
+        expect(payload?.reasoning).toMatchObject({ effort: model.thinkingLevelMap?.[level] })
+      }
+    }
+  })
+
+  // On pi 0.87 Grok 4.7 runs on Responses, which carries reasoning.effort.
+  // `off`, `minimal` and `max` are not xAI efforts, so they clamp onto real levels.
+  test('sends Grok 4.7 efforts through Responses reasoning.effort', async () => {
+    const model = KNOWN_PROVIDERS.xai.models['grok-4.7']
+    expect(getSupportedThinkingLevels(model)).toEqual(['low', 'medium', 'high', 'xhigh'])
+    expect(clampThinkingLevel(model, 'off')).toBe('low')
+    expect(clampThinkingLevel(model, 'minimal')).toBe('low')
+    expect(clampThinkingLevel(model, 'max')).toBe('xhigh')
+    for (const level of getSupportedThinkingLevels(model)) {
+      const payload = await captureRequest(streamResponses, model, 'xai-test', level)
+      expect(payload?.model).toBe('grok-4.7')
+      expect(payload?.reasoning).toMatchObject({ effort: level })
+    }
+  })
+
   test('does not list the limited-availability claude-mythos-5', () => {
     const refs = listKnownModelRefs()
     expect(refs).not.toContain('anthropic/claude-mythos-5')
@@ -613,6 +781,7 @@ describe('listKnownModelRefs', () => {
   test('includes the current xai Grok models', () => {
     const refs = listKnownModelRefs()
     expect(refs).toContain('xai/grok-4.3')
+    expect(refs).toContain('xai/grok-4.7')
     expect(refs).toContain('xai/grok-4.20-0309-reasoning')
     expect(refs).toContain('xai/grok-4.20-0309-non-reasoning')
     expect(refs).toContain('xai/grok-build-0.1')

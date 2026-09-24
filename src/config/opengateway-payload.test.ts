@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { Context, Model } from '@mariozechner/pi-ai'
-import { streamSimple } from '@mariozechner/pi-ai'
+import { normalizeContext, type Context, type Model } from '@earendil-works/pi-ai'
+import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions'
 
 import { resolveModel } from './config'
 import { KNOWN_PROVIDERS } from './providers'
@@ -35,7 +35,7 @@ async function buildPayload(model: Model<'openai-completions'>): Promise<Capture
   let captured: CapturedPayload | undefined
   const stopMarker = new Error('payload-captured')
 
-  const s = streamSimple(model, context, {
+  const s = streamSimple(model, normalizeContext(context), {
     apiKey: 'og-test-key',
     onPayload: (payload) => {
       captured = payload as CapturedPayload

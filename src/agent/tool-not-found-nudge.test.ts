@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { createCodingTools } from '@mariozechner/pi-coding-agent'
+import { createCodingTools } from '@earendil-works/pi-coding-agent'
 
 import {
   attachToolNotFoundNudge,

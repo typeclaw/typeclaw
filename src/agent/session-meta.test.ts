@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSessionFactory } from '@/sessions'
 

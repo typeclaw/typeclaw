@@ -1,5 +1,5 @@
-import { Type } from '@mariozechner/pi-ai'
-import { defineTool } from '@mariozechner/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
+import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import { extractAdaptiveHtml, validateAdaptiveHtmlComplexity } from './adaptive-html'
 import { fetchWithLimits, normalizeUrl, parseMimeType, WebFetchError } from './fetch'

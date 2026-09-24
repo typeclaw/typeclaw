@@ -1,8 +1,8 @@
 import { join } from 'node:path'
 
-import { AuthStorage, ModelRegistry } from '@mariozechner/pi-coding-agent'
+import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 
-import { getConfig } from '@/config'
+import { getConfig, resolveModel } from '@/config'
 import {
   KNOWN_PROVIDERS,
   providerForModelRef,
@@ -12,10 +12,8 @@ import {
 } from '@/config/providers'
 import { createSecretsStoreForAgent } from '@/secrets'
 
-type Auth = {
-  authStorage: AuthStorage
-  modelRegistry: ModelRegistry
-}
+export type ProviderAuth = { modelRuntime: ModelRuntime }
+type RuntimeProviderConfig = Parameters<ModelRuntime['registerProvider']>[1]
 
 const TEST_DUMMY_API_KEY = 'test_dummy_key'
 
@@ -23,86 +21,78 @@ function secretsJsonPath(): string {
   return join(process.cwd(), 'secrets.json')
 }
 
-// Per-provider cache. Sessions that use a profile mapped to provider X share
-// a single AuthStorage + ModelRegistry for that provider; first use of a new
-// provider lazily resolves its credentials. This replaces the singleton
-// `getAuth()` from before multi-model — the singleton couldn't represent
-// "auth for `default` is OpenAI, auth for `vision` is Fireworks" without
-// constructing both at boot.
-const cached = new Map<KnownProviderId, Auth>()
+// Cache the in-flight Promise: concurrent sessions for a provider share one
+// runtime and one credential store instead of racing OAuth refresh/setup.
+const cached = new Map<KnownProviderId, Promise<ProviderAuth>>()
 
-export function getAuthFor(providerId: KnownProviderId): Auth {
+export function getAuthFor(providerId: KnownProviderId): Promise<ProviderAuth> {
   const existing = cached.get(providerId)
   if (existing) return existing
+  const created: Promise<ProviderAuth> = createProviderAuth(providerId).catch((error) => {
+    // Evict only this attempt: after a reload, a newer creation may own the key.
+    if (cached.get(providerId) === created) cached.delete(providerId)
+    throw error
+  })
+  cached.set(providerId, created)
+  return created
+}
 
+async function createProviderAuth(providerId: KnownProviderId): Promise<ProviderAuth> {
   const provider = KNOWN_PROVIDERS[providerId]
+  const credentials = createSecretsStoreForAgent(secretsJsonPath())
+  const modelRuntime = await ModelRuntime.create({
+    credentials,
+    modelsPath: null,
+    refreshOnCreate: false,
+  })
+
+  // A session can switch to any configured fallback model. Register every
+  // curated provider, including built-ins: extension models replace the
+  // provider catalog, and composeModelProvider dispatches each passed model
+  // by its own api/baseUrl when its transport differs from the built-in.
+  for (const knownProvider of Object.values(KNOWN_PROVIDERS)) {
+    modelRuntime.registerProvider(knownProvider.id, toRuntimeProviderConfig(knownProvider))
+  }
+
+  const oauthProviders = new Set(
+    (await credentials.list())
+      .filter((credential) => credential.type === 'oauth')
+      .map((credential) => credential.providerId),
+  )
+  for (const knownProvider of Object.values(KNOWN_PROVIDERS)) {
+    if (!supportsApiKey(knownProvider) || !knownProvider.apiKeyEnv) continue
+    const envKey = process.env[knownProvider.apiKeyEnv]
+    // Runtime keys are memory-only. A persisted OAuth credential wins for
+    // dual-auth providers and env values never leak into the v2 envelope.
+    if (envKey && !oauthProviders.has(knownProvider.id)) {
+      await modelRuntime.setRuntimeApiKey(knownProvider.id, envKey)
+    }
+  }
 
   if (process.env.NODE_ENV === 'test' && !hasAnyCredentialInEnv(provider.apiKeyEnv)) {
-    const authStorage = AuthStorage.inMemory()
-    if (supportsApiKey(provider)) {
-      authStorage.setRuntimeApiKey(provider.id, TEST_DUMMY_API_KEY)
-    }
-    const modelRegistry = ModelRegistry.create(authStorage)
-    const auth = { authStorage, modelRegistry }
-    cached.set(providerId, auth)
-    return auth
+    if (supportsApiKey(provider)) await modelRuntime.setRuntimeApiKey(provider.id, TEST_DUMMY_API_KEY)
+    return { modelRuntime }
   }
-
-  const authStorage = createSecretsStoreForAgent(secretsJsonPath())
-
-  // Env-wins for api-key providers: when the canonical env var is set, layer
-  // that value in via setRuntimeApiKey so AuthStorage's hasAuth resolves
-  // true without persisting anything to secrets.json. This is the explicit
-  // reversal of the pre-v2 auto-migrate-to-file behaviour.
-  //
-  // setRuntimeApiKey is in-memory only (it writes to runtimeOverrides, never
-  // through withLock), so the file remains untouched even when the env var
-  // is set. OAuth credentials in the file still take precedence on read
-  // because AuthStorage's hasAuth checks runtimeOverrides first only for
-  // api-key-shaped credentials — OAuth on disk wins on its own.
-  if (supportsApiKey(provider) && provider.apiKeyEnv) {
-    const envKey = process.env[provider.apiKeyEnv]
-    if (envKey !== undefined && envKey !== '') {
-      const existingCred = authStorage.get(provider.id)
-      if (existingCred === undefined || existingCred.type === 'api_key') {
-        authStorage.setRuntimeApiKey(provider.id, envKey)
-      }
-    }
-  }
-
-  if (!authStorage.hasAuth(provider.id)) {
+  // checkAuth deliberately does not refresh OAuth. Boot must only reject a
+  // missing credential; a transient refresh failure belongs to the request
+  // path where pi can retry it on the next turn.
+  if (!(await modelRuntime.checkAuth(provider.id))) {
     console.error(missingCredentialMessage(providerId))
     process.exit(1)
   }
-
-  const modelRegistry = ModelRegistry.create(authStorage)
-  const auth = { authStorage, modelRegistry }
-  cached.set(providerId, auth)
-  return auth
+  return { modelRuntime }
 }
 
-// Back-compat shim for callers that still want the `default` profile's auth
-// (the main session path). Equivalent to `getAuthFor(provider-of-default)`.
-// Uses the head of the fallback chain; auth for the rest of the chain is
-// resolved lazily when fallback actually fires.
-export function getAuth(): Auth {
-  const defaultRef = getConfig().models.default.refs[0]!
-  return getAuthFor(providerForModelRef(defaultRef))
+function toRuntimeProviderConfig(provider: (typeof KNOWN_PROVIDERS)[KnownProviderId]): RuntimeProviderConfig {
+  return {
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    api: Object.values(provider.models)[0]?.api,
+    models: Object.values(provider.models) as RuntimeProviderConfig['models'],
+  }
 }
 
-// Clears the per-provider cache so the next getAuthFor() re-resolves from
-// secrets.json (bind-mounted live) and re-layers process.env. Wired into
-// `typeclaw reload` via the providers reloadable so a rotated secrets.json
-// key takes effect without a container restart. Resolution stays lazy, so a
-// half-written secrets.json can't turn reload into getAuthFor's process-kill;
-// the missing-credential exit only fires on next actual use. Does NOT mutate
-// live AgentSessions that already captured an AuthStorage — the run stage
-// tears those down so the next session is built with fresh auth.
 export function invalidateProviderAuthCache(): void {
-  cached.clear()
-}
-
-export function resetAuthForTesting(): void {
   cached.clear()
 }
 
@@ -114,18 +104,8 @@ function missingCredentialMessage(providerId: KnownProviderId): string {
   const provider = KNOWN_PROVIDERS[providerId]
   const defaultRef = getConfig().models.default.refs[0]!
   const defaultProviderId = providerForModelRef(defaultRef)
-  // For the `default` profile, name the model in the error message (matches
-  // pre-multi-model behavior). For any other profile, the user is mixing
-  // providers across profiles and the error must name the failing provider
-  // without claiming it's tied to the `default` model.
   const isDefault = defaultProviderId === providerId
-  const ref = isDefault ? defaultRef : null
-  const modelName =
-    ref !== null
-      ? ((provider.models as Record<string, { name: string }>)[ref.slice(ref.indexOf('/') + 1)]?.name ??
-        ref.slice(ref.indexOf('/') + 1))
-      : null
-
+  const modelName = isDefault ? resolveModel(defaultRef).name : null
   const oauthOnly = supportsOAuth(provider) && !supportsApiKey(provider)
   const apiKeyOnly = supportsApiKey(provider) && !supportsOAuth(provider)
 

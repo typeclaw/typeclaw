@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { SessionManager } from '@mariozechner/pi-coding-agent'
+import type { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { buildRestartHandoffWiring, currentChannelAuthor } from './index'
 import type { SessionOrigin } from './session-origin'

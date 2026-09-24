@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { ThinkingLevel } from '@mariozechner/pi-agent-core'
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core'
 
 import {
   applyTurnThinkingLevel,
@@ -248,9 +248,15 @@ describe('detectAttentionEscalation — Armenian sequential question turns (mode
 })
 
 describe('resolveTurnThinkingLevel', () => {
-  test('escalation text bumps to xhigh regardless of session default', () => {
+  test('escalation text bumps to xhigh from any weaker session default', () => {
     expect(resolveTurnThinkingLevel('wtf', 'low')).toBe('xhigh')
     expect(resolveTurnThinkingLevel('제대로 해', undefined)).toBe('xhigh')
+  })
+
+  test('escalation never lowers a max session default', () => {
+    expect(resolveTurnThinkingLevel('wtf', 'max')).toBe('max')
+    expect(resolveTurnThinkingLevel('제대로 해', 'max')).toBe('max')
+    expect(resolveTurnThinkingLevel('?', 'max')).toBe('max')
   })
 
   test('normal text falls back to the session default', () => {

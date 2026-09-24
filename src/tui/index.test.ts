@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { Terminal } from '@mariozechner/pi-tui'
+import type { Terminal } from '@earendil-works/pi-tui'
 
 import type { ClientMessage, ServerMessage } from '@/shared'
 

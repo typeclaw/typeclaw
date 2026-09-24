@@ -1,5 +1,5 @@
-import { Type } from '@mariozechner/pi-ai'
-import { defineTool } from '@mariozechner/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
+import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import { checkFalseReceipt } from '@/channels/github-false-receipt'
 import { evaluateRereviewGuard } from '@/channels/github-rereview-guard'

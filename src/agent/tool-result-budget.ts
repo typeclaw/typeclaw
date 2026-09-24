@@ -1,5 +1,5 @@
-import type { AgentTool } from '@mariozechner/pi-agent-core'
-import type { ToolDefinition } from '@mariozechner/pi-coding-agent'
+import type { AgentTool } from '@earendil-works/pi-agent-core'
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { TSchema } from 'typebox'
 
 // Subagents that read large files (memory-logger and dreaming each read parent

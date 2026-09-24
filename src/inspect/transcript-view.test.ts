@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { Markdown, type Terminal, Text } from '@mariozechner/pi-tui'
+import { Markdown, type Terminal, Text } from '@earendil-works/pi-tui'
 
 import type { SessionSummary } from './session-list'
 import { BoundedComponentWindow, createTranscriptView, componentFor, type HistoryEntry } from './transcript-view'

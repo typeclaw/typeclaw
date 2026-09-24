@@ -16,14 +16,14 @@ This skill covers BOTH authoring new plugins AND operating existing ones (config
 Three layers, sharply separated:
 
 ```
-Plugin API (typeclaw/plugin)  ← plugins live here. NO @mariozechner/* imports.
+Plugin API (typeclaw/plugin)  ← plugins live here. NO @earendil-works/* imports.
         ↓
 TypeClaw runtime (src/plugin, src/agent, src/run, src/server, src/cron)
         ↓
-Engine (@mariozechner/pi-coding-agent)  ← never visible to plugins
+Engine (@earendil-works/pi-coding-agent)  ← never visible to plugins
 ```
 
-**MUST NOT** import anything from `@mariozechner/*` in plugin code. The single bridge file is `src/agent/plugin-tools.ts` (runtime layer, not plugin layer). The boundary is enforced by convention — no lint rule today, but `grep` confirms no `src/plugin/**` file imports `@mariozechner/*`.
+**MUST NOT** import anything from `@earendil-works/*` in plugin code. The single bridge file is `src/agent/plugin-tools.ts` (runtime layer, not plugin layer). The boundary is enforced by convention — no lint rule today, but `grep` confirms no `src/plugin/**` file imports `@earendil-works/*`.
 
 **Allowed plugin imports**: `typeclaw/plugin`, `zod`, Node built-ins, your own modules.
 
@@ -761,7 +761,7 @@ When something goes wrong, you'll see one of these. Memorize the patterns.
 
 ```ts
 // WRONG — boundary violation
-import { something } from '@mariozechner/pi-coding-agent'
+import { something } from '@earendil-works/pi-coding-agent'
 ```
 
 **Plugins use `typeclaw/plugin` only.** The runtime translates to engine types behind the scenes.
@@ -974,4 +974,4 @@ export default definePlugin({
 
 **`exec → LLM` from cron** (best practice): plugin `cronJobs` entry with `kind: 'handler'` — a TypeScript function the cron consumer invokes directly with `ctx.prompt` / `ctx.subagent` / `ctx.exec`. No shell-out, no WS round-trip. Fall back to `surface: 'container'` command + cron `exec` pointing at `["typeclaw", "<cmd>"]` ONLY when the same logic must also be invocable as a reusable CLI command, the user owns the cadence for someone else's command, or the work needs `surface: 'host'`.
 
-**Boundary**: `src/plugin/**` MUST NOT import `@mariozechner/*`.
+**Boundary**: `src/plugin/**` MUST NOT import `@earendil-works/*`.

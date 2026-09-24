@@ -5,7 +5,7 @@ import { GUARD_IMAGE_READ_REDIRECT } from '@/bundled-plugins/guard/keys'
 
 export { GUARD_IMAGE_READ_REDIRECT } from '@/bundled-plugins/guard/keys'
 
-// Mirrors the IMAGE_MIME_TYPES set in @mariozechner/pi-coding-agent
+// Mirrors the IMAGE_MIME_TYPES set in @earendil-works/pi-coding-agent
 // (dist/utils/mime.ts). Keeping the trigger surface aligned with the upstream
 // read tool's image-attachment behavior means we redirect on exactly the
 // extensions that would otherwise inject `{ type: 'image' }` content parts

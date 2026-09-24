@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { autocomplete, cancel, intro, isCancel, log, select } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
-import type { CustomModelMeta, ThinkingLevel } from '@/config'
+import { type CustomModelMeta, type ThinkingLevel, thinkingLevelSchema } from '@/config'
 import {
   addProfile,
   listModelProfiles,
@@ -59,7 +59,7 @@ const setSub = defineCommand({
     thinking: {
       type: 'string',
       description:
-        "reasoning effort for THIS profile (off|minimal|low|medium|high|xhigh|default); the `default` profile's level is the de-facto global default",
+        "reasoning effort for THIS profile (off|minimal|low|medium|high|xhigh|max|default); the `default` profile's level is the de-facto global default",
       required: false,
     },
   },
@@ -117,7 +117,7 @@ const thinkingSub = defineCommand({
     level: {
       type: 'positional',
       description:
-        'reasoning effort (off|minimal|low|medium|high|xhigh); or "default" to clear and defer to the SDK default',
+        'reasoning effort (off|minimal|low|medium|high|xhigh|max); or "default" to clear and defer to the SDK default',
       required: false,
     },
   },
@@ -318,7 +318,9 @@ async function pickProfileName(): Promise<string> {
   return choice
 }
 
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+// The config schema is the single source of truth, so `--thinking` and the
+// picker accept exactly the levels typeclaw.json accepts (including `max`).
+const THINKING_LEVELS: readonly ThinkingLevel[] = thinkingLevelSchema.options
 const KEEP_THINKING_SENTINEL = '__keep__'
 
 export type ParsedThinkingArg = { ok: true; level: ThinkingLevel | undefined } | { ok: false; reason: string }
@@ -326,7 +328,7 @@ export type ParsedThinkingArg = { ok: true; level: ThinkingLevel | undefined } |
 export function parseThinkingArg(raw: string): ParsedThinkingArg {
   const value = raw.trim().toLowerCase()
   if (value === 'default' || value === 'unset' || value === 'none') return { ok: true, level: undefined }
-  if ((THINKING_LEVELS as string[]).includes(value)) return { ok: true, level: value as ThinkingLevel }
+  if ((THINKING_LEVELS as readonly string[]).includes(value)) return { ok: true, level: value as ThinkingLevel }
   return {
     ok: false,
     reason: `Invalid --thinking "${raw}". Use one of: ${THINKING_LEVELS.join(', ')}, or "default" to clear.`,

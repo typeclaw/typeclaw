@@ -1,8 +1,8 @@
 import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
-import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from '@mariozechner/pi-ai'
-import { type SessionEntry, SessionManager } from '@mariozechner/pi-coding-agent'
+import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from '@earendil-works/pi-ai'
+import { type SessionEntry, SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSession, renderTurnRoleAnchor, renderTurnTimeAnchor, type AgentSession } from '@/agent'
 import { applyTurnThinkingLevel, getQuestionSignal, type QuestionSignal } from '@/agent/attention-escalation'
@@ -302,16 +302,17 @@ export function buildRestartResumeWakeReminder(interruptedSubagents?: readonly s
 // start alongside `turnSeq`.
 export const MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN = 3
 // Per-request output-token cap for channel sessions, threaded into the agent's
-// stream options to override pi-ai's silent `Math.min(model.maxTokens, 32000)`
-// default (`buildBaseOptions` in @mariozechner/pi-ai). Without it, Fireworks'
+// stream options to override pi-ai's model max-tokens default, which 0.87.1
+// clamps to the remaining context window (`buildBaseOptions` in
+// @earendil-works/pi-ai/dist/api/simple-options.js:10-18). Without it, Fireworks'
 // kimi-k2p6-turbo — which degenerates into single-token repetition on the
-// post-tool follow-up turn — runs the full 32000 tokens (~116s of garbage that
-// never produces a reply) before `stopReason: 'length'`. The terminal-reply
-// hook below removes the turn that triggers this; the cap bounds any other path
-// that still reaches a channel LLM call. 4096 fits a thinking block plus a
-// nontrivial reply (healthy channel turns observed at ~317 output tokens
-// including reasoning). Deliberately NOT lowered in `providers.ts`, where
-// `maxTokens` is the model's true capability that compaction math reads.
+// post-tool follow-up turn — can run the model's full output capability
+// (~116s of garbage) before `stopReason: 'length'`. The terminal-reply hook
+// below removes the turn that triggers this; the cap bounds any other path that
+// still reaches a channel LLM call. 4096 fits a thinking block plus a nontrivial
+// reply (healthy channel turns observed at ~317 output tokens including
+// reasoning). Deliberately NOT lowered in `providers.ts`, where `maxTokens` is
+// the model's true capability that compaction math reads.
 export const CHANNEL_MAX_OUTPUT_TOKENS = 4096
 // Raised output-token budget threaded into the ONE re-prompt that follows a
 // `stopReason:'length'` empty turn. The default 4096 backstop bounds kimi's
@@ -320,8 +321,7 @@ export const CHANNEL_MAX_OUTPUT_TOKENS = 4096
 // prose — re-prompting under the identical cap reproduces the truncation. A
 // `length` truncation that the byte-identical loop guard did NOT catch is
 // evidence of genuine reasoning starved for room, not a repetition loop, so the
-// retry grants 4x headroom for thinking + a reply. Bounded (not 32000) so a
-// turn that IS looping still can't burn the full pi-ai default. Consumed
+// turn that IS looping still can't burn the model's full output capability. Consumed
 // one-shot via `LiveSession.nextPromptMaxTokens`, then reset at the next real
 // user turn so the raised budget never leaks past the turn that needed it.
 export const CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS = 16384
@@ -1155,7 +1155,7 @@ type LiveSession = {
   // turn can never trigger a nudge on a later one. `null` when no such reply
   // ended this turn.
   lastTerminalReplyCompletion: { turnSeq: number; text?: string; tokens: number } | null
-  // Armed after a successful terminal reply. pi-agent-core invokes streamFn
+  // Armed after a successful terminal reply. pi-agent-core invokes streamFunction
   // again only after emitting every matching toolResult into its event queue;
   // the wrapper consumes this marker at that awaited provider boundary and
   // returns a local aborted response instead of calling the provider. Event
@@ -3289,18 +3289,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  // Override pi-ai's hidden `Math.min(model.maxTokens, 32000)` output cap for
-  // channel sessions by threading an explicit `maxTokens` into every stream
-  // call. See CHANNEL_MAX_OUTPUT_TOKENS for why. Composes the existing streamFn
-  // (pi's default `streamSimple` unless a proxy was installed). Precedence:
-  // an explicit per-call `maxTokens` always wins; otherwise a one-shot
-  // `live.nextPromptMaxTokens` (set by the empty-turn length-retry) is consumed
-  // and cleared so the raised budget applies to exactly one stream call;
-  // otherwise the default backstop.
+  // Override pi-ai's model max-tokens default for channel sessions by threading an
+  // explicit `maxTokens` into every stream call. pi-ai 0.87.1 clamps the requested
+  // value to remaining context (`buildBaseOptions`, simple-options.js:10-18), rather
+  // than applying the removed 32k cap. See CHANNEL_MAX_OUTPUT_TOKENS for why.
+  // Composes the existing streamFunction (pi's default `Models.streamSimple` unless a
+  // proxy was installed). Compaction and branch-summary calls are excluded: pi 0.87.1
+  // invokes `agent.streamFunction` for compaction (pi-coding-agent
+  // dist/core/agent-session.js:1844) while `isCompacting` remains true
+  // (agent-session.js:927-932). They must retain pi's own stream options and cannot
+  // consume a channel turn's pending terminal stop or one-shot retry budget.
+  // Precedence for channel assistant calls: an explicit per-call `maxTokens` always
+  // wins; otherwise a one-shot `live.nextPromptMaxTokens` (set by the empty-turn
+  // length-retry) is consumed and cleared so the raised budget applies to exactly one
+  // stream call; otherwise the default backstop.
   const installChannelOutputCap = (live: LiveSession): void => {
     const { agent } = live.session
-    const inner = agent.streamFn
-    agent.streamFn = async (model, context, streamOptions) => {
+    const inner = agent.streamFunction
+    agent.streamFunction = async (model, context, streamOptions) => {
+      if (live.session.isCompacting) return await inner(model, context, streamOptions)
       const pendingTerminalStop = live.pendingTerminalReplyStop
       if (pendingTerminalStop?.turnSeq === live.turnSeq && live.userStoppedTurnSeq !== pendingTerminalStop.turnSeq) {
         live.pendingTerminalReplyStop = null
@@ -8631,7 +8638,10 @@ function repairDanglingToolUseBranch(session: AgentSession, timestamp: number): 
     timestamp,
   }))
   for (const message of repairedMessages) session.sessionManager.appendMessage(message)
-  session.agent.state.messages = [...session.agent.state.messages, ...repairedMessages]
+  // SessionManager is canonical in pi 0.87: assigning agent.state.messages no longer
+  // changes provider history. Refresh after appending so the next prompt sees the
+  // persisted interruption results (pi-coding-agent 0.87.0 CHANGELOG:39-45).
+  session.refreshContext()
   return missing.map((toolCall) => toolCall.name)
 }
 

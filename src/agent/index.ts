@@ -7,8 +7,8 @@ import {
   DefaultResourceLoader,
   defineTool as definePiTool,
   SessionManager,
-} from '@mariozechner/pi-coding-agent'
-import type { AgentSession, ToolDefinition } from '@mariozechner/pi-coding-agent'
+} from '@earendil-works/pi-coding-agent'
+import type { AgentSession, ToolDefinition } from '@earendil-works/pi-coding-agent'
 
 import type { ChannelRouter } from '@/channels/router'
 import type { ReactionRef } from '@/channels/types'
@@ -39,7 +39,6 @@ import type { ReloadRegistry } from '@/reload'
 import { enterSubagentTmpScope, resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
 
-import { applyAdaptiveThinkingCompat } from './adaptive-thinking-compat'
 import { getAuthFor } from './auth'
 import { createCompactionSettingsManager } from './compaction'
 import { renderGitNudge } from './git-nudge'
@@ -102,6 +101,13 @@ export type { AgentSession }
 export { renderTurnRoleAnchor, renderTurnTimeAnchor } from './system-prompt'
 
 type AgentSessionTools = NonNullable<Parameters<typeof createAgentSession>[0]>['tools']
+
+// Pi AI 0.73.1 capped an unset output budget at 32K
+// (pi-ai dist/providers/simple-options.js:4). Pi 0.87.1 instead defaults to
+// the full model maximum before context clamping (dist/api/simple-options.js:17),
+// so preserve the former safe default at the session boundary. Explicit budgets
+// remain untouched for compaction and channel-specific output caps.
+export const DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 export type PluginSessionWiring = {
   registry: PluginRegistry
@@ -276,7 +282,10 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // `refOverride` lets the model-fallback helper pin a specific entry from
   // the chain when it recreates a session after the previous ref failed.
   const activeRef: ModelRef = options.refOverride ?? resolved.ref
-  const { authStorage, modelRegistry } = getAuthFor(providerForModelRef(activeRef))
+  // Provider auth owns both credentials and model resolution in Pi 0.87.
+  // Passing its ModelRuntime keeps every session request and compaction on the
+  // same configured provider runtime (sdk.d.ts:15-16; CHANGELOG 0.80.0).
+  const { modelRuntime } = await getAuthFor(providerForModelRef(activeRef))
   const sessionManager = options.sessionManager ?? SessionManager.inMemory()
 
   const materializedSkills =
@@ -353,7 +362,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     : undefined
   const sessionBudgetState = sessionBudget ? createBudgetState() : undefined
 
-  // The session's tool-name allowlist (pi 0.73 `tools:` is names, not tools).
+  // The session's tool-name allowlist is authoritative: with an explicit list,
+  // pi activates only listed builtins and custom tools (sdk.d.ts:35-47).
   // A subagent narrows to its declared refs; a non-subagent caller passes its
   // own explicit list (e.g. look-at's `[]`); everyone else leaves it undefined
   // so pi's default builtins apply. Implementations arrive via `customTools`;
@@ -514,16 +524,29 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   const thinkingLevel = resolveSessionThinkingLevel(getConfig().models, resolved, activeRef)
   const { session } = await createAgentSession({
     model,
+    modelRuntime,
     sessionManager,
     settingsManager: createCompactionSettingsManager(model),
-    authStorage,
-    modelRegistry,
     resourceLoader,
     noTools: 'builtin',
     tools: intendedActiveToolNames,
     customTools,
     ...(thinkingLevel ? { thinkingLevel } : {}),
   })
+
+  // Wrapping also means `agent.streamFunction !== streamSimple`, which puts pi's
+  // summarization auth on its lenient branch (agent-session.js:214-232): a
+  // failed compaction auth surfaces from the request rather than as pi's
+  // "Authentication failed … /login" message. Channel sessions already wrap
+  // this function, so every origin now behaves the same way.
+  const innerStreamFunction = session.agent.streamFunction
+  session.agent.streamFunction = async (requestModel, context, streamOptions) => {
+    const maxTokens =
+      streamOptions?.maxTokens ??
+      (requestModel.maxTokens > 0 ? Math.min(requestModel.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS) : undefined)
+    return await innerStreamFunction(requestModel, context, { ...streamOptions, maxTokens })
+  }
+
   // typeclaw owns retry/fallback in its turn drivers, so the SDK's own
   // same-model auto-retry must be OFF. Leaving it on races typeclaw's
   // soft-error capture: the SDK can silently recover a `stopReason:'error'` turn
@@ -531,7 +554,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // failed (and burning an unnecessary failover). Disabling it makes a soft error
   // a deterministic, typeclaw-owned signal. Compaction/context-overflow recovery
   // is independent (gated on compaction settings), so this does not disable those.
-  ;(session as { setAutoRetryEnabled?: (enabled: boolean) => void }).setAutoRetryEnabled?.(false)
+  session.setAutoRetryEnabled(false)
   const getAbortReason = () => abortHolder.reason
   const sessionWithAbortReason = Object.assign(session, { getAbortReason })
   const unsubLoopGuardTurn = attachLoopGuardTurnTracking(session.agent, () => {
@@ -552,13 +575,6 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
       return converted
     }
   }
-
-  // Same seam, one hook later: layer the adaptive-thinking rewrite over pi's
-  // onPayload so Sonnet 5 / Fable 5 never receive the budget-based `thinking`
-  // payload the pinned pi-ai 0.73.x emits for them (a hard 400 — see
-  // adaptive-thinking-compat.ts). Covers every provider call path through the
-  // agent, including model switches mid-session.
-  applyAdaptiveThinkingCompat(session.agent)
 
   abortHolder.abort = (reason?: string) => {
     if (reason !== undefined) abortHolder.reason = reason

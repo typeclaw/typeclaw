@@ -1,5 +1,5 @@
-import type { ThinkingLevel } from '@mariozechner/pi-agent-core'
-import type { KnownApi, Model } from '@mariozechner/pi-ai'
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core'
+import type { KnownApi, Model } from '@earendil-works/pi-ai'
 
 // Authentication mechanism a provider supports. `api-key` reads a static key
 // from .env (the original path); `oauth` runs a browser flow at init time and
@@ -29,16 +29,16 @@ type KnownProvider = {
 //
 // Adding a new model: append it to the matching provider's `models` map. Each
 // model object is the literal `Model<...>` that pi-ai consumes — keep it
-// faithful to https://github.com/mariozechner/pi-ai (the readme's "Custom
-// Models" section). `setRuntimeApiKey(provider, key)` keys off the `provider`
-// field, so it MUST match the outer provider id.
+// faithful to pi-ai's "Custom Providers" README section
+// (https://github.com/earendil-works/pi/tree/main/packages/ai#custom-providers).
+// `setRuntimeApiKey(provider, key)` keys off the `provider` field, so it MUST
+// match the outer provider id.
 //
 // Adding a new provider: add a top-level entry. Set `auth` to the supported
 // methods. For `api-key` providers, `apiKeyEnv` is the .env var typeclaw
 // writes at init and reads at boot (match the upstream provider's standard,
 // e.g. `OPENAI_API_KEY`). For `oauth` providers, `oauthProviderId` MUST match
-// a pi-ai OAuth provider id exactly, otherwise `authStorage.login()` will
-// throw "Unknown OAuth provider".
+// a pi-ai OAuth provider id exactly, otherwise the provider login lookup fails.
 //
 // Granularity rule (split vs merge): a provider id is the runtime API surface,
 // not the brand. Different API call => different provider id; same API call =>
@@ -61,9 +61,14 @@ export const KNOWN_PROVIDERS = {
     auth: ['api-key'],
     apiKeyEnv: 'OPENAI_API_KEY',
     oauthProviderId: null,
-    // Costs and context windows mirror models.dev as of 2026-05-10. When
-    // refreshing, also rerun `scripts/generate-schema.ts` so typeclaw.schema.json
-    // picks up new enum values.
+    // Costs and context windows mirror models.dev as of 2026-05-10; the GPT-6
+    // Sol/Luna records mirror OpenAI's model docs as of 2026-09-22.
+    // GPT-6 bills cache writes at 1.25x input; pi 0.87's Responses transport
+    // reads cache_write_tokens (openai-responses-shared.js), so that rate is
+    // applied. The >272K-input 2x/1.5x tier is not expressible in TypeClaw's
+    // flat cost shape, so these records use the standard rate. When
+    // refreshing, also rerun `scripts/generate-schema.ts` so
+    // typeclaw.schema.json picks up new enum values.
     models: {
       // Default. Cheapest tool-calling reasoning model in the family;
       // available on every paid OpenAI account tier.
@@ -114,6 +119,67 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
         contextWindow: 1050000,
         maxTokens: 128000,
+      },
+      // GPT-6 Sol and Luna use Responses because Chat Completions accepts tools
+      // only at effort `none`. The full map and compat are pi-ai 0.87.1's
+      // catalog values, preserving every documented effort through `max`.
+      'gpt-6-sol': {
+        id: 'gpt-6-sol',
+        name: 'GPT-6 Sol',
+        api: 'openai-responses',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+        contextWindow: 1050000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsStrictMode: true,
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+          supportsExplicitPromptCacheMode: true,
+        },
+      },
+      'gpt-6-luna': {
+        id: 'gpt-6-luna',
+        name: 'GPT-6 Luna',
+        api: 'openai-responses',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+        contextWindow: 1050000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsStrictMode: true,
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+          supportsExplicitPromptCacheMode: true,
+        },
       },
     },
   },
@@ -177,6 +243,63 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 272000,
         maxTokens: 128000,
       },
+      // GPT-6 Sol and Luna use the documented Codex backend limits. Their
+      // 0.87.1 maps preserve all valid efforts through `max`; Codex floors
+      // unsupported `minimal` at `low`.
+      'gpt-6-sol': {
+        id: 'gpt-6-sol',
+        name: 'GPT-6 Sol',
+        api: 'openai-codex-responses',
+        provider: 'openai-codex',
+        baseUrl: 'https://chatgpt.com/backend-api',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+        },
+      },
+      'gpt-6-luna': {
+        id: 'gpt-6-luna',
+        name: 'GPT-6 Luna',
+        api: 'openai-codex-responses',
+        provider: 'openai-codex',
+        baseUrl: 'https://chatgpt.com/backend-api',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+        contextWindow: 272000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+        },
+      },
     },
   },
   // Anthropic Claude — both the Anthropic Console API (ANTHROPIC_API_KEY)
@@ -215,7 +338,8 @@ export const KNOWN_PROVIDERS = {
   // not the recommended path. Claude Mythos 5 (Fable 5's classifier-free
   // sibling, limited availability via Project Glasswing) is intentionally
   // NOT listed — access is gated per-org and a registry entry would fail for
-  // everyone else.
+  // everyone else. Opus 5.5 (Sep 22 2026) was added on its own; Claude Opus 5
+  // and Fable 5.1 are not registered yet.
   //
   // ID semantics differ across the lineup and matter for forward-compat:
   //   - `claude-haiku-4-5` is a 4.5-generation CONVENIENCE ALIAS that
@@ -238,8 +362,8 @@ export const KNOWN_PROVIDERS = {
   //     vs Opus 4.6, but total cost on identical workloads can rise meaningfully.
   //   - 1M token context window (vs 200k on Haiku) and 128k max output (vs
   //     64k on Sonnet/Haiku). 1M context is at standard pricing — no surcharge.
-  //   - New `xhigh` effort level between `high` and `max` (pi-ai 0.67.x may
-  //     not surface this knob yet; check before relying on it).
+  //   - `xhigh` effort level between `high` and `max`; each record's
+  //     `thinkingLevelMap` declares whether the model exposes it.
   //
   // Pricing mirrors Anthropic's official table as of 2026-05; cacheWrite is
   // the 5m-TTL rate (1.25x input). 1h TTL is ~2x input (not modeled here —
@@ -264,6 +388,11 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 200000,
         maxTokens: 64000,
       },
+      // pi-ai 0.73 inferred adaptive thinking from the 4.6/4.7 ids; 0.87 reads
+      // only `compat.forceAdaptiveThinking` (anthropic-messages.js). Without
+      // these catalog fields Sonnet 4.6 and Opus 4.7 fall back to budget
+      // thinking, which Anthropic deprecates on 4.6 and rejects with a 400 on
+      // 4.7+ (platform.claude.com/docs/en/build-with-claude/extended-thinking).
       'claude-sonnet-4-6': {
         id: 'claude-sonnet-4-6',
         name: 'Claude Sonnet 4.6',
@@ -275,6 +404,8 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
         contextWindow: 1000000,
         maxTokens: 64000,
+        thinkingLevelMap: { max: 'max' },
+        compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
       },
       // Sonnet 5 (Jul 1 2026) is the drop-in successor to Sonnet 4.6 with a
       // caveat set that affects consumers of this record:
@@ -282,17 +413,12 @@ export const KNOWN_PROVIDERS = {
       //     Per-token price is unchanged, so equivalent requests cost more.
       //   - Adaptive thinking only: manual extended thinking
       //     (`thinking: {type: "enabled"}` with `budget_tokens`) returns a
-      //     400. The pinned pi-ai 0.73.x DOES send that payload for this id
-      //     (its supportsAdaptiveThinking() only matches 4.6-generation ids,
-      //     and thinking defaults to "medium"), so registering this record
-      //     with `reasoning: true` depends on the rewrite shim in
-      //     src/agent/adaptive-thinking-compat.ts. Don't wire a
-      //     thinking-budget knob to this id.
+      //     400. `compat.forceAdaptiveThinking` makes pi-ai's Anthropic
+      //     transport send adaptive thinking on every path, compaction included.
       //   - Cost encodes the STANDARD rate (in effect Sep 1 2026+).
-      //     Introductory pricing ($2/$10, cacheRead 0.2, cacheWrite 2.5) runs
-      //     through Aug 31 2026, so `typeclaw usage` over-reports Sonnet 5
-      //     spend until then. Chosen so the record doesn't silently go stale
-      //     two months after landing.
+      //     Introductory pricing ($2/$10, cacheRead 0.2, cacheWrite 2.5) ran
+      //     through Aug 31 2026. It was chosen so the record doesn't silently
+      //     go stale two months after landing.
       'claude-sonnet-5': {
         id: 'claude-sonnet-5',
         name: 'Claude Sonnet 5',
@@ -304,6 +430,8 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
         contextWindow: 1000000,
         maxTokens: 128000,
+        thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
+        compat: { forceAdaptiveThinking: true, supportsStrictTools: true },
       },
       'claude-opus-4-7': {
         id: 'claude-opus-4-7',
@@ -316,7 +444,12 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
         contextWindow: 1000000,
         maxTokens: 128000,
+        thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false, supportsStrictTools: true },
       },
+      // Opus 4.8 was never in pi 0.73's adaptive id list, so it already got
+      // budget thinking (a 400 on 4.7+) before this migration. The catalog
+      // compat fixes it the same way.
       'claude-opus-4-8': {
         id: 'claude-opus-4-8',
         name: 'Claude Opus 4.8',
@@ -328,15 +461,62 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
         contextWindow: 1000000,
         maxTokens: 128000,
+        thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
+        compat: {
+          supportsMidConvoSystemMessages: true,
+          supportsMidConvoToolChanges: true,
+          forceAdaptiveThinking: true,
+          supportsTemperature: false,
+          supportsStrictTools: true,
+        },
+      },
+      // Opus 5.5 (Sep 22 2026) keeps adaptive thinking permanently on: both
+      // manual and disabled thinking return 400, which `forceAdaptiveThinking`
+      // plus `off`/`minimal: null` rule out. `supportsMidConvoEffort` routes the
+      // thinking level through the mid-conversation output-config control and
+      // sends `thinking-binding-controls-2026-08-01` with `drop_block`. Without
+      // that, a replayed thinking block whose prefix changed (for example after
+      // compaction) returns 400 on accounts created on or after 2026-08-31.
+      // Forced tool use is unsupported; typeclaw never sets toolChoice.
+      'claude-opus-5-5': {
+        id: 'claude-opus-5-5',
+        name: 'Claude Opus 5.5',
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsMidConvoEffort: true,
+          supportsMidConvoSystemMessages: true,
+          supportsMidConvoToolChanges: true,
+          forceAdaptiveThinking: true,
+          supportsTemperature: false,
+          supportsStrictTools: true,
+        },
       },
       // Fable 5 (Jun 2026) is a NEW TIER above Opus — Anthropic's most
       // capable widely released model, aimed at long-horizon agentic work.
       // Ships the 5-generation tokenizer: ~1.3x token counts for the same
       // text vs pre-5 models, so equivalent requests cost more than the
       // per-token rates alone suggest. Adaptive thinking only, same as
-      // Sonnet 5 above: `reasoning: true` here depends on the rewrite shim
-      // in src/agent/adaptive-thinking-compat.ts (pinned pi-ai 0.73.x would
-      // otherwise send budget-based `thinking`, a hard 400 on this id).
+      // Sonnet 5 above, via `compat.forceAdaptiveThinking`. Upstream's catalog
+      // also sets `allowedFallbackModels` (Anthropic server-side fallback to
+      // Opus 4.8 / Opus 5). That is deliberately NOT adopted: pi would send
+      // `fallbacks`, and a refused request would silently be served, and
+      // billed, by a different model than the one the operator configured.
       'claude-fable-5': {
         id: 'claude-fable-5',
         name: 'Claude Fable 5',
@@ -348,6 +528,13 @@ export const KNOWN_PROVIDERS = {
         cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
         contextWindow: 1000000,
         maxTokens: 128000,
+        thinkingLevelMap: { off: null, xhigh: 'xhigh', max: 'max' },
+        compat: {
+          supportsMidConvoSystemMessages: true,
+          supportsMidConvoToolChanges: true,
+          forceAdaptiveThinking: true,
+          supportsStrictTools: true,
+        },
       },
     },
   },
@@ -521,24 +708,23 @@ export const KNOWN_PROVIDERS = {
       },
     },
   },
-  // xAI (Grok). The native developer API at api.x.ai/v1 is OpenAI-compatible
-  // (Bearer auth + /chat/completions shape), so models go through pi-ai's
-  // `openai-completions` adapter with a custom baseUrl — same trick as
-  // Fireworks and Z.AI. This is a DUAL-AUTH provider like `anthropic`:
-  //   * api-key — XAI_API_KEY (the standard xAI env var), a plain Bearer token.
-  //   * oauth — Grok subscription login via xAI's OIDC server (auth.x.ai),
-  //     authorization-code + PKCE. pi-ai ships no built-in xAI OAuth provider,
-  //     so `oauthProviderId: 'xai'` resolves to the custom provider registered
-  //     in src/secrets/oauth-xai.ts (registered from createSecretsStoreForAgent
-  //     so both init-login and runtime-refresh see it). The dual-auth runtime
-  //     rule in src/agent/auth.ts applies: an OAuth credential on disk wins over
-  //     XAI_API_KEY in .env — remove it (`typeclaw provider remove xai`) to fall
-  //     back to the key.
+  // xAI (Grok) is a dual-auth provider: api-key requests use XAI_API_KEY and
+  // OAuth requests use the xAI OIDC credential. Grok 4.7 and 4.3 use
+  // `openai-responses` with pi-ai 0.87.1's catalog metadata, as upstream's
+  // built-in xAI provider does: Responses carries encrypted reasoning and the
+  // documented effort values. The grok-4.20 snapshots and grok-build-0.1 are
+  // not in that catalog, so they stay on `openai-completions`, where pi-ai
+  // sends no xAI reasoning_effort. That is their 0.73 wire behavior, unchanged.
+  // The built-in pi-ai xAI provider owns its device-code OAuth flow, including
+  // refresh. An OAuth credential on disk takes precedence over XAI_API_KEY in
+  // .env; remove it (`typeclaw provider remove xai`) to use the key instead.
   //
   // Costs and context windows mirror docs.x.ai/developers/models and the raw
   // /v1/models price fields as of 2026-06-08 (xAI quotes prices in cents per
-  // 100M tokens; e.g. grok-4.3 prompt 12500 = $1.25/1M). grok-4.3 is the
-  // flagship default; grok-build-0.1 is the coding-tuned model. The
+  // 100M tokens; e.g. grok-4.3 prompt 12500 = $1.25/1M); grok-4.7 mirrors
+  // docs.x.ai/developers/grok-4-7 and /pricing as of 2026-09-21. grok-4.7 is
+  // the flagship; grok-4.3 stays first as the template record for uncurated
+  // refs; grok-build-0.1 is the coding-tuned model. The
   // grok-4.20-0309 snapshots are pinned weights for reproducible runs.
   //
   // The earlier grok-4 / grok-4-fast / grok-code-fast-1 ids were RETIRED on
@@ -546,10 +732,10 @@ export const KNOWN_PROVIDERS = {
   // grok-4.3 / grok-build-0.1 rates, so they are intentionally NOT listed.
   //
   // cacheWrite is 0: xAI publishes no cache-write price (caching is implicit,
-  // billed only at the cacheRead rate). Models 1-4 also carry a long-context
-  // tier (2x rates above a 200k-token request); pi-ai's Model shape can't
-  // express tiered pricing, so the standard rate is used and the breakpoint is
-  // noted here. When refreshing, rerun `scripts/generate-schema.ts`.
+  // billed only at the cacheRead rate). Every model here also carries a
+  // long-context tier (2x rates above a 200k-token request); the flat cost
+  // shape can't express tiered pricing, so the standard rate is used and the
+  // breakpoint is noted here. When refreshing, rerun `scripts/generate-schema.ts`.
   xai: {
     id: 'xai',
     name: 'xAI (Grok)',
@@ -558,17 +744,56 @@ export const KNOWN_PROVIDERS = {
     apiKeyEnv: 'XAI_API_KEY',
     oauthProviderId: 'xai',
     models: {
+      // pi-ai 0.87.1's xAI catalog caps Grok 4.3 at 30K and maps its efforts;
+      // `minimal` is not an xAI effort, so it clamps to `low`. The current
+      // transport sends model.maxTokens by default, so keep that vendor-safe cap.
       'grok-4.3': {
         id: 'grok-4.3',
         name: 'Grok 4.3',
-        api: 'openai-completions',
+        api: 'openai-responses',
         provider: 'xai',
         baseUrl: 'https://api.x.ai/v1',
         reasoning: true,
         input: ['text', 'image'],
         cost: { input: 1.25, output: 2.5, cacheRead: 0.2, cacheWrite: 0 },
         contextWindow: 1000000,
-        maxTokens: 64000,
+        maxTokens: 30000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: null,
+          max: null,
+        },
+        compat: { supportsLongCacheRetention: false },
+      },
+      // Responses is required for Grok 4.7's encrypted reasoning and maps
+      // the documented low/medium/high/xhigh effort values on pi-ai 0.87.1.
+      'grok-4.7': {
+        id: 'grok-4.7',
+        name: 'Grok 4.7',
+        api: 'openai-responses',
+        provider: 'xai',
+        baseUrl: 'https://api.x.ai/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+        // xAI documents no text-output ceiling. Use the 500K context window;
+        // pi-ai clamps it to remaining context before the Responses request.
+        contextWindow: 500000,
+        maxTokens: 500000,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: null,
+        },
+        compat: { supportsLongCacheRetention: false },
       },
       'grok-4.20-0309-reasoning': {
         id: 'grok-4.20-0309-reasoning',

@@ -1,8 +1,8 @@
 import { join } from 'node:path'
 
-import { Type } from '@mariozechner/pi-ai'
-import type { ImageContent } from '@mariozechner/pi-ai'
-import { defineTool } from '@mariozechner/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
+import type { ImageContent } from '@earendil-works/pi-ai'
+import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import { createSessionWithDispose, type SessionOrigin } from '@/agent'
 import { readResponseBodyBounded } from '@/agent/network/response-body'

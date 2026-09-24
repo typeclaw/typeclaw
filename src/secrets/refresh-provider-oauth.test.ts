@@ -1,173 +1,180 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { describe, expect, test, afterEach, beforeEach } from 'bun:test'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-import { registerOAuthProvider, unregisterOAuthProvider } from '@mariozechner/pi-ai/oauth'
-import type { OAuthCredentials, OAuthProviderInterface } from '@mariozechner/pi-ai/oauth'
-import { AuthStorage } from '@mariozechner/pi-coding-agent'
-import type { AuthCredential } from '@mariozechner/pi-coding-agent'
+import { type CredentialStore, type Credential } from '@earendil-works/pi-ai'
+import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 
-import { refreshProviderOAuthCredentials } from './refresh-provider-oauth'
-
-const STUB_PROVIDER_ID = 'stub-oauth'
-const registered = new Set<string>()
-
-function installStubProvider(overrides: Partial<OAuthProviderInterface> & { id?: string } = {}): string {
-  const id = overrides.id ?? STUB_PROVIDER_ID
-  const provider: OAuthProviderInterface = {
-    id,
-    name: 'Stub OAuth',
-    login: async () => {
-      throw new Error('login not used in tests')
-    },
-    refreshToken: overrides.refreshToken ?? (async (creds) => creds),
-    getApiKey: overrides.getApiKey ?? ((creds) => creds.access),
-  }
-  registerOAuthProvider(provider)
-  registered.add(id)
-  return id
-}
-
-afterEach(() => {
-  for (const id of registered) unregisterOAuthProvider(id)
-  registered.clear()
-})
-
-function oauthCred(access: string, expires: number, refresh = 'refresh-token'): OAuthCredentials & { type: 'oauth' } {
-  return { type: 'oauth', access, refresh, expires }
-}
-
-function storageWith(data: Record<string, AuthCredential>): AuthStorage {
-  return AuthStorage.inMemory(data)
-}
-
-const FUTURE = Date.now() + 60 * 60 * 1000
-const PAST = Date.now() - 60 * 60 * 1000
+import { refreshProviderOAuthCredentials, refreshProviderOAuthForAgent } from './refresh-provider-oauth'
 
 describe('refreshProviderOAuthCredentials', () => {
-  test('no oauth providers → empty result, no work', async () => {
-    const storage = storageWith({ openai: { type: 'api_key', key: 'sk-test' } })
+  test('probes only stored OAuth credentials and isolates failures', async () => {
+    const calls: string[] = []
+    const credentials: CredentialStore = {
+      read: async () => undefined,
+      list: async () => [
+        { providerId: 'good', type: 'oauth' },
+        { providerId: 'bad', type: 'oauth' },
+        { providerId: 'key', type: 'api_key' },
+      ],
+      modify: async () => undefined,
+      delete: async () => {},
+    }
+    const modelRuntime = {
+      getAuth: async (providerId: string) => {
+        calls.push(providerId)
+        if (providerId === 'bad') throw new Error('refresh failed')
+        return { auth: { apiKey: 'fresh' } }
+      },
+    } as unknown as ModelRuntime
+    const result = await refreshProviderOAuthCredentials({ credentials, modelRuntime })
+    expect(calls).toEqual(['good', 'bad'])
+    expect(result.entries).toEqual([
+      { providerId: 'good', outcome: 'valid-or-refreshed' },
+      { providerId: 'bad', outcome: 'refresh-failed', error: 'refresh failed' },
+    ])
+  })
+})
 
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
+const future = () => Date.now() + 3_600_000
+const past = () => Date.now() - 1
 
+function credentials(initial: Record<string, Credential>): CredentialStore {
+  const values = new Map(Object.entries(initial))
+  return {
+    read: async (id) => values.get(id),
+    list: async () => [...values].map(([providerId, credential]) => ({ providerId, type: credential.type })),
+    modify: async (id, fn) => {
+      const next = await fn(values.get(id))
+      if (next) values.set(id, next)
+      return values.get(id)
+    },
+    delete: async (id) => {
+      values.delete(id)
+    },
+  }
+}
+
+async function runtime(
+  store: CredentialStore,
+  refreshToken: (credential: { refresh: string }) => Promise<{ access: string; refresh: string; expires: number }>,
+) {
+  const modelRuntime = await ModelRuntime.create({ credentials: store, modelsPath: null, refreshOnCreate: false })
+  modelRuntime.registerProvider('stub', {
+    baseUrl: 'https://example.test',
+    oauth: {
+      name: 'stub',
+      login: async () => ({ access: 'unused', refresh: 'unused', expires: future() }),
+      refreshToken: async (credential) => refreshToken(credential),
+      getApiKey: (credential) => credential.access,
+    },
+  })
+  return modelRuntime
+}
+
+describe('refreshProviderOAuthCredentials outcomes', () => {
+  test('no OAuth entries produces no work', async () => {
+    const store = credentials({ key: { type: 'api_key', key: 'key' } })
+    const result = await refreshProviderOAuthCredentials({
+      credentials: store,
+      modelRuntime: await runtime(store, async () => {
+        throw new Error('unused')
+      }),
+    })
     expect(result.entries).toEqual([])
   })
 
-  test('valid (unexpired) token → valid-or-refreshed without invoking refresh', async () => {
-    const id = installStubProvider({
-      refreshToken: async () => {
-        throw new Error('refresh must not run for an unexpired token')
-      },
+  test('valid token does not refresh and expired token refreshes and persists', async () => {
+    let calls = 0
+    const store = credentials({ stub: { type: 'oauth', access: 'old', refresh: 'r', expires: future() } })
+    const modelRuntime = await runtime(store, async (credential) => {
+      calls++
+      return { access: 'new', refresh: credential.refresh, expires: future() }
     })
-    const storage = storageWith({ [id]: oauthCred('valid-access', FUTURE) })
-
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
-
-    expect(result.entries).toEqual([{ providerId: id, outcome: 'valid-or-refreshed' }])
-  })
-
-  test('expired token → refresh runs, new credential persists, outcome valid-or-refreshed', async () => {
-    let refreshCalls = 0
-    const id = installStubProvider({
-      refreshToken: async (creds): Promise<OAuthCredentials> => {
-        refreshCalls += 1
-        return { access: 'fresh-access', refresh: creds.refresh, expires: FUTURE }
-      },
-    })
-    const storage = storageWith({ [id]: oauthCred('stale-access', PAST) })
-
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
-
-    expect(refreshCalls).toBe(1)
-    expect(result.entries).toEqual([{ providerId: id, outcome: 'valid-or-refreshed' }])
-    const persisted = storage.getAll()[id]
-    expect(persisted).toMatchObject({ type: 'oauth', access: 'fresh-access', expires: FUTURE })
-  })
-
-  test('expired token + failing refresh → refresh-failed with surfaced error', async () => {
-    const logs: string[] = []
-    const id = installStubProvider({
-      refreshToken: async () => {
-        throw new Error('token endpoint 400: invalid_grant')
-      },
-    })
-    const storage = storageWith({ [id]: oauthCred('stale-access', PAST) })
-
-    const result = await refreshProviderOAuthCredentials({
-      authStorage: storage,
-      log: (m) => logs.push(m),
-    })
-
-    expect(result.entries).toHaveLength(1)
-    expect(result.entries[0]!.providerId).toBe(id)
-    expect(result.entries[0]!.outcome).toBe('refresh-failed')
-    // The SDK wraps the underlying cause into "Failed to refresh OAuth token
-    // for <id>"; the raw cause (invalid_grant) is not propagated to drainErrors,
-    // so we assert on the operator-actionable wrapper we actually surface.
-    expect(result.entries[0]!.error).toContain('Failed to refresh OAuth token')
-    expect(result.entries[0]!.error).toContain(id)
-    expect(logs.some((m) => m.includes(id) && m.includes('refresh failed'))).toBe(true)
-  })
-
-  test('one failing provider does not stop others from being probed', async () => {
-    const good = installStubProvider({
-      id: 'stub-good',
-      refreshToken: async (creds): Promise<OAuthCredentials> => ({
-        access: 'good-fresh',
-        refresh: creds.refresh,
-        expires: FUTURE,
-      }),
-    })
-    const bad = installStubProvider({
-      id: 'stub-bad',
-      refreshToken: async () => {
-        throw new Error('boom')
-      },
-    })
-    const storage = storageWith({
-      [bad]: oauthCred('bad-stale', PAST),
-      [good]: oauthCred('good-stale', PAST),
-    })
-
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
-
-    const byId = Object.fromEntries(result.entries.map((e) => [e.providerId, e.outcome]))
-    expect(byId[good]).toBe('valid-or-refreshed')
-    expect(byId[bad]).toBe('refresh-failed')
-  })
-
-  test('unknown oauth provider (not registered) → refresh-failed, no throw', async () => {
-    const storage = storageWith({ 'never-registered': oauthCred('x', PAST) })
-
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
-
-    expect(result.entries).toEqual([
-      { providerId: 'never-registered', outcome: 'refresh-failed', error: expect.any(String) },
+    expect((await refreshProviderOAuthCredentials({ credentials: store, modelRuntime })).entries).toEqual([
+      { providerId: 'stub', outcome: 'valid-or-refreshed' },
     ])
+    expect(calls).toBe(0)
+    await store.modify('stub', async () => ({ type: 'oauth', access: 'old', refresh: 'r', expires: past() }))
+    expect((await refreshProviderOAuthCredentials({ credentials: store, modelRuntime })).entries).toEqual([
+      { providerId: 'stub', outcome: 'valid-or-refreshed' },
+    ])
+    expect(calls).toBe(1)
+    expect(await store.read('stub')).toMatchObject({ access: 'new' })
   })
 
-  test('one failing provider does not leak its error onto the next provider', async () => {
-    const bad = installStubProvider({
-      id: 'stub-bad-first',
-      refreshToken: async () => {
-        throw new Error('first-failure')
-      },
+  test('refresh failure is surfaced without stopping later entries', async () => {
+    const store = credentials({
+      stub: { type: 'oauth', access: 'old', refresh: 'r', expires: past() },
+      unknown: { type: 'oauth', access: 'old', refresh: 'r', expires: past() },
     })
-    const good = installStubProvider({
-      id: 'stub-good-second',
-      refreshToken: async (creds): Promise<OAuthCredentials> => ({
-        access: 'ok',
-        refresh: creds.refresh,
-        expires: FUTURE,
+    const modelRuntime = await runtime(store, async () => {
+      throw new Error('token endpoint failed')
+    })
+    const result = await refreshProviderOAuthCredentials({ credentials: store, modelRuntime })
+    expect(result.entries).toHaveLength(2)
+    expect(result.entries.every((entry) => entry.outcome === 'refresh-failed' && entry.error)).toBe(true)
+    expect(result.entries[0]!.error).toContain('token endpoint failed')
+    expect(result.entries[1]!.error).not.toContain('token endpoint failed')
+  })
+})
+
+describe('refreshProviderOAuthForAgent failures', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'typeclaw-refresh-'))
+  })
+  afterEach(async () => rm(dir, { recursive: true, force: true }))
+
+  test('logs malformed secrets and preserves non-fatal boot behavior', async () => {
+    await writeFile(join(dir, 'secrets.json'), '{broken')
+    const logs: string[] = []
+    await expect(
+      refreshProviderOAuthForAgent({ agentDir: dir, log: (message) => logs.push(message) }),
+    ).resolves.toEqual({
+      entries: [],
+    })
+    expect(logs.join('\\n')).toContain('not valid JSON')
+  })
+})
+
+describe('built-in xAI OAuth compatibility', () => {
+  let dir: string
+  let fetchBefore: typeof fetch
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'typeclaw-xai-'))
+    fetchBefore = globalThis.fetch
+  })
+  afterEach(async () => {
+    globalThis.fetch = fetchBefore
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('refreshes legacy xAI credential records with the same client and preserves an unrotated refresh token', async () => {
+    await writeFile(
+      join(dir, 'secrets.json'),
+      JSON.stringify({
+        version: 2,
+        providers: { xai: { type: 'oauth', access: 'old', refresh: 'legacy-refresh', expires: Date.now() - 1000 } },
+        channels: {},
       }),
-    })
-    const storage = storageWith({
-      [bad]: oauthCred('a', PAST),
-      [good]: oauthCred('b', PAST),
-    })
+    )
+    const requests: Array<{ url: string; body: string }> = []
+    globalThis.fetch = (async (url, init) => {
+      requests.push({ url: String(url), body: String(init?.body) })
+      return new Response(JSON.stringify({ access_token: 'new-access', expires_in: 3600 }), { status: 200 })
+    }) as typeof fetch
 
-    const result = await refreshProviderOAuthCredentials({ authStorage: storage })
-
-    const goodEntry = result.entries.find((e) => e.providerId === good)
-    expect(goodEntry?.outcome).toBe('valid-or-refreshed')
-    expect(goodEntry?.error).toBeUndefined()
+    const result = await refreshProviderOAuthForAgent({ agentDir: dir })
+    expect(result.entries).toEqual([{ providerId: 'xai', outcome: 'valid-or-refreshed' }])
+    expect(requests).toEqual([
+      { url: 'https://auth.x.ai/oauth2/token', body: expect.stringContaining('grant_type=refresh_token') },
+    ])
+    expect(requests[0]!.body).toContain('client_id=b1a00492-073a-47ea-816f-4c329264a828')
+    expect(requests[0]!.body).toContain('refresh_token=legacy-refresh')
+    const stored = JSON.parse(await readFile(join(dir, 'secrets.json'), 'utf8')).providers.xai
+    expect(stored).toMatchObject({ access: 'new-access', refresh: 'legacy-refresh' })
   })
 })

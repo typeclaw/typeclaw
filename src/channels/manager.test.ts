@@ -1448,7 +1448,7 @@ describe('channel manager — reload detects missing tokens and stops adapter', 
         prompts.push(text)
       },
       abort: async () => {},
-      agent: { streamFn: () => undefined, abort: () => {} },
+      agent: { streamFunction: () => undefined, abort: () => {} },
       sessionManager: { getLeafEntry: () => undefined },
       subscribe: () => () => {},
     } as unknown as AgentSession

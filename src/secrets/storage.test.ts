@@ -1,470 +1,296 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { AuthStorage } from '@mariozechner/pi-coding-agent'
-
 import { isWindows } from '@/shared'
 
-import { parseSecretsFile } from './schema'
-import { createSecretsStoreForAgent, SecretsBackend } from './storage'
+import { ASYNC_LOCK_OPTIONS, SecretsBackend } from './storage'
 
 const onWindows = isWindows()
 
-describe('SecretsBackend', () => {
+describe('SecretsBackend CredentialStore', () => {
   let dir: string
-  let secretsPath: string
-  let prevFireworks: string | undefined
+  let path: string
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'typeclaw-secrets-store-'))
-    secretsPath = join(dir, 'secrets.json')
-    // These tests exercise on-disk persistence via AuthStorage.get, which
-    // resolves api-keys with env-wins. CI sets FIREWORKS_API_KEY=dummy
-    // workflow-wide; scrub it so the disk value is what comes back.
-    prevFireworks = process.env.FIREWORKS_API_KEY
-    delete process.env.FIREWORKS_API_KEY
+    dir = await mkdtemp(join(tmpdir(), 'typeclaw-secrets-'))
+    path = join(dir, 'secrets.json')
+  })
+  afterEach(async () => rm(dir, { recursive: true, force: true }))
+
+  test('preserves untouched Secret bytes and channels while modifying another credential', async () => {
+    const backend = new SecretsBackend(path)
+    backend.writeProviderCredentialSync('fireworks', { type: 'api_key', key: { value: 'disk', env: 'CUSTOM_KEY' } })
+    backend.writeChannelsSync({ 'discord-bot': { token: { value: 'keep' } } })
+    await backend.modify('openai', async () => ({ type: 'api_key', key: 'new-key' }))
+    const parsed = JSON.parse(await readFile(path, 'utf8'))
+    expect(parsed.providers.fireworks).toEqual({ type: 'api_key', key: { value: 'disk', env: 'CUSTOM_KEY' } })
+    expect(parsed.providers.openai).toEqual({ type: 'api_key', key: { value: 'new-key' } })
+    expect(parsed.channels).toEqual({ 'discord-bot': { token: { value: 'keep' } } })
   })
 
-  afterEach(async () => {
-    if (prevFireworks === undefined) delete process.env.FIREWORKS_API_KEY
-    else process.env.FIREWORKS_API_KEY = prevFireworks
-    await rm(dir, { recursive: true, force: true })
+  test('empty API-key mutation is a no-op', async () => {
+    const backend = new SecretsBackend(path)
+    backend.writeProviderCredentialSync('openai', { type: 'api_key', key: { value: 'keep' } })
+    await backend.modify('openai', async () => ({ type: 'api_key', key: '' }))
+    expect(await backend.read('openai')).toEqual({ type: 'api_key', key: 'keep' })
   })
 
-  test('first write produces a v2 envelope with Secret-wrapped api-key', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai', { type: 'api_key', key: 'sk-test' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    expect(parsed['version']).toBe(2)
-    expect(parsed['providers']).toEqual({ openai: { type: 'api_key', key: { value: 'sk-test' } } })
-    expect(parsed['channels']).toEqual({})
-    expect(parsed['mcp']).toEqual({})
-    expect(parsed['$schema']).toBe('./node_modules/typeclaw/secrets.schema.json')
+  test('serializes concurrent provider mutations', async () => {
+    const backend = new SecretsBackend(path)
+    await Promise.all([
+      backend.modify('openai', async () => ({ type: 'api_key', key: 'one' })),
+      backend.modify('fireworks', async () => ({ type: 'api_key', key: 'two' })),
+    ])
+    expect(await backend.read('openai')).toEqual({ type: 'api_key', key: 'one' })
+    expect(await backend.read('fireworks')).toEqual({ type: 'api_key', key: 'two' })
   })
 
-  test('round-trip: set + reload + get returns the same value', () => {
-    const a = createSecretsStoreForAgent(secretsPath)
-    a.set('openai', { type: 'api_key', key: 'sk-roundtrip' })
+  test('rejects an already-aborted mutation before creating storage or calling its callback', async () => {
+    const backend = new SecretsBackend(path)
+    const controller = new AbortController()
+    controller.abort()
+    let callbackCalled = false
 
-    const b = createSecretsStoreForAgent(secretsPath)
-    expect(b.get('openai')).toEqual({ type: 'api_key', key: 'sk-roundtrip' })
-
-    b.set('openai', { type: 'api_key', key: 'sk-updated' })
-
-    const c = AuthStorage.fromStorage(new SecretsBackend(secretsPath))
-    expect(c.get('openai')).toEqual({ type: 'api_key', key: 'sk-updated' })
-  })
-
-  test('preserves channels and unknown top-level keys across writes', async () => {
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: { openai: { type: 'api_key', key: { value: 'sk-existing' } } },
-        channels: { 'discord-bot': { token: { value: 'd-keep' } } },
-        githubCli: { hosts: 'generated-store' },
-        futureSlice: { keep: true },
-      }),
-    )
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('fireworks', { type: 'api_key', key: 'fw-added' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as {
-      version: number
-      providers: Record<string, unknown>
-      channels: Record<string, unknown>
-      githubCli: unknown
-      futureSlice: unknown
-    }
-    expect(obj.version).toBe(2)
-    expect(obj.providers['openai']).toEqual({ type: 'api_key', key: { value: 'sk-existing' } })
-    expect(obj.providers['fireworks']).toEqual({ type: 'api_key', key: { value: 'fw-added' } })
-    expect(obj.channels['discord-bot']).toEqual({ token: { value: 'd-keep' } })
-    expect(obj.githubCli).toEqual({ hosts: 'generated-store' })
-    expect(obj.futureSlice).toEqual({ keep: true })
-  })
-
-  test('locked GitHub CLI reads and writes preserve every sibling and unknown slice', async () => {
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: { openai: { type: 'api_key', key: { value: 'provider-test' } } },
-        channels: { 'discord-bot': { token: { value: 'channel-test' } } },
-        mcp: { example: { tokens: { access_token: 'mcp-test' } } },
-        futureSlice: { keep: true },
-      }),
-    )
-    const backend = new SecretsBackend(secretsPath)
-
-    expect(backend.tryReadGithubCliSync()).toBeUndefined()
-    backend.writeGithubCliSync({ hosts: 'first-store' })
-    backend.writeGithubCliSync({ hosts: 'refreshed-store' })
-
-    expect(backend.tryReadGithubCliSync()).toEqual({ hosts: 'refreshed-store' })
-    const raw = JSON.parse(await readFile(secretsPath, 'utf8')) as Record<string, unknown>
-    expect(raw['providers']).toEqual({ openai: { type: 'api_key', key: { value: 'provider-test' } } })
-    expect(raw['channels']).toEqual({ 'discord-bot': { token: { value: 'channel-test' } } })
-    expect(raw['mcp']).toEqual({ example: { tokens: { access_token: 'mcp-test' } } })
-    expect(raw['futureSlice']).toEqual({ keep: true })
-  })
-
-  test('file mode is 0o600 after first write', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai', { type: 'api_key', key: 'sk-test' })
-
-    const stats = await stat(secretsPath)
-    const perms = stats.mode & 0o777
-    // NTFS mode bits are not meaningful on Windows; see #899.
-    if (!onWindows) expect(perms).toBe(0o600)
-  })
-
-  test('seed file is parseable as v2 envelope before any credential is written', async () => {
-    createSecretsStoreForAgent(secretsPath)
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const result = parseSecretsFile(JSON.parse(raw))
-    expect(result.ok).toBe(true)
-    if (!result.ok) return
-    expect(result.file.version).toBe(2)
-    expect(result.file.providers).toEqual({})
-    expect(result.file.channels).toEqual({})
-    expect(result.file.mcp).toEqual({})
-  })
-
-  test('surfaces a parse error via drainErrors when the file is unparseable', async () => {
-    await writeFile(secretsPath, JSON.stringify({ random: 'garbage', notACredential: 42 }))
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    const errors = store.drainErrors()
-    expect(errors.length).toBeGreaterThan(0)
-    expect(errors[0]?.message).toMatch(/secrets file is not a valid TypeClaw secrets file/)
-  })
-
-  test('surfaces a parse error via drainErrors when the file is not valid JSON', async () => {
-    await writeFile(secretsPath, '{ not json')
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    const errors = store.drainErrors()
-    expect(errors.length).toBeGreaterThan(0)
-    expect(errors[0]?.message).toMatch(/secrets file is not valid JSON/)
-  })
-
-  test('two store instances writing concurrently both land their changes', async () => {
-    const a = createSecretsStoreForAgent(secretsPath)
-    const b = createSecretsStoreForAgent(secretsPath)
-
-    a.set('openai', { type: 'api_key', key: 'sk-a' })
-    b.set('fireworks', { type: 'api_key', key: 'fw-b' })
-
-    const fresh = createSecretsStoreForAgent(secretsPath)
-    expect(fresh.get('openai')).toEqual({ type: 'api_key', key: 'sk-a' })
-    expect(fresh.get('fireworks')).toEqual({ type: 'api_key', key: 'fw-b' })
-  })
-
-  test('mutation check: bypassing the wrap (AuthStorage.create directly) breaks the envelope shape', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai', { type: 'api_key', key: 'sk-mutation' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as Record<string, unknown>
-
-    expect(obj['version']).toBe(2)
-    expect(obj['providers']).toBeDefined()
-    expect(obj['channels']).toBeDefined()
-    expect(obj['openai']).toBeUndefined()
-  })
-
-  describe('mcp credentials', () => {
-    async function readEnvelope(): Promise<{
-      providers: Record<string, unknown>
-      channels: Record<string, unknown>
-      mcp: Record<string, unknown>
-    }> {
-      return JSON.parse(await readFile(secretsPath, 'utf8')) as {
-        providers: Record<string, unknown>
-        channels: Record<string, unknown>
-        mcp: Record<string, unknown>
-      }
-    }
-
-    test('read/write/update/remove preserves sibling MCP servers and other slices', async () => {
-      await writeFile(
-        secretsPath,
-        JSON.stringify({
-          version: 2,
-          providers: { openai: { type: 'api_key', key: { value: 'sk-existing' } } },
-          channels: { 'discord-bot': { token: { value: 'discord-test' } } },
-          mcp: { existing: { client: { client_id: 'existing-client' } } },
-        }),
-      )
-      const backend = new SecretsBackend(secretsPath)
-
-      backend.writeMcpCredentialSync('linear', {
-        client: { client_id: 'test-client' },
-        tokens: { access_token: 'access-test', refresh_token: 'refresh-test' },
-      })
-      await backend.updateMcpAsync(async (mcp) => ({
-        result: undefined,
-        next: {
-          ...mcp,
-          linear: {
-            ...mcp.linear,
-            tokens: { access_token: 'access-rotated', refresh_token: 'refresh-rotated' },
-          },
+    await expect(
+      backend.modify(
+        'openai',
+        async () => {
+          callbackCalled = true
+          return { type: 'api_key', key: 'must-not-write' }
         },
-      }))
+        { signal: controller.signal },
+      ),
+    ).rejects.toBe(controller.signal.reason)
 
-      expect(backend.tryReadMcpSync().existing).toEqual({ client: { client_id: 'existing-client' } })
-      expect(backend.readMcpCredentialSync('linear')).toEqual({
-        client: { client_id: 'test-client' },
-        tokens: { access_token: 'access-rotated', refresh_token: 'refresh-rotated' },
-      })
-      const envelope = await readEnvelope()
-      expect(envelope.providers.openai).toEqual({ type: 'api_key', key: { value: 'sk-existing' } })
-      expect(envelope.channels['discord-bot']).toEqual({ token: { value: 'discord-test' } })
-      expect(envelope.mcp.existing).toEqual({ client: { client_id: 'existing-client' } })
-      expect(envelope.mcp.linear).toEqual({
-        client: { client_id: 'test-client' },
-        tokens: { access_token: 'access-rotated', refresh_token: 'refresh-rotated' },
-      })
+    expect(callbackCalled).toBe(false)
+    expect(existsSync(path)).toBe(false)
+  })
 
-      expect(backend.removeMcpCredentialSync('linear')).toBe(true)
-      expect(backend.removeMcpCredentialSync('missing')).toBe(false)
-      expect(backend.tryReadMcpSync()).toEqual({ existing: { client: { client_id: 'existing-client' } } })
+  test('rejects a waiting mutation on abort without running it or leaking the lock', async () => {
+    const backend = new SecretsBackend(path)
+    const { promise: firstCanFinish, resolve: finishFirst } = Promise.withResolvers<void>()
+    const { promise: firstHasLock, resolve: firstLocked } = Promise.withResolvers<void>()
+    const first = backend.modify('openai', async () => {
+      firstLocked()
+      await firstCanFinish
+      return { type: 'api_key', key: 'first' }
     })
+    await firstHasLock
+
+    const controller = new AbortController()
+    let waitingCallbackCalled = false
+    const waiting = backend.modify(
+      'fireworks',
+      async () => {
+        waitingCallbackCalled = true
+        return { type: 'api_key', key: 'must-not-write' }
+      },
+      { signal: controller.signal },
+    )
+    let waitingRejected = false
+    void waiting.catch(() => {
+      waitingRejected = true
+    })
+    controller.abort()
+    for (let i = 0; i < 5; i++) await Promise.resolve()
+
+    expect(waitingRejected).toBe(true)
+    expect(waitingCallbackCalled).toBe(false)
+    finishFirst()
+    await first
+    await expect(waiting).rejects.toBe(controller.signal.reason)
+    await expect(backend.modify('anthropic', async () => undefined)).resolves.toBeUndefined()
+    expect(waitingCallbackCalled).toBe(false)
+    expect(JSON.parse(await readFile(path, 'utf8')).providers).toEqual({
+      openai: { type: 'api_key', key: { value: 'first' } },
+    })
+  })
+
+  test('rejects a compromised provider lock without an uncaught exception or credential write', async () => {
+    const backend = new SecretsBackend(path, { ...ASYNC_LOCK_OPTIONS, stale: 2_000 })
+    const { promise: modifyCanContinue, resolve: continueModify } = Promise.withResolvers<void>()
+    const { promise: callbackHasStarted, resolve: callbackStarted } = Promise.withResolvers<void>()
+    let uncaughtError: Error | undefined
+    const captureUncaught = (error: Error): void => {
+      uncaughtError = error
+    }
+    process.on('uncaughtException', captureUncaught)
+
+    const modification = backend.modify('openai', async () => {
+      callbackStarted()
+      await modifyCanContinue
+      return { type: 'api_key', key: 'must-not-write' }
+    })
+    try {
+      await callbackHasStarted
+      await rm(`${path}.lock`, { recursive: true, force: true })
+      // proper-lockfile detects a removed lock from its real heartbeat
+      // (node_modules/proper-lockfile/lib/lockfile.js:109-122), whose fs
+      // callback fake timers cannot drive.
+      const { promise: heartbeatHasRun, resolve: heartbeatRan } = Promise.withResolvers<void>()
+      setTimeout(heartbeatRan, 3_000)
+      await heartbeatHasRun
+      continueModify()
+
+      let modificationError: unknown
+      try {
+        await modification
+      } catch (error) {
+        modificationError = error
+      }
+
+      expect(uncaughtError).toBeUndefined()
+      expect(modificationError).toMatchObject({ code: 'ECOMPROMISED' })
+      expect(await backend.read('openai')).toBeUndefined()
+    } finally {
+      continueModify()
+      process.off('uncaughtException', captureUncaught)
+      await modification.catch(() => undefined)
+    }
+  }, 10_000)
+
+  test('returns complete snapshots while a writer holds the provider lock', async () => {
+    const backend = new SecretsBackend(path)
+    await backend.modify('openai', async () => ({ type: 'api_key', key: 'old' }))
+    await mkdir(`${path}.lock`)
+
+    const snapshot = Promise.all([backend.read('openai'), backend.list()])
+    try {
+      // A snapshot read must not wait for a writer's lock. With the old locked
+      // reader, this remains pending while proper-lockfile retries. Yield a
+      // bounded number of microtasks so immediately resolved snapshots settle.
+      let settled = false
+      void snapshot.then(() => {
+        settled = true
+      })
+      for (let i = 0; i < 10; i++) await Promise.resolve()
+      expect(settled).toBe(true)
+      expect(await snapshot).toEqual([{ type: 'api_key', key: 'old' }, [{ providerId: 'openai', type: 'api_key' }]])
+    } finally {
+      await rm(`${path}.lock`, { recursive: true, force: true })
+      await snapshot
+    }
   })
 })
 
-describe('SecretsBackend idempotency (Oracle bridge rule)', () => {
+describe('v2 credential envelope regressions', () => {
   let dir: string
-  let secretsPath: string
-  let prevEnv: Record<string, string | undefined>
-
+  let path: string
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'typeclaw-secrets-idempotent-'))
-    secretsPath = join(dir, 'secrets.json')
-    prevEnv = {
-      FIREWORKS_API_KEY: process.env.FIREWORKS_API_KEY,
-      OPENAI_API_KEY: process.env.OPENAI_API_KEY,
-    }
-    delete process.env.FIREWORKS_API_KEY
-    delete process.env.OPENAI_API_KEY
+    dir = await mkdtemp(join(tmpdir(), 'typeclaw-storage-'))
+    path = join(dir, 'secrets.json')
   })
+  afterEach(async () => rm(dir, { recursive: true, force: true }))
 
-  afterEach(async () => {
-    for (const [k, v] of Object.entries(prevEnv)) {
-      if (v === undefined) delete process.env[k]
-      else process.env[k] = v
-    }
-    await rm(dir, { recursive: true, force: true })
-  })
-
-  test('OAuth-only write preserves untouched api-key Secret with env field verbatim', async () => {
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: {
-          fireworks: { type: 'api_key', key: { value: 'fw_disk', env: 'FIREWORKS_API_KEY' } },
-          'openai-codex': { type: 'oauth', access: 'a-old', refresh: 'r', expires: 1 },
-        },
-      }),
-    )
-    process.env.FIREWORKS_API_KEY = 'fw_from_env'
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    // OAuth-style mutation: AuthStorage rewrites the full slice
-    store.set('openai-codex', { type: 'oauth', access: 'a-refreshed', refresh: 'r', expires: 2 })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, unknown> }
-
-    expect(obj.providers['fireworks']).toEqual({
-      type: 'api_key',
-      key: { value: 'fw_disk', env: 'FIREWORKS_API_KEY' },
+  test('first modify creates parseable v2 envelope with 0600 mode', async () => {
+    const store = new SecretsBackend(path)
+    await store.modify('openai', async () => ({ type: 'api_key', key: 'key' }))
+    const file = JSON.parse(await readFile(path, 'utf8'))
+    expect(file).toMatchObject({
+      version: 2,
+      providers: { openai: { type: 'api_key', key: { value: 'key' } } },
+      channels: {},
+      mcp: {},
     })
-    expect(obj.providers['openai-codex']).toEqual({
+    // NTFS mode bits are not meaningful on Windows; see #899.
+    if (!onWindows) expect((await stat(path)).mode & 0o777).toBe(0o600)
+  })
+
+  test('storage failures reject rather than silently recording an internal error', async () => {
+    await writeFile(path, '{invalid')
+    await expect(new SecretsBackend(path).read('openai')).rejects.toThrow('not valid JSON')
+  })
+
+  test('preserves GitHub CLI, MCP, channels, and unknown top-level slices', async () => {
+    const store = new SecretsBackend(path)
+    store.writeGithubCliSync({ hosts: 'host-store' })
+    store.writeMcpCredentialSync('linear', { tokens: { access_token: 'token' } })
+    store.writeChannelsSync({ 'discord-bot': { token: { value: 'channel' } } })
+    await store.modify('openai', async () => ({ type: 'api_key', key: 'key' }))
+    const file = JSON.parse(await readFile(path, 'utf8'))
+    expect(file.githubCli).toEqual({ hosts: 'host-store' })
+    expect(file.mcp.linear).toEqual({ tokens: { access_token: 'token' } })
+    expect(file.channels['discord-bot']).toEqual({ token: { value: 'channel' } })
+  })
+
+  test('preserves env-bound Secret for an OAuth write and retains env when key changes', async () => {
+    const store = new SecretsBackend(path)
+    store.writeProviderCredentialSync('fireworks', { type: 'api_key', key: { value: 'old', env: 'CUSTOM' } })
+    await store.modify('openai-codex', async () => ({
       type: 'oauth',
-      access: 'a-refreshed',
+      access: 'a',
       refresh: 'r',
-      expires: 2,
-    })
+      expires: Date.now() + 60000,
+    }))
+    await store.modify('fireworks', async () => ({ type: 'api_key', key: 'new' }))
+    const file = JSON.parse(await readFile(path, 'utf8'))
+    expect(file.providers.fireworks).toEqual({ type: 'api_key', key: { value: 'new', env: 'CUSTOM' } })
   })
 
-  test('api-key value change preserves the env field across the write', async () => {
+  test('delete removes only the requested provider and channel removal stays idempotent', async () => {
+    const store = new SecretsBackend(path)
+    store.writeProviderCredentialSync('openai', { type: 'api_key', key: { value: 'one' } })
+    store.writeProviderCredentialSync('fireworks', { type: 'api_key', key: { value: 'two' } })
+    store.writeChannelsSync({ 'discord-bot': { token: { value: 'token' } } })
+    await store.delete('openai')
+    expect(store.removeChannelSync('discord-bot')).toBe(true)
+    expect(store.removeChannelSync('discord-bot')).toBe(false)
+    expect(await store.read('openai')).toBeUndefined()
+    expect(await store.read('fireworks')).toEqual({ type: 'api_key', key: 'two' })
+  })
+  test('concurrent store instances retain both independent credential writes', async () => {
+    const left = new SecretsBackend(path)
+    const right = new SecretsBackend(path)
+    await Promise.all([
+      left.modify('openai', async () => ({ type: 'api_key', key: 'left' })),
+      right.modify('fireworks', async () => ({ type: 'api_key', key: 'right' })),
+    ])
+    expect(await left.read('openai')).toEqual({ type: 'api_key', key: 'left' })
+    expect(await right.read('fireworks')).toEqual({ type: 'api_key', key: 'right' })
+  })
+
+  test('preserves unknown top-level data through a credential mutation', async () => {
     await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: {
-          fireworks: { type: 'api_key', key: { value: 'fw_old', env: 'CUSTOM_FW' } },
-        },
-      }),
+      path,
+      JSON.stringify({ version: 2, providers: {}, channels: {}, mcp: {}, futureSlice: { preserve: true } }),
     )
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('fireworks', { type: 'api_key', key: 'fw_new' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, unknown> }
-    expect(obj.providers['fireworks']).toEqual({
-      type: 'api_key',
-      key: { value: 'fw_new', env: 'CUSTOM_FW' },
-    })
+    await new SecretsBackend(path).modify('openai', async () => ({ type: 'api_key', key: 'key' }))
+    expect(JSON.parse(await readFile(path, 'utf8')).futureSlice).toEqual({ preserve: true })
+  })
+  test('updates and removes MCP credentials without disturbing sibling slices', async () => {
+    const store = new SecretsBackend(path)
+    store.writeProviderCredentialSync('openai', { type: 'api_key', key: { value: 'provider' } })
+    store.writeMcpCredentialSync('first', { tokens: { access_token: 'first' } })
+    store.writeMcpCredentialSync('second', { tokens: { access_token: 'second' } })
+    await store.updateMcpAsync(async (current) => ({
+      result: undefined,
+      next: { ...current, first: { tokens: { access_token: 'rotated' } } },
+    }))
+    expect(store.removeMcpCredentialSync('second')).toBe(true)
+    expect(store.tryReadMcpSync()).toEqual({ first: { tokens: { access_token: 'rotated' } } })
+    expect(await store.read('openai')).toEqual({ type: 'api_key', key: 'provider' })
   })
 
-  test('env-resolved api-key value is NOT persisted to disk on unrelated OAuth refresh', async () => {
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: {
-          fireworks: { type: 'api_key', key: { value: 'fw_disk' } },
-          'openai-codex': { type: 'oauth', access: 'a', refresh: 'r', expires: 1 },
-        },
-      }),
-    )
-    process.env.FIREWORKS_API_KEY = 'fw_env_only'
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai-codex', { type: 'oauth', access: 'a-refreshed', refresh: 'r', expires: 2 })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, { type: string; key?: unknown }> }
-    expect(obj.providers['fireworks']?.key).toEqual({ value: 'fw_disk' })
-  })
-
-  test('removed provider is actually removed (not resurrected)', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai', { type: 'api_key', key: 'sk-1' })
-    store.set('fireworks', { type: 'api_key', key: 'fw-1' })
-    store.remove('openai')
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, unknown> }
-    expect(obj.providers['openai']).toBeUndefined()
-    expect(obj.providers['fireworks']).toBeDefined()
-  })
-
-  test('newly added provider gets the string-value Secret shape with no env binding', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('openai', { type: 'api_key', key: 'sk-fresh' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, { key: { value?: string; env?: string } }> }
-    expect(obj.providers['openai']?.key).toEqual({ value: 'sk-fresh' })
-  })
-
-  test('env-wins on read: AuthStorage.get returns env value when api-key env var is set', async () => {
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: { fireworks: { type: 'api_key', key: { value: 'fw_disk' } } },
-      }),
-    )
-    process.env.FIREWORKS_API_KEY = 'fw_env'
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    expect(store.get('fireworks')).toEqual({ type: 'api_key', key: 'fw_env' })
-  })
-
-  test('env-snapshot: env mutation between read and write does NOT clobber on-disk value', async () => {
-    // Regression: env var is set at read time (AuthStorage sees fw_from_env
-    // for fireworks), removed before an unrelated OAuth-refresh write. The
-    // idempotency check must use the read-time snapshot, not re-resolve
-    // against current env — otherwise fireworks is misclassified as mutated
-    // and fw_disk is overwritten with fw_from_env.
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: {
-          fireworks: { type: 'api_key', key: { value: 'fw_disk' } },
-          'openai-codex': { type: 'oauth', access: 'a-old', refresh: 'r', expires: 1 },
-        },
-      }),
-    )
-    process.env.FIREWORKS_API_KEY = 'fw_from_env'
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    delete process.env.FIREWORKS_API_KEY
-    store.set('openai-codex', { type: 'oauth', access: 'a-refreshed', refresh: 'r', expires: 2 })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, { type: string; key?: unknown }> }
-    expect(obj.providers['fireworks']?.key).toEqual({ value: 'fw_disk' })
-  })
-
-  test('empty key from AuthStorage on api-key preserves prior on-disk Secret', async () => {
-    // AuthStorage handing back `{ type: 'api_key', key: '' }` would, if
-    // written verbatim, produce `{ value: '' }` on disk — which fails the
-    // schema's `min(1)` constraint at next read and locks the user out of
-    // their secrets file. The bridge treats empty `key` as a no-op and
-    // preserves the prior on-disk Secret if any.
-    await writeFile(
-      secretsPath,
-      JSON.stringify({
-        version: 2,
-        providers: { fireworks: { type: 'api_key', key: { value: 'fw_disk' } } },
-      }),
-    )
-
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('fireworks', { type: 'api_key', key: '' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, { key: { value?: string; env?: string } }> }
-    expect(obj.providers['fireworks']?.key).toEqual({ value: 'fw_disk' })
-
-    // Round-trip: re-opening must succeed (file is still parseable).
-    const fresh = createSecretsStoreForAgent(secretsPath)
-    expect(fresh.get('fireworks')).toEqual({ type: 'api_key', key: 'fw_disk' })
-  })
-
-  test('empty key from AuthStorage on a new provider is dropped (not written as { value: "" })', async () => {
-    const store = createSecretsStoreForAgent(secretsPath)
-    store.set('fireworks', { type: 'api_key', key: '' })
-
-    const raw = await readFile(secretsPath, 'utf8')
-    const obj = JSON.parse(raw) as { providers: Record<string, unknown> }
-    expect(obj.providers['fireworks']).toBeUndefined()
-  })
-
-  describe('removeChannelSync', () => {
-    async function seedChannels(channels: Record<string, unknown>): Promise<void> {
-      await writeFile(
-        secretsPath,
-        `${JSON.stringify({ $schema: './node_modules/typeclaw/secrets.schema.json', version: 2, providers: {}, channels }, null, 2)}\n`,
-      )
+  test('active canonical env cannot rewrite an untouched API-key Secret during another provider mutation', async () => {
+    const previous = process.env.FIREWORKS_API_KEY
+    process.env.FIREWORKS_API_KEY = 'runtime-only'
+    try {
+      const store = new SecretsBackend(path)
+      store.writeProviderCredentialSync('fireworks', { type: 'api_key', key: { value: 'disk', env: 'CUSTOM_KEY' } })
+      await store.modify('openai-codex', async () => ({
+        type: 'oauth',
+        access: 'access',
+        refresh: 'refresh',
+        expires: Date.now() + 60_000,
+      }))
+      const stored = JSON.parse(await readFile(path, 'utf8')).providers.fireworks
+      expect(stored).toEqual({ type: 'api_key', key: { value: 'disk', env: 'CUSTOM_KEY' } })
+    } finally {
+      if (previous === undefined) delete process.env.FIREWORKS_API_KEY
+      else process.env.FIREWORKS_API_KEY = previous
     }
-
-    test('removes a present channel and leaves siblings intact', async () => {
-      await seedChannels({ 'discord-bot': { token: { value: 't' } }, 'telegram-bot': { token: { value: 'u' } } })
-      const backend = new SecretsBackend(secretsPath)
-
-      expect(backend.removeChannelSync('discord-bot')).toBe(true)
-      expect(backend.readChannelsSync()).toEqual({ 'telegram-bot': { token: { value: 'u' } } })
-    })
-
-    test('returns false when the channel is absent and does not rewrite', async () => {
-      await seedChannels({ 'discord-bot': { token: { value: 't' } } })
-      const backend = new SecretsBackend(secretsPath)
-
-      expect(backend.removeChannelSync('slack-bot')).toBe(false)
-      expect(backend.readChannelsSync()).toEqual({ 'discord-bot': { token: { value: 't' } } })
-    })
-
-    test('returns false when secrets.json does not exist', () => {
-      const backend = new SecretsBackend(join(dir, 'missing.json'))
-      expect(backend.removeChannelSync('discord-bot')).toBe(false)
-    })
   })
 })

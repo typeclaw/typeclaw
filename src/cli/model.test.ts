@@ -128,7 +128,7 @@ describe('typeclaw model set/add reject a definitely-invalid ref via the real CL
 
 describe('parseThinkingArg', () => {
   test('accepts every supported level, case-insensitively', () => {
-    for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const) {
+    for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(parseThinkingArg(level.toUpperCase())).toEqual({ ok: true, level })
     }
   })

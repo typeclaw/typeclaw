@@ -1,4 +1,4 @@
-import type { EditorTheme, MarkdownTheme } from '@mariozechner/pi-tui'
+import type { EditorTheme, MarkdownTheme } from '@earendil-works/pi-tui'
 
 const wrap = (code: string) => (text: string) => `\x1b[${code}m${text}\x1b[0m`
 const wrapRgb = (r: number, g: number, b: number) => (text: string) => `\x1b[38;2;${r};${g};${b}m${text}\x1b[0m`

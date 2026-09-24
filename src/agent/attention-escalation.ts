@@ -1,4 +1,4 @@
-import type { ThinkingLevel } from '@mariozechner/pi-agent-core'
+import type { ThinkingLevel } from '@earendil-works/pi-agent-core'
 
 function normalize(text: string): string {
   return text
@@ -710,9 +710,11 @@ export function detectAttentionEscalation(text: string, prior?: QuestionSignal |
   return MORPHEME_PATTERNS.some((pattern) => pattern.test(normalized))
 }
 
-// `xhigh` is the strongest level. It's OpenAI-family-only, but `setThinkingLevel`
-// clamps it per-model (down to `high` on non-OpenAI), so it's safe to pass
-// unconditionally and gives OpenAI models maximum effort on escalation turns.
+// Escalation targets `xhigh`. `setThinkingLevel` clamps it per model (down to
+// `high` where unsupported), so it's safe to pass unconditionally. `max` ranks
+// above `xhigh` (pi-ai models.js level order) on the models that offer it
+// (GPT-6, Claude Opus 5.5), so a session already at `max` keeps it: an
+// escalation turn must never get less effort than an ordinary one.
 const ESCALATED_LEVEL: ThinkingLevel = 'xhigh'
 
 // `allowEscalation: false` pins the turn to `sessionDefault`. Subagent turns set
@@ -729,7 +731,8 @@ export function resolveTurnThinkingLevel(
   options?: TurnThinkingOptions,
 ): ThinkingLevel | undefined {
   if (options?.allowEscalation === false) return sessionDefault
-  return detectAttentionEscalation(text, prior) ? ESCALATED_LEVEL : sessionDefault
+  if (sessionDefault === 'max' || !detectAttentionEscalation(text, prior)) return sessionDefault
+  return ESCALATED_LEVEL
 }
 
 type ThinkingLevelSettable = {

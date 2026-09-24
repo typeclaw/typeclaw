@@ -1,5 +1,5 @@
-import type { KnownApi, Model } from '@mariozechner/pi-ai'
-import { SettingsManager } from '@mariozechner/pi-coding-agent'
+import type { KnownApi, Model } from '@earendil-works/pi-ai'
+import { SettingsManager } from '@earendil-works/pi-coding-agent'
 
 // Compaction trigger expressed as a fraction of the model's context window.
 // pi-coding-agent auto-compaction fires when `contextTokens > contextWindow -

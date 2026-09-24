@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
-import type { AgentSession } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
+import type { AgentSession } from '@earendil-works/pi-coding-agent'
 
 import type { CreateSessionOptions } from '@/agent'
 import * as realCapJsonlModule from '@/bundled-plugins/tool-result-cap/cap-jsonl'
@@ -634,7 +634,7 @@ describe('buildChannelSessionFactory — production wiring contract', () => {
     }
   })
 
-  test('warns when malformed JSONL is silently replaced during rehydrate', async () => {
+  test('warns and preserves malformed JSONL while creating a replacement session', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'channel-session-factory-'))
     const sessionId = 'private-persisted-session'
     const sessionFile = 'private-persisted-session.jsonl'
@@ -647,8 +647,8 @@ describe('buildChannelSessionFactory — production wiring contract', () => {
     const replacementSessionId = await rehydrateChannelSession(factory, sessionId, sessionFile)
 
     expect(replacementSessionId).not.toBe(sessionId)
-    expect(readFileSync(join(sessionDir, sessionFile), 'utf8')).not.toContain(malformedJsonl)
-    expect(warnings).toEqual(['[channels] persisted session was replaced during rehydrate'])
+    expect(readFileSync(join(sessionDir, sessionFile), 'utf8')).toBe(malformedJsonl)
+    expect(warnings).toEqual(['[channels] persisted session history unavailable; creating new'])
     expect(warnings.join('\n')).not.toContain(sessionId)
     expect(warnings.join('\n')).not.toContain(sessionFile)
     expect(warnings.join('\n')).not.toContain(tmp)
@@ -670,7 +670,7 @@ describe('buildChannelSessionFactory — production wiring contract', () => {
       const { factory, warnings } = makeRehydrateHarness(tmp, null)
       const sessionId = await rehydrateChannelSession(factory, 'persisted-session', 'persisted.jsonl')
       expect(sessionId).not.toBe('persisted-session')
-      expect(warnings).toEqual(['[channels] persisted session rehydrate failed; creating new'])
+      expect(warnings).toEqual(['[channels] persisted session history unavailable; creating new'])
     } finally {
       Object.defineProperty(SessionManager, 'open', {
         configurable: true,
@@ -763,7 +763,7 @@ describe('buildChannelSessionFactory — production wiring contract', () => {
       await rehydrateChannelSession(factory, sessionId, sessionFile)
       expect(warnings).toEqual([
         '[channels] rehydrate-cap unavailable; continuing with open',
-        '[channels] persisted session rehydrate failed; creating new',
+        '[channels] persisted session history unavailable; creating new',
       ])
       expect(warnings.join('\n')).not.toContain(sessionId)
       expect(warnings.join('\n')).not.toContain(sessionFile)

@@ -1,4 +1,4 @@
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 import type { Server as BunServer, ServerWebSocket } from 'bun'
 
 import {

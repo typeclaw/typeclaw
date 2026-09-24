@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSession as defaultCreateSession } from '@/agent'
 import type { LiveSessionRegistry } from '@/agent/live-sessions'
@@ -185,8 +185,9 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
 // because pi-coding-agent prefixes filenames with an ISO timestamp at write
 // time that is not derivable from sessionId alone. Failure to reopen
 // (corruption, missing file, schema drift, or v2 mapping with no sessionFile)
-// falls back to a fresh session — matching the router's existing best-effort
-// durability for channel sessions.
+// falls back to a fresh session. pi 0.87 preserves a non-empty invalid file
+// rather than silently rewriting it, so the warning below explicitly says its
+// history is unavailable while retaining the file for operator recovery.
 function tryReopenOrCreate(
   cwd: string,
   sessionDir: string,
@@ -234,7 +235,7 @@ function tryReopenOrCreate(
     return sessionManager
   } catch (err) {
     if (!errorChainHasCode(err, 'ENOENT')) {
-      logger.warn('[channels] persisted session rehydrate failed; creating new')
+      logger.warn('[channels] persisted session history unavailable; creating new')
     }
     return SessionManager.create(cwd, sessionDir)
   }

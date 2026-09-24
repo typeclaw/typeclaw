@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { Context, Model, ThinkingLevel } from '@mariozechner/pi-ai'
-import { streamSimple } from '@mariozechner/pi-ai'
+import { normalizeContext, type Context, type Model, type ThinkingLevel } from '@earendil-works/pi-ai'
+import { streamSimple } from '@earendil-works/pi-ai/api/openai-completions'
 
 import { KNOWN_PROVIDERS } from './providers'
 
@@ -33,7 +33,7 @@ async function buildUpstagePayload(
   let captured: CapturedPayload | undefined
   const stopMarker = new Error('payload-captured')
 
-  const s = streamSimple(model, context, {
+  const s = streamSimple(model, normalizeContext(context), {
     apiKey: 'up_test-key',
     reasoning,
     onPayload: (payload) => {

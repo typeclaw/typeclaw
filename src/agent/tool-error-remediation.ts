@@ -19,7 +19,7 @@ type RemediationRule = {
 }
 
 // First matching rule wins; keep the most specific patterns first. Upstream
-// sources: node_modules/@mariozechner/pi-coding-agent/dist/core/tools/{edit,read,ls,grep}.js
+// sources: node_modules/@earendil-works/pi-coding-agent/dist/core/tools/{edit,read,ls,grep}.js
 const RULES: readonly RemediationRule[] = [
   {
     tools: ['edit'],

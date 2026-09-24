@@ -7,8 +7,8 @@ import {
   ProcessTerminal,
   type Terminal,
   Text,
-  TUI,
-} from '@mariozechner/pi-tui'
+  TuiMainScreen,
+} from '@earendil-works/pi-tui'
 
 import { parseCommand } from '@/commands'
 
@@ -97,7 +97,9 @@ export function createTui({
 }: TuiOptions) {
   async function run(): Promise<TuiRunResult> {
     const terminal = createTerminal()
-    const tui = new TUI(terminal)
+    // pi-tui 0.87 exports TUI only as an interface; TuiMainScreen is the
+    // concrete scrollback renderer (dist/tui.d.ts:213-244, tui-main-screen.d.ts:11-12).
+    const tui = new TuiMainScreen(terminal)
     const displayUrl = redactUrl(url)
 
     const status = new Text(colors.dim(`connecting to ${displayUrl}...`), 0, 0)

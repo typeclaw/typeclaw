@@ -11,8 +11,8 @@ import {
   createReadToolDefinition as piCreateReadToolDefinition,
   createWriteToolDefinition as piCreateWriteToolDefinition,
   defineTool as piDefineTool,
-} from '@mariozechner/pi-coding-agent'
-import type { BashSpawnContext, ToolDefinition } from '@mariozechner/pi-coding-agent'
+} from '@earendil-works/pi-coding-agent'
+import type { BashSpawnContext, ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { Static, TSchema } from 'typebox'
 import { Type } from 'typebox'
 import { z } from 'zod'
@@ -182,22 +182,16 @@ export function sanitizeBashSpawnEnvironment(
   return env
 }
 
-// pi-coding-agent 0.73 contract (load-bearing for hook coverage):
+// pi-coding-agent 0.87 contract (load-bearing for hook coverage):
 //   - `createAgentSession({ tools: string[] })` is a name allowlist: only the
-//     listed names stay active, and that allowlist gates BOTH builtins and
-//     custom tools (see `allowedToolNames` in pi's `_refreshToolRegistry`).
-//   - `noTools: "builtin"` drops pi's read/bash/edit/write from the INITIAL
-//     active set; pi still registers its base builtins, so a same-named entry
-//     in `customTools` is what overrides the implementation (registry
-//     last-write-wins). Passing an explicit `tools:` allowlist plus shipping all
-//     seven wrapped builtins is what makes the wrapped versions the only
-//     callable ones.
+//     listed builtin and custom tool names are active (sdk.d.ts:35-47).
+//   - `noTools: "builtin"` disables Pi's default read/bash/edit/write tools but
+//     leaves custom tools eligible for that allowlist (sdk.d.ts:27-47).
 //
-// Consequence: every builtin enters as a `ToolDefinition` (pi now exposes
-// `create*ToolDefinition` factories), TypeClaw wraps each one with its hook +
-// guard + sandbox pipeline, and the call site routes them through `customTools`
-// while narrowing via `tools:` names. There is no longer an `AgentTool` vs
-// `ToolDefinition` split.
+// Consequence: every builtin enters as a `ToolDefinition`, TypeClaw wraps each
+// one with its hook + guard + sandbox pipeline, and the call site routes them
+// through `customTools` while narrowing via `tools:` names. A named custom
+// definition replaces the built-in implementation in the active registry.
 type TypeclawToolName = 'web_search' | 'web_fetch'
 
 // pi builtins resolve relative paths (and, for trusted/owner bash, the spawn
@@ -211,7 +205,13 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
     case 'read':
       return piCreateReadToolDefinition(cwd)
     case 'bash':
-      return piCreateBashToolDefinition(cwd, { spawnHook: bashSpawnHookWithOverlay })
+      return piCreateBashToolDefinition(cwd, {
+        // Pi 0.87 assumes a non-empty ExtensionContext when session metadata is
+        // enabled (tools/bash.js:122-143). TypeClaw owns the bash environment
+        // boundary, so disable Pi metadata rather than bypassing the spawn hook.
+        exposeSessionEnvironment: false,
+        spawnHook: bashSpawnHookWithOverlay,
+      })
     case 'edit':
       return piCreateEditToolDefinition(cwd)
     case 'write':
@@ -326,20 +326,15 @@ export type WrapSystemToolOptions = {
 }
 
 // Zod 4 emits a top-level `"$schema": "https://json-schema.org/draft/2020-12/schema"`
-// pointer on every converted schema. Ajv v8 (used by pi-ai's runtime tool-argument
-// validator and by ModelRegistry's models.json validator) is configured for
-// Draft 7 and rejects unknown `$schema` URIs with:
-//
-//   no schema with key or ref "https://json-schema.org/draft/2020-12/schema"
-//
-// That error is raised before the tool's execute is even invoked, so the model
-// sees the failure as a tool-call result and reacts by retrying or falling back
-// to other tools. In the memory-logger / dreaming subagents this meant the
-// `find_entry` tool was permanently broken: the subagent kept falling back to
-// `read(offset=1, limit=2000)` and chunked through entire multi-hundred-KB
-// transcripts on every channel turn. Stripping `$schema` is the minimal,
-// converter-version-independent fix; it leaves the actual JSON-schema body
-// untouched and lets Ajv use its default draft.
+// pointer on every converted schema. It was first stripped because pi-ai's former
+// Ajv (draft 7) validator rejected that URI before execute ran, which left the
+// memory-logger and dreaming subagents without `find_entry` and made them read
+// whole transcripts on every channel turn. pi 0.87 validates with TypeBox
+// instead, but these parameter schemas are still forwarded verbatim to provider
+// APIs, and pi strips JSON-Schema meta declarations itself only for Google
+// (`sanitizeForOpenApi` in pi-ai dist/api/google-shared.js). Stripping the
+// pointer keeps every provider's tool payload identical to earlier releases; it
+// removes no constraint, since the schema body is untouched.
 export function zodToToolParameters(schema: z.ZodType<unknown>): TSchema {
   const json = z.toJSONSchema(schema, { io: 'input', reused: 'inline' }) as Record<string, unknown>
   delete json.$schema

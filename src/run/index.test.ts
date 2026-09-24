@@ -115,10 +115,10 @@ describe('startAgent', () => {
     }
   })
 
-  test('awaits provider-OAuth refresh before any session consumer starts, so a lock-holding refresh cannot ELOCKED a boot auth read', async () => {
-    // given a refresh that acquires the REAL secrets lock and blocks on a gate,
-    // and a channel manager whose start() does a real synchronous secrets read
-    // (the same lock path getAuthFor() uses; it ELOCKEDs if the lock is held)
+  test('awaits provider-OAuth refresh before any session consumer starts, so a lock-holding refresh cannot block a boot credential read', async () => {
+    // given a refresh that acquires the REAL CredentialStore lock and blocks on
+    // a gate, and a channel manager whose start() does a real synchronous
+    // secrets read on the same file
     const order: string[] = []
     let releaseGate: () => void = () => {}
     const gate = new Promise<void>((resolve) => {
@@ -131,13 +131,14 @@ describe('startAgent', () => {
 
     const refreshProviderOAuth = async ({ agentDir }: { agentDir: string }): Promise<unknown> => {
       const backend = new SecretsBackend(join(agentDir, 'secrets.json'))
-      return backend.withLockAsync(async () => {
+      await backend.modify('openai', async (current) => {
         order.push('refresh:lock-acquired')
         lockAcquired()
         await gate
         order.push('refresh:lock-released')
-        return { result: undefined }
+        return current
       })
+      return { result: undefined }
     }
 
     const createChannelManagerFor = (): ChannelManager => ({

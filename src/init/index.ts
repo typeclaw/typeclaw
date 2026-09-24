@@ -29,7 +29,7 @@ import {
 } from '@/container'
 import { hooklessGitArgs } from '@/git/hookless'
 import { commitSystemFile } from '@/git/system-commit'
-import { createSecretsStoreForAgent, type Channels, type Secret, SecretsBackend } from '@/secrets'
+import { type Channels, type Secret, SecretsBackend } from '@/secrets'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
 import { isWindows } from '@/shared/platform'
 import { createTui } from '@/tui'
@@ -949,10 +949,10 @@ export async function writeSecrets(
     visionProviderId !== null &&
     KNOWN_PROVIDERS[visionProviderId].apiKeyEnv !== null
   if (wantsDefaultKey || wantsVisionKey) {
-    const secretsStore = createSecretsStoreForAgent(join(root, 'secrets.json'))
-    if (wantsDefaultKey) secretsStore.set(providerId, { type: 'api_key', key: apiKey! })
+    const backend = new SecretsBackend(join(root, 'secrets.json'))
+    if (wantsDefaultKey) backend.writeProviderCredentialSync(providerId, { type: 'api_key', key: { value: apiKey! } })
     if (wantsVisionKey) {
-      secretsStore.set(visionProviderId, { type: 'api_key', key: visionApiKey! })
+      backend.writeProviderCredentialSync(visionProviderId, { type: 'api_key', key: { value: visionApiKey! } })
     }
   }
 

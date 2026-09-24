@@ -4,356 +4,241 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { resolveModel } from '@/config'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
-import { parseSecretsFile } from '@/secrets/schema'
+import { KNOWN_PROVIDERS, supportsApiKey } from '@/config/providers'
 
-import { getAuth, getAuthFor, resetAuthForTesting } from './auth'
+import { getAuthFor, invalidateProviderAuthCache } from './auth'
 
-describe('getAuth', () => {
-  let prevOpenai: string | undefined
-  let prevFireworks: string | undefined
-  let prevZai: string | undefined
-  let prevZaiCoding: string | undefined
-  let prevNodeEnv: string | undefined
-  let prevCwd: string
-  let cwd: string
+describe('getAuthFor', () => {
+  const priorEnv: Record<string, string | undefined> = {}
+  const priorNodeEnv = process.env.NODE_ENV
 
-  beforeEach(async () => {
-    prevOpenai = process.env.OPENAI_API_KEY
-    prevFireworks = process.env.FIREWORKS_API_KEY
-    prevZai = process.env.ZAI_API_KEY
-    prevZaiCoding = process.env.ZAI_CODING_API_KEY
-    prevNodeEnv = process.env.NODE_ENV
-    delete process.env.OPENAI_API_KEY
-    delete process.env.FIREWORKS_API_KEY
-    delete process.env.ZAI_API_KEY
-    delete process.env.ZAI_CODING_API_KEY
-    cwd = await mkdtemp(join(tmpdir(), 'typeclaw-auth-'))
-    prevCwd = process.cwd()
-    process.chdir(cwd)
-    resetAuthForTesting()
-  })
-
-  afterEach(async () => {
-    if (prevOpenai === undefined) delete process.env.OPENAI_API_KEY
-    else process.env.OPENAI_API_KEY = prevOpenai
-    if (prevFireworks === undefined) delete process.env.FIREWORKS_API_KEY
-    else process.env.FIREWORKS_API_KEY = prevFireworks
-    if (prevZai === undefined) delete process.env.ZAI_API_KEY
-    else process.env.ZAI_API_KEY = prevZai
-    if (prevZaiCoding === undefined) delete process.env.ZAI_CODING_API_KEY
-    else process.env.ZAI_CODING_API_KEY = prevZaiCoding
-    if (prevNodeEnv === undefined) delete process.env.NODE_ENV
-    else process.env.NODE_ENV = prevNodeEnv
-    resetAuthForTesting()
-    __resetConfigForTesting()
-    process.chdir(prevCwd)
-    await rm(cwd, { recursive: true, force: true })
-  })
-
-  test('env-wins: FIREWORKS_API_KEY satisfies hasAuth without persisting to secrets.json', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
-    )
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_test'
-
-    const auth = getAuth()
-
-    expect(auth.authStorage.hasAuth('fireworks')).toBe(true)
-    expect(await auth.authStorage.getApiKey('fireworks')).toBe('fw_test')
-
-    if (existsSync(join(cwd, 'secrets.json'))) {
-      const file = await readSecretsFile(join(cwd, 'secrets.json'))
-      expect(file.providers).toEqual({})
+  beforeEach(() => {
+    invalidateProviderAuthCache()
+    for (const provider of Object.values(KNOWN_PROVIDERS)) {
+      if (!provider.apiKeyEnv) continue
+      priorEnv[provider.apiKeyEnv] = process.env[provider.apiKeyEnv]
+      delete process.env[provider.apiKeyEnv]
     }
   })
 
-  test('env-wins: ZAI_API_KEY satisfies hasAuth for zai (paygo) without persisting to secrets.json', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'zai/glm-4.6' } }))
-    reloadConfig(cwd)
-    process.env.ZAI_API_KEY = 'zai_test'
+  afterEach(() => {
+    for (const [name, value] of Object.entries(priorEnv)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    if (priorNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = priorNodeEnv
+    invalidateProviderAuthCache()
+  })
 
-    const auth = getAuth()
-
-    expect(auth.authStorage.hasAuth('zai')).toBe(true)
-    expect(await auth.authStorage.getApiKey('zai')).toBe('zai_test')
-    if (existsSync(join(cwd, 'secrets.json'))) {
-      const file = await readSecretsFile(join(cwd, 'secrets.json'))
-      expect(file.providers).toEqual({})
+  test('resolves every API-key provider from its canonical env key', async () => {
+    for (const provider of Object.values(KNOWN_PROVIDERS)) {
+      if (!supportsApiKey(provider) || !provider.apiKeyEnv) continue
+      const key = `test-${provider.id}`
+      process.env[provider.apiKeyEnv] = key
+      const { modelRuntime } = await getAuthFor(provider.id)
+      const modelId = Object.keys(provider.models)[0]!
+      const auth = await modelRuntime.getAuth(resolveModel(`${provider.id}/${modelId}`))
+      expect(auth?.auth.apiKey).toBe(key)
     }
   })
 
-  test('env-wins: ZAI_CODING_API_KEY satisfies hasAuth for zai-coding (subscription) and does not bleed into zai', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'zai-coding/glm-5.1' } }))
-    reloadConfig(cwd)
-    process.env.ZAI_CODING_API_KEY = 'zai_coding_test'
-
-    const auth = getAuth()
-
-    expect(auth.authStorage.hasAuth('zai-coding')).toBe(true)
-    expect(await auth.authStorage.getApiKey('zai-coding')).toBe('zai_coding_test')
-    // The paygo provider must not pick up the coding-plan key: distinct env
-    // vars guarantee the two billing surfaces stay isolated.
-    expect(auth.authStorage.hasAuth('zai')).toBe(false)
+  test('shares one in-flight ModelRuntime per provider', async () => {
+    process.env.OPENAI_API_KEY = 'test-openai'
+    const first = getAuthFor('openai')
+    expect(getAuthFor('openai')).toBe(first)
+    expect((await first).modelRuntime).toBe((await getAuthFor('openai')).modelRuntime)
   })
 
-  test('env-wins: OPENAI_API_KEY satisfies hasAuth without persisting to secrets.json', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-5.4-nano' } }))
-    reloadConfig(cwd)
-    process.env.OPENAI_API_KEY = 'sk-test'
-
-    const auth = getAuth()
-
-    expect(auth.authStorage.hasAuth('openai')).toBe(true)
-    expect(await auth.authStorage.getApiKey('openai')).toBe('sk-test')
-    if (existsSync(join(cwd, 'secrets.json'))) {
-      const file = await readSecretsFile(join(cwd, 'secrets.json'))
-      expect(file.providers).toEqual({})
+  // pi 0.87 dispatches through the PROVIDER's transport, not `model.api`. A
+  // built-in provider whose transport differs from typeclaw's record (MiniMax is
+  // Anthropic Messages upstream, openai-completions here) would otherwise send
+  // every request to the wrong endpoint shape.
+  test('routes every curated API-key model to the endpoint its record declares', async () => {
+    const endpoint: Record<string, string> = {
+      'openai-completions': '/chat/completions',
+      'openai-responses': '/responses',
+      'anthropic-messages': '/messages',
+    }
+    const originalFetch = globalThis.fetch
+    let requested: string | undefined
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requested = input instanceof Request ? input.url : String(input)
+      return new Response('{"error":{"message":"routing probe"}}', {
+        status: 401,
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as typeof fetch
+    try {
+      for (const provider of Object.values(KNOWN_PROVIDERS)) {
+        if (!supportsApiKey(provider) || !provider.apiKeyEnv) continue
+        process.env[provider.apiKeyEnv] = `test-${provider.id}`
+        const { modelRuntime } = await getAuthFor(provider.id)
+        for (const modelId of Object.keys(provider.models)) {
+          const model = resolveModel(`${provider.id}/${modelId}`)
+          requested = undefined
+          const stream = modelRuntime.streamSimple(model, {
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }], timestamp: 0 }],
+          })
+          for await (const _event of stream) {
+            if (requested !== undefined) break
+          }
+          const url = new URL(requested ?? 'about:blank')
+          expect({ ref: `${provider.id}/${modelId}`, url: `${url.origin}${url.pathname}` }).toEqual({
+            ref: `${provider.id}/${modelId}`,
+            url: expect.stringMatching(
+              new RegExp(`^${model.baseUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*${endpoint[model.api]}$`),
+            ),
+          })
+        }
+      }
+    } finally {
+      globalThis.fetch = originalFetch
     }
   })
 
-  test('env wins over file value when both are set', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
-    )
-    await writeFile(
-      join(cwd, 'secrets.json'),
-      JSON.stringify({
-        version: 2,
-        providers: { fireworks: { type: 'api_key', key: { value: 'fw_disk' } } },
-        channels: {},
-      }),
-    )
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_env'
-
-    const auth = getAuth()
-
-    expect(await auth.authStorage.getApiKey('fireworks')).toBe('fw_env')
-  })
-
-  test('file value is used when env var is unset', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
-    )
-    await writeFile(
-      join(cwd, 'secrets.json'),
-      JSON.stringify({
-        version: 2,
-        providers: { fireworks: { type: 'api_key', key: { value: 'fw_disk' } } },
-        channels: {},
-      }),
-    )
-    reloadConfig(cwd)
-    // The dummy in-memory branch in getAuth() triggers under NODE_ENV=test
-    // when no api-key env var is set. Bypass it so the on-disk file is the
-    // credential source under test.
-    delete process.env.NODE_ENV
-
-    const auth = getAuth()
-
-    expect(auth.authStorage.hasAuth('fireworks')).toBe(true)
-    expect(await auth.authStorage.getApiKey('fireworks')).toBe('fw_disk')
-  })
-
-  test('does NOT strip .env after layering env-resolved api-key in-memory', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
-    )
-    const original = 'FIREWORKS_API_KEY=fw_from_env\nUNRELATED=keep-me\n'
-    await writeFile(join(cwd, '.env'), original)
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_from_env'
-
-    getAuth()
-
-    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe(original)
-  })
-
-  test('preserves an existing OAuth credential and ignores the .env key', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-5.4-nano' } }))
-    const oauthCredential = {
-      type: 'oauth' as const,
-      access_token: 'tok',
-      refresh_token: 'refresh',
-      expires_at: Date.now() + 1_000_000,
-    }
-    await writeFile(
-      join(cwd, 'secrets.json'),
-      JSON.stringify({ version: 2, providers: { openai: oauthCredential }, channels: {} }),
-    )
-    reloadConfig(cwd)
-    process.env.OPENAI_API_KEY = 'sk-from-env'
-
-    getAuth()
-
-    const file = await readSecretsFile(join(cwd, 'secrets.json'))
-    expect(file.providers['openai']).toEqual(oauthCredential)
-  })
-
-  test('does not touch .env when an OAuth credential already owns the provider slot', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-5.4-nano' } }))
-    const oauthCredential = {
-      type: 'oauth' as const,
-      access_token: 'tok',
-      refresh_token: 'refresh',
-      expires_at: Date.now() + 1_000_000,
-    }
-    await writeFile(
-      join(cwd, 'secrets.json'),
-      JSON.stringify({ version: 2, providers: { openai: oauthCredential }, channels: {} }),
-    )
-    const envBefore = 'OPENAI_API_KEY=sk-leave-me\n'
-    await writeFile(join(cwd, '.env'), envBefore)
-    reloadConfig(cwd)
-    process.env.OPENAI_API_KEY = 'sk-leave-me'
-
-    getAuth()
-
-    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe(envBefore)
-  })
-
-  test('falls back to a dummy in-memory storage when the provider env var is missing under NODE_ENV=test', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-5.4-nano' } }))
-    reloadConfig(cwd)
-    process.env.NODE_ENV = 'test'
-
-    const auth = getAuth()
-
-    expect(auth.authStorage).toBeDefined()
-    expect(auth.modelRegistry).toBeDefined()
-  })
-
-  test('caches the auth object across calls', async () => {
-    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ models: { default: 'openai/gpt-5.4-nano' } }))
-    reloadConfig(cwd)
-    process.env.OPENAI_API_KEY = 'sk-test'
-
-    const a = getAuth()
-    const b = getAuth()
-
-    expect(a).toBe(b)
+  test('initial-provider runtime resolves a typeclaw-only fallback provider', async () => {
+    process.env.OPENAI_API_KEY = 'openai-key'
+    process.env.UPSTAGE_API_KEY = 'upstage-key'
+    const { modelRuntime } = await getAuthFor('openai')
+    const fallbackId = Object.keys(KNOWN_PROVIDERS.upstage.models)[0]!
+    expect((await modelRuntime.getAuth(resolveModel(`upstage/${fallbackId}`)))?.auth.apiKey).toBe('upstage-key')
   })
 })
 
-async function readSecretsFile(path: string): Promise<{ providers: Record<string, unknown> }> {
-  const raw = await readFile(path, 'utf8')
-  const result = parseSecretsFile(JSON.parse(raw))
-  if (!result.ok) throw new Error(`secrets.json failed to parse: ${result.reason}`)
-  return result.file
-}
-
-describe('getAuthFor — per-provider lazy resolution', () => {
-  let prevOpenai: string | undefined
-  let prevFireworks: string | undefined
-  let prevNodeEnv: string | undefined
-  let prevCwd: string
+describe('ModelRuntime credential resolution regressions', () => {
   let cwd: string
+  let previousCwd: string
+  let previousNodeEnv: string | undefined
+  let previousFireworks: string | undefined
+  let previousXai: string | undefined
 
   beforeEach(async () => {
-    prevOpenai = process.env.OPENAI_API_KEY
-    prevFireworks = process.env.FIREWORKS_API_KEY
-    prevNodeEnv = process.env.NODE_ENV
-    delete process.env.OPENAI_API_KEY
-    delete process.env.FIREWORKS_API_KEY
-    cwd = await mkdtemp(join(tmpdir(), 'typeclaw-authfor-'))
-    prevCwd = process.cwd()
+    cwd = await mkdtemp(join(tmpdir(), 'typeclaw-auth-runtime-'))
+    previousCwd = process.cwd()
+    previousNodeEnv = process.env.NODE_ENV
+    previousFireworks = process.env.FIREWORKS_API_KEY
+    previousXai = process.env.XAI_API_KEY
     process.chdir(cwd)
-    resetAuthForTesting()
-  })
-
-  afterEach(async () => {
-    if (prevOpenai === undefined) delete process.env.OPENAI_API_KEY
-    else process.env.OPENAI_API_KEY = prevOpenai
-    if (prevFireworks === undefined) delete process.env.FIREWORKS_API_KEY
-    else process.env.FIREWORKS_API_KEY = prevFireworks
-    if (prevNodeEnv === undefined) delete process.env.NODE_ENV
-    else process.env.NODE_ENV = prevNodeEnv
-    resetAuthForTesting()
-    __resetConfigForTesting()
-    process.chdir(prevCwd)
-    await rm(cwd, { recursive: true, force: true })
-  })
-
-  test('returns the requested provider when called with an explicit providerId', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({
-        models: {
-          default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo',
-          fast: 'openai/gpt-5.4-nano',
-        },
-      }),
-    )
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_test'
-    process.env.OPENAI_API_KEY = 'sk_test'
-
-    const fireworksAuth = getAuthFor('fireworks')
-    const openaiAuth = getAuthFor('openai')
-
-    expect(fireworksAuth.authStorage.hasAuth('fireworks')).toBe(true)
-    expect(openaiAuth.authStorage.hasAuth('openai')).toBe(true)
-  })
-
-  test('caches per-provider so repeated calls return the same instance', async () => {
+    delete process.env.FIREWORKS_API_KEY
+    delete process.env.XAI_API_KEY
+    invalidateProviderAuthCache()
     await writeFile(
       join(cwd, 'typeclaw.json'),
       JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
     )
     reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_test'
-
-    const a = getAuthFor('fireworks')
-    const b = getAuthFor('fireworks')
-
-    expect(a).toBe(b)
-    expect(a.authStorage).toBe(b.authStorage)
-    expect(a.modelRegistry).toBe(b.modelRegistry)
   })
 
-  test('different providers get separate Auth instances (independent caches)', async () => {
-    await writeFile(
-      join(cwd, 'typeclaw.json'),
-      JSON.stringify({
-        models: {
-          default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo',
-          fast: 'openai/gpt-5.4-nano',
-        },
-      }),
-    )
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_test'
-    process.env.OPENAI_API_KEY = 'sk_test'
-
-    const fireworks = getAuthFor('fireworks')
-    const openai = getAuthFor('openai')
-
-    expect(fireworks).not.toBe(openai)
-    expect(fireworks.authStorage).not.toBe(openai.authStorage)
+  afterEach(async () => {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV
+    else process.env.NODE_ENV = previousNodeEnv
+    if (previousFireworks === undefined) delete process.env.FIREWORKS_API_KEY
+    else process.env.FIREWORKS_API_KEY = previousFireworks
+    if (previousXai === undefined) delete process.env.XAI_API_KEY
+    else process.env.XAI_API_KEY = previousXai
+    invalidateProviderAuthCache()
+    __resetConfigForTesting()
+    process.chdir(previousCwd)
+    await rm(cwd, { recursive: true, force: true })
   })
 
-  test('getAuth() back-compat shim resolves to the default profile provider', async () => {
+  test('env wins over disk without persisting its value or changing .env', async () => {
     await writeFile(
-      join(cwd, 'typeclaw.json'),
+      join(cwd, 'secrets.json'),
       JSON.stringify({
-        models: {
-          default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo',
-          fast: 'openai/gpt-5.4-nano',
-        },
+        version: 2,
+        providers: { fireworks: { type: 'api_key', key: { value: 'disk' } } },
+        channels: {},
       }),
     )
-    reloadConfig(cwd)
-    process.env.FIREWORKS_API_KEY = 'fw_test'
+    const envFile = 'FIREWORKS_API_KEY=runtime\nUNRELATED=keep\n'
+    delete process.env.ZAI_API_KEY
+    delete process.env.ZAI_CODING_API_KEY
+    await writeFile(join(cwd, '.env'), envFile)
+    process.env.FIREWORKS_API_KEY = 'runtime'
+    const { modelRuntime } = await getAuthFor('fireworks')
+    expect(
+      (await modelRuntime.getAuth(resolveModel('fireworks/accounts/fireworks/routers/kimi-k2p6-turbo')))?.auth.apiKey,
+    ).toBe('runtime')
+    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe(envFile)
+    expect(JSON.parse(await readFile(join(cwd, 'secrets.json'), 'utf8')).providers.fireworks.key.value).toBe('disk')
+  })
 
-    const shimAuth = getAuth()
-    const direct = getAuthFor('fireworks')
+  test('uses disk when env is unset', async () => {
+    process.env.NODE_ENV = 'production'
+    await writeFile(
+      join(cwd, 'secrets.json'),
+      JSON.stringify({
+        version: 2,
+        providers: { fireworks: { type: 'api_key', key: { value: 'disk' } } },
+        channels: {},
+      }),
+    )
+    const { modelRuntime } = await getAuthFor('fireworks')
+    expect((await modelRuntime.getAuth('fireworks'))?.auth.apiKey).toBe('disk')
+  })
 
-    expect(shimAuth).toBe(direct)
+  test('persisted xAI OAuth takes precedence over XAI_API_KEY', async () => {
+    await writeFile(
+      join(cwd, 'secrets.json'),
+      JSON.stringify({
+        version: 2,
+        providers: {
+          xai: { type: 'oauth', access: 'oauth-access', refresh: 'refresh', expires: Date.now() + 3600000 },
+        },
+        channels: {},
+      }),
+    )
+    process.env.XAI_API_KEY = 'env-key'
+    const { modelRuntime } = await getAuthFor('xai')
+    expect((await modelRuntime.getAuth('xai'))?.auth.apiKey).toBe('oauth-access')
+    expect(JSON.parse(await readFile(join(cwd, 'secrets.json'), 'utf8')).providers.xai.access).toBe('oauth-access')
+  })
+
+  test('uses the NODE_ENV=test dummy only when no environment credential exists', async () => {
+    process.env.NODE_ENV = 'test'
+    const { modelRuntime } = await getAuthFor('fireworks')
+    expect((await modelRuntime.getAuth('fireworks'))?.auth.apiKey).toBe('test_dummy_key')
+    expect(existsSync(join(cwd, 'secrets.json'))).toBe(false)
+  })
+  test('provider-scoped environment keys and runtime caches are isolated', async () => {
+    process.env.ZAI_API_KEY = 'paygo'
+    process.env.ZAI_CODING_API_KEY = 'coding'
+    const zai = await getAuthFor('zai')
+    const coding = await getAuthFor('zai-coding')
+    expect((await zai.modelRuntime.getAuth('zai'))?.auth.apiKey).toBe('paygo')
+    expect((await coding.modelRuntime.getAuth('zai-coding'))?.auth.apiKey).toBe('coding')
+    expect(zai.modelRuntime).not.toBe(coding.modelRuntime)
+  })
+
+  // A reload (invalidateProviderAuthCache) can land while a creation is in
+  // flight. If that stale creation then fails, it must not evict the runtime a
+  // later caller already cached, or the next caller builds a second runtime
+  // that refreshes the same OAuth credential independently.
+  test('a stale failed creation does not evict the runtime cached after a reload', async () => {
+    process.env.FIREWORKS_API_KEY = 'runtime'
+    const healthyDir = await mkdtemp(join(tmpdir(), 'typeclaw-auth-healthy-'))
+    await writeFile(join(cwd, 'secrets.json'), '{ not json')
+    try {
+      // The secrets path is captured from cwd synchronously at creation, so
+      // the stale creation reads the corrupt file and the next one does not.
+      const stale = getAuthFor('fireworks')
+      const staleOutcome = stale.then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      invalidateProviderAuthCache()
+      process.chdir(healthyDir)
+      const current = getAuthFor('fireworks')
+      expect(await staleOutcome).toBeInstanceOf(Error)
+      await current
+      expect(getAuthFor('fireworks')).toBe(current)
+    } finally {
+      process.chdir(cwd)
+      await rm(healthyDir, { recursive: true, force: true })
+    }
   })
 })

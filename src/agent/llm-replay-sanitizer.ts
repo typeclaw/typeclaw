@@ -33,7 +33,7 @@
 // This is a read-only projection: it never mutates the persisted JSONL, so an
 // already-poisoned session becomes usable without destructive migration.
 
-import type { Message } from '@mariozechner/pi-ai'
+import type { Message } from '@earendil-works/pi-ai'
 
 export type ReplaySanitizerStats = {
   droppedOrphans: number

@@ -1,4 +1,4 @@
-import type { Api, Model } from '@mariozechner/pi-ai'
+import type { Api, Model } from '@earendil-works/pi-ai'
 
 import { providerForModelRef, type KnownModelRef, type KnownProviderId, type ModelRef } from '@/config/providers'
 

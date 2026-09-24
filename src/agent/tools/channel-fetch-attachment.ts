@@ -1,7 +1,7 @@
 import { join, sep } from 'node:path'
 
-import { Type } from '@mariozechner/pi-ai'
-import { defineTool } from '@mariozechner/pi-coding-agent'
+import { Type } from '@earendil-works/pi-ai'
+import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 import { TOOL_INPUT_MAX_BYTES, writeFileAnchored } from '@/agent/tool-file-safety'

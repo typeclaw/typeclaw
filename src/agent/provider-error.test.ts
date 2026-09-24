@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { AgentSession as PiAgentSession, SettingsManager } from '@mariozechner/pi-coding-agent'
+import { AgentSession as PiAgentSession, SettingsManager } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession } from './index'
 import {

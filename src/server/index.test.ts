@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession, CreateSessionOptions } from '@/agent'
 import { LiveSubagentRegistry } from '@/agent/live-subagents'

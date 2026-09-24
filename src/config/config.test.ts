@@ -5,6 +5,10 @@ import { createServer, type Server } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { normalizeContext, type Context, type Model, type ThinkingLevel } from '@earendil-works/pi-ai'
+import { streamSimple } from '@earendil-works/pi-ai/api/anthropic-messages'
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
+
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import { isWindows } from '@/shared'
 
@@ -39,6 +43,36 @@ const onWindows = isWindows()
 
 const VALID_MODEL = 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo'
 const VALID_MODEL_2 = 'openai/gpt-5.4-nano'
+
+type AnthropicPayload = Record<string, unknown>
+
+async function captureAnthropicPayload(
+  model: Model<'anthropic-messages'>,
+  reasoning: ThinkingLevel | undefined,
+): Promise<AnthropicPayload> {
+  const context: Context = {
+    systemPrompt: 'You are a helpful assistant.',
+    messages: [{ role: 'user', content: 'Hi', timestamp: Date.now() }],
+    tools: [],
+  }
+  let captured: AnthropicPayload | undefined
+  const stopMarker = new Error('payload-captured')
+  const stream = streamSimple(model, normalizeContext(context), {
+    apiKey: 'sk-ant-test',
+    reasoning,
+    onPayload: (payload) => {
+      captured = payload as AnthropicPayload
+      throw stopMarker
+    },
+  })
+
+  for await (const _event of stream) {
+    if (captured !== undefined) break
+  }
+
+  if (captured === undefined) throw new Error('onPayload never fired — adapter path changed')
+  return captured
+}
 
 function parseModels(models: Record<string, unknown>): Models {
   return configSchema.parse({ models }).models
@@ -106,6 +140,11 @@ describe('configSchema models field', () => {
   test('accepts a rich profile object with model + thinkingLevel', () => {
     const parsed = configSchema.parse({ models: { default: { model: VALID_MODEL, thinkingLevel: 'high' } } })
     expect(parsed.models.default).toEqual({ refs: modelRefList(VALID_MODEL), thinkingLevel: 'high' })
+  })
+
+  test('accepts max as a per-profile thinkingLevel', () => {
+    const parsed = configSchema.parse({ models: { default: { model: VALID_MODEL_2, thinkingLevel: 'max' } } })
+    expect(parsed.models.default).toEqual({ refs: modelRefList(VALID_MODEL_2), thinkingLevel: 'max' })
   })
 
   test('accepts a rich profile object with a models chain + thinkingLevel', () => {
@@ -246,6 +285,101 @@ describe('resolveModel', () => {
     })
     expect(model.contextWindow).toBe(400000)
     expect(model.maxTokens).toBe(128000)
+  })
+  test('uses same-transport catalog metadata for dated custom Anthropic refs', () => {
+    for (const [ref, catalogId] of [
+      ['anthropic/claude-sonnet-5-20260701', 'claude-sonnet-5'],
+      ['anthropic/claude-opus-5-5-20260922', 'claude-opus-5-5'],
+    ] as const) {
+      const catalog = getBuiltinModel('anthropic', catalogId)
+      const model = resolveModel(ref)
+
+      expect(model).toMatchObject({
+        name: catalog.name,
+        reasoning: true,
+        input: catalog.input,
+        contextWindow: catalog.contextWindow,
+        maxTokens: catalog.maxTokens,
+        cost: catalog.cost,
+      })
+    }
+  })
+
+  test('sends adaptive thinking for dated Anthropic aliases at the normal thinking level', async () => {
+    const sonnet = resolveModel('anthropic/claude-sonnet-5-20260701') as Model<'anthropic-messages'>
+    const opus = resolveModel('anthropic/claude-opus-5-5-20260922') as Model<'anthropic-messages'>
+
+    // The caller chooses a normal level only for reasoning-capable models. pi-ai
+    // 0.87.1 streamSimple checks that option before selecting adaptive thinking.
+    const sonnetPayload = await captureAnthropicPayload(sonnet, sonnet.reasoning ? 'high' : undefined)
+    const opusPayload = await captureAnthropicPayload(opus, opus.reasoning ? 'high' : undefined)
+
+    expect(sonnetPayload.thinking).toMatchObject({ type: 'adaptive' })
+    expect(opusPayload.thinking).toMatchObject({
+      type: 'adaptive',
+      block_binding: { prefix_mismatch_behavior: 'drop_block' },
+    })
+  })
+
+  // pi's Fable 5 catalog entry carries allowedFallbackModels, which the
+  // Anthropic transport sends as server-side `fallbacks` (a different model
+  // served and billed). A dated alias takes catalog compat, so it must not
+  // inherit that list either.
+  test('never sends server-side fallbacks for a dated Fable alias', async () => {
+    expect(getBuiltinModel('anthropic', 'claude-fable-5').compat).toHaveProperty('allowedFallbackModels')
+    const fable = resolveModel('anthropic/claude-fable-5-20260801') as Model<'anthropic-messages'>
+    expect(fable.compat).not.toHaveProperty('allowedFallbackModels')
+    const payload = await captureAnthropicPayload(fable, 'high')
+    expect(payload).not.toHaveProperty('fallbacks')
+  })
+
+  test('customModels metadata overrides catalog defaults for dated custom refs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-resolve-model-'))
+    try {
+      await writeFile(
+        join(cwd, 'typeclaw.json'),
+        JSON.stringify({
+          models: { default: 'anthropic/claude-sonnet-5-20260701' },
+          customModels: {
+            'anthropic/claude-sonnet-5-20260701': {
+              name: 'Private Sonnet',
+              reasoning: false,
+              input: ['text'],
+              contextWindow: 123456,
+              maxTokens: 6543,
+              cost: { input: 1, output: 2, cacheRead: 0.25, cacheWrite: 0.5 },
+            },
+          },
+        }),
+      )
+      reloadConfig(cwd)
+
+      expect(resolveModel('anthropic/claude-sonnet-5-20260701')).toMatchObject({
+        name: 'Private Sonnet',
+        reasoning: false,
+        input: ['text'],
+        contextWindow: 123456,
+        maxTokens: 6543,
+        cost: { input: 1, output: 2, cacheRead: 0.25, cacheWrite: 0.5 },
+      })
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  // resolveModel templates an uncurated ref from its provider's first record.
+  // Newer flagships must not change what older uncurated snapshots inherit.
+  test("does not give uncurated xai snapshots Grok 4.7's limits", () => {
+    const model = resolveModel('xai/grok-4.20-multi-agent-0309')
+    expect(model.contextWindow).toBe(1000000)
+    expect(model.maxTokens).toBeLessThan(KNOWN_PROVIDERS.xai.models['grok-4.7'].maxTokens)
+  })
+
+  test('uses the undated pi catalog metadata for a dated custom Sonnet 5 ref', () => {
+    const model = resolveModel('anthropic/claude-sonnet-5-20260701')
+    expect(model.api).toBe('anthropic-messages')
+    expect(model.compat).toMatchObject({ forceAdaptiveThinking: true })
+    expect(model.thinkingLevelMap).toEqual(KNOWN_PROVIDERS.anthropic.models['claude-sonnet-5'].thinkingLevelMap)
   })
 
   test('a formerly static OpenGateway ref still parses and resolves through the anchor transport', () => {

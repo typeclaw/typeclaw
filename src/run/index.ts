@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 
-import { SessionManager } from '@mariozechner/pi-coding-agent'
+import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSession, createSessionWithDispose } from '@/agent'
 import { createProviderAuthReloadable } from '@/agent/auth-reloadable'
@@ -410,15 +410,15 @@ async function startAgentRuntime(
   //
   // MUST be awaited, and MUST run before the credential-file exporters below
   // and the first session-producing consumer (subagentConsumer.start /
-  // cronConsumer.start / channelManager.start / the websocket server). The SDK
-  // refresh holds SecretsBackend's async file lock across its network request;
-  // getAuthFor()'s synchronous lock read gives up after ~200ms and
-  // process.exit(1)s on ELOCKED. Fire-and-forget here would let a slow refresh
-  // still own the lock when an exporter or consumer reads secrets — worse than
-  // the lazy path. Awaiting behind this barrier guarantees no synchronous auth
-  // reader exists while the refresh owns the lock. Never throws (the wrapper
-  // swallows and logs), so a probe failure can't block boot; a refresh that
-  // hangs on a wedged network hangs the first turn today anyway.
+  // cronConsumer.start / channelManager.start / the websocket server). The
+  // refresh holds SecretsBackend's file lock across its network request
+  // (`CredentialStore.modify`), while the synchronous readers the exporters and
+  // channel hydration use give up after ~200ms and throw ELOCKED.
+  // Fire-and-forget here would let a slow refresh still own the lock when an
+  // exporter or consumer reads secrets — worse than the lazy path. Awaiting
+  // behind this barrier guarantees no synchronous reader races the refresh.
+  // Never throws (the wrapper swallows and logs), so a probe failure can't block
+  // boot; a refresh that hangs on a wedged network hangs the first turn anyway.
   await refreshProviderOAuth({
     agentDir: cwd,
     log: (message) => console.warn(message),
@@ -898,7 +898,7 @@ async function startAgentRuntime(
   // session teardown observes it. secrets.json provider credentials are not
   // part of the typeclaw.json config diff, so a rotated key takes effect on
   // `typeclaw reload` only via this dedicated scope. Live sessions captured
-  // their AuthStorage at creation, so teardown recreates them with fresh auth.
+  // their ModelRuntime at creation, so teardown recreates them with fresh auth.
   reloadRegistry.register(
     createProviderAuthReloadable({
       onProviderAuthChanged: () => channelManager.router.tearDownAllLive(),

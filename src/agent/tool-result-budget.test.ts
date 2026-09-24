@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { defineTool as definePiTool } from '@mariozechner/pi-coding-agent'
+import { defineTool as definePiTool } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 
 import { createBudgetState, wrapAgentToolWithBudget, wrapToolDefinitionWithBudget } from './tool-result-budget'

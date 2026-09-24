@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test'
 
-import type { AssistantMessage, Message, ToolResultMessage } from '@mariozechner/pi-ai'
+import type { AssistantMessage, Message, ToolResultMessage } from '@earendil-works/pi-ai'
 
 import { sanitizeMessagesForLlmReplay } from '@/agent/llm-replay-sanitizer'
 

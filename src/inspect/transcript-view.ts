@@ -6,8 +6,8 @@ import {
   type Component,
   type Terminal,
   Text,
-  TUI,
-} from '@mariozechner/pi-tui'
+  TuiMainScreen,
+} from '@earendil-works/pi-tui'
 
 import { formatToolEnd, formatToolStart, formatUserPromptHistory } from '@/tui/format'
 import { armTerminalGuard } from '@/tui/terminal-guard'
@@ -41,7 +41,10 @@ export const MAX_LIVE_HISTORY_ENTRIES = 250
 export function createTranscriptView(opts: TranscriptViewOptions) {
   async function run(): Promise<TranscriptViewOutcome> {
     const terminal = (opts.createTerminal ?? (() => new ProcessTerminal()))()
-    const tui = new TUI(terminal)
+    // pi-tui 0.87 exports TUI only as an interface; use its concrete
+    // main-screen renderer to preserve this viewer's scrollback behavior
+    // (dist/tui.d.ts:213-244, tui-main-screen.d.ts:11-12).
+    const tui = new TuiMainScreen(terminal)
 
     const status = new Text(statusLine('replay'), 0, 0)
     tui.addChild(new Text(header(opts.summary), 0, 0))

@@ -3,10 +3,9 @@ import { z } from 'zod'
 import { secretFieldSchema } from './resolve'
 
 // providers.<id> for api-key credentials: the `key` field is a Secret (string
-// shorthand or `{ value?, env? }` object). resolveSecret turns this into a
-// flat string at read time so AuthStorage (which expects `key: string`)
-// stays happy. OAuth credentials carry stateful refresh/access tokens that
-// are not env-injectable, so they pass through unchanged via catchall.
+// shorthand or `{ value?, env? }` object). CredentialStore resolves this at
+// request time; OAuth credentials carry stateful refresh/access tokens and
+// are never env-injectable.
 const apiKeyProviderSchema = z.object({
   type: z.literal('api_key'),
   key: secretFieldSchema,

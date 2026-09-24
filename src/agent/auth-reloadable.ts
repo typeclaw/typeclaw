@@ -3,9 +3,8 @@ import type { Reloadable, ReloadResult } from '@/reload'
 import { invalidateProviderAuthCache } from './auth'
 
 export type CreateProviderAuthReloadableOptions = {
-  // Fired after the auth cache is cleared. The run stage wires this to channel
-  // session teardown so live sessions — which captured an AuthStorage at
-  // creation — are recreated with freshly-resolved credentials.
+  // Fired after the runtime cache is cleared. The run stage tears down live
+  // sessions so replacements capture freshly resolved credentials.
   onProviderAuthChanged?: () => void | Promise<void>
 }
 

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 
-import { getAuthFor, resetAuthForTesting } from './auth'
+import { getAuthFor, invalidateProviderAuthCache } from './auth'
 import { createProviderAuthReloadable } from './auth-reloadable'
 
 describe('createProviderAuthReloadable', () => {
@@ -21,7 +21,7 @@ describe('createProviderAuthReloadable', () => {
     cwd = await mkdtemp(join(tmpdir(), 'typeclaw-auth-reload-'))
     prevCwd = process.cwd()
     process.chdir(cwd)
-    resetAuthForTesting()
+    invalidateProviderAuthCache()
     await writeFile(
       join(cwd, 'typeclaw.json'),
       JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
@@ -34,7 +34,7 @@ describe('createProviderAuthReloadable', () => {
     else process.env.FIREWORKS_API_KEY = prevFireworks
     if (prevNodeEnv === undefined) delete process.env.NODE_ENV
     else process.env.NODE_ENV = prevNodeEnv
-    resetAuthForTesting()
+    invalidateProviderAuthCache()
     __resetConfigForTesting()
     process.chdir(prevCwd)
     await rm(cwd, { recursive: true, force: true })
@@ -53,8 +53,8 @@ describe('createProviderAuthReloadable', () => {
     delete process.env.NODE_ENV
     await writeSecretsFireworksKey('fw_first')
 
-    const before = getAuthFor('fireworks')
-    expect(await before.authStorage.getApiKey('fireworks')).toBe('fw_first')
+    const before = await getAuthFor('fireworks')
+    expect((await before.modelRuntime.getAuth('fireworks'))?.auth.apiKey).toBe('fw_first')
 
     // given: the credential is rotated on disk (e.g. `typeclaw provider set`)
     await writeSecretsFireworksKey('fw_rotated')
@@ -64,9 +64,9 @@ describe('createProviderAuthReloadable', () => {
 
     // then: the next resolution reads the rotated value from the file
     expect(result.ok).toBe(true)
-    const after = getAuthFor('fireworks')
+    const after = await getAuthFor('fireworks')
     expect(after).not.toBe(before)
-    expect(await after.authStorage.getApiKey('fireworks')).toBe('fw_rotated')
+    expect((await after.modelRuntime.getAuth('fireworks'))?.auth.apiKey).toBe('fw_rotated')
   })
 
   async function writeSecretsFireworksKey(value: string): Promise<void> {

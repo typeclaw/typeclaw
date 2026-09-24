@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { defineTool as definePiTool } from '@mariozechner/pi-coding-agent'
+import { defineTool as definePiTool } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
@@ -3299,7 +3299,7 @@ describe('resolveBuiltinToolRefs', () => {
 
   test('bash resolves to the spawnHook-wired ToolDefinition, not pi bare createBashToolDefinition', async () => {
     const { resolveBuiltinToolRefs } = await import('./plugin-tools')
-    const pi = await import('@mariozechner/pi-coding-agent')
+    const pi = await import('@earendil-works/pi-coding-agent')
     const r = resolveBuiltinToolRefs([{ __builtinTool: 'bash' }], process.cwd())
     expect(r.length).toBe(1)
     expect(r[0]?.name).toBe('bash')
@@ -5889,9 +5889,9 @@ describe('setupSession integration: builtin pi tools route through customTools w
     if (prevFireworks === undefined) delete process.env.FIREWORKS_API_KEY
     else process.env.FIREWORKS_API_KEY = prevFireworks
     const { __resetConfigForTesting } = await import('@/config/config')
-    const { resetAuthForTesting } = await import('./auth')
+    const { invalidateProviderAuthCache } = await import('./auth')
     __resetConfigForTesting()
-    resetAuthForTesting()
+    invalidateProviderAuthCache()
     process.chdir(prevCwd)
     await rm(agentDir, { recursive: true, force: true })
   })
@@ -5941,11 +5941,9 @@ describe('setupSession integration: builtin pi tools route through customTools w
   })
 
   test('even without tool hooks, the active `edit` is the typeclaw customTools override (sandbox/guards are hook-independent)', async () => {
-    // pi 0.73: builtins are always TypeClaw-owned wrapped definitions shipped via
-    // customTools with `noTools: "builtin"` disabling pi's raw copies. The wrap is
-    // no longer gated on plugin hooks because the bwrap sandbox and bash policy
-    // must apply regardless — so `edit` is always sourced from `sdk`, never the
-    // unwrapped `builtin`.
+    // Pi's documented SDK behavior is that custom definitions replace the
+    // enabled builtin with the same name. `noTools: "builtin"` prevents raw
+    // default tools; the wrapped definitions remain active through `tools:`.
     const { createSession } = await import('./index')
 
     const session = await createSession({})
@@ -5961,11 +5959,11 @@ describe('setupSession integration: builtin pi tools route through customTools w
   test('security: subagent declaring [edit] only must NOT also activate read/bash/write/grep/find/ls, even though all 7 wrapped builtins ride in customTools', async () => {
     // Security boundary: all 7 wrapped builtins are always in `customTools`, so a
     // subagent could over-broaden if the active set were "registry ∪ customTools".
-    // pi 0.73 gates the active set on the explicit `tools:` allowlist
-    // (`allowedToolNames` in `_refreshToolRegistry`), which we set to exactly the
-    // subagent's declared refs. A read-only memory-logger subagent declaring
-    // `[edit]` must therefore expose ONLY `edit` — a silent widening to bash/write
-    // would be a privilege-escalation regression (QA finding, PR #290).
+    // The explicit `tools:` allowlist controls both builtin and custom names
+    // (sdk.d.ts:35-47), and is set to exactly the declared subagent refs.
+    // A read-only memory-logger subagent declaring `[edit]` must therefore
+    // expose ONLY `edit` — a silent widening to bash/write would be a
+    // privilege-escalation regression (QA finding, PR #290).
     const { createSession } = await import('./index')
     const hooks = createHookBus()
     hooks.registerAll('p1', agentDir, noopLogger, {
