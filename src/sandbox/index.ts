@@ -46,7 +46,14 @@ export {
   verifyPrivilegedSandboxRuntime,
   type PrivilegedSandboxRuntime,
 } from './privileged-runtime'
-export { ensureSessionTmpDir, isUnderTmp, mapVirtualTmpPath, SESSION_TMP_ROOT, sessionTmpDir } from './session-tmp'
+export {
+  ensureSessionTmpDir,
+  isUnderTmp,
+  mapVirtualTmpPath,
+  SESSION_TMP_ROOT,
+  enterSubagentTmpScope,
+  sessionTmpDir,
+} from './session-tmp'
 export {
   DEPENDENCY_BIN_SANDBOX_DIR,
   DEPENDENCY_BIN_SANDBOX_PATH,

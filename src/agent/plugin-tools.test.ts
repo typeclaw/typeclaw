@@ -5916,6 +5916,30 @@ describe('setupSession integration: builtin pi tools route through customTools w
     session.dispose()
   })
 
+  test('subagent sessions share their top-level subagent /tmp, not the spawning session /tmp, until disposed', async () => {
+    const { createSessionWithDispose } = await import('./index')
+    const { sessionTmpDir } = await import('@/sandbox')
+    const hooks = createHookBus()
+    const registry: PluginRegistry = emptyRegistry()
+
+    const reviewer = await createSessionWithDispose({
+      origin: { kind: 'subagent', subagent: 'reviewer', parentSessionId: 'tmp-scope-channel' },
+      plugins: { registry, hooks, sessionId: 'tmp-scope-reviewer', agentDir },
+    })
+    const explorer = await createSessionWithDispose({
+      origin: { kind: 'subagent', subagent: 'explorer', parentSessionId: 'tmp-scope-reviewer' },
+      plugins: { registry, hooks, sessionId: 'tmp-scope-explorer', agentDir },
+    })
+
+    expect(sessionTmpDir('tmp-scope-explorer')).toBe(sessionTmpDir('tmp-scope-reviewer'))
+    expect(sessionTmpDir('tmp-scope-reviewer')).not.toBe(sessionTmpDir('tmp-scope-channel'))
+    for (const created of [explorer, reviewer]) {
+      created.session.dispose()
+      await created.dispose()
+    }
+    expect(sessionTmpDir('tmp-scope-explorer')).not.toBe(sessionTmpDir('tmp-scope-reviewer'))
+  })
+
   test('even without tool hooks, the active `edit` is the typeclaw customTools override (sandbox/guards are hook-independent)', async () => {
     // pi 0.73: builtins are always TypeClaw-owned wrapped definitions shipped via
     // customTools with `noTools: "builtin"` disabling pi's raw copies. The wrap is

@@ -36,7 +36,7 @@ import type {
 import { createHookBus, materializeSkills } from '@/plugin'
 import { CORE_SYSTEM_TOOL_NAMES } from '@/plugin/core-tool-names'
 import type { ReloadRegistry } from '@/reload'
-import { resolveHiddenPaths } from '@/sandbox'
+import { enterSubagentTmpScope, resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
 
 import { applyAdaptiveThinkingCompat } from './adaptive-thinking-compat'
@@ -569,7 +569,17 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
 
   const unsubToolNudge = attachToolNotFoundNudge(session, intendedActiveToolNames)
 
+  // Registered only once creation can no longer fail, so a rejected creation
+  // leaves no scope entry behind; tools resolve the scope lazily at call time.
+  const releaseSubagentTmp =
+    options.origin?.kind === 'subagent' && options.origin.parentSessionId !== '<unknown>'
+      ? enterSubagentTmpScope(
+          options.plugins?.sessionId ?? sessionManager.getSessionId(),
+          options.origin.parentSessionId,
+        )
+      : undefined
   const dispose = async () => {
+    releaseSubagentTmp?.()
     unsubLoopGuardTurn()
     unsubRestart?.()
     unsubToolNudge()
