@@ -18440,6 +18440,54 @@ describe('GitHub review follow-up round composition', () => {
     await router.stop()
   })
 
+  test('a sibling promoted mid-turn sees itself as carrier in the same turn', async () => {
+    // given: carrier 101 and sibling 202 on one round, with 202 still mid-turn
+    //   when 101 ends without a verdict
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const originRefs: SessionOriginRef[] = []
+    const { router, sessions } = makeRouter(dir, { logs, originRefs, nowRef: { value: Date.now() } })
+    const round = {
+      kind: 'reply',
+      roundId: 'mid-turn-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
+    const carrierKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const siblingKey = { ...carrierKey, thread: '202' }
+    await router.route(inbound({ ...carrierKey, externalMessageId: 'mid-101', githubReviewRound: round }))
+    await router.route(
+      inbound({ ...siblingKey, externalMessageId: 'mid-202', text: 'mid-turn sibling', githubReviewRound: round }),
+    )
+    const [carrier, sibling] = sessions
+    const siblingStarted = Promise.withResolvers<void>()
+    const carrierThreadsSeenBySibling: (string | null | undefined)[] = []
+    carrier!.onPrompt = async () => {
+      await siblingStarted.promise
+      carrier!.setAssistantText('NO_REPLY')
+    }
+    sibling!.onPrompt = async (text) => {
+      if (text.includes('mid-turn')) {
+        siblingStarted.resolve()
+        await waitFor(() => logs.some((log) => log.includes('carrier promoted')))
+      }
+      const origin = originRefs[1]?.current
+      carrierThreadsSeenBySibling.push(origin?.kind === 'channel' ? origin.githubReviewRound?.carrierThread : undefined)
+      sibling!.setAssistantText('NO_REPLY')
+    }
+
+    // when
+    await Promise.all([router.__testing!.flushDebounce(carrierKey), router.__testing!.flushDebounce(siblingKey)])
+
+    // then: the promotion is visible to the sibling's tools before its turn ends
+    expect(carrierThreadsSeenBySibling[0]).toBe('202')
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('warns when failover exhausts every candidate carrier', async () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
