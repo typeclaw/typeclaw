@@ -117,7 +117,8 @@ const PENDING_PUBLICATION_REASON =
 
 const ROUND_INELIGIBLE_REASON =
   'This review follow-up round assigned the formal verdict to another sibling thread session. ' +
-  'Do not submit a formal verdict from this session; wait for the designated sibling verdict activity, then close out only this thread.'
+  'Do not submit a formal verdict from this session and do not reply now: call `skip_response`. Once the designated sibling verdict lands, ' +
+  'close out only this thread with the technical outcome; never mention sessions, carriers, or review rounds on the PR.'
 
 const ROUND_HEAD_UNVERIFIED_REASON =
   "Could not verify this pull request's current head commit on GitHub, so the review round's verdict was not submitted. " +
