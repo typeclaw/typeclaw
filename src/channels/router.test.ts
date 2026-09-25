@@ -18440,6 +18440,58 @@ describe('GitHub review follow-up round composition', () => {
     await router.stop()
   })
 
+  test('a carrier awaiting its own background reviewer keeps the round until the child reports', async () => {
+    // given: carrier 101 spawned a reviewer this turn and ends silent while it runs
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const nowRef = { value: Date.now() }
+    let childStartedAt: number | null = nowRef.value
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_1' ? childStartedAt : null),
+    })
+    const round = {
+      kind: 'reply',
+      roundId: 'awaiting-child-round',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-round',
+      carrierThread: '101',
+    } as const
+    const carrierKey = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    const siblingKey = { ...carrierKey, thread: '202' }
+    await router.route(inbound({ ...carrierKey, externalMessageId: 'child-101', githubReviewRound: round }))
+    await router.route(inbound({ ...siblingKey, externalMessageId: 'child-202', githubReviewRound: round }))
+    for (const session of sessions) session.onPrompt = () => session.setAssistantText('NO_REPLY')
+    await router.__testing!.flushDebounce(siblingKey)
+
+    // when
+    await router.__testing!.flushDebounce(carrierKey)
+
+    // then: the sibling is not promoted over a carrier still waiting on its verdict
+    expect(logs.some((log) => log.includes('carrier promoted'))).toBe(false)
+
+    // when: a fresh inbound reaches the carrier before the reviewer completes and that turn ends silent
+    nowRef.value += 1_000
+    await router.route(inbound({ ...carrierKey, externalMessageId: 'child-101-again', githubReviewRound: round }))
+    await router.__testing!.flushDebounce(carrierKey)
+
+    // then: the still-running reviewer keeps the round with the carrier
+    expect(logs.some((log) => log.includes('carrier promoted'))).toBe(false)
+
+    // when: the child is gone and the carrier's next turn also ends without a verdict
+    childStartedAt = null
+    await router.route(inbound({ ...carrierKey, externalMessageId: 'child-101-done', githubReviewRound: round }))
+    await router.__testing!.flushDebounce(carrierKey)
+
+    // then: failover still promotes the sibling
+    await waitFor(() => logs.some((log) => log.includes('carrier promoted')))
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('a sibling promoted mid-turn sees itself as carrier in the same turn', async () => {
     // given: carrier 101 and sibling 202 on one round, with 202 still mid-turn
     //   when 101 ends without a verdict

@@ -313,8 +313,13 @@ describe('startDaemon', () => {
   test('GC ignores a threshold probe that raced a re-registration', async () => {
     const probeStarted = deferred()
     const releaseProbe = deferred()
+    let reregistering = false
     const exec: DockerExec = async (args) => {
       if (args[0] !== 'ps') return { exitCode: 1, stdout: '', stderr: 'unknown command' }
+      // GC ticks overlap, so a tick started after the re-register would observe
+      // the renewed generation and legitimately deregister it on a "gone"
+      // answer. Only probes that began before it may report gone.
+      if (reregistering) return { exitCode: 1, stdout: '', stderr: 'docker unavailable' }
       probeStarted.resolve()
       await releaseProbe.promise
       return { exitCode: 0, stdout: '', stderr: '' }
@@ -323,6 +328,7 @@ describe('startDaemon', () => {
     await send({ kind: 'register', containerName: 'coder', cwd: '/old' })
 
     await probeStarted.promise
+    reregistering = true
     expect((await send({ kind: 'register', containerName: 'coder', cwd: '/renewed' })).ok).toBe(true)
     releaseProbe.resolve()
 
