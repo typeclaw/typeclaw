@@ -75,6 +75,7 @@ export function createPostGithubReviewTool(options: {
           verdict,
           ...(origin.githubReviewRound !== undefined ? { round: origin.githubReviewRound } : {}),
           thread: origin.thread,
+          ...(params.head_sha !== undefined ? { reviewedHeadSha: params.head_sha } : {}),
           retainDuplicateLease: params.event === 'REQUEST_CHANGES',
         })
         if (blocked !== null) {
