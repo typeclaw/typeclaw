@@ -77,8 +77,21 @@ describe('github review submitter', () => {
     const seen: SeenPost[] = []
     const result = await submitter(fakeGithub({ seen }))(request())
 
-    expect(result).toEqual({ ok: true, reviewId: 123, state: 'COMMENTED' })
+    expect(result).toEqual({ ok: true, reviewId: 123, state: 'COMMENTED', commitSha: 'head-sha' })
     expect(seen[0]).toMatchObject({ commit_id: 'head-sha', comments: [{ path: 'src/app.ts', line: 2 }] })
+  })
+
+  test('posts only while the PR head is still the reviewed commit', async () => {
+    const seen: SeenPost[] = []
+    const reviewed = await submitter(fakeGithub({ seen }))(request({ event: 'APPROVE', expectedHeadSha: 'HEAD-SHA' }))
+    const stale = await submitter(fakeGithub({ seen, headShas: ['newer-sha'] }))(
+      request({ event: 'APPROVE', expectedHeadSha: 'head-sha' }),
+    )
+
+    expect(reviewed).toMatchObject({ ok: true, state: 'APPROVED' })
+    expect(stale).toMatchObject({ ok: false, code: 'transient' })
+    expect(stale.ok === false && stale.error).toContain('newer-sha')
+    expect(seen).toHaveLength(1)
   })
 
   test('demotes out-of-diff findings into the review body', async () => {
@@ -239,7 +252,7 @@ describe('github review submitter', () => {
     githubReviewSubmitter.invalidateGithubReviewSubmission('acme/widgets', 7)
     releasePost.resolve()
 
-    expect(await pending).toEqual({ ok: true, reviewId: 123, state: 'COMMENTED' })
+    expect(await pending).toEqual({ ok: true, reviewId: 123, state: 'COMMENTED', commitSha: 'head-sha' })
     expect(verificationReads).toBe(1)
   })
 

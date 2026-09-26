@@ -53,6 +53,13 @@ export function createPostGithubReviewTool(options: {
           { minItems: 1 },
         ),
       ),
+      head_sha: Type.Optional(
+        Type.String({
+          pattern: '^[0-9a-fA-F]{40}$',
+          description:
+            'Full SHA of the commit your review covers. When set, the review is only posted if the PR head is still this commit.',
+        }),
+      ),
     }),
     async execute(toolCallId, params) {
       if (origin.adapter !== 'github') return denied(logger, 'post_github_review is only supported on github sessions.')
@@ -112,6 +119,7 @@ export function createPostGithubReviewTool(options: {
         event: params.event,
         body: params.body,
         comments: (params.comments ?? []).map(toReviewFinding),
+        ...(params.head_sha !== undefined ? { expectedHeadSha: params.head_sha } : {}),
       }
       let releaseAsLanded = false
       try {
