@@ -65,6 +65,7 @@ import {
   hasGithubReviewRoundDismissalAttempt,
   isGithubReviewRoundComplete,
   isGithubReviewRoundPending,
+  isGithubReviewRoundSuperseded,
   promoteGithubReviewRound,
   registerGithubReviewRound,
   restoreGithubReviewRound,
@@ -1596,6 +1597,7 @@ export type ChannelRouter = {
     prNumber: number
     verdict: ReviewRoundOutcome
     sessionId: string
+    commitSha?: string
   }) => Promise<{ kind: 'completed' | 'no-round' }>
   finishGithubReviewThreadCloseout?: (args: {
     sessionId: string
@@ -7131,6 +7133,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     prNumber: number
     verdict: ReviewRoundOutcome
     sessionId: string
+    commitSha?: string
   }): Promise<{ kind: 'completed' | 'no-round' }> => {
     const chat = `pr:${args.prNumber}`
     const publisher = Array.from(liveSessions.values()).find(
@@ -7160,6 +7163,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'no-round' }
     }
 
+    // Checked before re-registration, which would evict the newer round that
+    // replaced this one between the verdict landing and this observation.
+    if (isGithubReviewRoundSuperseded(round, now)) {
+      logger.warn(
+        `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: round superseded`,
+      )
+      return { kind: 'no-round' }
+    }
     const activeRound = registerGithubReviewRound(round, now(), now)
     if (activeRound === null) {
       logger.warn(
@@ -7176,7 +7187,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       return { kind: 'no-round' }
     }
-    if (!(await validateGithubReviewRound(activeRound, undefined, now))) {
+    if (!(await validateGithubReviewRound(activeRound, undefined, now, args.commitSha ?? null))) {
       resetGithubReviewRoundCompletion(activeRound, now)
       persistMatchingGithubReviewRound(activeRound)
       logger.warn(

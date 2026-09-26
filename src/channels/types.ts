@@ -599,10 +599,20 @@ export type SubmitReviewRequest = {
   event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT'
   body: string
   comments: ReviewFinding[]
+  // The commit the review describes. When set, the submitter refuses to post
+  // unless the PR head is still exactly this commit.
+  expectedHeadSha?: string
 }
 
 export type SubmitReviewResult =
-  | { ok: true; reviewId: number; state: string; downgraded?: boolean; reanchored?: ReviewFinding[] }
+  | {
+      ok: true
+      reviewId: number
+      state: string
+      commitSha?: string
+      downgraded?: boolean
+      reanchored?: ReviewFinding[]
+    }
   | { ok: false; error: string; code: SubmitReviewErrorCode; submitted?: boolean }
 
 export type SubmitReviewErrorCode = 'unsupported' | 'permission-denied' | 'bad-anchor' | 'not-found' | 'transient'

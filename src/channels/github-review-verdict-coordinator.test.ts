@@ -137,6 +137,164 @@ describe('review verdict idempotency guard', () => {
     expect(warnings.some((line) => line.includes('current_head=sha-newer'))).toBe(true)
   })
 
+  test('keeps a reply-round carrier eligible after a push the adapter never turned into a round', async () => {
+    // given: the author replied, then force-pushed; no push round supersedes the reply round
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-head-moved' } as const
+    registerGithubReviewRound(replyRound)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({ [`${WS}#60`]: 'CHANGES_REQUESTED' }),
+      resolveHeadSha: async () => 'sha-newer',
+    })
+
+    // when
+    const decision = await g.guard({
+      callId: 'reply-carrier-head-moved',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: replyRound,
+      thread: '101',
+      reviewedHeadSha: 'sha-newer',
+    })
+
+    // then
+    expect(decision).toBeNull()
+  })
+
+  test('denies a moved reply-round carrier whose verdict does not name the current head', async () => {
+    // given: the carrier reviewed an earlier head (or named none) before the author pushed again
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-stale-review' } as const
+    registerGithubReviewRound(replyRound)
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-latest',
+    })
+    const attempt = (callId: string, reviewedHeadSha?: string) =>
+      g.guard({
+        callId,
+        workspace: WS,
+        prNumber: 60,
+        verdict: 'APPROVE',
+        round: replyRound,
+        thread: '101',
+        ...(reviewedHeadSha !== undefined ? { reviewedHeadSha } : {}),
+      })
+
+    // when
+    const stale = await attempt('reply-reviewed-earlier', 'sha-newer')
+    const unnamed = await attempt('reply-reviewed-unnamed')
+
+    // then
+    for (const decision of [stale, unnamed]) {
+      expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+      expect(decision?.reason).toContain('head_sha')
+      expect(decision?.reason).toContain('sha-latest')
+    }
+  })
+
+  test('does not let a moved reply round evict a push round registered during its head read', async () => {
+    // given
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-racing-push' } as const
+    const pushRound = { ...ROUND, roundId: 'push-racing-reply', headSha: 'sha-newer', carrierThread: '202' } as const
+    registerGithubReviewRound(replyRound)
+    const headRead = Promise.withResolvers<string>()
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: () => headRead.promise,
+    })
+
+    // when: the push round registers while the carrier awaits the head
+    const decision = g.guard({
+      callId: 'reply-carrier-racing-push',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: replyRound,
+      thread: '101',
+      reviewedHeadSha: 'sha-newer',
+    })
+    registerGithubReviewRound(pushRound)
+    headRead.resolve('sha-newer')
+
+    // then
+    expect(await decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(isGithubReviewRoundPending(pushRound)).toBe(true)
+    expect(isGithubReviewRoundPending(replyRound)).toBe(false)
+  })
+
+  test('still rejects a moved reply-round carrier once a push round owns the new head', async () => {
+    // given
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-superseded' } as const
+    registerGithubReviewRound(replyRound)
+    registerGithubReviewRound({ ...ROUND, roundId: 'push-newer', headSha: 'sha-newer', carrierThread: '202' })
+    const g = createApproveIdempotencyGuard({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-newer',
+    })
+
+    // when
+    const decision = await g.guard({
+      callId: 'reply-carrier-superseded',
+      workspace: WS,
+      prNumber: 60,
+      verdict: 'APPROVE',
+      round: replyRound,
+      thread: '101',
+      reviewedHeadSha: 'sha-newer',
+    })
+
+    // then
+    expect(decision).toMatchObject({ block: true, kind: 'round-ineligible' })
+    expect(decision?.reason).toContain('head moved')
+  })
+
+  test('validates a moved reply round only while no push round owns the PR', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-newer',
+    })
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-validate-moved' } as const
+    registerGithubReviewRound(replyRound)
+
+    expect(await validateGithubReviewRound(replyRound)).toBe(true)
+    expect(await validateGithubReviewRound(ROUND)).toBe(false)
+
+    registerGithubReviewRound({ ...ROUND, roundId: 'push-validate', headSha: 'sha-newer' })
+    expect(await validateGithubReviewRound(replyRound)).toBe(false)
+  })
+
+  test('requires a completed moved reply round to carry a verdict landed on the current head', async () => {
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: async () => 'sha-newer',
+    })
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-validate-landed' } as const
+    registerGithubReviewRound(replyRound)
+
+    expect(await validateGithubReviewRound(replyRound, undefined, Date.now, 'SHA-NEWER')).toBe(true)
+    expect(await validateGithubReviewRound(replyRound, undefined, Date.now, 'sha-reviewed-earlier')).toBe(false)
+    expect(await validateGithubReviewRound(replyRound, undefined, Date.now, null)).toBe(false)
+  })
+
+  test('rejects a reply round whose push successor registers during validation', async () => {
+    // given
+    const headRead = Promise.withResolvers<string>()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: resolver({}),
+      resolveHeadSha: () => headRead.promise,
+    })
+    const replyRound = { ...ROUND, kind: 'reply', roundId: 'reply-validate-race' } as const
+    registerGithubReviewRound(replyRound)
+
+    // when
+    const validation = validateGithubReviewRound(replyRound)
+    registerGithubReviewRound({ ...ROUND, roundId: 'push-validate-race', headSha: 'sha-newer' })
+    headRead.resolve('sha-newer')
+
+    // then
+    expect(await validation).toBe(false)
+  })
+
   test('rejects a non-carrier dismissal before the authoritative head read', async () => {
     let headReads = 0
     configureReviewVerdictCoordinator({

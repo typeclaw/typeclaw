@@ -45,6 +45,16 @@ export function createGithubReviewSubmitter(deps: {
     const token = await deps.token({ repoSlug: `${target.owner}/${target.repo}` })
     const stable = await fetchStableAnchors(fetchImpl, token, target)
     if (!stable.ok) return stable
+    if (
+      req.expectedHeadSha !== undefined &&
+      req.expectedHeadSha.toLocaleLowerCase() !== stable.headSha.toLocaleLowerCase()
+    ) {
+      return {
+        ok: false,
+        error: `GitHub pull request head is ${stable.headSha}, not the reviewed commit ${req.expectedHeadSha}; re-review the current head before submitting`,
+        code: 'transient',
+      }
+    }
 
     const { inline, reanchored } = partitionComments(req.comments, stable.anchors)
     const downgraded = req.event === 'APPROVE' && !deps.allowApprove()
@@ -72,6 +82,7 @@ export function createGithubReviewSubmitter(deps: {
       ok: true,
       reviewId: verified.reviewId,
       state: verified.state,
+      commitSha: stable.headSha,
       ...(downgraded ? { downgraded: true } : {}),
       ...(reanchored.length > 0 ? { reanchored } : {}),
     }

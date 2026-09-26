@@ -4,6 +4,7 @@ import {
   __resetReviewObserverForTest,
   hasReview,
   resetReviewTurn,
+  setReviewObserver,
   setReviewOutputObserver,
 } from '@/channels/github-review-turn-ledger'
 import {
@@ -102,6 +103,28 @@ describe('post_github_review', () => {
     expect(result.details).toMatchObject({ ok: true, state })
     expect(hasReview({ sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict })).toBe(true)
     expect(output).toEqual([{ sessionId, workspace: githubOrigin.workspace, prNumber: 7, state: verdict }])
+  })
+
+  test('binds the verdict to the reviewed head and reports the landed commit to round completion', async () => {
+    const channelRouter = router()
+    const requests: SubmitReviewRequest[] = []
+    channelRouter.registerReviewSubmitter('github', async (request) => {
+      requests.push(request)
+      return { ok: true, reviewId: 47, state: 'APPROVED', commitSha: 'c'.repeat(40) }
+    })
+    const landed: unknown[] = []
+    setReviewObserver((review) => landed.push(review))
+
+    await run(createPostGithubReviewTool({ router: channelRouter, origin: githubOrigin, sessionId }), {
+      event: 'APPROVE',
+      body: 'summary',
+      head_sha: 'c'.repeat(40),
+    })
+
+    expect(requests[0]?.expectedHeadSha).toBe('c'.repeat(40))
+    expect(landed).toEqual([
+      { sessionId, workspace: githubOrigin.workspace, prNumber: 7, verdict: 'APPROVE', commitSha: 'c'.repeat(40) },
+    ])
   })
 
   test('failed or unknown verification receives no ledger credit', async () => {

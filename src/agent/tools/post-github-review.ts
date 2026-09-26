@@ -53,6 +53,13 @@ export function createPostGithubReviewTool(options: {
           { minItems: 1 },
         ),
       ),
+      head_sha: Type.Optional(
+        Type.String({
+          pattern: '^[0-9a-fA-F]{40}$',
+          description:
+            'Full SHA of the commit your review covers. When set, the review is only posted if the PR head is still this commit.',
+        }),
+      ),
     }),
     async execute(toolCallId, params) {
       if (origin.adapter !== 'github') return denied(logger, 'post_github_review is only supported on github sessions.')
@@ -68,6 +75,7 @@ export function createPostGithubReviewTool(options: {
           verdict,
           ...(origin.githubReviewRound !== undefined ? { round: origin.githubReviewRound } : {}),
           thread: origin.thread,
+          ...(params.head_sha !== undefined ? { reviewedHeadSha: params.head_sha } : {}),
           retainDuplicateLease: params.event === 'REQUEST_CHANGES',
         })
         if (blocked !== null) {
@@ -112,6 +120,7 @@ export function createPostGithubReviewTool(options: {
         event: params.event,
         body: params.body,
         comments: (params.comments ?? []).map(toReviewFinding),
+        ...(params.head_sha !== undefined ? { expectedHeadSha: params.head_sha } : {}),
       }
       let releaseAsLanded = false
       try {
@@ -127,7 +136,13 @@ export function createPostGithubReviewTool(options: {
         if (effective === null)
           return denied(logger, `GitHub returned an unknown verified review state: ${result.state}`)
         releaseAsLanded = verdict !== null && effective === verdict
-        creditVerifiedReview({ sessionId, workspace: origin.workspace, prNumber, effective })
+        creditVerifiedReview({
+          sessionId,
+          workspace: origin.workspace,
+          prNumber,
+          effective,
+          ...(result.commitSha !== undefined ? { commitSha: result.commitSha } : {}),
+        })
 
         const receipt = renderReceipt(
           result.reviewId,
@@ -254,6 +269,7 @@ function creditVerifiedReview(args: {
   workspace: string
   prNumber: number
   effective: ReviewVerdict | 'COMMENT'
+  commitSha?: string
 }): void {
   if (args.effective === 'COMMENT') {
     recordReviewOutput({
@@ -271,6 +287,7 @@ function creditVerifiedReview(args: {
     workspace: args.workspace,
     prNumber: args.prNumber,
     verdict: args.effective,
+    ...(args.commitSha !== undefined ? { commitSha: args.commitSha } : {}),
   })
 }
 

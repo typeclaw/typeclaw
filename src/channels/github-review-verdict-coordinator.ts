@@ -51,6 +51,7 @@ export type ReviewVerdictGuard = {
     verdict: ReviewVerdict
     round?: GithubReviewFollowupRound
     thread?: string | null
+    reviewedHeadSha?: string
     retainDuplicateLease?: boolean
   }) => Promise<ApproveBlock | null>
   release: (args: { callId: string; outcome: ReviewOutputOutcome }) => Promise<void>
@@ -129,6 +130,18 @@ const ROUND_HEAD_UNVERIFIED_REASON =
 const ROUND_HEAD_MOVED_REASON =
   'The pull request head moved past the commit this review round covers, so a verdict from this round would describe stale code. ' +
   'Do not submit it; the new push starts its own review round.'
+
+function reviewedHeadRequiredReason(currentHead: string): string {
+  return (
+    `The pull request head moved to ${currentHead} after this review round opened. ` +
+    'Submit the verdict with `post_github_review` and set `head_sha` to the full commit SHA your review covered. ' +
+    `If you did not review ${currentHead}, re-review that commit first.`
+  )
+}
+
+function sameSha(a: string | undefined, b: string): boolean {
+  return a !== undefined && a.toLocaleLowerCase() === b.toLocaleLowerCase()
+}
 
 // The standing verdict a fresh attempt would duplicate. APPROVE duplicates a
 // standing APPROVED; REQUEST_CHANGES duplicates a standing CHANGES_REQUESTED.
@@ -411,15 +424,53 @@ export function canPromoteGithubReviewRoundTo(
   return current !== undefined && current.status !== 'completed' && !current.attemptedCarriers.has(thread)
 }
 
+// `landedCommitSha` distinguishes the two callers. A restore (undefined) only
+// asks whether the round still owns the PR. A completion passes the commit the
+// landed verdict is attached to (null when the publisher cannot tell), because
+// completing releases the carrier's thread close-outs: after an unobserved push
+// the verdict must still describe the current head.
 export async function validateGithubReviewRound(
   round: GithubReviewFollowupRound,
   createdAt?: number,
   now: () => number = Date.now,
+  landedCommitSha?: string | null,
 ): Promise<boolean> {
   if (createdAt !== undefined && now() - createdAt >= reviewRoundTtlMs(round)) return false
   if (expiredReviewRoundKeys.has(githubReviewRoundKey(round))) return false
+  if (isGithubReviewRoundSuperseded(round, now)) return false
   const currentHead = await processHeadShaResolver({ workspace: round.workspace, prNumber: round.prNumber })
-  return currentHead !== null && currentHead === round.headSha
+  if (currentHead === null || isGithubReviewRoundSuperseded(round, now)) return false
+  if (currentHead === round.headSha) return true
+  if (round.kind !== 'reply') return false
+  return landedCommitSha === undefined || sameSha(landedCommitSha ?? undefined, currentHead)
+}
+
+// Registering a round evicts every other round for the same PR, so a round that
+// is no longer registered while a sibling round is has been replaced by a newer
+// one (a later push, or a later reply generation). Re-registering it would evict
+// that newer round in turn, so callers must check this BEFORE re-registration.
+export function isGithubReviewRoundSuperseded(round: GithubReviewFollowupRound, now: () => number = Date.now): boolean {
+  const key = githubReviewRoundKey(round)
+  if (activeReviewRoundState(key, now) !== undefined) return false
+  expireReviewRounds(now)
+  return Array.from(reviewRounds.entries()).some(
+    ([candidateKey, state]) =>
+      candidateKey !== key && state.round.workspace === round.workspace && state.round.prNumber === round.prNumber,
+  )
+}
+
+function pendingPushRoundForPr(
+  target: { workspace: string; prNumber: number },
+  now: () => number = Date.now,
+): ReviewRoundState | undefined {
+  expireReviewRounds(now)
+  return Array.from(reviewRounds.values()).find(
+    (state) =>
+      state.status === 'pending' &&
+      state.round.kind === 'push' &&
+      state.round.workspace === target.workspace &&
+      state.round.prNumber === target.prNumber,
+  )
 }
 
 export async function guardGithubReviewRoundDismissal(args: {
@@ -774,19 +825,13 @@ async function evaluateRoundEligibility(
     prNumber: number
     round?: GithubReviewFollowupRound
     thread?: string | null
+    reviewedHeadSha?: string
   },
   resolveHeadSha: HeadShaResolver,
   now: () => number = Date.now,
   logger: ReviewVerdictCoordinatorLogger = processLogger,
 ): Promise<ApproveBlock | null> {
-  expireReviewRounds(now)
-  const pendingRoundForPr = Array.from(reviewRounds.values()).find(
-    (state) =>
-      state.status === 'pending' &&
-      state.round.kind === 'push' &&
-      state.round.workspace === args.workspace &&
-      state.round.prNumber === args.prNumber,
-  )
+  const pendingRoundForPr = pendingPushRoundForPr(args, now)
   // Pushes invalidate the whole PR's prior verdict, so their round legitimately
   // owns every verdict attempt until one sibling carries it. Reply rounds only
   // coordinate the stamped siblings answering one blocking review: their
@@ -821,11 +866,25 @@ async function evaluateRoundEligibility(
     )
     return { block: true, kind: 'round-ineligible', reason: ROUND_HEAD_UNVERIFIED_REASON }
   }
-  if (currentRoundHead !== activeRound.headSha) {
+  // Re-read ownership after the await: a round registered meanwhile evicted this
+  // one, and the registration below would evict it right back.
+  const superseded = isGithubReviewRoundSuperseded(activeRound, now)
+  if (superseded || (currentRoundHead !== activeRound.headSha && activeRound.kind === 'push')) {
     logger.warn(
-      `[github] review round head moved pr=${activeRound.workspace}#${activeRound.prNumber} round=${activeRound.roundId} round_head=${activeRound.headSha} current_head=${currentRoundHead}`,
+      `[github] review round head moved pr=${activeRound.workspace}#${activeRound.prNumber} round=${activeRound.roundId} round_head=${activeRound.headSha} current_head=${currentRoundHead}${superseded ? ' superseded=true' : ''}`,
     )
     return { block: true, kind: 'round-ineligible', reason: ROUND_HEAD_MOVED_REASON }
+  }
+  // A reply round's head is only the webhook snapshot at reply time, and no push
+  // round replaces it unless the adapter receives the push (never when
+  // `pull_request.synchronize` is off the event allowlist). So a moved reply round
+  // follows the head, but only for a verdict bound to the commit it describes:
+  // the carrier must name the head it reviewed, and it must still be current.
+  if (currentRoundHead !== activeRound.headSha && !sameSha(args.reviewedHeadSha, currentRoundHead)) {
+    logger.warn(
+      `[github] review round head moved without a matching reviewed head pr=${activeRound.workspace}#${activeRound.prNumber} round=${activeRound.roundId} current_head=${currentRoundHead} reviewed_head=${args.reviewedHeadSha ?? 'none'}`,
+    )
+    return { block: true, kind: 'round-ineligible', reason: reviewedHeadRequiredReason(currentRoundHead) }
   }
   registerGithubReviewRound(activeRound, now())
   return null

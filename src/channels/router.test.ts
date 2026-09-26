@@ -55,6 +55,8 @@ import {
   configureReviewVerdictCoordinator,
   guardGithubReviewRoundDismissal,
   isGithubReviewRoundComplete,
+  isGithubReviewRoundPending,
+  registerGithubReviewRound,
   REPLY_REVIEW_ROUND_TTL_MS,
   releaseGithubReviewRoundDismissal,
   REVIEW_ROUND_TTL_MS,
@@ -18237,6 +18239,90 @@ describe('GitHub review follow-up round composition', () => {
       }),
     ).toBeNull()
     releaseGithubReviewRoundDismissal('dismiss-after-missing-publisher', false)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('does not complete a reply round that a push round replaced after its verdict landed', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => 'sha-pushed',
+    })
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const replyRound = {
+      kind: 'reply',
+      roundId: 'reply-before-push',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-replied',
+      carrierThread: '101',
+    } as const
+    const pushRound = { ...replyRound, kind: 'push', roundId: 'push-after-verdict', headSha: 'sha-pushed' } as const
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await router.route(inbound({ ...key, externalMessageId: 'reply-101', githubReviewRound: replyRound }))
+    await router.__testing!.flushDebounce(key)
+
+    // given: the carrier's verdict landed, then a push round registered before completion observed it
+    registerGithubReviewRound(pushRound)
+
+    // when
+    const completion = await router.completeGithubReviewRound?.({
+      workspace: replyRound.workspace,
+      prNumber: replyRound.prNumber,
+      verdict: 'APPROVE',
+      sessionId: 'ses_fake_1',
+    })
+
+    // then: the push round keeps ownership and the reply round is not completed
+    expect(completion).toEqual({ kind: 'no-round' })
+    expect(isGithubReviewRoundPending(pushRound)).toBe(true)
+    expect(isGithubReviewRoundComplete(replyRound)).toBe(false)
+    expect(logs.some((log) => log.includes('round superseded'))).toBe(true)
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
+  test('completes a moved reply round only for a verdict landed on the current head', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    configureReviewVerdictCoordinator({
+      resolveEffectiveApproval: async () => ({ ok: true, effective: 'APPROVED' }),
+      resolveHeadSha: async () => 'sha-c',
+    })
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+    const replyRound = {
+      kind: 'reply',
+      roundId: 'reply-moved-after-verdict',
+      workspace: 'acme/widgets',
+      prNumber: 7,
+      headSha: 'sha-a',
+      carrierThread: '101',
+    } as const
+    const key = { adapter: 'github' as const, workspace: 'acme/widgets', chat: 'pr:7', thread: '101' }
+    await router.route(inbound({ ...key, externalMessageId: 'reply-moved-101', githubReviewRound: replyRound }))
+    await router.__testing!.flushDebounce(key)
+    const complete = (commitSha?: string) =>
+      router.completeGithubReviewRound?.({
+        workspace: replyRound.workspace,
+        prNumber: replyRound.prNumber,
+        verdict: 'APPROVE',
+        sessionId: 'ses_fake_1',
+        ...(commitSha !== undefined ? { commitSha } : {}),
+      })
+
+    // given: the verdict landed on B, then an unobserved push moved the head to C
+    // when / then: neither a B verdict nor an unattributed one completes the round
+    expect(await complete('sha-b')).toEqual({ kind: 'no-round' })
+    expect(await complete()).toEqual({ kind: 'no-round' })
+    expect(isGithubReviewRoundComplete(replyRound)).toBe(false)
+
+    // when / then: a verdict landed on C does
+    expect(await complete('sha-c')).toEqual({ kind: 'completed' })
+    expect(isGithubReviewRoundComplete(replyRound)).toBe(true)
     __resetReviewVerdictGuardForTest()
     await router.stop()
   })
