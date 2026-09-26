@@ -136,7 +136,13 @@ export function createPostGithubReviewTool(options: {
         if (effective === null)
           return denied(logger, `GitHub returned an unknown verified review state: ${result.state}`)
         releaseAsLanded = verdict !== null && effective === verdict
-        creditVerifiedReview({ sessionId, workspace: origin.workspace, prNumber, effective })
+        creditVerifiedReview({
+          sessionId,
+          workspace: origin.workspace,
+          prNumber,
+          effective,
+          ...(result.commitSha !== undefined ? { commitSha: result.commitSha } : {}),
+        })
 
         const receipt = renderReceipt(
           result.reviewId,
@@ -263,6 +269,7 @@ function creditVerifiedReview(args: {
   workspace: string
   prNumber: number
   effective: ReviewVerdict | 'COMMENT'
+  commitSha?: string
 }): void {
   if (args.effective === 'COMMENT') {
     recordReviewOutput({
@@ -280,6 +287,7 @@ function creditVerifiedReview(args: {
     workspace: args.workspace,
     prNumber: args.prNumber,
     verdict: args.effective,
+    ...(args.commitSha !== undefined ? { commitSha: args.commitSha } : {}),
   })
 }
 

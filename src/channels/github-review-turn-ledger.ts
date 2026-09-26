@@ -14,6 +14,8 @@ export type ReviewObserver = (args: {
   workspace: string
   prNumber: number
   verdict: ReviewRoundOutcome
+  // The commit the landed review is attached to, when the publisher knows it.
+  commitSha?: string
 }) => void
 
 // A formal review LANDED this turn, of ANY state — the two decisive verdicts PLUS
@@ -81,6 +83,7 @@ export function recordReview(args: {
   workspace: string
   prNumber: number
   verdict: ReviewVerdict
+  commitSha?: string
 }): void {
   const key = prKey(args.sessionId, args.workspace, args.prNumber)
   const set = reviewsByPr.get(key) ?? new Set<ReviewVerdict>()
