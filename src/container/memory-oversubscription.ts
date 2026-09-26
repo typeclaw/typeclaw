@@ -1,4 +1,5 @@
 import { COMPOSE_PROJECT } from './compose-project'
+import { HOST_HEADROOM_BYTES } from './memory-limit'
 import type { DockerExec } from './shared'
 
 // `bytes: null` means the container runs with NO memory limit. That is a
@@ -78,9 +79,22 @@ export function formatOversubscriptionWarning(warning: OversubscriptionWarning):
   const remedy =
     warning.unbounded.length > 0
       ? ['An unbounded agent can exhaust the host on its own. Restart it to apply', 'the current limit.']
-      : ['If they peak together the host can still exhaust. Stop an agent, or', 'give Docker more memory.']
+      : oversubscriptionRemedy(warning.claimedBytes)
 
   return [headline, ...roster, ...remedy]
+}
+
+function oversubscriptionRemedy(claimedBytes: number): string[] {
+  const targetGib = Math.ceil((claimedBytes + HOST_HEADROOM_BYTES) / (1024 * 1024 * 1024))
+  return [
+    'If they peak together the host can still exhaust. Either:',
+    '  • Stop an agent: run `typeclaw stop` in its folder.',
+    `  • Give Docker at least ${targetGib}GiB of memory, then restart the runtime:`,
+    '      Docker Desktop: Settings → Resources → Memory limit → Apply & restart',
+    `      OrbStack:       orb config set memory_mib ${targetGib * 1024}`,
+    `      Colima:         colima stop && colima start --memory ${targetGib}`,
+    '      Linux Engine:   Docker uses host RAM directly; stop an agent instead.',
+  ]
 }
 
 // Reads the memory cap Docker actually applied to every running agent. Docker

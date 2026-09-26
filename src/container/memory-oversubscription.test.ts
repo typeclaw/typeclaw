@@ -108,7 +108,25 @@ describe('formatOversubscriptionWarning', () => {
     expect(text).toContain('8.0GiB')
     expect(text).toContain('alpha')
     expect(text).toContain('beta')
-    expect(text).toContain('give Docker more memory')
+  })
+
+  test('tells the operator how to act, per runtime, with a concrete size', () => {
+    const lines = formatOversubscriptionWarning({
+      claims: [
+        { containerName: 'alpha', bytes: 6 * GIB },
+        { containerName: 'beta', bytes: 6 * GIB },
+      ],
+      claimedBytes: 12 * GIB,
+      totalMemoryBytes: 8 * GIB,
+      unbounded: [],
+    })
+    const text = lines.join('\n')
+
+    expect(text).toContain('typeclaw stop')
+    expect(text).toContain('at least 14GiB')
+    expect(text).toContain('Docker Desktop: Settings → Resources → Memory limit')
+    expect(text).toContain('orb config set memory_mib 14336')
+    expect(text).toContain('colima start --memory 14')
   })
 })
 

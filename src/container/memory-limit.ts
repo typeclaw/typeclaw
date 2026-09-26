@@ -14,7 +14,7 @@ export const DEFAULT_CONTAINER_MEMORY_BYTES = 6 * BYTES_PER_GIB
 // Memory left to the Docker VM itself (dockerd, containerd, the guest kernel,
 // page cache) when the default does not fit. Without it a single agent sized to
 // the whole machine reproduces the exhaustion this limit exists to prevent.
-const HOST_HEADROOM_BYTES = 2 * BYTES_PER_GIB
+export const HOST_HEADROOM_BYTES = 2 * BYTES_PER_GIB
 
 // Below this a container cannot boot the agent at all, so clamping further down
 // would trade a slow host for an agent that never starts.
