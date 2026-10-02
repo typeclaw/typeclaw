@@ -7,7 +7,6 @@ import { createProviderAuthReloadable } from '@/agent/auth-reloadable'
 import { LiveSessionRegistry } from '@/agent/live-sessions'
 import { LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
 import { requestContainerRestart } from '@/agent/restart'
-import { consumeRestartHandoff } from '@/agent/restart-handoff'
 import { sessionMetaPayload } from '@/agent/session-meta'
 import type { SessionOrigin } from '@/agent/session-origin'
 import {
@@ -34,12 +33,18 @@ import {
   createGithubTokenBridge,
   createPrVerdictActivityBridge,
   createSubagentCompletionBridge,
+  setReviewCoverageCapture,
   setReviewObserver,
   setReviewOutputObserver,
   type ChannelManager,
   type PrVerdictActivityBridge,
   type SubagentCompletionBridge,
 } from '@/channels'
+import { LegacyBackgroundHandoffReader } from '@/channels/background-handoff'
+import { BackgroundObligationStore } from '@/channels/background-obligations'
+import { InboundJournal } from '@/channels/inbound-journal'
+import { RecoveryDispatcher } from '@/channels/recovery-dispatcher'
+import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
 import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
 import {
@@ -86,6 +91,7 @@ import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 
+import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
 import { installFatalGuard } from './fatal-guard'
@@ -478,15 +484,38 @@ async function startAgentRuntime(
     },
   })
 
+  const legacyBackgroundHandoffs = new LegacyBackgroundHandoffReader(cwd, {
+    onError: (error) => console.warn(`[run] legacy background upgrade failed: ${error}`),
+  })
+  const backgroundObligations = new BackgroundObligationStore(cwd, {
+    epoch: legacyBackgroundHandoffs.processEpoch,
+    onError: (error) => console.warn(`[run] background continuity failed: ${error}`),
+  })
   const liveSubagentRegistry = new LiveSubagentRegistry()
   const subagentCoalescer = new SubagentCoalescer()
   const liveSessionRegistry = new LiveSessionRegistry()
 
+  const recoveryOutbox = new RecoveryOutbox(cwd, {
+    epoch: backgroundObligations.epoch,
+    onError: (error) => console.warn(`[run] recovery outbox failed: ${error}`),
+  })
+  const inboundJournal = new InboundJournal(cwd, {
+    backgroundObligations,
+    onError: (error) => console.warn(`[run] inbound continuity recovery blocked: ${error}`),
+  })
+  registerBootCleanup(() => inboundJournal.close())
+  let recoveryDispatcher: RecoveryDispatcher | undefined
   const channelManager = createChannelManagerFor({
     agentDir: cwd,
+    backgroundObligations,
+    inboundJournal,
+    recoveryOutbox,
     secretsProvider: caps.secrets,
     channelsConfigRef: () => getConfig().channels,
     aliasesRef: () => getConfig().alias,
+    onRecoveryReady: () => {
+      void recoveryDispatcher?.wake().catch((error) => console.warn(`[run] recovery wake failed: ${error}`))
+    },
     tunnelUrlForChannel: (name) => resolveTunnelUrlForChannel(name, tunnelManager),
     tunnelConfiguredForChannel: (name) => isTunnelConfiguredForChannel(name),
     createSessionForChannel: buildChannelSessionFactory({
@@ -514,11 +543,6 @@ async function startAgentRuntime(
     stream,
     newestRunningChildSubagentStartedAt: (sessionId) =>
       newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId })),
-    listRunningBackgroundSubagentNames: (sessionId) =>
-      liveSubagentRegistry
-        .list({ parentSessionId: sessionId })
-        .filter((child) => child.status === 'running' && child.background === true)
-        .map((child) => child.subagentName),
     cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()
@@ -889,9 +913,13 @@ async function startAgentRuntime(
   // empty-turn fallback is suppressed: the review IS the turn's output, but it goes
   // through the GitHub API, not the channel send path. In-process router call — no
   // stream fan-out, since this is the recording session's own bookkeeping.
-  setReviewOutputObserver((output) => {
-    channelManager.router.noteGithubReviewOutput(output)
-  })
+  setReviewCoverageCapture(async (sessionId) => ({
+    expectedAccountIdentity: await channelManager.router.captureTurnAccountIdentity?.(sessionId),
+    inboundCoverage: (await channelManager.router.captureInboundResultCoverage?.(sessionId)) ?? [],
+    backgroundCoverage: (await channelManager.router.captureBackgroundResultCoverage?.(sessionId)) ?? [],
+  }))
+  registerBootCleanup(() => setReviewCoverageCapture(null))
+  setReviewOutputObserver((output) => channelManager.router.noteGithubReviewOutput(output).then(() => {}))
   registerBootCleanup(() => setReviewOutputObserver(null))
 
   // Registered before channels so its cache clear lands before any channel
@@ -907,36 +935,37 @@ async function startAgentRuntime(
 
   reloadRegistry.register(createChannelsReloadable({ manager: channelManager }))
 
-  // Two-phase channel restart-resume around adapter startup, to close the race
-  // where an adapter starts receiving before the resume claims the handoff:
-  //   1. Claim the channel handoff and RESERVE the originating key BEFORE
-  //      channelManager.start(). The reservation installs a per-key gate, so an
-  //      inbound that arrives the instant an adapter connects coalesces onto the
-  //      resume instead of stale-rolling the mapping or creating a rival session.
-  //   2. start() the adapters (registers outbound callbacks the wake reply needs).
-  //   3. resume() the reservation: reopen the exact session and enqueue the wake
-  //      — skipped automatically if a real inbound already coalesced in (2)→(3).
-  // Claims ONLY channel handoffs; tui handoffs are left on disk (peek-then-delete
-  // never removes an unclaimed handoff) for the websocket open handler to claim.
-  // Best-effort throughout: any failure leaves the todo to resume on the next inbound.
-  let restartReservation: ReturnType<typeof channelManager.router.reserveRestartHandoff> = null
-  try {
-    const handoff = await consumeRestartHandoff(cwd, { accept: (h) => h.origin.kind === 'channel' })
-    if (handoff !== null) restartReservation = channelManager.router.reserveRestartHandoff(handoff)
-  } catch (err) {
-    console.warn(`[run] channel restart-resume reserve failed: ${err instanceof Error ? err.message : err}`)
-  }
-
   registerBootCleanup(() => channelManager.stop())
-  await channelManager.start()
-
-  if (restartReservation !== null) {
-    try {
-      await restartReservation.resume()
-    } catch (err) {
-      console.warn(`[run] channel restart-resume failed: ${err instanceof Error ? err.message : err}`)
-    }
+  recoveryDispatcher = new RecoveryDispatcher(recoveryOutbox, channelManager.router, {
+    onError: (error) => console.warn(`[run] recovery dispatch failed: ${error}`),
+    backgroundObligations,
+    inboundJournal,
+  })
+  registerBootCleanup(() => recoveryDispatcher?.stop())
+  try {
+    // Mixed source decisions are repaired before any child or notice can progress.
+    await inboundJournal.initialize()
+    await inboundJournal.repair()
+    await inboundJournal.importOldEpoch(recoveryOutbox)
+    await bootBackgroundObligations({
+      obligations: backgroundObligations,
+      outbox: recoveryOutbox,
+      inventory: legacyBackgroundHandoffs,
+    })
+  } catch (error) {
+    // Keep the operator/adapter surface and verified inventory-only notices alive.
+    // Journal failure freezes dependent work; valid-looking child JSON is not proof of independence.
+    backgroundObligations.setFrozen(error)
+    console.warn(`[run] continuity blocked pending operator repair: ${error}`)
   }
+  await bootChannelRestartGreeting({
+    agentDir: cwd,
+    router: channelManager.router,
+    configured: (key) => getConfig().channels[key.adapter] !== undefined,
+    startAdapters: () => channelManager.start(),
+    onError: (error) => console.warn(`[run] channel restart-resume failed: ${error}`),
+  })
+  await recoveryDispatcher.wake()
 
   // Captured separately from setSpawnSubagent so both the plugin context and
   // the plugin-command runner can dispatch through the same path. The setter
@@ -1107,10 +1136,17 @@ async function startAgentRuntime(
       subagentCompletionBridge.stop()
       prVerdictActivityBridge.stop()
       setReviewObserver(null)
+      setReviewCoverageCapture(null)
+      setReviewOutputObserver(null)
       await tunnelManager.stop()
+      await recoveryDispatcher?.stop()
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
+      await inboundJournal.close().catch((error) => console.warn(`[run] inbound continuity close failed: ${error}`))
+      await backgroundObligations
+        .flush()
+        .catch((error) => console.warn(`[run] background continuity flush failed: ${error}`))
       await pluginsLoaded.disposePlugins()
       disposeProcessGlobals()
     }
@@ -1133,10 +1169,6 @@ async function startAgentRuntime(
     forceExit.unref()
     void (async () => {
       if (containerName !== undefined) {
-        // Persist the interrupted-subagent handoff BEFORE markRestartAbortForAllLive
-        // aborts the sessions and stop() tears them down — both read the same live
-        // set this write depends on.
-        await channelManager.router.writeInterruptedSubagentHandoff().catch(() => undefined)
         await markRestartAbortPendingForOrigin(cwd, { kind: 'tui', sessionId: 'tui' }).catch(() => undefined)
         await channelManager.router.markRestartAbortForAllLive().catch(() => undefined)
       }

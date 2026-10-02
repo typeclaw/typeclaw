@@ -299,6 +299,7 @@ function noopRouter(route?: (message: InboundMessage) => void): ChannelRouter {
         property === 'route'
           ? async (message: InboundMessage) => {
               route?.(message)
+              return { kind: 'accepted' as const, inputId: message.externalMessageId, generation: 0 }
             }
           : () => {},
     },
@@ -2214,9 +2215,11 @@ class FakeDiscordBotRouter {
   readonly unregistered: string[] = []
   selfIdentity: ((workspace: string) => { id: string; username?: string } | null) | null = null
   readonly value = {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' as const }),
     registerOutbound: () => this.registered.push('outbound'),
     unregisterOutbound: () => this.unregistered.push('outbound'),
+    registerRecoveryAdapter: () => {},
+    unregisterRecoveryAdapter: () => {},
     registerReaction: () => this.registered.push('reaction'),
     unregisterReaction: () => this.unregistered.push('reaction'),
     registerRemoveReaction: () => this.registered.push('removeReaction'),

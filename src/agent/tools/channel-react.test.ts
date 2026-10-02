@@ -7,7 +7,7 @@ import { createChannelReactTool, type ChannelReactOrigin } from './channel-react
 
 function fakeRouter(queueReactionAfterReply: (req: ReactionRequest) => Promise<ReactionResult>): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     send: async () => ({ ok: true }),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
@@ -51,10 +51,10 @@ function fakeRouter(queueReactionAfterReply: (req: ReactionRequest) => Promise<R
     markRestartAbortForAllLive: async () => {},
     liveCount: () => 0,
     executeCommand: async () => ({ kind: 'no-live-session' }),
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
+    injectSubagentCompletionReminder: async () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: () => ({ kind: 'no-live-session' }),
+    noteGithubReviewOutput: async () => ({ kind: 'no-live-session' }),
+    markTurnSkipped: async () => ({ kind: 'no-live-session' }),
     resumeRestartHandoff: async () => {},
   } as unknown as ChannelRouter
 }

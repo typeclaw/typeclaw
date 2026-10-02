@@ -7,7 +7,7 @@ import { createChannelEditTool } from './channel-edit'
 
 function fakeRouter(handler: (req: EditMessageRequest) => Promise<EditMessageResult>): ChannelRouter {
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
     send: async () => ({ ok: true }),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 5_000 }),
@@ -58,13 +58,12 @@ function fakeRouter(handler: (req: EditMessageRequest) => Promise<EditMessageRes
     stop: async () => {},
     tearDownAllLive: async () => {},
     markRestartAbortForAllLive: async () => {},
-    writeInterruptedSubagentHandoff: async () => false,
     liveCount: () => 0,
     executeCommand: async () => ({ kind: 'no-live-session' }),
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
+    injectSubagentCompletionReminder: async () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: () => ({ kind: 'no-live-session' }),
+    noteGithubReviewOutput: async () => ({ kind: 'no-live-session' }),
+    markTurnSkipped: async () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
     reserveRestartHandoff: () => null,
     resumeRestartHandoff: async () => {},

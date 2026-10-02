@@ -26,8 +26,11 @@ import { createTeamsAdapter, type TeamsAdapter } from './adapters/teams'
 import { createTelegramBotAdapter, type TelegramBotAdapter } from './adapters/telegram-bot'
 import { createWebexAdapter, type WebexAdapter } from './adapters/webex'
 import { createWebexBotAdapter, type WebexBotAdapter } from './adapters/webex-bot'
+import type { BackgroundObligationStore } from './background-obligations'
 import { describeError } from './describe-error'
 import type { GithubTokenBridge } from './github-token-bridge'
+import type { InboundJournal } from './inbound-journal'
+import type { RecoveryOutbox } from './recovery-outbox'
 import {
   createChannelRouter,
   type ChannelRouter,
@@ -58,6 +61,7 @@ const consoleLogger: ChannelManagerLogger = {
 export type ChannelManagerOptions = {
   agentDir: string
   channelsConfigRef: () => ChannelsConfig
+  onRecoveryReady?: () => void
   // Plain-text names the agent answers to in channel engagement (the
   // `alias` field in `typeclaw.json`), forwarded to the router as
   // `configuredAliases`. Read live on every inbound so an `applied`-class
@@ -97,6 +101,9 @@ export type ChannelManagerOptions = {
   createTelegramAdapter?: typeof createTelegramBotAdapter
   createWebexAdapter?: typeof createWebexAdapter
   createWebexBotAdapter?: typeof createWebexBotAdapter
+  backgroundObligations?: BackgroundObligationStore
+  inboundJournal?: InboundJournal
+  recoveryOutbox?: RecoveryOutbox
   // Wake-up gate: forwarded to the router, which calls
   // `permissions.has(origin, 'channel.respond')` BEFORE creating a
   // session for any inbound. Optional here to keep direct manager-level
@@ -135,10 +142,6 @@ export type ChannelManagerOptions = {
   // otherwise spawn a duplicate child). Production wiring (src/run/index.ts)
   // supplies it from the LiveSubagentRegistry; tests omit it.
   newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
-  // Forwarded to the router so the graceful-restart handoff can name the
-  // background subagents a session was still awaiting. Same wiring shape as
-  // newestRunningChildSubagentStartedAt; tests omit it.
-  listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
   // Forwarded to the router so an adapter-triggered work invalidation can stop
   // independent background sessions that a parent AgentSession abort cannot reach.
   cancelRunningSubagentsByWorkKey?: (
@@ -249,6 +252,9 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const env = options.env ?? process.env
   const router = createChannelRouter({
     agentDir: options.agentDir,
+    ...(options.backgroundObligations ? { backgroundObligations: options.backgroundObligations } : {}),
+    ...(options.inboundJournal ? { inboundJournal: options.inboundJournal } : {}),
+    ...(options.recoveryOutbox ? { recoveryOutbox: options.recoveryOutbox } : {}),
     configForAdapter: (adapter) => options.channelsConfigRef()[adapter],
     logger,
     ...(options.aliasesRef ? { configuredAliases: options.aliasesRef } : {}),
@@ -260,9 +266,6 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     ...(options.onRestart ? { onRestart: options.onRestart } : {}),
     ...(options.newestRunningChildSubagentStartedAt
       ? { newestRunningChildSubagentStartedAt: options.newestRunningChildSubagentStartedAt }
-      : {}),
-    ...(options.listRunningBackgroundSubagentNames
-      ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
     ...(options.cancelRunningSubagentsByWorkKey
       ? { cancelRunningSubagentsByWorkKey: options.cancelRunningSubagentsByWorkKey }
@@ -528,6 +531,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         recoveryRestartAttempts: 0,
         recoveryRestartQueued: false,
       })
+      options.onRecoveryReady?.()
       return { status: 'started' }
     } catch (err) {
       await cleanupPartialStart(adapter)
@@ -1028,6 +1032,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         }
       }
 
+      options.onRecoveryReady?.()
       return { started, stopped, restarted, restartRequired, ...(credentialApply ? { credentialApply } : {}) }
     },
   }

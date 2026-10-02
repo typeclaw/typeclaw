@@ -42,6 +42,8 @@ import { chunkMarkdown } from '@/markdown'
 
 import { describeError } from '../describe-error'
 import { addSlackMentionHints } from './mention-hints'
+import { withOutboundAccount } from './outbound-account'
+import { createBotRecoveryCallbacks, sendBotRecovery } from './recovery-correlation'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
 import { createSlackAuthorResolver, type SlackAuthorResolver } from './slack-bot-author-resolver'
 import { createSlackChannelResolver } from './slack-bot-channel-resolver'
@@ -72,6 +74,7 @@ import {
 } from './slack-bot-slash-commands'
 import { slackTsToMillis } from './slack-bot-time'
 import { toSlackMrkdwn } from './slack-format'
+import { normalizeSlackInbound } from './slack-inbound-revision'
 import { invalidSlackThreadTs } from './slack-thread-ts'
 
 // One slash command per logical agent gesture. Mirrors the discord-bot
@@ -975,12 +978,18 @@ export function createOutboundCallback(deps: {
   formatChannelTag: (workspace: string, chat: string) => Promise<string>
   readFile?: (path: string) => Promise<Buffer>
   typingTracker?: Pick<SlackTypingTracker, 'clearAfterSend'>
+  token?: string
+  fetchImpl?: typeof fetch
 }): OutboundCallback {
   const { client, logger, formatChannelTag, typingTracker } = deps
   const readFile = deps.readFile ?? readAttachmentBuffer
   return async (msg: OutboundMessage): Promise<SendResult> => {
     if (msg.adapter !== 'slack-bot') {
       return { ok: false, error: `unknown adapter: ${msg.adapter}` }
+    }
+    if (msg.sendOptions?.accounting === 'recovery') {
+      if (!deps.token) return { ok: false, error: 'recovery-token-unavailable' }
+      return sendBotRecovery('slack-bot', deps.token, msg, deps.fetchImpl)
     }
     const text = msg.text ?? ''
     const attachments = msg.attachments ?? []
@@ -1159,6 +1168,11 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
   const logger = options.logger ?? consoleLogger
   const client = options.createClient?.() ?? new SlackBotClient()
   const fetchImpl = options.fetchImpl ?? fetch
+  const recoveryCallbacks = createBotRecoveryCallbacks('slack-bot', options.token, fetchImpl, (workspace) =>
+    botUserId !== null && teamId !== null && (workspace === undefined || workspace === '@dm' || workspace === teamId)
+      ? `slack-bot:${teamId}:${botUserId}`
+      : undefined,
+  )
   let listener: SlackBotListener | null = null
   let botUserId: string | null = null
   let teamId: string | null = null
@@ -1214,12 +1228,17 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     historyCallback,
   })
 
-  const outboundCallback = createOutboundCallback({
-    client,
-    logger,
-    formatChannelTag,
-    typingTracker,
-  })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({
+      client,
+      token: options.token,
+      fetchImpl,
+      logger,
+      formatChannelTag,
+      typingTracker,
+    }),
+    (workspace) => recoveryCallbacks.cachedAccountIdentity?.(workspace),
+  )
 
   const fetchAttachmentCallback = createFetchAttachmentCallback({ client, logger, token: options.token })
 
@@ -1254,10 +1273,14 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     },
   })
 
+  // Normalize edits before dedupe, commands and reference enrichment.
   const handleMessageEvent = async (
     event: SlackInboundMessageEvent,
     source: 'message' | 'app_mention',
   ): Promise<void> => {
+    const inboundTeamId = teamId
+    const inboundBotId = botUserId
+    event = normalizeSlackInbound(event)
     inflightInbounds++
     try {
       const text = event.text ?? ''
@@ -1271,7 +1294,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         `[slack-bot] inbound source=${source} ts=${event.ts} user=${formatLabel(resolvedUserName, userId)} ${inboundTag} text_len=${text.length}`,
       )
 
-      if (teamId === null) {
+      if (inboundTeamId === null) {
         logger.warn(`[slack-bot] dropped ts=${event.ts} reason=pre_connected (team_id unknown)`)
         return
       }
@@ -1292,7 +1315,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       // system event. The `reserve` closure marks dedupe synchronously the
       // instant the command is recognised (before the router await), closing
       // the check→execute race for duplicate deliveries.
-      if (event.user !== undefined && event.user !== '' && (botUserId === null || event.user !== botUserId)) {
+      if (event.user !== undefined && event.user !== '' && (inboundBotId === null || event.user !== inboundBotId)) {
         const reserve = (): boolean => {
           if (dedupe.check(event) !== null) return false
           dedupe.mark(event)
@@ -1304,7 +1327,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
             channel: event.channel,
             threadTs: event.thread_ts ?? null,
             isDm: event.channel_type === 'im',
-            teamId,
+            teamId: inboundTeamId,
             invokerId: event.user,
           },
           reserve,
@@ -1317,8 +1340,8 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       }
 
       const verdict = classifyInbound(event, options.configRef(), {
-        teamId,
-        botUserId,
+        teamId: inboundTeamId,
+        botUserId: inboundBotId,
         ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
       })
       if (verdict.kind === 'drop') {
@@ -1326,7 +1349,6 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         return
       }
 
-      dedupe.mark(event)
       const hintedText = await addSlackMentionHints(verdict.payload.text, authorResolver.resolve, { botUserId })
       const slackAttachments = Array.isArray(event.attachments) ? event.attachments : undefined
       const referenceResult = await enrichSlackReferenceContext({
@@ -1349,6 +1371,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         `[slack-bot] routed ts=${event.ts} ${routedTag} mention=${enriched.isBotMention} reply=${enriched.replyToBotMessageId !== null}`,
       )
       await options.router.route(enriched)
+      dedupe.mark(event)
     } catch (err) {
       logger.error(`[slack-bot] handleInbound failed: ${describeError(err)}`)
     } finally {
@@ -1442,6 +1465,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       })
 
       options.router.registerOutbound('slack-bot', outboundCallback)
+      options.router.registerRecoveryAdapter('slack-bot', recoveryCallbacks)
       options.router.registerReaction('slack-bot', reactionCallback)
       options.router.registerRemoveReaction('slack-bot', removeReactionCallback)
       options.router.registerTyping('slack-bot', typingCallback)
@@ -1463,6 +1487,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         // !started and would otherwise skip cleanup), mirroring the github
         // adapter's rollback path.
         options.router.unregisterOutbound('slack-bot', outboundCallback)
+        options.router.unregisterRecoveryAdapter('slack-bot', recoveryCallbacks)
         options.router.unregisterReaction('slack-bot', reactionCallback)
         options.router.unregisterRemoveReaction('slack-bot', removeReactionCallback)
         options.router.unregisterTyping('slack-bot', typingCallback)
@@ -1497,6 +1522,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       options.router.unregisterChannelNameResolver('slack-bot', channelResolver)
       options.router.unregisterSelfIdentity('slack-bot', selfIdentityResolver)
       options.router.unregisterHistory('slack-bot', historyCallback)
+      options.router.unregisterRecoveryAdapter('slack-bot', recoveryCallbacks)
       options.router.unregisterMessageGet('slack-bot', messageGetCallback)
       options.router.unregisterList('slack-bot', listCallback)
       options.router.unregisterEditMessage('slack-bot', editMessageCallback)

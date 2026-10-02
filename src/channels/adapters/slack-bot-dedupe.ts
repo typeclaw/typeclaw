@@ -1,4 +1,5 @@
 import type { SlackInboundMessageEvent } from './slack-bot-classify'
+import { slackInboundRevision } from './slack-inbound-revision'
 
 export const SLACK_DEDUPE_CAPACITY = 256
 
@@ -37,15 +38,17 @@ export function createSlackDedupe(capacity: number = SLACK_DEDUPE_CAPACITY): Sla
 
   return {
     check: (event) => {
+      const revision = slackInboundRevision(event)
       const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '' && clientMsgIdRing.has(cmid)) return 'client_msg_id'
-      if (tsRing.has(`${event.channel}:${event.ts}`)) return 'channel_ts'
+      if (cmid !== undefined && cmid !== '' && clientMsgIdRing.has(`${cmid}:${revision}`)) return 'client_msg_id'
+      if (tsRing.has(`${event.channel}:${event.ts}:${revision}`)) return 'channel_ts'
       return null
     },
     mark: (event) => {
-      remember(tsRing, `${event.channel}:${event.ts}`)
+      const revision = slackInboundRevision(event)
+      remember(tsRing, `${event.channel}:${event.ts}:${revision}`)
       const cmid = event.client_msg_id
-      if (cmid !== undefined && cmid !== '') remember(clientMsgIdRing, cmid)
+      if (cmid !== undefined && cmid !== '') remember(clientMsgIdRing, `${cmid}:${revision}`)
     },
   }
 }

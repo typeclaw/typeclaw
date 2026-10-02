@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
@@ -10,13 +11,7 @@ import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
 import { detectHardProviderError, isFailoverWorthy, subscribeProviderErrors } from '@/agent/provider-error'
-import {
-  acquireRestartHandoffLock,
-  peekRestartHandoff,
-  RESTART_HANDOFF_TTL_MS,
-  type RestartHandoff,
-  writeRestartHandoff,
-} from '@/agent/restart-handoff'
+import type { RestartHandoff } from '@/agent/restart-handoff'
 import type { ChannelParticipant, SessionOrigin } from '@/agent/session-origin'
 import { renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
 import {
@@ -39,9 +34,11 @@ import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 
 import { extractMentionedUserIds } from './adapters/mention-hints'
+import { BackgroundObligationStore, type BackgroundObligationRef } from './background-obligations'
 import { formatChannelCommandHelp } from './commands'
 import { isQualifyingWorkResult } from './completion-claim'
 import { detectContinuationWillingness } from './continuation-willingness'
+import type { RecoveryFailure, RecoveryRecord } from './continuity-types'
 import { describeError } from './describe-error'
 import {
   countEffectiveHumans,
@@ -74,6 +71,7 @@ import {
   validateGithubReviewRound,
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
+import { InboundJournal, type InboundRef } from './inbound-journal'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
   type MembershipCount,
@@ -90,6 +88,7 @@ import {
   saveChannelSessions,
   type ChannelSessionRecord,
 } from './persistence'
+import { RecoveryOutbox } from './recovery-outbox'
 import {
   ADAPTER_READ_CAPABILITIES,
   ADAPTER_WRITE_CAPABILITIES,
@@ -120,6 +119,7 @@ import type {
   GithubReviewFollowupRound,
   GithubReviewThreadCloseout,
   InboundMessage,
+  RouteReceipt,
   InboundReferenceContext,
   ListCallback,
   ListChannelsArgs,
@@ -148,7 +148,8 @@ import type {
   SubmitReviewResult,
   TypingCallback,
 } from './types'
-import { channelKeyId } from './types'
+import { channelKeyId, fallbackChannelAccountIdentity } from './types'
+import type { RecoveryAdapterCallbacks, RecoveryReconcileResult, SendOptions as TransportSendOptions } from './types'
 
 export const INITIAL_DEBOUNCE_MS = 600
 export const HOT_DEBOUNCE_MS = 1500
@@ -254,37 +255,6 @@ export const RESTART_RESUME_WAKE_REMINDER = [
   '---',
 ].join('\n')
 
-// The lost-work directive: names the interrupted subagents and tells the model
-// to inform the thread, in the audience's language, that the result was lost —
-// never to re-run it automatically (the human decides whether to re-ask). Used
-// standalone when a racing inbound already provides the wake turn, and embedded
-// in the fuller resume reminder when the synthetic wake fires. Rendered as plain
-// text so a non-Latin subagent name survives intact.
-export function buildInterruptedSubagentNotice(interruptedSubagents: readonly string[]): string {
-  const names = interruptedSubagents.join(', ')
-  return [
-    '---',
-    '**[SYSTEM MESSAGE — not from a human]**',
-    '',
-    `A background task you had promised a result for was lost when the container`,
-    `restarted (interrupted subagent(s): ${names}). Briefly tell the people in`,
-    `this conversation, in their own language, that the result was lost to a`,
-    `restart and they can ask again if they still want it. Do not silently`,
-    `re-run it. Do not acknowledge or reply to this notice itself.`,
-    '',
-    '---',
-  ].join('\n')
-}
-
-// The synthetic "I'm back" wake, optionally carrying the lost-work directive
-// when the restart interrupted background subagents this session had promised
-// results for. With none, it is the plain wake reminder unchanged.
-export function buildRestartResumeWakeReminder(interruptedSubagents?: readonly string[]): string {
-  if (interruptedSubagents === undefined || interruptedSubagents.length === 0) {
-    return RESTART_RESUME_WAKE_REMINDER
-  }
-  return `${RESTART_RESUME_WAKE_REMINDER}\n\n${buildInterruptedSubagentNotice(interruptedSubagents)}`
-}
 // Ceiling on tool-source channel sends that a same-turn router policy DENIED
 // without delivering — `skip-locked`, `turn-cap`, or `duplicate`. Such denials
 // return a soft error and do NOT increment `consecutiveSends`, so a model that
@@ -755,6 +725,7 @@ export type CreateSessionForChannel = (params: {
 export type ConfigForAdapter = (adapter: ChannelKey['adapter']) => ChannelAdapterConfig | undefined
 
 type QueuedInbound = {
+  inputId: string
   text: string
   referenceContext?: InboundReferenceContext
   attachments?: readonly InboundAttachment[]
@@ -833,7 +804,21 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // TEXT was rejected: a wakeup body that happened to equal a nudge constant
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
-type PendingSystemReminder = { text: string; kind: 'retry' | 'wakeup'; githubReviewRoundKey?: string }
+type PendingSystemReminder = {
+  text: string
+  kind: 'retry' | 'wakeup'
+  githubReviewRoundKey?: string
+  backgroundObligationId?: string
+  inboundRetry?: { inputIds: string[]; turnId: string }
+  backgroundRetry?: {
+    turnId: string
+    obligationIds: string[]
+    emptyTurnRetries: number
+    toolLeakRetries: number
+    willingnessNudges: number
+    nextPromptMaxTokens: number | undefined
+  }
+}
 
 type PendingReloadHandoff = {
   key: ChannelKey
@@ -1050,6 +1035,12 @@ type LiveSession = {
   // the drain loop's run condition checks BOTH queues so a system
   // reminder alone is enough to trigger a turn.
   pendingSystemReminders: PendingSystemReminder[]
+  // Identity-only cache; every durable transition resolves ownership in its lane.
+  backgroundCoverage: string[]
+  inboundCoverage: string[]
+  turnAccountIdentity?: string
+  backgroundTurnId: string
+  backgroundStopVersion: number
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
   // nonzero after a substantive result and would misclassify NO_REPLY from a
@@ -1390,7 +1381,7 @@ export type ExecuteCommandOptions = {
 
 export type SendSource = 'tool' | 'system'
 
-export type SendOptions = {
+export type SendOptions = TransportSendOptions & {
   source?: SendSource
   // Apply tool-send accounting to the originating conversation while delivering
   // elsewhere. The outbound target remains unchanged; only per-turn cap/dedup,
@@ -1418,8 +1409,24 @@ export const SKIP_RESPONSE_LOCK_ERROR =
   'something to say, send it on the next turn.'
 
 export type ChannelRouter = {
-  route: (event: InboundMessage) => Promise<void>
+  route: (event: InboundMessage) => Promise<RouteReceipt>
   send: (msg: OutboundMessage, opts?: SendOptions) => Promise<SendResult>
+  acceptBackgroundResponse: (args: {
+    parentSessionId: string
+    parentSessionFile?: string
+    key: ChannelKey
+    taskId: string
+    subagentName: string
+    startedAt: number
+    accountIdentity: string
+    triggeringAuthorId?: string
+    parentChat?: string
+  }) => Promise<BackgroundObligationRef>
+  suppressUnstartedBackgroundResponse: (ref: BackgroundObligationRef, reason: string) => Promise<void>
+  attachBackgroundResultCoverage: (args: { parentSessionId: string; taskId: string }) => Promise<void>
+  captureBackgroundResultCoverage?: (parentSessionId: string) => Promise<BackgroundObligationRef[]>
+  captureInboundResultCoverage?: (parentSessionId: string) => Promise<InboundRef[]>
+  captureTurnAccountIdentity?: (parentSessionId: string) => Promise<string | undefined>
   getConsecutiveSendCount: (target: {
     adapter: ChannelKey['adapter']
     workspace: string
@@ -1435,6 +1442,12 @@ export type ChannelRouter = {
   }) => { count: number; windowMs: number }
   registerOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
   unregisterOutbound: (adapter: ChannelKey['adapter'], cb: OutboundCallback) => void
+  registerRecoveryAdapter: (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks) => void
+  unregisterRecoveryAdapter: (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks) => void
+  getRecoveryAccountIdentity: (adapter: ChannelKey['adapter'], workspace?: string) => Promise<string | undefined>
+  validateRecovery: (record: RecoveryRecord) => Promise<RecoveryFailure | undefined>
+  reconcileRecovery: (record: RecoveryRecord) => Promise<RecoveryReconcileResult>
+  setRecoveryStopHandler: (handler: (target: ChannelKey, parentSessionId: string) => Promise<void>) => void
   // Reaction support is opt-in per adapter: an adapter that never calls
   // registerReaction makes `react` resolve to `code: 'unsupported'`, and
   // auto-react-on-engage becomes a silent no-op for it. Kept separate from
@@ -1570,7 +1583,7 @@ export type ChannelRouter = {
     durationMs: number
     error?: string
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
-  }) => { kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }
+  }) => Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }>
   // Fan a LANDED formal review verdict out to the OTHER live sessions reviewing
   // the same PR so they stand down from posting a redundant verdict. Targets every
   // live github session whose chat is `pr:<prNumber>` in `workspace`, EXCLUDING the
@@ -1611,7 +1624,9 @@ export type ChannelRouter = {
     workspace: string
     prNumber: number
     state: ReviewOutputState
-  }) => { kind: 'stamped' | 'no-live-session' }
+    inboundCoverage?: InboundRef[]
+    backgroundCoverage?: BackgroundObligationRef[]
+  }) => Promise<{ kind: 'stamped' | 'no-live-session' }>
   hasOutstandingGithubReviewThreadCloseout?: (sessionId: string) => boolean
   // Record that the agent invoked `skip_response` during the current turn
   // for the channel session identified by `parentSessionId`. The reason is
@@ -1636,10 +1651,9 @@ export type ChannelRouter = {
   markTurnSkipped: (args: {
     parentSessionId: string
     reason: string
-  }) =>
-    | { kind: 'recorded'; keyId: string }
-    | { kind: 'recorded-after-send'; keyId: string }
-    | { kind: 'no-live-session' }
+  }) => Promise<
+    { kind: 'recorded'; keyId: string } | { kind: 'recorded-after-send'; keyId: string } | { kind: 'no-live-session' }
+  >
   // Force-clear every sticky credit for one channel key. Stickiness normally
   // expires on TTL or is consumed on the next inbound, but in a busy group each
   // reply re-grants a fresh credit, so the bot can stay force-engaged turn after
@@ -1664,12 +1678,9 @@ export type ChannelRouter = {
   // Graceful-restart shutdown: mark + abort every live channel session so each
   // scope's incomplete todos auto-continue on the next boot. See the impl.
   markRestartAbortForAllLive: () => Promise<void>
-  // Graceful-restart shutdown: persist a channel handoff naming the background
-  // subagents a live session was still awaiting, so the resume greeting can tell
-  // that thread the promised result was lost. Resolves true iff one was written.
-  writeInterruptedSubagentHandoff: () => Promise<boolean>
   liveCount: () => number
   __testing?: {
+    getRecoveryAccountingSnapshot: (key: ChannelKey) => Record<string, unknown> | undefined
     flushDebounce: (key: ChannelKey) => Promise<void>
     fireTypingHeartbeat: (key: ChannelKey, phase?: 'tick' | 'stop') => Promise<void>
     fireTypingInterval: (key: ChannelKey) => Promise<void>
@@ -1703,11 +1714,6 @@ export type ChannelRouter = {
     // (a continuation re-prompt queued after a willingness-ack strand) at the
     // channels layer, without coupling to todo-file persistence formats.
     injectContinuationReminder: (key: ChannelKey, text: string) => void
-    // Enqueues a real user batch onto the live session's promptQueue via the same
-    // `enqueue` path route() uses, letting a test reproduce a fresh inbound that
-    // supersedes a still-pending staged fallback mid-drain (the A → staged B →
-    // queued C question-signal supersession case) without the debounce timing dance.
-    enqueueUserInbound: (key: ChannelKey, event: InboundMessage) => void
     // Returns a shallow copy of `live.originRef.current` for the live
     // session matching `key`, or undefined when no live session exists.
     // Exists so tests can assert on the per-turn origin that tool.before
@@ -1734,6 +1740,9 @@ export type AliasesProvider = () => readonly string[]
 
 export type CreateChannelRouterOptions = {
   agentDir: string
+  backgroundObligations?: BackgroundObligationStore
+  inboundJournal?: InboundJournal
+  recoveryOutbox?: RecoveryOutbox
   configForAdapter: ConfigForAdapter
   configuredAliases?: AliasesProvider
   createSessionForChannel?: CreateSessionForChannel
@@ -1834,11 +1843,6 @@ export type CreateChannelRouterOptions = {
   // spawned child is still inside its window. Production wiring forwards the
   // LiveSubagentRegistry; omitted (tests, no-subagent setups) means no pin.
   newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
-  // Names of the still-running BACKGROUND subagents for a parent session, used
-  // by writeInterruptedSubagentHandoff on graceful restart to name the lost
-  // work in the resume greeting. Background-only: a foreground child returns its
-  // result inline, so it is not orphaned by the bounce. Omitted means none.
-  listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
   cancelRunningSubagentsByWorkKey?: (
     workKey: string,
     reason: string,
@@ -1874,6 +1878,7 @@ export type RestartReservation = {
   keyId: string
   sawInbound: boolean
   resume: () => Promise<void>
+  release: () => void
 }
 
 export type ClaimHandler = (input: ClaimHandlerInput) => Promise<ClaimHandlerOutcome>
@@ -1890,6 +1895,12 @@ const GRANT_ALL_PERMISSIONS: PermissionService = {
 export function createChannelRouter(options: CreateChannelRouterOptions): ChannelRouter {
   const logger = options.logger ?? consoleLogger
   const now = options.now ?? Date.now
+  const backgroundObligations = options.backgroundObligations ?? new BackgroundObligationStore(options.agentDir)
+  const inboundJournal = options.inboundJournal ?? new InboundJournal(options.agentDir, { backgroundObligations })
+  const ready = inboundJournal.initialize()
+  const recoveryOutbox =
+    options.recoveryOutbox ?? new RecoveryOutbox(options.agentDir, { epoch: backgroundObligations.epoch })
+  void ready.catch((error) => logger.error(`[channels] inbound journal initialization failed: ${describeError(error)}`))
   const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
   const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
@@ -1905,6 +1916,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const onRestart = options.onRestart
   const newestRunningChildSubagentStartedAt = options.newestRunningChildSubagentStartedAt ?? (() => null)
   const liveSessions = new Map<string, LiveSession>()
+  const unsubscribeJournalFailure = inboundJournal.subscribeFailure((error) => {
+    // Abort the SDK's active loop synchronously, not session.abort() (which waits
+    // for that loop). A failed admission can occur inside another turn's fetch.
+    for (const live of liveSessions.values()) {
+      if (live.destroyed || !live.promptInFlight) continue
+      live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason: 'continuity-unavailable' }
+      try {
+        live.session.agent.abort()
+      } catch (abortError) {
+        logger.error(`[channels] continuity cancellation failed: ${describeError(abortError)}`)
+      }
+    }
+    logger.error(`[channels] cancelling in-flight turns after continuity failure: ${describeError(error)}`)
+  })
   const creating = new Map<string, Promise<LiveSession>>()
   let nextCreationToken = 0
   const activeCreationAttempts = new Map<string, number>()
@@ -1937,6 +1962,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // teardown was meant to clear.
   let liveGeneration = 0
   const outboundCallbacks = new Map<ChannelKey['adapter'], Set<OutboundCallback>>()
+  const recoveryAdapters = new Map<ChannelKey['adapter'], RecoveryAdapterCallbacks>()
+  let recoveryStopHandler: ((target: ChannelKey, parentSessionId: string) => Promise<void>) | undefined
   const reactionCallbacks = new Map<ChannelKey['adapter'], Set<ReactionCallback>>()
   const removeReactionCallbacks = new Map<ChannelKey['adapter'], Set<RemoveReactionCallback>>()
   const typingCallbacks = new Map<ChannelKey['adapter'], Set<TypingCallback>>()
@@ -2334,31 +2361,164 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return total
   }
 
-  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
-    const count = pendingReloadHandoffItemCount(pending)
-    const recovery =
-      "Re-send the affected messages. If provider credentials changed, run reload({ scope: 'providers' }); " +
-      'otherwise check the channel logs and retry after session creation is healthy.'
-    logger.error(
-      `[channels] ${channelKeyId(pending.key)}: reload handoff retention policy discarded ${count} queued item(s): ${reason}. ${recovery}`,
-    )
-    await dropPendingReloadHandoffEngageReactions(pending)
-    const result = await send(
-      {
-        adapter: pending.key.adapter,
-        workspace: pending.key.workspace,
-        chat: pending.key.chat,
-        thread: pending.key.thread,
-        text: `⚠️ TypeClaw could not replay ${count} queued item(s) after reload: ${reason}. ${recovery}`,
-      },
-      { source: 'system', outputKind: 'meta' },
-    ).catch((err) => {
-      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice threw: ${describeError(err)}`)
-      return null
-    })
-    if (result !== null && !result.ok) {
-      logger.error(`[channels] ${channelKeyId(pending.key)}: reload handoff loss notice failed: ${result.error}`)
+  const transferLostCoverageInLane = async (
+    target: ChannelKey,
+    inputIds: readonly string[],
+    backgroundIds: readonly string[],
+    ownerSessionId?: string,
+  ): Promise<void> => {
+    await ready
+    inboundJournal.assertAvailable()
+    // Frozen notices retain the admission's principal, including its original author.
+    const partitionId = (accountIdentity: string, principal: object, parentSessionId?: string): string =>
+      JSON.stringify([
+        accountIdentity,
+        Object.entries(principal)
+          .filter(([, value]) => value !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right)),
+        parentSessionId,
+      ])
+    const groups = new Map<string, { inboundRefs: InboundRef[]; backgroundRefs: BackgroundObligationRef[] }>()
+    for (const ref of inboundJournal.resolve([...new Set(inputIds)])) {
+      const row = inboundJournal.get(ref.inputId)
+      if (!row || row.phase === 'closed' || row.transfer) continue
+      const identity = partitionId(
+        row.accountIdentity,
+        row.principal,
+        row.claim?.ownerSessionId ?? ownerSessionId ?? row.sourceParentSessionId,
+      )
+      let group = groups.get(identity)
+      if (!group) {
+        group = { inboundRefs: [], backgroundRefs: [] }
+        groups.set(identity, group)
+      }
+      group.inboundRefs.push(ref)
     }
+    const backgroundOnly: BackgroundObligationRef[] = []
+    for (const id of new Set(backgroundIds)) {
+      const row = await backgroundObligations.get(id)
+      if (!row || row.phase === 'closed' || row.transfer || channelKeyId(row.target) !== channelKeyId(target)) continue
+      const ref = { obligationId: id, generation: row.generation }
+      const group = groups.get(
+        partitionId(
+          row.accountIdentity,
+          row.principal,
+          row.claim?.ownerSessionId ?? ownerSessionId ?? row.parentSessionId,
+        ),
+      )
+      if (group) group.backgroundRefs.push(ref)
+      else backgroundOnly.push(ref)
+    }
+    for (const group of groups.values()) {
+      const record = await inboundJournal.prepareNotice(group.inboundRefs, target, group.backgroundRefs, ownerSessionId)
+      await inboundJournal.importPrepared(recoveryOutbox, record)
+    }
+    for (const ref of backgroundOnly) {
+      const prepared = await backgroundObligations.prepareNotice(ref.obligationId, ref.generation)
+      if (!prepared?.transfer) continue
+      const imported = await recoveryOutbox.import(prepared.transfer)
+      await backgroundObligations.ownNotice(prepared.obligationId, prepared.generation, imported.deliveryId)
+    }
+  }
+
+  const transferMismatchedAccountCoverageInLane = async (live: LiveSession): Promise<string | undefined> => {
+    const currentAccount = currentAccountIdentityFor(live.key)
+    if (currentAccount === undefined) return undefined
+    const inputIds = new Set([
+      ...live.inboundCoverage,
+      ...live.promptQueue.map((input) => input.inputId),
+      ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+    ])
+    const mismatchedInputs = new Set<string>()
+    for (const id of inputIds) {
+      const row = inboundJournal.get(id)
+      if (row && row.accountIdentity !== currentAccount) mismatchedInputs.add(id)
+    }
+    const backgroundIds = new Set([
+      ...live.backgroundCoverage,
+      ...live.pendingSystemReminders.flatMap((reminder) => [
+        ...(reminder.backgroundObligationId ? [reminder.backgroundObligationId] : []),
+        ...(reminder.backgroundRetry?.obligationIds ?? []),
+      ]),
+    ])
+    const mismatchedBackground = new Set<string>()
+    for (const id of backgroundIds) {
+      const row = await backgroundObligations.get(id)
+      if (row && row.accountIdentity !== currentAccount) mismatchedBackground.add(id)
+    }
+    if (mismatchedInputs.size === 0 && mismatchedBackground.size === 0) return currentAccount
+    await transferLostCoverageInLane(live.key, [...mismatchedInputs], [...mismatchedBackground], live.sessionId)
+    // Publish only compatible cache entries after the original-account transfer commits.
+    const affectedRetries = new Set(
+      live.pendingSystemReminders.filter(
+        (reminder) =>
+          reminder.inboundRetry?.inputIds.some((id) => mismatchedInputs.has(id)) ||
+          reminder.backgroundRetry?.obligationIds.some((id) => mismatchedBackground.has(id)),
+      ),
+    )
+    live.promptQueue = live.promptQueue.filter((input) => !mismatchedInputs.has(input.inputId))
+    live.inboundCoverage = live.inboundCoverage.filter((id) => !mismatchedInputs.has(id))
+    retireBackgroundCache(live, mismatchedBackground)
+    live.pendingSystemReminders = live.pendingSystemReminders.filter((reminder) => {
+      if (reminder.inboundRetry)
+        reminder.inboundRetry.inputIds = reminder.inboundRetry.inputIds.filter((id) => !mismatchedInputs.has(id))
+      return (
+        !affectedRetries.has(reminder) ||
+        (reminder.inboundRetry?.inputIds.length ?? 0) > 0 ||
+        (reminder.backgroundRetry?.obligationIds.length ?? 0) > 0
+      )
+    })
+    return currentAccount
+  }
+
+  const retainLiveQueuesInLane = async (live: LiveSession): Promise<boolean> => {
+    await ready
+    inboundJournal.assertAvailable()
+    const inbounds = live.promptQueue.slice()
+    const observed = live.contextBuffer.slice()
+    const reminders = live.pendingSystemReminders.slice()
+    const hasWork = inbounds.length > 0 || observed.length > 0 || reminders.length > 0
+    const retained = hasWork && retainReloadHandoff(live.key, inbounds, observed, reminders)
+    if (hasWork && !retained) {
+      await transferLostCoverageInLane(
+        live.key,
+        [...inbounds.map((input) => input.inputId), ...reminders.flatMap((r) => r.inboundRetry?.inputIds ?? [])],
+        reminders.flatMap((r) => [
+          ...(r.backgroundObligationId ? [r.backgroundObligationId] : []),
+          ...(r.backgroundRetry?.obligationIds ?? []),
+        ]),
+        live.sessionId,
+      )
+    }
+    live.promptQueue.length = 0
+    live.contextBuffer.length = 0
+    live.pendingSystemReminders.length = 0
+    return retained
+  }
+
+  const reportDiscardedReloadHandoff = async (pending: PendingReloadHandoff, reason: string): Promise<void> => {
+    logger.error(
+      `[channels] ${channelKeyId(pending.key)}: reload handoff unavailable (${pendingReloadHandoffItemCount(pending)} items): ${reason}`,
+    )
+    try {
+      await backgroundObligations.withTargetLane(pending.key, () =>
+        transferLostCoverageInLane(
+          pending.key,
+          [
+            ...pending.inbounds.flatMap((input) => (input.inputId ? [input.inputId] : [])),
+            ...pending.reminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
+          ],
+          pending.reminders.flatMap((r) => [
+            ...(r.backgroundObligationId ? [r.backgroundObligationId] : []),
+            ...(r.backgroundRetry?.obligationIds ?? []),
+          ]),
+        ),
+      )
+    } catch (error) {
+      // The durable rows remain owed; failed transfer must never become an ad-hoc send.
+      logger.error(`[channels] reload interruption transfer failed: ${describeError(error)}`)
+    }
+    await dropPendingReloadHandoffEngageReactions(pending)
   }
 
   const expirePendingReloadHandoffs = async (): Promise<void> => {
@@ -2476,8 +2636,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // parent-scoped from the first fetch (Discord threads resolve `chat` to the
     // thread id, so an unscoped warm would prime the cache against the thread).
     room?: InboundMessage['room'],
+    // route captures this before journal/account precreation awaits, so a reload
+    // during initialization cannot make a pre-reload inbound look newly arrived.
+    generation = liveGeneration,
   ): Promise<LiveSession> => {
     const keyId = channelKeyId(key)
+    if (generation !== liveGeneration) throw new StaleLiveSessionError(keyId)
     const existing = liveSessions.get(keyId)
     if (existing && !existing.destroyed) {
       // A resume that finds the key already live is a no-op for reopening: the
@@ -2529,7 +2693,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const inFlight = creating.get(keyId)
     if (inFlight) return inFlight
 
-    const generation = liveGeneration
     const creationToken = ++nextCreationToken
     latestCreationTokens.set(keyId, creationToken)
     activeCreationAttempts.set(keyId, (activeCreationAttempts.get(keyId) ?? 0) + 1)
@@ -2756,6 +2919,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
+        backgroundCoverage: [],
+        inboundCoverage: [],
+        backgroundStopVersion: 0,
+        backgroundTurnId: randomUUID(),
         willingnessReminderIteration: false,
         contextBuffer: [],
         currentTurnAttachments: [],
@@ -3245,12 +3412,125 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // proceeds. The kimi 32k loop only recurs when the model genuinely has nothing
   // left to say after a reply, which `more_work_this_turn` asserts is not the
   // case; Layer 2's maxTokens cap still bounds any misuse.
+  // IDs are cache hints, never generation authority. Call only inside the lane.
+  const resolveBackgroundCoverage = async (
+    live: LiveSession,
+    ids: readonly string[],
+    ownedOnly = false,
+  ): Promise<BackgroundObligationRef[]> => {
+    const refs: BackgroundObligationRef[] = []
+    for (const id of new Set(ids)) {
+      const row = await backgroundObligations.get(id)
+      if (
+        !row ||
+        row.transfer ||
+        channelKeyId(row.target) !== live.keyId ||
+        (row.phase !== 'result-ready' && row.phase !== 'turn-owned')
+      )
+        continue
+      if (ownedOnly && (row.claim?.turnId !== live.backgroundTurnId || row.claim.ownerSessionId !== live.sessionId))
+        continue
+      refs.push({ obligationId: id, generation: row.generation })
+    }
+    if (refs.length > 0) backgroundObligations.assertAvailable()
+    return refs
+  }
+
+  const retireBackgroundCache = (live: LiveSession, covered: Set<string>): void => {
+    live.backgroundCoverage = live.backgroundCoverage.filter((id) => !covered.has(id))
+    live.pendingSystemReminders = live.pendingSystemReminders.filter(
+      (reminder) => !reminder.backgroundObligationId || !covered.has(reminder.backgroundObligationId),
+    )
+    for (const reminder of live.pendingSystemReminders) {
+      if (reminder.backgroundRetry) {
+        reminder.backgroundRetry.obligationIds = reminder.backgroundRetry.obligationIds.filter((id) => !covered.has(id))
+      }
+    }
+  }
+
+  const settleBackgroundCoverageInLane = async (
+    live: LiveSession,
+    kind: 'delivered' | 'intentionally-suppressed',
+    reason: string,
+    ids: readonly string[],
+    capturedInbound?: readonly InboundRef[],
+    capturedBackground?: readonly BackgroundObligationRef[],
+  ): Promise<void> => {
+    const currentBackground = await resolveBackgroundCoverage(live, ids)
+    const refs = capturedBackground
+      ? currentBackground.filter((ref) =>
+          capturedBackground.some(
+            (captured) => captured.obligationId === ref.obligationId && captured.generation === ref.generation,
+          ),
+        )
+      : currentBackground
+    const currentInbound = await inboundJournal.resolve(
+      capturedInbound ? capturedInbound.map((ref) => ref.inputId) : live.inboundCoverage,
+    )
+    const inboundRefs = capturedInbound
+      ? currentInbound.filter((ref) =>
+          capturedInbound.some(
+            (captured) => captured.inputId === ref.inputId && captured.generation === ref.generation,
+          ),
+        )
+      : currentInbound
+    if (inboundRefs.length > 0) {
+      await inboundJournal.settle(inboundRefs, { kind, decisionId: randomUUID(), reason }, refs, live.key)
+    } else if (refs.length > 0) {
+      inboundJournal.assertAvailable()
+      await backgroundObligations.settle(refs, { kind, decisionId: randomUUID(), reason })
+    }
+    const retiredInbound = new Set(inboundRefs.map((ref) => ref.inputId))
+    live.inboundCoverage = live.inboundCoverage.filter((id) => !retiredInbound.has(id))
+    retireBackgroundCache(live, new Set(refs.map((ref) => ref.obligationId)))
+  }
+
+  const settleBackgroundCoverage = async (
+    live: LiveSession,
+    kind: 'delivered' | 'intentionally-suppressed',
+    reason: string,
+    refs?: BackgroundObligationRef[],
+    inboundRefs?: readonly InboundRef[],
+  ): Promise<void> => {
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      await settleBackgroundCoverageInLane(
+        live,
+        kind,
+        reason,
+        refs ? refs.map((ref) => ref.obligationId) : live.backgroundCoverage,
+        inboundRefs,
+        refs,
+      )
+    })
+  }
+
+  // A landed response must never be replayed because its local outcome failed.
+  const recordLandedBackgroundResponse = async (
+    live: LiveSession,
+    reason: string,
+    refs: BackgroundObligationRef[],
+    inboundRefs?: readonly InboundRef[],
+  ): Promise<void> => {
+    try {
+      await settleBackgroundCoverage(live, 'delivered', reason, refs, inboundRefs)
+    } catch (error) {
+      logger.error(`[channels] background response outcome failed: ${describeError(error)}`)
+    }
+  }
+
   const installChannelReplyTerminalHook = (live: LiveSession): void => {
     const { agent } = live.session
     const prior = agent.afterToolCall
     agent.afterToolCall = async (context, signal) => {
       const result = prior ? await prior(context, signal) : undefined
-      const details = context.result.details as { ok?: unknown; more_work_this_turn?: unknown } | undefined
+      const details = context.result.details as
+        | {
+            ok?: unknown
+            more_work_this_turn?: unknown
+            backgroundCoverage?: BackgroundObligationRef[]
+            inboundCoverage?: InboundRef[]
+          }
+        | undefined
       if (
         isQualifyingWorkResult({
           toolName: context.toolCall.name,
@@ -3267,6 +3547,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // cannot distinguish channel_reply from channel_send, but here the
         // explicit more_work_this_turn flag tells us whether the delivered reply
         // renewed the promise or terminally fulfilled it.
+        const text = (context.toolCall.arguments as { text?: unknown } | undefined)?.text
+        if (!keepTurnAlive && !(typeof text === 'string' && detectContinuationWillingness(text))) {
+          await recordLandedBackgroundResponse(
+            live,
+            'terminal-channel-reply',
+            details?.backgroundCoverage ?? [],
+            details?.inboundCoverage ?? [],
+          )
+        }
         live.promisedWorkOutstandingThisLogicalTurn = keepTurnAlive
         if (keepTurnAlive) {
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
@@ -3475,6 +3764,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.warn(`[channels] ${live.keyId} empty_turn_fallback cause=${cause}`)
     live.emptyTurnFallbackTurn = live.turnSeq
     try {
+      const inboundCoverage = await captureInboundResultCoverage(live.sessionId)
       const result = await send(
         {
           adapter: live.key.adapter,
@@ -3487,6 +3777,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       if (!result.ok) {
         logger.warn(`[channels] ${live.keyId}: empty-turn fallback send failed: ${result.error}`)
+      } else {
+        await recordLandedBackgroundResponse(live, 'empty-turn-fallback', [], inboundCoverage)
       }
     } finally {
       void dropContinuationReactions(live)
@@ -3804,16 +4096,77 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const stopCurrentChannelTurn = async (live: LiveSession, reason: string): Promise<boolean> => {
-    live.userStoppedTurnSeq = live.turnSeq
-    live.lastTerminalReplyCompletion = null
-    live.pendingTerminalReplyStop = null
-    live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
-    if (live.debounceTimer) clearTimeout(live.debounceTimer)
-    live.debounceTimer = null
-    live.firstUnprocessedAt = 0
-    live.promptQueue.length = 0
-    live.pendingSystemReminders.length = 0
-    live.continueReplyTurn = null
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      try {
+        if (reason === 'user_stop') {
+          // Select after predecessors commit; queued entries contain IDs only.
+          const ids = [
+            ...live.backgroundCoverage,
+            ...live.pendingSystemReminders.flatMap((r) => (r.backgroundObligationId ? [r.backgroundObligationId] : [])),
+            ...live.pendingSystemReminders.flatMap((r) => r.backgroundRetry?.obligationIds ?? []),
+          ]
+          live.inboundCoverage = [
+            ...new Set([
+              ...live.inboundCoverage,
+              ...live.promptQueue.flatMap((input) => (input.inputId ? [input.inputId] : [])),
+              ...live.pendingSystemReminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
+            ]),
+          ]
+          // Rotation can leave the old actor's active turn beside a new actor's
+          // queued input. Journal decisions must retain one account scope.
+          const partitions = new Map<string, { inbound: InboundRef[]; background: BackgroundObligationRef[] }>()
+          const partition = (accountIdentity: string) => {
+            let group = partitions.get(accountIdentity)
+            if (!group) {
+              group = { inbound: [], background: [] }
+              partitions.set(accountIdentity, group)
+            }
+            return group
+          }
+          for (const ref of inboundJournal.resolve(live.inboundCoverage)) {
+            const row = inboundJournal.get(ref.inputId)!
+            if (row.phase !== 'closed' && !row.transfer) partition(row.accountIdentity).inbound.push(ref)
+          }
+          for (const ref of await resolveBackgroundCoverage(live, ids)) {
+            const row = (await backgroundObligations.get(ref.obligationId))!
+            partition(row.accountIdentity).background.push(ref)
+          }
+          for (const group of partitions.values()) {
+            await settleBackgroundCoverageInLane(
+              live,
+              'intentionally-suppressed',
+              'user-stop',
+              group.background.map((ref) => ref.obligationId),
+              group.inbound,
+              group.background,
+            )
+          }
+        }
+      } catch (error) {
+        // A failed withdrawal remains owed for conservative boot recovery.
+        // Bookkeeping must never prevent the user's parent abort.
+        logger.error(`[channels] background stop withdrawal failed: ${describeError(error)}`)
+      } finally {
+        live.backgroundStopVersion++
+        live.userStoppedTurnSeq = live.turnSeq
+        live.lastTerminalReplyCompletion = null
+        live.pendingTerminalReplyStop = null
+        live.abortReasonThisTurn = { turnSeq: live.turnSeq, reason }
+        clearTimeout(live.debounceTimer ?? undefined)
+        live.debounceTimer = null
+        live.firstUnprocessedAt = 0
+        live.promptQueue.length = 0
+        live.pendingSystemReminders.length = 0
+        live.continueReplyTurn = null
+      }
+    })
+    if (reason === 'user_stop') {
+      try {
+        await recoveryStopHandler?.(live.key, live.sessionId)
+      } catch (error) {
+        logger.error(`[channels] recovery stop withdrawal failed: ${describeError(error)}`)
+      }
+    }
     void dropContinuationReactions(live)
     enqueueTodoOutcomeWrite(live, {
       agentDir: options.agentDir,
@@ -3821,7 +4174,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       turnId: live.sessionId,
       stopReason: 'aborted',
     })
-    await stopTypingHeartbeat(live)
+    void stopTypingHeartbeat(live).catch((error) =>
+      logger.warn(`[channels] stop typing failed: ${describeError(error)}`),
+    )
     let aborted = true
     try {
       await live.session.abort()
@@ -4060,9 +4415,136 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // without re-entering route(), the route() call site alone wouldn't
         // keep the indicator alive across multiple drain iterations.
         startTypingHeartbeat(live)
-        const batch = live.promptQueue.splice(0, live.promptQueue.length)
-        const observed = live.contextBuffer.splice(0, live.contextBuffer.length)
-        const reminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
+        // Result claims commit before content leaves the queues or enters a prompt.
+        const consume = async () => {
+          if (live.destroyed || live.pendingTeardown) return undefined
+          if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
+          await ready
+          await transferMismatchedAccountCoverageInLane(live)
+          if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
+          const batchCount = live.promptQueue.length
+          const observedCount = live.contextBuffer.length
+          const reminderCount = live.pendingSystemReminders.length
+          const queued = live.pendingSystemReminders.slice(0, reminderCount)
+          const eligible = new Set<PendingSystemReminder>()
+          const refs: BackgroundObligationRef[] = []
+          for (const reminder of queued) {
+            if (!reminder.backgroundObligationId) {
+              eligible.add(reminder)
+              continue
+            }
+            const row = await backgroundObligations.get(reminder.backgroundObligationId)
+            // Fetch/settlement may have overtaken this wake. Durable ownership
+            // wins: retire the obsolete entry instead of poisoning later input.
+            if (
+              !row ||
+              row.phase !== 'result-ready' ||
+              row.claim ||
+              row.transfer ||
+              channelKeyId(row.target) !== live.keyId
+            )
+              continue
+            eligible.add(reminder)
+            refs.push({ obligationId: row.obligationId, generation: row.generation })
+          }
+          const fresh = batchCount > 0 || queued.some((r) => eligible.has(r) && r.kind === 'wakeup')
+          const carried = fresh ? undefined : queued.find((r) => r.backgroundRetry)?.backgroundRetry
+          const turnId = fresh ? randomUUID() : (carried?.turnId ?? live.backgroundTurnId)
+          await ready
+          inboundJournal.assertAvailable()
+          const inboundRetry = fresh ? undefined : queued.find((r) => r.inboundRetry)?.inboundRetry
+          const inputIds = live.promptQueue
+            .slice(0, batchCount)
+            .flatMap((input) => (input.inputId ? [input.inputId] : []))
+          const inboundRefs = await inboundJournal.resolve(inputIds)
+          if (fresh && live.inboundCoverage.length > 0) {
+            if (batchCount > 0) {
+              await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+            } else {
+              const previous = await inboundJournal.resolve(live.inboundCoverage)
+              const movedInputs = await inboundJournal.move(previous, {
+                fromTurnId: live.backgroundTurnId,
+                turnId,
+                ownerSessionId: live.sessionId,
+                target: live.key,
+              })
+              inboundRefs.push(...movedInputs.inboundRefs)
+            }
+          }
+          const owner = { turnId, ownerSessionId: live.sessionId, target: live.key }
+          const claimedCoverage =
+            inboundRefs.length > 0
+              ? await inboundJournal.claim(inboundRefs, owner, refs)
+              : {
+                  inboundRefs: [],
+                  backgroundRefs: refs.length > 0 ? await backgroundObligations.claim(refs, owner) : [],
+                }
+          const claimed = claimedCoverage.backgroundRefs
+          let carriedInboundIds = fresh ? [] : live.inboundCoverage
+          const retryRefs = inboundRetry ? await inboundJournal.resolve(inboundRetry.inputIds) : []
+          const moved: BackgroundObligationRef[] = []
+          if (carried) {
+            for (const id of new Set(carried.obligationIds)) {
+              const row = await backgroundObligations.get(id)
+              if (
+                !row ||
+                row.transfer ||
+                row.phase !== 'turn-owned' ||
+                row.claim?.turnId !== carried.turnId ||
+                channelKeyId(row.target) !== live.keyId
+              )
+                continue
+              moved.push({ obligationId: id, generation: row.generation })
+            }
+          }
+          if (retryRefs.length > 0) {
+            const movedCoverage = await inboundJournal.move(
+              retryRefs,
+              { ...owner, fromTurnId: inboundRetry!.turnId },
+              moved,
+            )
+            carriedInboundIds = movedCoverage.inboundRefs.map((ref) => ref.inputId)
+            moved.splice(0, moved.length, ...movedCoverage.backgroundRefs)
+          } else if (moved.length > 0) {
+            const movedRefs = await backgroundObligations.move(moved, { ...owner, fromTurnId: carried!.turnId })
+            moved.splice(0, moved.length, ...movedRefs)
+          }
+          live.inboundCoverage = [...carriedInboundIds, ...claimedCoverage.inboundRefs.map((ref) => ref.inputId)]
+          live.backgroundTurnId = turnId
+          if (fresh) live.backgroundCoverage = []
+          else
+            live.backgroundCoverage = (await resolveBackgroundCoverage(live, live.backgroundCoverage, true)).map(
+              (ref) => ref.obligationId,
+            )
+          live.backgroundCoverage.push(...claimed.map((ref) => ref.obligationId))
+          if (carried) {
+            live.backgroundCoverage = [...moved, ...claimed].map((ref) => ref.obligationId)
+            live.emptyTurnRetries = carried.emptyTurnRetries
+            live.toolLeakRetries = carried.toolLeakRetries
+            live.willingnessNudges = carried.willingnessNudges
+            live.nextPromptMaxTokens = carried.nextPromptMaxTokens
+          }
+          const ownedInput = live.inboundCoverage[0] ? inboundJournal.get(live.inboundCoverage[0]) : undefined
+          const ownedBackground = live.backgroundCoverage[0]
+            ? await backgroundObligations.get(live.backgroundCoverage[0])
+            : undefined
+          live.turnAccountIdentity =
+            ownedInput?.accountIdentity ??
+            ownedBackground?.accountIdentity ??
+            (fresh ? undefined : live.turnAccountIdentity)
+          return {
+            batch: live.promptQueue.splice(0, batchCount),
+            observed: live.contextBuffer.splice(0, observedCount),
+            reminders: live.pendingSystemReminders
+              .splice(0, reminderCount)
+              .filter((reminder) => eligible.has(reminder)),
+            stopVersion: live.backgroundStopVersion,
+          }
+        }
+        const drained = await backgroundObligations.withTargetLane(live.key, consume)
+        if (drained === undefined) break
+        const { batch, observed, reminders, stopVersion } = drained
+        if (live.backgroundStopVersion !== stopVersion || (batch.length === 0 && reminders.length === 0)) continue
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
         // A reminder-only iteration carrying externally-injected work opens a
         // NEW logical turn. Without this, the completed-subagent wakeup that
@@ -4251,6 +4733,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.pendingUserTurnSignal = { signal: getQuestionSignal(retrievalQuery) }
         }
         const retrievalContext = await fireSessionTurnStart(live, retrievalQuery)
+        if (live.backgroundStopVersion !== stopVersion) continue
+        const accountMayPrompt = await backgroundObligations.withTargetLane(live.key, async () => {
+          const currentAccount = await transferMismatchedAccountCoverageInLane(live)
+          return (
+            currentAccount === undefined ||
+            live.turnAccountIdentity === undefined ||
+            currentAccount === live.turnAccountIdentity
+          )
+        })
+        if (!accountMayPrompt || live.backgroundStopVersion !== stopVersion) continue
         const promptText = retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
@@ -4269,6 +4761,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               live.activeModelRef = ref
             },
             beforeAttempt: () => {
+              inboundJournal.assertAvailable()
+              if (live.backgroundStopVersion !== stopVersion) throw new Error('Channel turn stopped before dispatch')
+              const currentAccount = currentAccountIdentityFor(live.key)
+              if (
+                currentAccount !== undefined &&
+                live.turnAccountIdentity !== undefined &&
+                currentAccount !== live.turnAccountIdentity
+              ) {
+                void backgroundObligations
+                  .withTargetLane(live.key, () => transferMismatchedAccountCoverageInLane(live))
+                  .catch((error) => logger.error(`[channels] account-change transfer failed: ${describeError(error)}`))
+                throw new Error('Channel turn account identity changed before dispatch')
+              }
               applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
             },
             onAttemptFailed: (attempt) => {
@@ -4448,12 +4953,30 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // BEFORE tearDownLive (its clearQueuedEngageReactions must not drop the
       // engage acks we are handing to the successor). Clear the source arrays so
       // the dying session owns nothing we are moving forward.
-      const carriedInbounds = live.promptQueue.splice(0, live.promptQueue.length)
-      const carriedObserved = live.contextBuffer.splice(0, live.contextBuffer.length)
-      const carriedReminders = live.pendingSystemReminders.splice(0, live.pendingSystemReminders.length)
-      const hasCarriedWork = carriedInbounds.length > 0 || carriedObserved.length > 0 || carriedReminders.length > 0
-      const retained =
-        hasCarriedWork && retainReloadHandoff(live.key, carriedInbounds, carriedObserved, carriedReminders)
+      const retained = await backgroundObligations.withTargetLane(live.key, async () => {
+        const retry =
+          live.promptQueue.length === 0 ? live.pendingSystemReminders.find((r) => r.kind === 'retry') : undefined
+        const refs = retry ? await resolveBackgroundCoverage(live, live.backgroundCoverage, true) : []
+        if (retry && (refs.length > 0 || live.inboundCoverage.length > 0)) {
+          retry.backgroundRetry = {
+            turnId: live.backgroundTurnId,
+            obligationIds: refs.map((ref) => ref.obligationId),
+            emptyTurnRetries: live.emptyTurnRetries,
+            toolLeakRetries: live.toolLeakRetries,
+            willingnessNudges: live.willingnessNudges,
+            nextPromptMaxTokens: live.nextPromptMaxTokens,
+          }
+        }
+        if (retry && live.inboundCoverage.length > 0) {
+          retry.inboundRetry = { inputIds: [...live.inboundCoverage], turnId: live.backgroundTurnId }
+        }
+        if (!retry) {
+          await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+          live.inboundCoverage = []
+          live.backgroundCoverage = []
+        }
+        return retainLiveQueuesInLane(live)
+      })
       liveSessions.delete(live.keyId)
       await tearDownLive(live)
       if (retained) await handOffToSuccessor(live.key)
@@ -4594,15 +5117,19 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           thread: event.thread,
           text: result.reply,
         },
-        { source: 'system', outputKind: 'meta' },
+        {
+          source: 'system',
+          outputKind: 'meta',
+          expectedAccountIdentity: event.accountIdentity ?? currentAccountIdentityFor(event),
+        },
       )
     }
     return result
   }
 
-  const route = async (event: InboundMessage): Promise<void> => {
+  const route = async (event: InboundMessage): Promise<RouteReceipt> => {
     const adapterConfig = options.configForAdapter(event.adapter)
-    if (!adapterConfig) return
+    if (!adapterConfig) return { kind: 'denied' }
 
     const key: ChannelKey = {
       adapter: event.adapter,
@@ -4641,9 +5168,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             thread: event.thread,
             text: outcome.reply,
           },
-          { source: 'system', outputKind: 'meta' },
+          {
+            source: 'system',
+            outputKind: 'meta',
+            expectedAccountIdentity: event.accountIdentity ?? currentAccountIdentityFor(event),
+          },
         )
-        return
+        return { kind: 'control' }
       }
     }
 
@@ -4663,7 +5194,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // messages all fall through to the gate unchanged.
     if (parsedCommand !== null && commandInfo?.permission === 'none' && !commandInfo.requiresLiveSession) {
       await runChannelCommand(event, null)
-      return
+      return { kind: 'control' }
     }
 
     if (isChannelRespondDenied(event)) {
@@ -4671,7 +5202,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.info(
         `[channels] ${channelKeyId(key)}: denied by permissions (channel.respond) author=${event.authorId} id=${event.externalMessageId}`,
       )
-      return
+      return { kind: 'denied' }
     }
 
     if (parsedCommand !== null) {
@@ -4680,14 +5211,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const keyId = channelKeyId(key)
       if (commandInfo === undefined) {
         logger.info(`[channels] ${keyId}: ignoring unknown command /${parsedCommand.name}`)
-        return
+        return { kind: 'control' }
       }
       const requiredPermission = commandPermissionString(commandInfo.permission)
       if (requiredPermission !== null && !permissions.has(inboundAuthorOrigin(event), requiredPermission)) {
         logger.info(
           `[channels] ${keyId}: denied command /${parsedCommand.name} by permissions (${requiredPermission}) author=${event.authorId}`,
         )
-        return
+        return { kind: 'denied' }
       }
       // Session-less commands (e.g. /help) are informational and run without a
       // live session; their handler reply is posted straight back to the channel.
@@ -4698,15 +5229,32 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         existingLive = liveSessions.get(keyId) ?? null
         if (existingLive === null || existingLive.destroyed) {
           logger.info(`[channels] ${keyId}: ignoring command /${parsedCommand.name} with no live session`)
-          return
+          return { kind: 'control' }
         }
       } else if (commandInfo.wantsLiveSession) {
         const candidate = liveSessions.get(keyId) ?? null
         existingLive = candidate !== null && !candidate.destroyed ? candidate : null
       }
       const commandResult = await runChannelCommand(event, existingLive)
-      if (commandResult.kind !== 'not-command') return
+      if (commandResult.kind !== 'not-command') return { kind: 'control' }
     }
+    const generation = liveGeneration
+    await ready.catch(() => undefined)
+    const accountIdentity = event.accountIdentity ?? (await getRecoveryAccountIdentity(event.adapter, event.workspace))
+    const identity = {
+      accountIdentity: accountIdentity ?? '',
+      target: key,
+      messageId: event.externalMessageId || undefined,
+      eventKind: event.eventKind ?? 'message',
+      revision: event.revision ?? '',
+      receiptId: event.receiptId,
+    }
+    const existingAdmission =
+      accountIdentity && inboundJournal.health().available
+        ? await backgroundObligations.withTargetLane(key, async () => inboundJournal.lookupAdmission(identity))
+        : undefined
+    if (existingAdmission)
+      return { kind: 'duplicate', inputId: existingAdmission.inputId, outcome: existingAdmission.outcome?.kind }
 
     // If a boot restart-resume reservation is pending for this key, mark that a
     // real inbound arrived: ensureLive below will coalesce onto the reservation
@@ -4715,7 +5263,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const reservation = restartReservations.get(channelKeyId(key))
     if (reservation !== undefined) reservation.sawInbound = true
 
-    const live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
+    let live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room, generation)
     live.room = event.room
 
     const isNewAuthor = !live.participants.some((p) => p.authorId === event.authorId)
@@ -4769,46 +5317,76 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // shape mirrors `prompting batch=` so log scraping can pair them.
       logger.info(`[channels] ${live.keyId} observed id=${event.externalMessageId}`)
       observe(live, event)
-      return
+      return { kind: 'observed' }
     }
 
-    publishInbound(event, 'engage', live.sessionId)
-
-    // Arm cold-start bare-empty recovery only for the exact incident shape: the
-    // FIRST prompt (`turnSeq === 0`) of a freshly cold-started session that
-    // engaged via the solo-human answer-everything fallback — a lone human, no
-    // explicit mention/reply/DM, not a multi-human group. Recomputed on every
-    // engage so it self-clears once the first turn advances `turnSeq`; explicit
-    // address (mention/reply/DM) keeps the historical silent-on-empty path.
-    live.coldStartSoloFallbackTurnActive =
-      live.createdFromColdStart &&
-      live.turnSeq === 0 &&
-      effectiveHumans <= 1 &&
-      !event.authorIsBot &&
-      !event.isDm &&
-      !event.isBotMention &&
-      event.replyToBotMessageId === null &&
-      !live.multiHumanGroup
-
-    const engageReaction = autoReactOnEngage(event)
-
-    updateLoopGuard(live, event)
-
-    enqueue(live, event, engageReaction)
-
-    // Start showing "typing..." the moment we know we're going to engage,
-    // so users see the indicator during the debounce window — not just
-    // during LLM generation. drain() will keep it alive across iterations
-    // and the finally-block will stop it when the queue empties.
-    startTypingHeartbeat(live)
-
-    if (live.draining) {
-      // In-flight turn; let coalesce-on-drain pick it up. Same-author abort
-      // is a v0.2 enhancement once we have safe abort semantics through
-      // pi-coding-agent for in-flight tool calls.
-      return
+    await ready
+    if (!accountIdentity) {
+      logger.warn(
+        `[channels] ${live.keyId}: authenticated account is not ready; admitting as unbound so the message is not dropped`,
+      )
+      identity.accountIdentity = `unbound:${event.adapter}:${event.workspace}`
     }
-    scheduleDebouncedDrain(live)
+    return backgroundObligations.withTargetLane(key, async (): Promise<RouteReceipt> => {
+      if (live.destroyed || liveSessions.get(live.keyId) !== live) {
+        live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room)
+        live.room = event.room
+      }
+      if (isChannelRespondDenied(event)) return { kind: 'denied' }
+      const principal = {
+        kind: 'channel' as const,
+        adapter: event.adapter,
+        workspace: event.workspace,
+        chat: event.chat,
+        ...(event.room?.parentChat !== undefined ? { parentChat: event.room.parentChat } : {}),
+        lastInboundAuthorId: event.authorId,
+      }
+      const admission = await inboundJournal.admit({
+        ...identity,
+        principal,
+        ownerSessionId: live.sessionId,
+      })
+      if (admission.kind === 'duplicate')
+        return { kind: 'duplicate', inputId: admission.inputId, outcome: admission.outcome?.kind }
+      publishInbound(event, 'engage', live.sessionId)
+
+      // Arm cold-start bare-empty recovery only for the exact incident shape: the
+      // FIRST prompt (`turnSeq === 0`) of a freshly cold-started session that
+      // engaged via the solo-human answer-everything fallback — a lone human, no
+      // explicit mention/reply/DM, not a multi-human group. Recomputed on every
+      // engage so it self-clears once the first turn advances `turnSeq`; explicit
+      // address (mention/reply/DM) keeps the historical silent-on-empty path.
+      live.coldStartSoloFallbackTurnActive =
+        live.createdFromColdStart &&
+        live.turnSeq === 0 &&
+        effectiveHumans <= 1 &&
+        !event.authorIsBot &&
+        !event.isDm &&
+        !event.isBotMention &&
+        event.replyToBotMessageId === null &&
+        !live.multiHumanGroup
+
+      const engageReaction = autoReactOnEngage(event)
+
+      updateLoopGuard(live, event)
+
+      enqueue(live, event, engageReaction, admission.inputId)
+
+      // Start showing "typing..." the moment we know we're going to engage,
+      // so users see the indicator during the debounce window — not just
+      // during LLM generation. drain() will keep it alive across iterations
+      // and the finally-block will stop it when the queue empties.
+      startTypingHeartbeat(live)
+
+      if (live.draining) {
+        // In-flight turn; let coalesce-on-drain pick it up. Same-author abort
+        // is a v0.2 enhancement once we have safe abort semantics through
+        // pi-coding-agent for in-flight tool calls.
+        return admission
+      }
+      scheduleDebouncedDrain(live)
+      return admission
+    })
   }
 
   const inboundAuthorOrigin = (event: InboundMessage): SessionOrigin => ({
@@ -4904,9 +5482,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live: LiveSession,
     event: InboundMessage,
     engageReaction: Promise<ReactionRef | null> | null,
+    inputId: string,
   ): void => {
     clearQueuedEngageReactions(live)
     live.promptQueue.push({
+      inputId,
       text: event.text,
       ...(event.referenceContext !== undefined ? { referenceContext: event.referenceContext } : {}),
       ...(event.attachments !== undefined && event.attachments.length > 0 ? { attachments: event.attachments } : {}),
@@ -5474,7 +6054,47 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (submitter === undefined) {
       return { ok: false, error: `adapter "${req.adapter}" does not support review submission`, code: 'unsupported' }
     }
-    return await submitter(req).catch(
+    const sourceLive = req.sourceSessionId
+      ? [...liveSessions.values()].find(
+          (live) =>
+            !live.destroyed &&
+            live.sessionId === req.sourceSessionId &&
+            live.key.adapter === req.adapter &&
+            live.key.workspace === req.workspace &&
+            live.key.chat === req.chat,
+        )
+      : liveSessions.get(channelKeyId({ ...req, thread: null }))
+    const expectedAccountIdentity =
+      req.expectedAccountIdentity ?? activeTurnAccountIdentity(sourceLive) ?? currentAccountIdentityFor(req)
+    if (
+      sourceLive &&
+      (sourceLive.promptInFlight || sourceLive.inboundCoverage.length > 0 || sourceLive.backgroundCoverage.length > 0)
+    ) {
+      try {
+        await ready
+        inboundJournal.assertAvailable()
+      } catch (error) {
+        return { ok: false, error: `continuity persistence unavailable: ${describeError(error)}`, code: 'transient' }
+      }
+    }
+    const currentAccount = currentAccountIdentityFor(req)
+    if (
+      expectedAccountIdentity !== undefined &&
+      currentAccount !== undefined &&
+      expectedAccountIdentity !== currentAccount
+    ) {
+      if (sourceLive) {
+        try {
+          await backgroundObligations.withTargetLane(sourceLive.key, () =>
+            transferMismatchedAccountCoverageInLane(sourceLive),
+          )
+        } catch (error) {
+          logger.error(`[channels] review account-change transfer failed: ${describeError(error)}`)
+        }
+      }
+      return { ok: false, error: 'original channel account identity changed', code: 'permission-denied' }
+    }
+    return await submitter({ ...req, expectedAccountIdentity }).catch(
       (err): SubmitReviewResult => ({ ok: false, error: describeError(err), code: 'transient' }),
     )
   }
@@ -5566,6 +6186,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const flood = checkOutboundFlood(authoredText)
       if (!flood.ok) return { ok: false, error: OUTBOUND_FLOOD_ERROR, code: 'outbound-flood' }
     }
+    // Recovery is a transport-only operation. Do not even look up the live
+    // session: doing so would let a delayed notice alter a newer logical turn.
+    if (opts?.accounting === 'recovery') {
+      for (const callback of Array.from(callbacks)) {
+        const result = await callback({ ...msg, sendOptions: opts })
+        if (result.ok) return result
+        return result
+      }
+      return { ok: false, error: 'no recovery transport available', code: 'no-adapter' }
+    }
 
     const accountingTarget = opts?.accountingTarget ?? {
       adapter: msg.adapter,
@@ -5580,6 +6210,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       accountingTarget.thread === (msg.thread ?? null)
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
+    const originalTurnAccount = activeTurnAccountIdentity(live)
+    const sameAdapterAccountScope =
+      accountingTarget.adapter === msg.adapter && accountingTarget.workspace === msg.workspace
+    const expectedAccountIdentity =
+      opts?.expectedAccountIdentity ?? (sameAdapterAccountScope ? originalTurnAccount : currentAccountIdentityFor(msg))
+    const dependentLiveSend =
+      live &&
+      (source === 'tool' || opts?.outputKind === 'substantive' || opts?.accounting === 'live-turn') &&
+      (live.promptInFlight || live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0)
+    if (dependentLiveSend) {
+      try {
+        await ready
+        inboundJournal.assertAvailable()
+      } catch (error) {
+        return { ok: false, error: `continuity persistence unavailable: ${describeError(error)}` }
+      }
+    }
     // Credit sticky where the reply was PUBLISHED, not where it was accounted.
     // The two diverge when a caller answers from one sub-surface but publishes
     // to another in the same room — `postDuplicateRequestChangesComment` sends
@@ -5731,7 +6378,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     let reactionRef: ReactionRef | undefined
     try {
       for (const cb of snapshot) {
-        const result = await cb(msg)
+        if (dependentLiveSend && !inboundJournal.health().available) {
+          lastError = 'continuity persistence unavailable'
+          break
+        }
+        if (dependentLiveSend && live && originalTurnAccount !== undefined) {
+          const currentSourceAccount = currentAccountIdentityFor(live.key)
+          if (currentSourceAccount !== undefined && currentSourceAccount !== originalTurnAccount) {
+            await backgroundObligations.withTargetLane(live.key, () => transferMismatchedAccountCoverageInLane(live))
+            lastError = 'original channel account identity changed'
+            break
+          }
+        }
+        if (expectedAccountIdentity !== undefined) {
+          const currentAccount = currentAccountIdentityFor(msg)
+          if (currentAccount !== undefined && currentAccount !== expectedAccountIdentity) {
+            if (live && sameAdapterAccountScope)
+              await backgroundObligations.withTargetLane(live.key, () => transferMismatchedAccountCoverageInLane(live))
+            lastError = 'original channel account identity changed'
+            break
+          }
+        }
+        const result = await cb(
+          expectedAccountIdentity === undefined
+            ? msg
+            : {
+                ...msg,
+                sendOptions: { ...opts, accounting: 'live-turn', expectedAccountIdentity },
+              },
+        )
         if (result.ok) {
           delivered = true
           messageId = result.messageId
@@ -6358,6 +7033,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         return
       }
       const leakedReasoning = !isNoReplySignal(assistantText)
+      if (
+        assistantText.trim() !== '' &&
+        live.backgroundCoverage.length === 0 &&
+        live.inboundCoverage.length > 0 &&
+        !live.willingnessReminderIteration
+      ) {
+        await settleBackgroundCoverage(live, 'intentionally-suppressed', 'explicit-no-reply')
+      }
       logger.info(`[channels] ${live.keyId} no_reply${leakedReasoning ? ' (with_leaked_reasoning)' : ''}`)
       void dropContinuationReactions(live)
       return
@@ -6484,6 +7167,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.warn(
       `[channels] ${live.keyId}: recovering assistant_text_without_channel_tool source=${source} text_len=${assistantText.length}`,
     )
+    const capturedCoverage = await captureBackgroundResultCoverage(live.sessionId)
+    const capturedInbound = await captureInboundResultCoverage(live.sessionId)
     const result = await send(
       {
         adapter: live.key.adapter,
@@ -6496,6 +7181,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     )
     if (!result.ok) {
       logger.warn(`[channels] ${live.keyId}: recovery send failed: ${result.error}`)
+    } else if (!detectContinuationWillingness(assistantText)) {
+      await recordLandedBackgroundResponse(live, 'recovered-terminal-response', capturedCoverage, capturedInbound)
     }
   }
 
@@ -6678,6 +7365,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const stop = async (): Promise<void> => {
     closing = true
+    if (!options.inboundJournal) inboundJournal.cancelInitialization()
+    unsubscribeJournalFailure()
     if (gcTimer) clearInterval(gcTimer)
     gcTimer = null
     liveGeneration++
@@ -6691,7 +7380,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const live of all) {
       await tearDownLive(live)
     }
-    await persistChain
+    try {
+      await persistChain
+    } finally {
+      if (!options.inboundJournal) {
+        await inboundJournal.close()
+      }
+    }
   }
 
   // Drops every in-memory session but KEEPS the on-disk records, so the next
@@ -6727,11 +7422,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Seal only around the flush — unlike stop() the router keeps serving after a
     // roles reload, so re-enable persist() once pending writes have drained.
     closing = true
+    const successors: ChannelKey[] = []
     for (const live of immediate) {
+      const retained = await backgroundObligations.withTargetLane(live.key, async () => {
+        await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, live.sessionId)
+        live.inboundCoverage = []
+        live.backgroundCoverage = []
+        return retainLiveQueuesInLane(live)
+      })
+      if (retained) successors.push(live.key)
       await tearDownLive(live)
     }
     await persistChain
     closing = false
+    await Promise.all(successors.map(handOffToSuccessor))
   }
 
   // Graceful-restart shutdown: mark every live channel session's todo scope so
@@ -6753,73 +7457,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           )
         })
         .catch((err) => logger.error(`[channels] graceful-restart abort failed: ${describeError(err)}`))
-    }
-  }
-
-  // Graceful-restart hint: if a live channel session has background subagents
-  // still running, record their names in the restart handoff so the boot resume
-  // can tell that thread its promised result was lost. Only one handoff exists
-  // on disk, so the FIRST session with running background children wins; the
-  // rare "two threads mid-research at once" case notifies one. The fresh/stale
-  // and augment-vs-fresh-write decision is documented inline below.
-  //
-  // Returns whether the handoff now carries interrupted names, propagated from
-  // the writer's real result so a swallowed filesystem failure reports false.
-  const writeInterruptedSubagentHandoff = async (): Promise<boolean> => {
-    const listNames = options.listRunningBackgroundSubagentNames
-    if (listNames === undefined) return false
-
-    // Take the same lock `/restart` holds so our peek→select→write is atomic
-    // relative to its post-ACK write: either it commits first and we augment the
-    // exact handoff, or we commit first and it overwrites with its own origin —
-    // never an interleaved read-modify-write that drops one producer's data.
-    const release = await acquireRestartHandoffLock(options.agentDir)
-    try {
-      // A FRESH existing handoff is authoritative: it is the accepted in-session
-      // restart's, so we augment it (never clobber its origin/author with a
-      // different live session's) — or, if its own session has no running
-      // children, leave it untouched and record nothing. A STALE handoff is not
-      // authoritative: peekRestartHandoff applies no TTL, so an unclaimed TUI
-      // handoff left on disk by kind-aware consume can surface here; honoring it
-      // would suppress THIS restart's note or preserve its old restartedAt so the
-      // next boot discards the note as stale — so we ignore it and write fresh
-      // from the current live sessions. When we augment, stamp restartedAt=now()
-      // so the note survives the boot TTL.
-      const existing = await peekRestartHandoff(options.agentDir)
-      const existingIsFresh = existing !== null && now() - Date.parse(existing.restartedAt) <= RESTART_HANDOFF_TTL_MS
-      if (existing !== null && existingIsFresh) {
-        const names = listNames(existing.originatingSessionId)
-        if (names.length === 0) return false
-        return await writeRestartHandoff(options.agentDir, {
-          ...existing,
-          restartedAt: new Date(now()).toISOString(),
-          interruptedSubagents: names,
-        })
-      }
-
-      for (const live of Array.from(liveSessions.values())) {
-        const names = listNames(live.sessionId)
-        if (names.length === 0) continue
-        const sessionFile = live.getTranscriptPath?.()
-        if (sessionFile === undefined) continue
-        // Carry the session's author (same precedence as buildRestartCommandContext)
-        // so boot re-seeds lastTurnAuthorId. Without it an author-scoped role demotes
-        // on resume and the reminder-only turn can lose channel.send — i.e. fail to
-        // deliver the very lost-work notice this handoff exists for.
-        const triggeringAuthorId = live.currentTurnAuthorId ?? live.lastTurnAuthorId ?? undefined
-        return await writeRestartHandoff(options.agentDir, {
-          schemaVersion: 2,
-          restartedAt: new Date(now()).toISOString(),
-          originatingSessionId: live.sessionId,
-          origin: { kind: 'channel', key: live.key },
-          originatingSessionFile: basename(sessionFile),
-          interruptedSubagents: names,
-          ...(triggeringAuthorId !== undefined ? { triggeringAuthorId } : {}),
-        })
-      }
-      return false
-    } finally {
-      release()
     }
   }
 
@@ -6859,6 +7496,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.warn(`[channels] ${keyId}: restart-resume skipped — adapter not configured`)
       return null
     }
+    if (restartReservations.has(keyId)) throw new Error(`restart reservation already exists for ${keyId}`)
 
     let resolveGate!: (live: LiveSession) => void
     let rejectGate!: (err: unknown) => void
@@ -6875,13 +7513,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const reservation: RestartReservation = {
       keyId,
       sawInbound: false,
+      release: () => {
+        if (creating.get(keyId) === gate) creating.delete(keyId)
+        if (restartReservations.get(keyId) === reservation) restartReservations.delete(keyId)
+        rejectGate(new StaleLiveSessionError(keyId))
+      },
       resume: async () => {
         // Drop our own seed BEFORE calling ensureLive, or ensureLive would
         // await the gate we are about to resolve and deadlock.
         if (creating.get(keyId) === gate) creating.delete(keyId)
         restartReservations.delete(keyId)
 
-        await ensureLoaded()
+        try {
+          await ensureLoaded()
+        } catch (error) {
+          reservation.release()
+          throw error
+        }
         const record = mappings ? findRecord(mappings, key) : undefined
         if (record?.sessionId !== handoff.originatingSessionId) {
           logger.warn(
@@ -6916,27 +7564,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // A real inbound coalesced onto the reservation during boot: it is the
         // wake. Adding the synthetic "I'm back" turn on top would duplicate
         // work / stack a spurious turn, so skip it and let the inbound drain.
-        // The interrupted-subagent directive is NOT part of that generic wake,
-        // though: it is the only signal that a promised result was lost, and the
-        // boot already consumed the handoff, so if we drop it here no later turn
-        // re-delivers it. Queue it AND drain ourselves: `sawInbound` is set
-        // before engagement is decided, so an observe-only inbound returns
-        // without draining and would strand the reminder. drain() is guarded
-        // (`draining || destroyed` no-ops) so if the inbound WILL engage this is
-        // a harmless second call, and its loop consumes pendingSystemReminders
-        // either way. Still skip the generic synthetic wake.
         if (reservation.sawInbound) {
-          if (handoff.interruptedSubagents !== undefined && handoff.interruptedSubagents.length > 0) {
-            live.pendingSystemReminders.push(
-              wakeupReminder(buildInterruptedSubagentNotice(handoff.interruptedSubagents)),
-            )
-            logger.info(
-              `[channels] ${keyId}: restart-resume coalesced with a real inbound; delivering interrupted-subagent notice`,
-            )
-            void drain(live)
-          } else {
-            logger.info(`[channels] ${keyId}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
-          }
+          logger.info(`[channels] ${keyId}: restart-resume coalesced with a real inbound; skipping synthetic wake`)
           return
         }
 
@@ -6950,7 +7579,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           logger.error(`[channels] ${keyId}: restart-resume clear abort suppression failed: ${describeError(err)}`),
         )
 
-        live.pendingSystemReminders.push(wakeupReminder(buildRestartResumeWakeReminder(handoff.interruptedSubagents)))
+        live.pendingSystemReminders.push(wakeupReminder(RESTART_RESUME_WAKE_REMINDER))
         logger.info(`[channels] ${keyId}: restart-resume waking session ${live.sessionId}`)
         void drain(live)
       },
@@ -7044,6 +7673,132 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'unknown-command', name: lowered }
   }
 
+  const acceptBackgroundResponse: ChannelRouter['acceptBackgroundResponse'] = async (args) =>
+    backgroundObligations.withTargetLane(args.key, async () => {
+      await ready
+      inboundJournal.assertAvailable()
+      const row = await backgroundObligations.accept(args)
+      return { obligationId: row.obligationId, generation: row.generation }
+    })
+
+  const suppressUnstartedBackgroundResponse: ChannelRouter['suppressUnstartedBackgroundResponse'] = async (
+    ref,
+    reason,
+  ) => {
+    const row = await backgroundObligations.get(ref.obligationId)
+    if (!row) throw new Error('Missing background launch obligation')
+    await backgroundObligations.withTargetLane(row.target, async () => {
+      await ready
+      inboundJournal.assertAvailable()
+      const current = await backgroundObligations.get(ref.obligationId)
+      if (!current || current.phase === 'closed') return
+      if (current.phase !== 'accepted') throw new Error('Background launch already progressed')
+      await backgroundObligations.settle([{ obligationId: current.obligationId, generation: current.generation }], {
+        kind: 'intentionally-suppressed',
+        decisionId: randomUUID(),
+        reason,
+      })
+    })
+  }
+
+  const attachBackgroundResultCoverage: ChannelRouter['attachBackgroundResultCoverage'] = async (args) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === args.parentSessionId,
+    )
+    if (!live) return
+    await backgroundObligations.withTargetLane(live.key, async () => {
+      await ready
+      inboundJournal.assertAvailable()
+      if (live.destroyed) return
+      const source =
+        (await backgroundObligations.lookup(args.parentSessionId, args.taskId)) ??
+        (await backgroundObligations.list()).find(
+          (row) => row.taskId === args.taskId && channelKeyId(row.target) === live.keyId,
+        )
+      if (!source || channelKeyId(source.target) !== live.keyId) return
+      const row = await backgroundObligations.resultReady(source.obligationId)
+      if (!row || row.phase === 'closed' || row.transfer) {
+        retireBackgroundCache(live, new Set([source.obligationId]))
+        return
+      }
+      const refs = [{ obligationId: row.obligationId, generation: row.generation }]
+      const owner = { turnId: live.backgroundTurnId, ownerSessionId: live.sessionId, target: live.key }
+      if (
+        row.claim &&
+        (row.claim.turnId !== live.backgroundTurnId ||
+          row.claim.ownerSessionId !== live.sessionId ||
+          row.claim.epoch !== backgroundObligations.epoch)
+      ) {
+        if (live.inboundCoverage.length > 0) {
+          await inboundJournal.move([], { ...owner, fromTurnId: row.claim.turnId }, refs)
+        } else {
+          await backgroundObligations.move(refs, { ...owner, fromTurnId: row.claim.turnId })
+        }
+      } else if (!row.claim) {
+        if (live.inboundCoverage.length > 0) {
+          await inboundJournal.claim([], owner, refs)
+        } else {
+          await backgroundObligations.claim(refs, owner)
+        }
+      }
+      // Fetch consumed this result into the active prompt. Its queued wake must
+      // not advertise an old owner or start a second prompt for the same result.
+      retireBackgroundCache(live, new Set([row.obligationId]))
+      live.backgroundCoverage.push(row.obligationId)
+    })
+  }
+
+  const captureTurnAccountIdentity: NonNullable<ChannelRouter['captureTurnAccountIdentity']> = async (
+    parentSessionId,
+  ) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === parentSessionId,
+    )
+    if (!live) return undefined
+    return backgroundObligations.withTargetLane(live.key, async () => {
+      await ready
+      inboundJournal.assertAvailable()
+      return activeTurnAccountIdentity(live) ?? currentAccountIdentityFor(live.key)
+    })
+  }
+
+  const captureInboundResultCoverage: NonNullable<ChannelRouter['captureInboundResultCoverage']> = async (
+    parentSessionId,
+  ) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === parentSessionId,
+    )
+    if (!live) return []
+    return backgroundObligations.withTargetLane(live.key, async () => {
+      await ready
+      if (live.destroyed) return []
+      return inboundJournal.resolve(live.inboundCoverage).filter((ref) => {
+        const row = inboundJournal.get(ref.inputId)
+        return (
+          row?.phase === 'turn-owned' &&
+          row.claim?.turnId === live.backgroundTurnId &&
+          row.claim.ownerSessionId === live.sessionId &&
+          row.claim.epoch === inboundJournal.epoch
+        )
+      })
+    })
+  }
+
+  const captureBackgroundResultCoverage: NonNullable<ChannelRouter['captureBackgroundResultCoverage']> = async (
+    parentSessionId,
+  ) => {
+    const live = [...liveSessions.values()].find(
+      (candidate) => !candidate.destroyed && candidate.sessionId === parentSessionId,
+    )
+    if (!live) return []
+    return backgroundObligations.withTargetLane(live.key, async () => {
+      if (live.destroyed) return []
+      const refs = await resolveBackgroundCoverage(live, live.backgroundCoverage, true)
+      live.backgroundCoverage = refs.map((ref) => ref.obligationId)
+      return refs
+    })
+  }
+
   const deliverCompletionReminder = (
     live: LiveSession,
     args: {
@@ -7054,6 +7809,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       durationMs: number
       error?: string
       hasRecoverableOutput?: boolean
+      backgroundObligationId?: string
     },
   ): { kind: 'delivered'; keyId: string } => {
     const adapter = live.keyId.split(':', 1)[0] ?? ''
@@ -7067,7 +7823,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       channel: true,
       adapter,
     })
-    live.pendingSystemReminders.push(wakeupReminder(text))
+    if (
+      args.backgroundObligationId &&
+      (live.backgroundCoverage.includes(args.backgroundObligationId) ||
+        live.pendingSystemReminders.some((r) => r.backgroundObligationId === args.backgroundObligationId))
+    )
+      return { kind: 'delivered', keyId: live.keyId }
+    live.pendingSystemReminders.push({
+      ...wakeupReminder(text),
+      ...(args.backgroundObligationId ? { backgroundObligationId: args.backgroundObligationId } : {}),
+    })
     // The reminder tells the agent to fetch this result now; clear the
     // subagent_output window so an earlier premature-polling streak can't
     // hard-block that legitimate fetch.
@@ -7084,7 +7849,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'delivered', keyId: live.keyId }
   }
 
-  const injectSubagentCompletionReminder = (args: {
+  const injectSubagentCompletionReminder = async (args: {
     parentSessionId: string
     subagent: string
     taskId: string
@@ -7093,11 +7858,35 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     error?: string
     hasRecoverableOutput?: boolean
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
-  }): { kind: 'delivered'; keyId: string } | { kind: 'no-live-session' } => {
+  }): Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }> => {
+    // Completion admission is independent of the presence or health of a parent.
+    const existing = await backgroundObligations.lookup(args.parentSessionId, args.taskId)
+    const row = existing
+      ? await backgroundObligations.withTargetLane(existing.target, async () => {
+          await ready
+          inboundJournal.assertAvailable()
+          return backgroundObligations.resultReady(existing.obligationId)
+        })
+      : undefined
+    if (existing && !row) return { kind: 'no-live-session' }
+    const queueCompletion = (
+      live: LiveSession,
+    ): Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }> =>
+      backgroundObligations.withTargetLane(live.key, async () => {
+        await ready
+        inboundJournal.assertAvailable()
+        const current = row ? await backgroundObligations.get(row.obligationId) : undefined
+        if (row && (!current || current.phase === 'closed' || current.transfer)) return { kind: 'no-live-session' }
+        return deliverCompletionReminder(live, {
+          ...args,
+          ...(current ? { backgroundObligationId: current.obligationId } : {}),
+        })
+      })
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
-      return deliverCompletionReminder(live, args)
+      if (row && channelKeyId(row.target) !== live.keyId) continue
+      return queueCompletion(live)
     }
     // The exact parent session is gone. If the subagent was spawned from a
     // channel session, the conversation may have rolled over
@@ -7112,7 +7901,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         logger.info(
           `[channels] ${targetKeyId}: subagent-completion reminder rerouted to live successor (parent ${args.parentSessionId} gone) task=${args.taskId}`,
         )
-        return deliverCompletionReminder(successor, args)
+        if (row && channelKeyId(row.target) !== successor.keyId) return { kind: 'no-live-session' }
+        return queueCompletion(successor)
       }
     }
     return { kind: 'no-live-session' }
@@ -7321,18 +8111,28 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // event.sessionId), and confirmed to be the right github PR live session so a
   // stray/mismatched signal can't suppress an unrelated turn's fallback. See
   // `githubReviewOutputTurn`.
-  const noteGithubReviewOutput = (args: {
+  const noteGithubReviewOutput = async (args: {
     sessionId: string
     workspace: string
     prNumber: number
     state: ReviewOutputState
-  }): { kind: 'stamped' | 'no-live-session' } => {
+    inboundCoverage?: InboundRef[]
+    backgroundCoverage?: BackgroundObligationRef[]
+  }): Promise<{ kind: 'stamped' | 'no-live-session' }> => {
     const chat = `pr:${args.prNumber}`
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.sessionId) continue
       if (live.key.adapter !== 'github') continue
       if (live.key.workspace !== args.workspace || live.key.chat !== chat) continue
+      // Only pre-publication coverage can be credited. An output-only recognizer
+      // still stamps ordinary review accounting, but cannot borrow current debt.
+      await recordLandedBackgroundResponse(
+        live,
+        'formal-review',
+        args.backgroundCoverage ?? [],
+        args.inboundCoverage ?? [],
+      )
       live.githubReviewOutputTurn = live.turnSeq
       logger.info(`[channels] ${live.keyId}: github_review_output state=${args.state} turn=${live.turnSeq}`)
       return { kind: 'stamped' }
@@ -7340,16 +8140,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return { kind: 'no-live-session' }
   }
 
-  const markTurnSkipped = (args: {
+  const markTurnSkipped = async (args: {
     parentSessionId: string
     reason: string
-  }):
-    | { kind: 'recorded'; keyId: string }
-    | { kind: 'recorded-after-send'; keyId: string }
-    | { kind: 'no-live-session' } => {
+  }): Promise<
+    { kind: 'recorded'; keyId: string } | { kind: 'recorded-after-send'; keyId: string } | { kind: 'no-live-session' }
+  > => {
     for (const live of liveSessions.values()) {
       if (live.destroyed) continue
       if (live.sessionId !== args.parentSessionId) continue
+      await settleBackgroundCoverage(live, 'intentionally-suppressed', 'explicit-skip')
       if (live.successfulChannelSends > live.successfulSendsAtTurnStart) {
         // Reply-first skip ("acked, now going quiet"): accept as a terminal
         // no-op, never stamp `skippedTurn`. The delivered reply stands and must
@@ -7556,10 +8356,75 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ),
     ).then(() => undefined)
   }
+  const registerRecoveryAdapter = (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks): void => {
+    recoveryAdapters.set(adapter, callbacks)
+  }
+  const unregisterRecoveryAdapter = (adapter: ChannelKey['adapter'], callbacks: RecoveryAdapterCallbacks): void => {
+    if (recoveryAdapters.get(adapter) === callbacks) recoveryAdapters.delete(adapter)
+  }
+  const activeTurnAccountIdentity = (live: LiveSession | undefined): string | undefined =>
+    live && (live.promptInFlight || live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0)
+      ? live.turnAccountIdentity
+      : undefined
+
+  const currentAccountIdentityFor = (key: Pick<ChannelKey, 'adapter' | 'workspace'>): string | undefined => {
+    const callbacks = recoveryAdapters.get(key.adapter)
+    if (callbacks) return callbacks.cachedAccountIdentity?.(key.workspace)
+    return fallbackChannelAccountIdentity(
+      key.adapter,
+      key.workspace,
+      selfIdentityResolvers.get(key.adapter)?.(key.workspace)?.id,
+    )
+  }
+
+  const getRecoveryAccountIdentity = async (
+    adapter: ChannelKey['adapter'],
+    workspace = '',
+  ): Promise<string | undefined> => {
+    return currentAccountIdentityFor({ adapter, workspace })
+  }
+  const validateRecovery = async (record: RecoveryRecord): Promise<RecoveryFailure | undefined> => {
+    const config = options.configForAdapter(record.target.adapter)
+    if (!config || !config.enabled) {
+      return { kind: 'configuration', safeReason: 'original adapter is not configured' }
+    }
+    if (
+      record.principal.kind !== 'channel' ||
+      !permissions.has({ ...record.principal, thread: record.target.thread }, CORE_PERMISSIONS.channelRespond)
+    ) {
+      return { kind: 'permission', safeReason: 'original principal cannot respond or send' }
+    }
+    const callbacks = recoveryAdapters.get(record.target.adapter)
+    const identity = await (callbacks
+      ? callbacks.accountIdentity(record.target.workspace)
+      : getRecoveryAccountIdentity(record.target.adapter, record.target.workspace))
+    if (identity === undefined) return { kind: 'unavailable', safeReason: 'adapter account is not ready' }
+    if (record.accountIdentity === 'unbound-legacy' && record.boundAccountIdentity === undefined) return undefined
+    if (identity !== (record.boundAccountIdentity ?? record.accountIdentity))
+      return { kind: 'identity', safeReason: 'original account identity changed' }
+    return undefined
+  }
+  const reconcileRecovery = async (record: RecoveryRecord): Promise<RecoveryReconcileResult> =>
+    recoveryAdapters.get(record.target.adapter)?.reconcile(record) ?? { status: 'unreconcilable' }
+  const setRecoveryStopHandler = (handler: (target: ChannelKey, parentSessionId: string) => Promise<void>): void => {
+    recoveryStopHandler = handler
+  }
 
   return {
     route,
     send,
+    acceptBackgroundResponse,
+    suppressUnstartedBackgroundResponse,
+    attachBackgroundResultCoverage,
+    captureBackgroundResultCoverage,
+    captureInboundResultCoverage,
+    captureTurnAccountIdentity,
+    registerRecoveryAdapter,
+    unregisterRecoveryAdapter,
+    getRecoveryAccountIdentity,
+    validateRecovery,
+    reconcileRecovery,
+    setRecoveryStopHandler,
     getConsecutiveSendCount,
     hasQualifyingWorkThisLogicalTurn,
     getSendRate,
@@ -7626,7 +8491,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     stop,
     tearDownAllLive,
     markRestartAbortForAllLive,
-    writeInterruptedSubagentHandoff,
     liveCount: () => liveSessions.size,
     __testing: {
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
@@ -7707,6 +8571,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       },
       typingHeartbeatIntervalFor,
       runIdleGc,
+      getRecoveryAccountingSnapshot: (key: ChannelKey) => {
+        const live = liveSessions.get(channelKeyId(key))
+        if (!live) return undefined
+        return {
+          successfulChannelSends: live.successfulChannelSends,
+          promisedWorkOutstandingThisLogicalTurn: live.promisedWorkOutstandingThisLogicalTurn,
+          lastSendLeafId: live.lastSendLeafId,
+          skippedTurn: live.skippedTurn,
+          consecutiveSends: [...live.consecutiveSends],
+          lastSentText: [...live.lastSentText],
+          policyDeniedToolSendsThisTurn: [...live.policyDeniedToolSendsThisTurn],
+          silentAckReactions: [...live.activeSilentAckReactions],
+          continuationReactions: [...live.activeContinuationReactions],
+          typingEpoch: live.typingEpoch,
+          continueReplyTurn: live.continueReplyTurn,
+        }
+      },
       getLiveOriginSnapshot: (key: ChannelKey) => {
         const live = liveSessions.get(channelKeyId(key))
         const origin = live?.originRef.current
@@ -7727,11 +8608,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const live = liveSessions.get(channelKeyId(key))
         if (!live) return
         live.pendingSystemReminders.push(retryReminder(text))
-      },
-      enqueueUserInbound: (key: ChannelKey, event: InboundMessage): void => {
-        const live = liveSessions.get(channelKeyId(key))
-        if (!live) return
-        enqueue(live, event, null)
       },
     },
   }

@@ -29,12 +29,27 @@ type FakeRouterOptions = {
 function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
   const attachments = options.attachments ?? []
   return {
-    route: async () => {},
+    route: async () => ({ kind: 'observed' }),
+    acceptBackgroundResponse: async () => {
+      throw new Error('Unexpected background admission')
+    },
+    suppressUnstartedBackgroundResponse: async () => {
+      throw new Error('Unexpected background suppression')
+    },
+    attachBackgroundResultCoverage: async () => {
+      throw new Error('Unexpected background coverage')
+    },
     send: async () => ({ ok: true }),
     getConsecutiveSendCount: () => 0,
     getSendRate: () => ({ count: 0, windowMs: 0 }),
     registerOutbound: () => {},
     unregisterOutbound: () => {},
+    registerRecoveryAdapter: () => {},
+    unregisterRecoveryAdapter: () => {},
+    getRecoveryAccountIdentity: async () => undefined,
+    validateRecovery: async () => undefined,
+    reconcileRecovery: async () => ({ status: 'unreconcilable' }),
+    setRecoveryStopHandler: () => {},
     registerReaction: () => {},
     unregisterReaction: () => {},
     react: async () => ({ ok: true }),
@@ -82,17 +97,16 @@ function makeRouter(options: FakeRouterOptions = {}): ChannelRouter {
     registerHistoryAttachments: () => {},
     executeCommand: async () => ({ kind: 'no-live-session' }),
     getSelfAliases: () => [],
-    injectSubagentCompletionReminder: () => ({ kind: 'no-live-session' }),
+    injectSubagentCompletionReminder: async () => ({ kind: 'no-live-session' }),
     injectPrVerdictActivity: () => ({ kind: 'delivered', count: 0 }),
-    noteGithubReviewOutput: () => ({ kind: 'no-live-session' }),
-    markTurnSkipped: () => ({ kind: 'no-live-session' }),
+    noteGithubReviewOutput: async () => ({ kind: 'no-live-session' }),
+    markTurnSkipped: async () => ({ kind: 'no-live-session' }),
     clearSticky: () => ({ keyId: '', cleared: 0 }),
     reserveRestartHandoff: () => null,
     resumeRestartHandoff: async () => {},
     stop: async () => {},
     tearDownAllLive: async () => {},
     markRestartAbortForAllLive: async () => {},
-    writeInterruptedSubagentHandoff: async () => false,
     liveCount: () => 0,
   }
 }

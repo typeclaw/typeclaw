@@ -287,6 +287,7 @@ export class LiveSubagentRegistry {
   }
 
   clear(): void {
+    // Shutdown must not erase evidence of children that have not terminated.
     this.entries.clear()
     this.events.clear()
     this.capturedFinalMessages.clear()

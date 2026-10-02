@@ -21,7 +21,9 @@ import type { KakaoAccountCredentials, KakaoConfig, PendingLoginState } from 'ag
 
 import { prependQuoteAnchor, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
+import { fallbackChannelAccountIdentity } from '@/channels/types'
 import type {
+  ChannelSelfIdentityResolver,
   ChannelHistoryMessage,
   FetchHistoryArgs,
   FetchHistoryResult,
@@ -47,6 +49,7 @@ import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
+import { withOutboundAccount } from './outbound-account'
 
 // Structural duck-type of the upstream KakaoTalkClient class. The upstream
 // type is a class with private fields, and TypeScript treats those
@@ -361,6 +364,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     })
   let listener: KakaoTalkListener | null = null
   let selfUserId: string | null = null
+  const selfIdentityResolver: ChannelSelfIdentityResolver = () => (selfUserId === null ? null : { id: selfUserId })
   let connected = false
   let started = false
   let lastConnectedAt: number | null = null
@@ -400,11 +404,14 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     selfUserIdRef: () => selfUserId,
   })
 
-  const outboundCallback = createOutboundCallback({
-    client,
-    logger,
-    formatChannelTag,
-  })
+  const outboundCallback = withOutboundAccount(
+    createOutboundCallback({
+      client,
+      logger,
+      formatChannelTag,
+    }),
+    (workspace) => fallbackChannelAccountIdentity('kakaotalk', workspace, selfUserId),
+  )
 
   const typing = createKakaoTypingCallback({
     logger,
@@ -435,6 +442,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     event: KakaoTalkPushMessageEvent,
     attachments: readonly InboundAttachment[] = [],
   ): Promise<void> => {
+    const inboundSelfId = selfUserId
     inflightInbounds++
     try {
       if (channelResolver.lookupChat(event.chat_id) === null) {
@@ -472,7 +480,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       markReadIfSupported({ client, event, channelResolver, logger })
 
       const verdict = classifyInbound(event, options.configRef(), {
-        selfUserId,
+        selfUserId: inboundSelfId,
         lookupChat: (id) => channelResolver.lookupChat(id),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(options.selfAliasesRef ? { selfAliases: options.selfAliasesRef() } : {}),
@@ -491,7 +499,12 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       logger.info(
         `[kakaotalk] routed log_id=${event.log_id} ${inboundTag} mention=${enriched.isBotMention} reply=${enriched.replyToBotMessageId !== null} dm=${enriched.isDm}`,
       )
-      await options.router.route(enriched)
+      await options.router.route({
+        ...enriched,
+        accountIdentity: fallbackChannelAccountIdentity('kakaotalk', enriched.workspace, inboundSelfId),
+        eventKind: 'message',
+        revision: 'original',
+      })
     } catch (err) {
       logger.error(`[kakaotalk] handleInbound failed: ${describeError(err)}`)
     } finally {
@@ -678,6 +691,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       // but outboundCallback would still send via a dead client). Stop()
       // unregisters in the inverse order.
       options.router.registerOutbound('kakaotalk', outboundCallback)
+      options.router.registerSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.registerTyping('kakaotalk', typing.callback)
       options.router.setTypingCapability('kakaotalk', true)
       // KakaoTalk expires the indicator ~5s after the last packet, faster than
@@ -694,6 +708,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       if (!started) return
       started = false
       options.router.unregisterOutbound('kakaotalk', outboundCallback)
+      options.router.unregisterSelfIdentity('kakaotalk', selfIdentityResolver)
       options.router.unregisterTyping('kakaotalk', typing.callback)
       options.router.setTypingCapability('kakaotalk', false)
       typing.reset()

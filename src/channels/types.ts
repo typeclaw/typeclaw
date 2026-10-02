@@ -1,3 +1,4 @@
+import type { RecoveryFailure, RecoveryRecord } from './continuity-types'
 import type { AdapterId } from './schema'
 
 export type ChannelKey = {
@@ -5,6 +6,15 @@ export type ChannelKey = {
   workspace: string
   chat: string
   thread: string | null
+}
+// Matches the router's existing self-identity fallback and persisted background
+// account identity. Adapters with platform-specific resolvers retain those IDs.
+export function fallbackChannelAccountIdentity(
+  adapter: AdapterId,
+  workspace: string,
+  userId: string | null | undefined,
+): string | undefined {
+  return userId == null ? undefined : `${adapter}:${workspace}:${userId}`
 }
 
 // Inbound (non-text) media that the user attached to a channel message.
@@ -62,6 +72,13 @@ export type GithubReviewThreadCloseout = {
   deferUntil?: { kind: 'review-state-unknown'; expiresAt: number }
 }
 
+export type RouteReceipt =
+  | { kind: 'accepted'; inputId: string; generation: number }
+  | { kind: 'duplicate'; inputId: string; outcome?: 'delivered' | 'intentionally-suppressed' }
+  | { kind: 'observed' }
+  | { kind: 'denied' }
+  | { kind: 'control' }
+
 export type InboundMessage = {
   adapter: AdapterId
   workspace: string
@@ -92,6 +109,12 @@ export type InboundMessage = {
   // resolve `attachment_id` → ref without the agent ever seeing the ref.
   attachments?: readonly InboundAttachment[]
   externalMessageId: string
+  // Authenticated adapter account, never a credential or its fingerprint.
+  accountIdentity?: string
+  eventKind?: string
+  revision?: string
+  // Local receipt identity when upstream supplies no stable event identity.
+  receiptId?: string
   authorId: string
   authorName: string
   // Set true when the inbound is from another bot (NOT this typeclaw
@@ -222,6 +245,33 @@ export type OutboundAttachment = {
   filename?: string
 }
 
+export type SendOptions =
+  | {
+      accounting?: 'live-turn'
+      sessionId?: string
+      turnId?: string
+      claimGeneration?: number
+      expectedAccountIdentity?: string
+      coveredIds?: readonly string[]
+    }
+  | { accounting: 'recovery'; deliveryId: string; coveredIds: readonly string[]; expectedAccountIdentity: string }
+
+export type RecoveryReconcileResult =
+  | { status: 'found'; messageId?: string; messageIds?: readonly string[] }
+  | { status: 'unknown' | 'unreconcilable' }
+
+export class RecoveryTransportError extends Error {
+  constructor(readonly failure: RecoveryFailure) {
+    super(failure.safeReason)
+  }
+}
+
+export type RecoveryAdapterCallbacks = {
+  accountIdentity: (workspace?: string) => Promise<string | undefined>
+  cachedAccountIdentity?: (workspace?: string) => string | undefined
+  reconcile: (record: RecoveryRecord) => Promise<RecoveryReconcileResult>
+}
+
 export type OutboundMessage = {
   adapter: AdapterId
   workspace: string
@@ -252,6 +302,7 @@ export type OutboundMessage = {
   // send time (KakaoTalk: payload built from a source message that may have
   // scrolled out of history) degrade to the same blockquote fallback.
   replyTo?: OutboundReplyTo
+  sendOptions?: SendOptions
 }
 
 export type OutboundReplyTo = {
@@ -301,7 +352,7 @@ export type SendErrorCode =
 // removal-instance ref returned by `ReactionResult.reactionRef` after an add.
 export type SendResult =
   | { ok: true; messageId?: string; messageIds?: readonly string[]; reactionRef?: ReactionRef }
-  | { ok: false; error: string; code?: SendErrorCode }
+  | { ok: false; error: string; code?: SendErrorCode; recoveryFailure?: RecoveryFailure }
 
 export type OutboundCallback = (msg: OutboundMessage) => Promise<SendResult>
 
@@ -604,6 +655,8 @@ export type SubmitReviewRequest = {
   // The commit the review describes. When set, the submitter refuses to post
   // unless the PR head is still exactly this commit.
   expectedHeadSha?: string
+  expectedAccountIdentity?: string
+  sourceSessionId?: string
 }
 
 export type SubmitReviewResult =
