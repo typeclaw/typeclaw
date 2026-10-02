@@ -58,6 +58,7 @@ const consoleLogger: ChannelManagerLogger = {
 export type ChannelManagerOptions = {
   agentDir: string
   channelsConfigRef: () => ChannelsConfig
+  onRecoveryReady?: () => void
   // Plain-text names the agent answers to in channel engagement (the
   // `alias` field in `typeclaw.json`), forwarded to the router as
   // `configuredAliases`. Read live on every inbound so an `applied`-class
@@ -135,10 +136,6 @@ export type ChannelManagerOptions = {
   // otherwise spawn a duplicate child). Production wiring (src/run/index.ts)
   // supplies it from the LiveSubagentRegistry; tests omit it.
   newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
-  // Forwarded to the router so the graceful-restart handoff can name the
-  // background subagents a session was still awaiting. Same wiring shape as
-  // newestRunningChildSubagentStartedAt; tests omit it.
-  listRunningBackgroundSubagentNames?: (sessionId: string) => string[]
   // Forwarded to the router so an adapter-triggered work invalidation can stop
   // independent background sessions that a parent AgentSession abort cannot reach.
   cancelRunningSubagentsByWorkKey?: (
@@ -260,9 +257,6 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     ...(options.onRestart ? { onRestart: options.onRestart } : {}),
     ...(options.newestRunningChildSubagentStartedAt
       ? { newestRunningChildSubagentStartedAt: options.newestRunningChildSubagentStartedAt }
-      : {}),
-    ...(options.listRunningBackgroundSubagentNames
-      ? { listRunningBackgroundSubagentNames: options.listRunningBackgroundSubagentNames }
       : {}),
     ...(options.cancelRunningSubagentsByWorkKey
       ? { cancelRunningSubagentsByWorkKey: options.cancelRunningSubagentsByWorkKey }
@@ -528,6 +522,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         recoveryRestartAttempts: 0,
         recoveryRestartQueued: false,
       })
+      options.onRecoveryReady?.()
       return { status: 'started' }
     } catch (err) {
       await cleanupPartialStart(adapter)
@@ -1028,6 +1023,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
         }
       }
 
+      options.onRecoveryReady?.()
       return { started, stopped, restarted, restartRequired, ...(credentialApply ? { credentialApply } : {}) }
     },
   }

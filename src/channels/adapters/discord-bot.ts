@@ -74,6 +74,7 @@ import {
 } from './discord-bot-slash-commands'
 import { createDiscordThreadRoomResolver } from './discord-bot-thread-room'
 import { addDiscordMentionHints, type DiscordMentionUser } from './mention-hints'
+import { createBotRecoveryCallbacks, sendBotRecovery } from './recovery-correlation'
 
 // One declared slash command per logical agent gesture. /stop maps to the
 // existing channel-command of the same name in the router. Adding new
@@ -787,6 +788,7 @@ export function createOutboundCallback(deps: {
     if (msg.adapter !== 'discord-bot') {
       return { ok: false, error: `unknown adapter: ${msg.adapter}` }
     }
+    if (msg.sendOptions?.accounting === 'recovery') return sendBotRecovery('discord-bot', token, msg, fetchImpl)
     const text = convertDiscordTables(msg.text ?? '')
     const attachments = msg.attachments ?? []
     if (text === '' && attachments.length === 0) {
@@ -1046,6 +1048,9 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
     options.createListener ?? ((client, listenerOptions) => new DiscordBotListener(client, listenerOptions))
   const client = createClient()
   const fetchImpl = options.fetchImpl ?? fetch
+  const recoveryCallbacks = createBotRecoveryCallbacks('discord-bot', options.token, fetchImpl, () =>
+    botUserId !== null ? `discord-bot:${botUserId}` : undefined,
+  )
   let listener: DiscordBotListener | null = null
   let botUserId: string | null = null
   let connected = false
@@ -1267,6 +1272,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       })
 
       options.router.registerOutbound('discord-bot', outboundCallback)
+      options.router.registerRecoveryAdapter('discord-bot', recoveryCallbacks)
       options.router.registerReaction('discord-bot', reactionCallback)
       options.router.registerRemoveReaction('discord-bot', removeReactionCallback)
       options.router.registerTyping('discord-bot', typingCallback)
@@ -1288,6 +1294,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         // !started and would otherwise skip cleanup), mirroring the github
         // adapter's rollback path.
         options.router.unregisterOutbound('discord-bot', outboundCallback)
+        options.router.unregisterRecoveryAdapter('discord-bot', recoveryCallbacks)
         options.router.unregisterReaction('discord-bot', reactionCallback)
         options.router.unregisterRemoveReaction('discord-bot', removeReactionCallback)
         options.router.unregisterTyping('discord-bot', typingCallback)
@@ -1361,6 +1368,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       options.router.unregisterChannelNameResolver('discord-bot', channelResolver)
       options.router.unregisterSelfIdentity('discord-bot', selfIdentityResolver)
       options.router.unregisterHistory('discord-bot', historyCallback)
+      options.router.unregisterRecoveryAdapter('discord-bot', recoveryCallbacks)
       options.router.unregisterMessageGet('discord-bot', messageGetCallback)
       options.router.unregisterList('discord-bot', listCallback)
       options.router.unregisterEditMessage('discord-bot', editMessageCallback)
