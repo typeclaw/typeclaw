@@ -26,6 +26,7 @@ import { createGithubReactionCallback, createGithubRemoveReactionCallback } from
 import { loadReconcileCooldownStore, type ReconcileCooldownStore } from './reconcile-cooldown-store'
 import { reconcileOpenPrs } from './reconcile-open-prs'
 import { createRecoveredGuidLog, recoverFailedGithubDeliveries } from './recover-failed-deliveries'
+import { createGithubRecoveryCallbacks } from './recovery'
 import { createGithubReviewStateResolver } from './review-state'
 import { createGithubReviewSubmitter } from './review-submitter'
 import { createGithubReviewThreadResolver } from './review-thread-resolver'
@@ -151,11 +152,15 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   // does NOT mutate process.env.GH_TOKEN. App credentials stay behind this
   // repo-scoped resolver instead of entering the ambient process environment.
   const authToken = (context?: GithubAuthContext) => auth.token(context)
+  const recoveryCallbacks = createGithubRecoveryCallbacks(auth, fetchImpl, () =>
+    selfId !== null ? `github:${selfId}` : undefined,
+  )
   const outbound = createGithubOutboundCallback({
     token: authToken,
     authType: options.secrets.auth.type,
     logger,
     fetchImpl,
+    accountIdentity: recoveryCallbacks.accountIdentity,
   })
   const reaction = createGithubReactionCallback({
     token: authToken,
@@ -244,6 +249,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       // Register all callbacks before binding the HTTP listener so the router
       // is fully wired before any webhook can arrive.
       options.router.registerOutbound('github', outbound)
+      options.router.registerRecoveryAdapter('github', recoveryCallbacks)
       options.router.registerReaction('github', reaction)
       options.router.registerRemoveReaction('github', removeReaction)
       options.router.registerTyping('github', typing)
@@ -261,6 +267,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         // Listener failed — roll back all registrations so stop() is a no-op
         // and the manager can report the failure cleanly.
         options.router.unregisterOutbound('github', outbound)
+        options.router.unregisterRecoveryAdapter('github', recoveryCallbacks)
         options.router.unregisterReaction('github', reaction)
         options.router.unregisterRemoveReaction('github', removeReaction)
         options.router.unregisterTyping('github', typing)
@@ -454,6 +461,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       options.router.unregisterRemoveReaction('github', removeReaction)
       options.router.unregisterTyping('github', typing)
       options.router.unregisterHistory('github', history)
+      options.router.unregisterRecoveryAdapter('github', recoveryCallbacks)
       options.router.unregisterMembership('github', membership)
       options.router.unregisterChannelNameResolver('github', channelNameResolver)
       options.router.unregisterSelfIdentity('github', selfIdentityResolver)

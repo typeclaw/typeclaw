@@ -19,6 +19,19 @@ This is the **user-account** Slack adapter (`slack`). It signs in as your own Sl
   account you are comfortable putting at risk.
 </Callout>
 
+## Crash recovery notices
+
+Background admission snapshots the authenticated team/user from the running
+adapter, without a network lookup. Direct-message workspace coordinates use a
+sentinel rather than a team ID; they still retain the real authenticated account
+identity. An unavailable identity cache does not prevent a healthy launch:
+recovery binds the unbound record before its first authorized send.
+
+This user-account transport does not provide durable notice correlation.
+An ambiguous send can therefore produce a duplicate interruption notice after
+retry. Recovery never redirects the original target or reruns the interrupted
+work, and ordinary replies remain unchanged.
+
 ## Auth
 
 QR-code login. `typeclaw channel add slack` prompts for the QR data URL copied from the Slack desktop app's "Sign in on mobile" screen; the resulting token + cookie session is stored in `secrets.json#channels.slack` as one or more account records.

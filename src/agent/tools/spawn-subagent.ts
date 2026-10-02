@@ -4,6 +4,7 @@ import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
 
 import { githubReviewerWorkKey } from '@/channels/github-repo'
+import type { ChannelRouter } from '@/channels/router'
 import type { PermissionService } from '@/permissions'
 import type { Stream } from '@/stream'
 
@@ -53,6 +54,12 @@ export type CreateSpawnSubagentToolOptions = {
   agentDir: string
   parentSessionId: string
   getOrigin: () => SessionOrigin | undefined
+  getSessionFile?: () => string | undefined
+  router?: Pick<ChannelRouter, 'acceptBackgroundResponse' | 'suppressUnstartedBackgroundResponse'>
+  getAccountIdentity?: (
+    adapter: NonNullable<Extract<SessionOrigin, { kind: 'channel' }>['adapter']>,
+    workspace?: string,
+  ) => Promise<string | undefined>
   permissions?: PermissionService
   stream?: Stream
   generateTaskId?: () => string
@@ -138,7 +145,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       ),
     }),
 
-    async execute(_toolCallId, params): Promise<ToolReturn> {
+    async execute(_toolCallId, params, signal): Promise<ToolReturn> {
       const origin = getOrigin()
       const subagent = lookupPublicSubagent(registry, params.subagent_type)
       if (subagent === null) {
@@ -227,6 +234,69 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       const startedAt = now()
       const spawnedByRole = permissions?.resolveRole(origin)
       let capturedFinalMessage: string | undefined
+      const channelKey =
+        origin?.kind === 'channel'
+          ? { adapter: origin.adapter, workspace: origin.workspace, chat: origin.chat, thread: origin.thread }
+          : undefined
+      let backgroundResponse: { obligationId: string; generation: number } | undefined
+      if (background && origin?.kind === 'channel') {
+        if (options.router === undefined) {
+          if (pendingWorkKeyRegistration !== undefined) {
+            liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+          }
+          releaseCoalesceKey()
+          return errorResult('failed to persist background response: channel router unavailable')
+        }
+        try {
+          const { parentChat, lastInboundAuthorId } = origin
+          let parentSessionFile: string | undefined
+          try {
+            parentSessionFile = options.getSessionFile?.()
+          } catch {
+            // Recovery notices do not need the parent transcript to launch work.
+          }
+          let accountIdentity: string | undefined
+          try {
+            accountIdentity = await options.getAccountIdentity?.(origin.adapter, origin.workspace)
+          } catch {
+            // Recovery identity must not add a prerequisite to healthy launches.
+          }
+          backgroundResponse = await options.router.acceptBackgroundResponse({
+            parentSessionId,
+            parentSessionFile,
+            key: channelKey!,
+            taskId,
+            subagentName,
+            startedAt,
+            accountIdentity: accountIdentity ?? 'unbound-legacy',
+            ...(parentChat !== undefined ? { parentChat } : {}),
+            ...(lastInboundAuthorId !== undefined ? { triggeringAuthorId: lastInboundAuthorId } : {}),
+          })
+        } catch (error) {
+          if (pendingWorkKeyRegistration !== undefined) {
+            liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+          }
+          releaseCoalesceKey()
+          return errorResult(
+            `failed to persist background response: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        // An aborted parent must not launch work after the durability await.
+        if (signal?.aborted) {
+          try {
+            await options.router.suppressUnstartedBackgroundResponse(
+              backgroundResponse,
+              'background launch cancelled before execution',
+            )
+          } finally {
+            if (pendingWorkKeyRegistration !== undefined) {
+              liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+            }
+            releaseCoalesceKey()
+          }
+          return errorResult('background launch cancelled before execution')
+        }
+      }
       const { handle, completion } = startSubagent(subagentName, {
         registry,
         createSessionForSubagent,
@@ -271,10 +341,27 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         abort: resolvedHandle.abort,
         releaseCoalesceKey,
       }
-      const registered =
-        pendingWorkKeyRegistration === undefined
-          ? (liveRegistry.register(live), true)
-          : liveRegistry.registerIfWorkKeyActive(live, pendingWorkKeyRegistration)
+      let registered: boolean
+      try {
+        registered =
+          pendingWorkKeyRegistration === undefined
+            ? (liveRegistry.register(live), true)
+            : liveRegistry.registerIfWorkKeyActive(live, pendingWorkKeyRegistration)
+      } catch (error) {
+        if (pendingWorkKeyRegistration !== undefined) {
+          liveRegistry.abandonWorkKeyRegistration(pendingWorkKeyRegistration)
+        }
+        try {
+          await resolvedHandle.abort()
+        } catch {
+          // Execution may already have started. Its response remains owed.
+        }
+        void completion.then(releaseCoalesceKey)
+        releaseCoalesceKey()
+        return errorResult(
+          `failed to register ${subagentName}: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
       let delayedCancellationError: string | undefined
       if (!registered) {
         void completion.then(releaseCoalesceKey)
@@ -284,7 +371,14 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           const message = err instanceof Error ? err.message : String(err)
           // The child is still live. Register it so later cancellation, status
           // inspection, and completion settlement can still reach it.
-          liveRegistry.register(live)
+          try {
+            liveRegistry.register(live)
+          } catch (registrationError) {
+            releaseCoalesceKey()
+            return errorResult(
+              `failed to register ${subagentName} after cancellation failed: ${registrationError instanceof Error ? registrationError.message : String(registrationError)}`,
+            )
+          }
           delayedCancellationError = `reviewer cancellation failed before registration: ${message}`
         }
         if (delayedCancellationError === undefined) {
@@ -295,11 +389,6 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       if (capturedFinalMessage !== undefined) {
         liveRegistry.recordCapturedFinalMessageIfRunning(taskId, capturedFinalMessage)
       }
-
-      const channelKey =
-        origin?.kind === 'channel'
-          ? { adapter: origin.adapter, workspace: origin.workspace, chat: origin.chat, thread: origin.thread }
-          : undefined
 
       void completion.then((c) => {
         releaseCoalesceKey()
