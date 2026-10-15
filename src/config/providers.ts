@@ -63,12 +63,6 @@ export const KNOWN_PROVIDERS = {
     oauthProviderId: null,
     // Costs and context windows mirror models.dev as of 2026-05-10; the GPT-6
     // Sol/Luna records mirror OpenAI's model docs as of 2026-09-22.
-    // GPT-6 bills cache writes at 1.25x input; pi 0.87's Responses transport
-    // reads cache_write_tokens (openai-responses-shared.js), so that rate is
-    // applied. The >272K-input 2x/1.5x tier is not expressible in TypeClaw's
-    // flat cost shape, so these records use the standard rate. When
-    // refreshing, also rerun `scripts/generate-schema.ts` so
-    // typeclaw.schema.json picks up new enum values.
     models: {
       // Default. Cheapest tool-calling reasoning model in the family;
       // available on every paid OpenAI account tier.
@@ -76,6 +70,7 @@ export const KNOWN_PROVIDERS = {
         id: 'gpt-5.4-nano',
         name: 'GPT-5.4 nano',
         api: 'openai-responses',
+        compat: { supportsStrictMode: true },
         provider: 'openai',
         baseUrl: 'https://api.openai.com/v1',
         reasoning: true,
@@ -88,6 +83,7 @@ export const KNOWN_PROVIDERS = {
         id: 'gpt-5.4-mini',
         name: 'GPT-5.4 mini',
         api: 'openai-responses',
+        compat: { supportsStrictMode: true },
         provider: 'openai',
         baseUrl: 'https://api.openai.com/v1',
         reasoning: true,
@@ -100,6 +96,7 @@ export const KNOWN_PROVIDERS = {
         id: 'gpt-5.4',
         name: 'GPT-5.4',
         api: 'openai-responses',
+        compat: { supportsStrictMode: true },
         provider: 'openai',
         baseUrl: 'https://api.openai.com/v1',
         reasoning: true,
@@ -112,6 +109,7 @@ export const KNOWN_PROVIDERS = {
         id: 'gpt-5.5',
         name: 'GPT-5.5',
         api: 'openai-responses',
+        compat: { supportsStrictMode: true },
         provider: 'openai',
         baseUrl: 'https://api.openai.com/v1',
         reasoning: true,
@@ -151,6 +149,62 @@ export const KNOWN_PROVIDERS = {
           supportsMidConvoSystemMessages: true,
           supportsExplicitPromptCacheMode: true,
         },
+      },
+      'gpt-6.1-sol': {
+        id: 'gpt-6.1-sol',
+        name: 'GPT-6.1 Sol',
+        api: 'openai-responses',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: {
+          input: 2,
+          output: 10,
+          cacheRead: 0.1,
+          cacheWrite: 2.5,
+          tiers: [
+            {
+              inputTokensAbove: 272000,
+              input: 4,
+              output: 15,
+              cacheRead: 0.2,
+              cacheWrite: 5,
+            },
+          ],
+        },
+        contextWindow: 272000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsStrictMode: true,
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+          supportsExplicitPromptCacheMode: true,
+        },
+        inputLimits: {
+          maxRequestBytes: 536870912,
+          images: {
+            maxPerRequest: 1500,
+            resize: {
+              maxWidth: 2000,
+              maxHeight: 2000,
+              maxBytes: 4718592,
+              jpegQuality: 80,
+            },
+          },
+        },
+        type: 'chat',
       },
       'gpt-6-luna': {
         id: 'gpt-6-luna',
