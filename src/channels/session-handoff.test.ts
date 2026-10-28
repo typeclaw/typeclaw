@@ -1,13 +1,61 @@
 import { describe, expect, test } from 'bun:test'
 
+import { wrapSystemTool } from '@/agent/plugin-tools'
+import { createChannelHandoffTool } from '@/agent/tools/channel-handoff'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import { rolesConfigSchema } from '@/permissions'
+import { createHookBus } from '@/plugin'
 
 import type { ChannelHandoffResult } from './session-handoff'
 import { handoffFixture, inbound, sourceKey, targetKey } from './session-handoff.fixture'
 import { channelKeyId } from './types'
 
 describe('cross-adapter handoff', () => {
+  for (const thread of ['1699999999.000100', null]) {
+    test(`wrapped handoff delivers path-shaped context to a Slack conversation with thread ${thread}`, async () => {
+      await using f = await handoffFixture({
+        roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }),
+      })
+      const source = { adapter: 'slack-bot' as const, workspace: 'T0', chat: 'source', thread: null }
+      const target = { ...source, chat: 'target', thread }
+      await f.receive(inbound(target))
+      await f.receive(inbound(source))
+      const session = f.session(source)
+      const tool = wrapSystemTool(createChannelHandoffTool({ router: f.router, sessionId: session.id }), {
+        agentDir: f.agentDir,
+        sessionId: session.id,
+        hooks: createHookBus(),
+        permissions: f.permissions,
+        getOrigin: () => session.origin.current,
+      })
+      const text = 'Retry /warehouse/approval and record the result in workspace/report.md.'
+      const result = await tool.execute(
+        'handoff',
+        {
+          adapter: target.adapter,
+          workspace: target.workspace,
+          chat: target.chat,
+          ...(thread === null ? {} : { thread }),
+          text,
+        },
+        undefined,
+        undefined,
+        session.context,
+      )
+      await f.flush(target)
+
+      expect(result.details).toEqual({ ok: true, target: channelKeyId(target) })
+      expect(f.session(target).prompts.at(-1)).toContain(text)
+      expect(f.session(target).origin.current).toMatchObject({
+        lastInboundAuthorId: 'alice',
+        adapter: 'slack-bot',
+        chat: target.chat,
+        thread,
+      })
+      expect(f.sent).toEqual([])
+    })
+  }
+
   test('delivers through the target bot identity without reply anchors', async () => {
     // Given: only Bob spoke in the target; Alice requested work in a user-account session.
     await using f = await handoffFixture()

@@ -16,6 +16,7 @@
 export const TOOLS_WITHOUT_LOCAL_FILE_OPERANDS: ReadonlySet<string> = new Set([
   'channel_read',
   'channel_history',
+  'channel_handoff',
   'channel_edit',
   'channel_react',
   'channel_fetch_attachment',

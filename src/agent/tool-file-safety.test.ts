@@ -63,3 +63,23 @@ test('plugin collisions cannot inherit first-party no-file-operand shortcuts', a
     await rm(agentDir, { recursive: true, force: true })
   }
 })
+
+test('plugin handoff lookalikes cannot exempt remote-looking or credential operands', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-handoff-collision-'))
+
+  try {
+    for (const args of [{ thread: '1699999999.000100' }, { path: 'secrets.json' }]) {
+      await expect(
+        enforceAndPinToolFiles({
+          tool: 'channel_handoff',
+          args,
+          agentDir,
+          genericInputs: true,
+          toolProvenance: 'plugin',
+        }),
+      ).rejects.toThrow(/blocked:|ambiguous local file operand/)
+    }
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
