@@ -73,6 +73,23 @@ async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> 
   return values
 }
 
+// Printing a whole tool result dumps its content array and details into the
+// transcript, defeating the point of a cell. text() pulls just the text parts.
+function text(result: unknown, maxChars = 4000): string {
+  const content = (result as { content?: unknown } | null)?.content
+  const joined = Array.isArray(content)
+    ? content
+        .filter(
+          (part): part is { type: 'text'; text: string } => part?.type === 'text' && typeof part.text === 'string',
+        )
+        .map((part) => part.text)
+        .join('\n')
+    : typeof result === 'string'
+      ? result
+      : format(result)
+  return joined.length > maxChars ? `${joined.slice(0, maxChars)}\n…[${joined.length - maxChars} more chars]` : joined
+}
+
 const replOptions = {
   input: new PassThrough(),
   output: new Writable({
@@ -96,6 +113,7 @@ Object.assign(repl.context, {
   tool,
   parallel,
   print,
+  text,
   display: print,
   console: { log: print, info: print, warn: print, error: print, debug: print },
 })

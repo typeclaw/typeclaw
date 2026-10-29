@@ -52,6 +52,25 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(result.text).not.toContain('omitted intermediate')
   })
 
+  test('text() extracts only the text parts of a tool result and caps them', async () => {
+    const instance = kernel()
+    const result = await instance.run('const r = await tool.read({path:"x"}); print(text(r)); print(text(r, 5))', {
+      dispatch: async () => ({
+        content: [
+          { type: 'text', text: '배포 메모' },
+          { type: 'image', data: 'BASE64BLOB' },
+          { type: 'text', text: 'second line' },
+        ],
+        details: { secretDetail: 'not for the transcript' },
+      }),
+    })
+    expect(result.isError).toBe(false)
+    expect(result.text).toContain('배포 메모\nsecond line')
+    expect(result.text).toContain('…[')
+    expect(result.text).not.toContain('BASE64BLOB')
+    expect(result.text).not.toContain('secretDetail')
+  })
+
   test('a busy loop times out and the next cell recovers without old bindings', async () => {
     const instance = kernel()
     await instance.run('const beforeTimeout = 1', { dispatch })

@@ -13,7 +13,8 @@ import { EVAL_LIMITS, EvalError } from './protocol'
 import { createSandboxedEvalKernel } from './sandbox'
 
 export const EVAL_PROMPT_HINT =
-  'Use eval for independent tool batches and local filtering: await parallel([() => tool.read({...}), () => tool.grep({...})]); print(selected). ' +
+  'Use eval for independent tool batches and local filtering: const [a, b] = await parallel([() => tool.read({...}), () => tool.grep({...})]); print(text(a, 2000)). ' +
+  "Print only what you need: text(result, maxChars) extracts a tool result's text; never print whole result objects. " +
   'JavaScript bindings persist in this session until idle expiry, authority changes, or kernel failure. ' +
   'Only printed/displayed output is returned. Await all work; no background cells, install helpers, or Python cells.'
 
@@ -47,7 +48,8 @@ export function registerEvalTool(options: {
       description:
         'Run a foreground JavaScript cell in a persistent, bash-sandboxed Bun kernel. ' +
         'Use await tool.read/grep/find/ls/bash/write/edit/web_search/web_fetch with their normal arguments, ' +
-        'parallel(thunks) (up to 8 workers), and print/display(value). tool calls return the normal content/details object. ' +
+        "parallel(thunks) (up to 8 workers), print/display(value), and text(result, maxChars = 4000) to extract a result's text. " +
+        'Tool calls return the normal content/details object; print selected text, not whole results. ' +
         'Only active tools are callable; recursion, orchestration, posting, role changes and MCP dispatch are refused. ' +
         '30s default, 60s hard maximum; timeout kills the kernel. Output is capped at 64 KiB / 1000 lines. ' +
         'No background cells, package installation helpers or Python. Use await import(...) for modules.',

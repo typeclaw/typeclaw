@@ -309,7 +309,7 @@ Off switch — the broker is constructed but never opens a WS, no LISTEN gets fo
 
 ## eval
 
-`eval` turns on TypeClaw's own `eval` tool: the agent writes a JavaScript cell that runs in a persistent per-session Bun kernel and calls its normal tools from inside it (`await tool.read(...)`, `tool.grep`, `tool.bash`, `parallel(...)`, `print(...)`). Several dependent or independent tool calls become one model step, and intermediate output stays out of the transcript. It is not a generic "code execution" feature to be wary of: the kernel runs in the same bwrap sandbox as model bash, with the same masks and environment, and every `tool.*` call goes through the same permission and security guards as a direct call. Its power equals the bash you already have.
+`eval` turns on TypeClaw's own `eval` tool: the agent writes a JavaScript cell that runs in a persistent per-session Bun kernel and calls its normal tools from inside it (`await tool.read(...)`, `tool.grep`, `tool.bash`, `parallel(...)`, `text(...)`, `print(...)`). Several dependent or independent tool calls become one model step, and intermediate output stays out of the transcript. It is not a generic "code execution" feature to be wary of: the kernel runs in the same bwrap sandbox as model bash, with the same masks and environment, and every `tool.*` call goes through the same permission and security guards as a direct call. Its power equals the bash you already have.
 
 ```json
 "eval": { "enabled": true, "origins": ["subagent", "cron"] }
