@@ -14,7 +14,9 @@ import { createEvalDispatch } from './dispatch'
 import { testContext, testKernel } from './fixtures.test'
 import type { EvalKernel } from './kernel'
 
-describe('eval wrapped tool routing', () => {
+// The kernel spawns bash and kills POSIX process groups; eval only runs in the
+// Linux container stage.
+describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () => {
   let dir: string
   let kernel: EvalKernel
   beforeEach(async () => {

@@ -22,7 +22,9 @@ const dispatch = async () => {
   throw new EvalError('refused', 'test has no tools')
 }
 
-describe('persistent Bun kernel', () => {
+// The kernel spawns bash and kills POSIX process groups; eval only runs in the
+// Linux container stage.
+describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
   test('top-level bindings survive subsequent cells including awaited declarations', async () => {
     const instance = kernel()
     const first = await instance.run('const answer = await Promise.resolve(41)', { dispatch })
