@@ -14,6 +14,9 @@
 // can both read it without a circular-init TDZ. Add a tool here ONLY after
 // confirming it dereferences no argument as a local path.
 export const TOOLS_WITHOUT_LOCAL_FILE_OPERANDS: ReadonlySet<string> = new Set([
+  // Source code is not a host-side path operand. Raw I/O is confined by the
+  // shared bash sandbox; tool.* operands enter their own wrapped definitions.
+  'eval',
   'channel_read',
   'channel_history',
   'channel_handoff',
