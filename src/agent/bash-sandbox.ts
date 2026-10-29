@@ -26,6 +26,7 @@ import {
   verifyPrivilegedSandboxRuntime,
   type SandboxMount,
   type SandboxNetwork,
+  type SandboxPolicy,
   type DependencyBinReconciliation,
 } from '@/sandbox'
 import { resolveDevSourceMount } from '@/sandbox/dev-source'
@@ -69,6 +70,7 @@ type BashFilesystemPolicyOptions = {
 
 export type PreparedBashSandbox = {
   commandString: string
+  policy: SandboxPolicy
   verify: () => Promise<void>
   cleanup: () => Promise<void>
   spawnEnv: Record<string, string>
@@ -167,7 +169,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     })
     await verifyHiddenMaskTargets(maskTargets)
     const devSourceMount = await resolveDevSourceMount(agentDir)
-    const { commandString, spawnEnv } = boundary.buildCommand(command, {
+    const policy: SandboxPolicy = {
       mounts: [
         { type: 'ro-bind', source: agentDir, dest: agentDir },
         { type: 'bind', source: sessionTmp, dest: '/tmp' },
@@ -198,7 +200,8 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
       ...spreadSandboxEnv(
         buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable, envWithhold),
       ),
-    })
+    }
+    const { commandString, spawnEnv } = boundary.buildCommand(command, policy)
     // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
     // that live in neither process.env nor argv; resolveSpawnEnv snapshots
     // inherited names from process.env only, so merge the overlay values in here
@@ -208,6 +211,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     const runtimeForResult = privilegedRuntime
     return {
       commandString,
+      policy,
       verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(runtimeForResult),
       cleanup,
       spawnEnv: mergedSpawnEnv,
