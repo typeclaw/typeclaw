@@ -34,10 +34,10 @@ const results = await parallel([
   () => tool.read({ path: 'workspace/report.md' }),
   () => tool.grep({ pattern: 'TODO', path: 'workspace/project' }),
 ])
-print(results.map((result) => result.content.filter((part) => part.type === 'text')))
+print(results.map((result) => text(result, 2000)))
 ```
 
-Top-level bindings, including awaited declarations, persist between successful cells. Use `await import(...)` for imports. `print(...)`, `display(...)`, and console output produce bounded text output. Tool results remain normal `{ content, details }` objects; image data is not automatically displayed. Unprinted intermediate values stay out of the model transcript.
+Top-level bindings, including awaited declarations, persist between successful cells. Use `await import(...)` for imports. `print(...)`, `display(...)`, and console output produce bounded text output. `text(result, maxChars = 4000)` extracts just the text parts of a tool result; print that rather than whole result objects, whose content arrays and details would otherwise land in the transcript. Tool results remain normal `{ content, details }` objects; image data is not automatically displayed. Unprinted intermediate values stay out of the model transcript.
 
 `parallel(thunks)` uses at most eight workers and preserves input order. Await all work. There are no detached/background-cell operations, Python cells, or package-install helpers. Bun's automatic package installation is disabled.
 
