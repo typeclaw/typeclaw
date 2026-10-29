@@ -17,10 +17,10 @@ Memory is split across two on-disk surfaces and two subagents that move data bet
 | `memory/streams/yyyy-MM-dd.jsonl` | Append-only daily log of `fragment \| watermark \| legacy_prose` | `memory-logger` (runtime)                 |
 | `memory/topics/<slug>.md`         | Consolidated beliefs, one topic per file, with citations         | `dreaming` (body) + runtime (frontmatter) |
 
-| Subagent        | Cadence                                                   | Job                                                                     |
-| --------------- | --------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `memory-logger` | `session.idle` / `session.end`                            | Distills the transcript past a watermark into stream fragments.         |
-| `dreaming`      | cron (`memory.dreaming.schedule`, default `*/30 * * * *`) | Consolidates undreamed fragments into topic shards; rebalances the set. |
+| Subagent        | Cadence                                                   | Job                                                                                                                                                                                                                                                                                                                                                  |
+| --------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory-logger` | `session.idle` / `session.end`                            | Distills the transcript past a watermark into stream fragments. The runtime preloads that slice (`transcript-preload.ts`; up to 256 KB, sized so prompt bytes (a token upper bound) plus each `fast` fallback model's output allowance fit its context window, oversized lines truncated; read loop when nothing useful fits) into its first prompt. |
+| `dreaming`      | cron (`memory.dreaming.schedule`, default `*/30 * * * *`) | Consolidates undreamed fragments into topic shards; rebalances the set.                                                                                                                                                                                                                                                                              |
 
 The loop is **observe → dream → apply**: `memory-logger` observes, `dreaming` consolidates, and the next prompt applies the updated shards automatically.
 
