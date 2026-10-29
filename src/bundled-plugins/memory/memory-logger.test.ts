@@ -19,9 +19,13 @@ import { streamFilePath } from './paths'
 import { parseReference } from './references/frontmatter'
 import { storeReferenceTool } from './references/store-reference-tool'
 import { readEvents } from './stream-io'
+import { PRELOAD_OVERHEAD_TOKENS } from './transcript-preload'
 
 const silentLogger: MemoryLoggerLogger = { info: () => {}, warn: () => {}, error: () => {} }
-const silentSubagent = createMemoryLoggerSubagent({ logger: silentLogger })
+const silentSubagent = createMemoryLoggerSubagent({
+  logger: silentLogger,
+  fastModelLimits: () => [{ contextWindow: 400_000, outputTokens: 32_000 }],
+})
 
 function fragment(source: string, entry: string, id = `f-${entry}`): string {
   return `${JSON.stringify({ type: 'fragment', id, ts: '2026-05-16T12:00:00.000Z', source, entry, topic: 'T', body: 'B' })}\n`
@@ -42,6 +46,7 @@ function makeAgentDir(): string {
 async function invokeWith(
   payload: MemoryLoggerPayload,
   agentDir: string,
+  subagent = silentSubagent,
 ): Promise<{ runSessionCalls: { userPrompt: string | undefined }[] }> {
   const calls: { userPrompt: string | undefined }[] = []
   const runSession: RunSession = async (override) => {
@@ -52,7 +57,7 @@ async function invokeWith(
     agentDir,
     payload,
   }
-  await silentSubagent.handler!(ctx, runSession)
+  await subagent.handler!(ctx, runSession)
   return { runSessionCalls: calls }
 }
 
@@ -198,6 +203,76 @@ describe('memoryLoggerSubagent', () => {
     expect(prompt).toContain(transcript)
     expect(prompt).toContain('ses_abc')
     expect(prompt).toMatch(/memory[/\\]streams[/\\]\d{4}-\d{2}-\d{2}\.jsonl/)
+  })
+
+  test('handler preloads the transcript slice past the watermark into the initial prompt', async () => {
+    // given
+    const agentDir = makeAgentDir()
+    const transcript = join(agentDir, 'sessions', 'ses_abc.jsonl')
+    writeFileSync(
+      transcript,
+      ['seen', 'watermrk', 'fresh'].map((id) => `${JSON.stringify({ type: 'message', id })}\n`).join(''),
+    )
+    writeFileSync(join(agentDir, 'memory', 'streams', `${formatLocalDate()}.jsonl`), watermark('ses_abc', 'watermrk'))
+
+    // when
+    const { runSessionCalls } = await invokeWith(
+      { parentSessionId: 'ses_abc', parentTranscriptPath: transcript, agentDir },
+      agentDir,
+    )
+
+    // then
+    const prompt = runSessionCalls[0]!.userPrompt!
+    const preloaded = prompt.slice(prompt.indexOf('<transcript>'))
+    expect(prompt).toContain('Preloaded transcript lines 3-3 of totalLines=3')
+    expect(preloaded).toContain('"id":"fresh"')
+    expect(preloaded).not.toContain('"id":"seen"')
+  })
+
+  test('handler keeps a token-dense preload inside the smallest fast-chain context window', async () => {
+    // given a near-cap transcript of comma-separated digits (about one token per byte)
+    const agentDir = makeAgentDir()
+    const transcript = join(agentDir, 'sessions', 'ses_abc.jsonl')
+    const dense = Array.from({ length: 1000 }, (_, i) => i % 10).join(',')
+    const line = (i: number) => `${JSON.stringify({ type: 'message', id: `e${i}`, text: dense })}\n`
+    writeFileSync(transcript, Array.from({ length: 130 }, (_, i) => line(i)).join(''))
+    const small = { contextWindow: 128_000, outputTokens: 32_000 }
+    const subagent = createMemoryLoggerSubagent({
+      logger: silentLogger,
+      fastModelLimits: () => [{ contextWindow: 400_000, outputTokens: 32_000 }, small],
+    })
+
+    // when
+    const { runSessionCalls } = await invokeWith(
+      { parentSessionId: 'ses_abc', parentTranscriptPath: transcript, agentDir },
+      agentDir,
+      subagent,
+    )
+
+    // then: UTF-8 bytes bound the input tokens for any byte-level tokenizer, and
+    // the request's output allowance must fit beside them
+    const prompt = runSessionCalls[0]!.userPrompt!
+    expect(prompt).toContain('More lines remain')
+    const promptBytes = Buffer.byteLength(prompt, 'utf8') + Buffer.byteLength(MEMORY_LOGGER_SYSTEM_PROMPT, 'utf8')
+    expect(promptBytes + PRELOAD_OVERHEAD_TOKENS + small.outputTokens).toBeLessThanOrEqual(small.contextWindow)
+  })
+
+  test('handler keeps the read loop when no useful preload fits the context window', async () => {
+    const agentDir = makeAgentDir()
+    const transcript = join(agentDir, 'sessions', 'ses_abc.jsonl')
+    writeFileSync(transcript, `${JSON.stringify({ type: 'message', id: 'a' })}\n`)
+    const smallContext = createMemoryLoggerSubagent({
+      logger: silentLogger,
+      fastModelLimits: () => [{ contextWindow: 32_768, outputTokens: 8_192 }],
+    })
+
+    const { runSessionCalls } = await invokeWith(
+      { parentSessionId: 'ses_abc', parentTranscriptPath: transcript, agentDir },
+      agentDir,
+      smallContext,
+    )
+
+    expect(runSessionCalls[0]!.userPrompt!).not.toContain('<transcript>')
   })
 
   test('handler includes channel location and participants in the initial prompt', async () => {

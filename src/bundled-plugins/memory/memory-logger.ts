@@ -1,6 +1,9 @@
 import { z } from 'zod'
 
+import { resolveFallbackChain } from '@/agent/model-fallback'
+import { DEFAULT_MAX_OUTPUT_TOKENS, defaultOutputAllowance } from '@/agent/output-allowance'
 import type { SessionOrigin } from '@/agent/session-origin'
+import { getConfig, resolveModel } from '@/config'
 import { type Subagent, readTool } from '@/plugin'
 import { formatLocalDate } from '@/shared'
 
@@ -11,6 +14,12 @@ import { streamFilePath, streamsDir } from './paths'
 import { listReferenceSlugs } from './references/load-references'
 import { createStoreReferenceTool, type ReferenceStoredHook } from './references/store-reference-tool'
 import { readEvents } from './stream-io'
+import {
+  buildTranscriptPreload,
+  preloadBudgetBytes,
+  type PreloadModelLimits,
+  type TranscriptPreload,
+} from './transcript-preload'
 import { readLatestWatermark } from './watermark'
 
 export const memoryLoggerPayloadSchema = z.object({
@@ -75,6 +84,8 @@ A separate \`dreaming\` subagent later consolidates fragments into \`memory/topi
 Tools: \`read\`, \`find_entry\`, \`append\`, \`store_reference\`, and the watermark-advance tool. You cannot run shell commands, overwrite files, or edit existing content.
 
 # Read loop, watermark, and stopping
+
+The runtime usually preloads the transcript past the watermark into your first message. Evaluate that slice directly: do not call \`find_entry\` or \`read\` for lines it already contains. If it says more lines remain, continue with \`read\` from the offset it gives and follow the loop below from there. A preloaded line ending in a \`truncated\` marker was too large to show whole; judge it from the part shown. Without a preload, use the loop below from the start.
 
 Session transcripts are JSONL; each line has an \`id\`. They can be large, and \`read\` truncates output to 50 KB or 2000 lines, returning the line range and next offset. Do not scroll from line 1 through a prefix already covered by the watermark.
 
@@ -221,7 +232,12 @@ This restricts fragment shape, not whether taught knowledge is captured: store t
 
 If you evaluated transcript entries and found nothing worth a fragment, call the watermark-advance tool with \`{source, latestEntryId}\` so the next run does not re-read the same prefix. Do not call \`append\` with fake content just to move the watermark. After your fragment(s) or zero-fragments path advances the watermark to the farthest evaluated entry and the transcript is exhausted, stop with no completion message.`
 
-function buildInitialPrompt(payload: MemoryLoggerPayload, streamFile: string, watermark: string | null): string {
+function buildInitialPrompt(
+  payload: MemoryLoggerPayload,
+  streamFile: string,
+  watermark: string | null,
+  preload: TranscriptPreload | null,
+): string {
   const lines: string[] = [
     `Parent session: ${payload.parentSessionId}`,
     `Transcript file: ${payload.parentTranscriptPath}`,
@@ -249,7 +265,21 @@ function buildInitialPrompt(payload: MemoryLoggerPayload, streamFile: string, wa
       payload.parentSessionId +
       '", latestEntryId: "<latestEntryId>" }` instead of a fake fragment.',
   )
+  if (preload !== null) lines.push('', renderPreload(preload))
   return lines.join('\n')
+}
+
+function renderPreload(preload: TranscriptPreload): string {
+  if (preload.endLine < preload.startLine) {
+    return `Preloaded transcript: nothing past the watermark (totalLines=${preload.totalLines}). Advance nothing; exit.`
+  }
+  const header = [
+    `Preloaded transcript lines ${preload.startLine}-${preload.endLine} of totalLines=${preload.totalLines}${preload.watermarkFound ? ' (starting right after the watermark)' : ''}.`,
+    preload.nextOffset === null
+      ? 'This reaches the end of the transcript; do not call read on it.'
+      : `More lines remain: after evaluating these, continue with read(path=<transcript>, offset=${preload.nextOffset}).`,
+  ]
+  return [...header, '<transcript>', preload.text, '</transcript>'].join('\n')
 }
 
 function renderConversationContext(origin: SessionOrigin | undefined): string | null {
@@ -296,12 +326,28 @@ export type CreateMemoryLoggerSubagentOptions = {
   logger?: MemoryLoggerLogger
   onFragmentsAppended?: FragmentsAppendedHook
   onReferenceStored?: ReferenceStoredHook
+  // Context window and request output allowance of every model the `fast`
+  // profile can fall back to.
+  fastModelLimits?: () => PreloadModelLimits[]
+}
+
+// memory-logger is spawned under a `system` parent origin, so channel model
+// overrides never apply and the global `fast` chain is the one it runs on.
+function defaultFastModelLimits(): PreloadModelLimits[] {
+  return resolveFallbackChain(getConfig().models, 'fast').map((ref) => {
+    const model = resolveModel(ref)
+    return {
+      contextWindow: model.contextWindow,
+      outputTokens: defaultOutputAllowance(model) ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    }
+  })
 }
 
 export function createMemoryLoggerSubagent(
   options: CreateMemoryLoggerSubagentOptions = {},
 ): Subagent<MemoryLoggerPayload> {
   const logger = options.logger ?? consoleLogger
+  const fastModelLimits = options.fastModelLimits ?? defaultFastModelLimits
   // The handler runs one logger spawn at a time per agentDir (inFlightKey), so a
   // single mutable cell safely carries this spawn's origin to the append tool.
   let currentOrigin: SessionOrigin | undefined
@@ -342,6 +388,25 @@ export function createMemoryLoggerSubagent(
       exhaustedMessage: memoryLoggerExhaustedMessage,
     },
     handler: async (ctx, runSession) => {
+      const preloadFor = async (
+        path: string,
+        mark: string | null,
+        basePrompt: string,
+      ): Promise<TranscriptPreload | null> => {
+        let models: PreloadModelLimits[]
+        try {
+          models = fastModelLimits()
+        } catch (err) {
+          logger.warn(
+            `[memory-logger] preload skipped: cannot resolve fast model limits: ${err instanceof Error ? err.message : String(err)}`,
+          )
+          return null
+        }
+        const promptBytes =
+          Buffer.byteLength(MEMORY_LOGGER_SYSTEM_PROMPT, 'utf8') + Buffer.byteLength(basePrompt, 'utf8')
+        const maxBytes = preloadBudgetBytes(models, promptBytes)
+        return maxBytes === null ? null : buildTranscriptPreload(path, mark, { maxBytes })
+      }
       currentOrigin = ctx.payload.origin
       currentTranscriptPath = ctx.payload.parentTranscriptPath
       const today = formatLocalDate()
@@ -354,7 +419,9 @@ export function createMemoryLoggerSubagent(
         `[memory-logger] ${ctx.payload.parentSessionId} start stream=${today}.jsonl watermark=${watermark ?? 'none'}`,
       )
       try {
-        await runSession({ userPrompt: buildInitialPrompt(ctx.payload, streamFile, watermark) })
+        const basePrompt = buildInitialPrompt(ctx.payload, streamFile, watermark, null)
+        const preload = await preloadFor(ctx.payload.parentTranscriptPath, watermark, basePrompt)
+        await runSession({ userPrompt: buildInitialPrompt(ctx.payload, streamFile, watermark, preload) })
         const fragmentsWritten = (await countFragments(streamFile)) - fragmentsBefore
         logger.info(
           `[memory-logger] ${ctx.payload.parentSessionId} done fragments_written=${fragmentsWritten} elapsed_ms=${Date.now() - start} ${formatMemorySnapshot()}`,
