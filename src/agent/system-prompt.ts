@@ -206,8 +206,8 @@ export function renderTurnTimeAnchor(now: Date = new Date()): string {
 // This anchor surfaces the per-turn resolved role in the one place that costs
 // zero cached bytes (the non-cacheable user-turn suffix).
 //
-// Omitted for `owner`: owner is the unconstrained default, an absent tag means
-// "no special handling", and emitting it on every interactive turn would be
+// Omitted for `owner`: the channel role block tells the model an absent tag
+// means the owner, and emitting it on every interactive turn would be
 // pure token overhead. This mirrors resolveRoleContext skipping the session
 // block for a TUI owner.
 export function renderTurnRoleAnchor(role: string): string | undefined {

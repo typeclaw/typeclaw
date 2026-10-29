@@ -346,7 +346,7 @@ function renderChannelRolePolicy(): string {
     '',
     'Channel sessions may include multiple speakers; never carry one speaker’s',
     'role onto later messages. The current speaker’s authoritative role is the',
-    '`<your-role>` turn tag; absent tag = unconstrained default.',
+    '`<your-role>` turn tag; no tag means the speaker is the owner.',
     '',
     'Tool calls/channel admission are gated by that speaker’s permissions;',
     '`blocked:` or "denied by permissions" means they lack the needed grant.',
