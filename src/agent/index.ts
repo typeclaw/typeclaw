@@ -53,6 +53,7 @@ import type { LiveSubagentRegistry } from './live-subagents'
 import { sanitizeMessagesForLlmReplay } from './llm-replay-sanitizer'
 import { applyModelRuntimeOverrides } from './model-overrides'
 import { createChannelLookAtTool, createLookAtTool } from './multimodal'
+import { defaultOutputAllowance } from './output-allowance'
 import {
   buildBuiltinPiToolOverrides,
   isPiCodingBuiltinName,
@@ -121,7 +122,7 @@ type AgentSessionTools = NonNullable<Parameters<typeof createAgentSession>[0]>['
 // the full model maximum before context clamping (dist/api/simple-options.js:17),
 // so preserve the former safe default at the session boundary. Explicit budgets
 // remain untouched for compaction and channel-specific output caps.
-export const DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+export { DEFAULT_MAX_OUTPUT_TOKENS } from './output-allowance'
 
 export type PluginSessionWiring = {
   registry: PluginRegistry
@@ -612,9 +613,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // this function, so every origin now behaves the same way.
   const innerStreamFunction = session.agent.streamFunction
   session.agent.streamFunction = async (requestModel, context, streamOptions) => {
-    const maxTokens =
-      streamOptions?.maxTokens ??
-      (requestModel.maxTokens > 0 ? Math.min(requestModel.maxTokens, DEFAULT_MAX_OUTPUT_TOKENS) : undefined)
+    const maxTokens = streamOptions?.maxTokens ?? defaultOutputAllowance(requestModel)
     const promptCacheKey = promptCacheKeyForOrigin(getOrigin())
     const onPayload = async (payload: unknown, payloadModel: typeof requestModel) => {
       const next = (await streamOptions?.onPayload?.(payload, payloadModel)) ?? payload
