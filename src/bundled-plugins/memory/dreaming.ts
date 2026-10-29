@@ -622,7 +622,10 @@ async function recomputeShardFrontmatter(agentDir: string, slug: string, logger:
     heading: parsed.frontmatter.heading || synthesizeHeadingFromBody(parsed.body) || slug,
     cites,
     days: dates.length,
-    lastReinforced: dates.at(-1) ?? formatLocalDate(),
+    // No dated citation (e.g. only pre-cutover line-range citations, which
+    // parseCitations drops) is no evidence of reinforcement, so keep the prior
+    // date instead of stamping today and making a stale shard look fresh.
+    lastReinforced: dates.at(-1) ?? parsed.frontmatter.lastReinforced,
     ...(tags !== undefined ? { tags } : {}),
   }
   const nextRaw = renderShard(nextFrontmatter, parsed.body)

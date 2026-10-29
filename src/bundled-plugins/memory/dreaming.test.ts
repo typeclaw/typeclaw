@@ -977,6 +977,22 @@ describe('dreaming subagent (runtime-managed shard frontmatter)', () => {
     expect(await readFile(topicShard('exact'), 'utf8')).toBe(exact)
   })
 
+  test('keeps the prior last reinforced date for a shard with no dated citations', async () => {
+    // given
+    await writeFile(streamFile('2026-04-27'), fragmentLine('new'))
+    const body = ['Old conclusion.', '', 'fragments:', '- memory/2026-04-01:1-10'].join('\n')
+    const stale = shardText('Stale', body, { cites: 0, days: 0, lastReinforced: '2026-04-01' })
+    const runSession: RunSession = async () => {
+      await writeTopicShard('stale', stale)
+    }
+
+    // when
+    await invokeDreaming(agentDir, { runSession })
+
+    // then
+    expect(await readFile(topicShard('stale'), 'utf8')).toBe(stale)
+  })
+
   test('drops malformed tags with a warning while preserving other runtime-managed fields', async () => {
     await writeFile(streamFile('2026-04-27'), fragmentLine('new'))
     const raw = [
