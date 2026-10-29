@@ -8,6 +8,7 @@ import { z } from 'zod'
 
 import { BROWSER_ENGINE_IDS, BROWSER_EXTENSION_IDS } from '@/browser/registry'
 import { channelsSchema, SEEDED_GITHUB_EVENT_ALLOWLISTS } from '@/channels/schema'
+import { evalConfigSchema } from '@/eval/config'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
@@ -884,6 +885,7 @@ export const configSchema = z
     portForward: portForwardSchema,
     network: networkSchema,
     sandbox: sandboxSchema,
+    eval: evalConfigSchema,
     docker: dockerSchema,
     browser: browserSchema,
     git: gitSchema,
@@ -1175,6 +1177,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   portForward: 'restart-required',
   network: 'restart-required',
   sandbox: 'restart-required',
+  eval: 'restart-required',
   tunnels: 'restart-required',
   'docker.file': 'restart-required', // Includes omoCli; installation changes rebuild the image.
   browser: 'restart-required',
