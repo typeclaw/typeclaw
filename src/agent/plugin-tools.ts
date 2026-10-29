@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir } from 'node:fs/promises'
-import { join, relative, sep } from 'node:path'
+import { relative, sep } from 'node:path'
 
 import {
   createBashToolDefinition as piCreateBashToolDefinition,
@@ -19,10 +19,8 @@ import { Type } from 'typebox'
 import { z } from 'zod'
 
 import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/keys'
-import { config, getSandboxWritablePathSpecs } from '@/config/config'
 import { readOomEvents, toolOomNote } from '@/container/oom-events'
 import { withToolOomPriorityCommand } from '@/container/tool-oom-priority'
-import { readEnvFile } from '@/init/env-file'
 import {
   classifyToolOutcome,
   deriveMechanicallyVerifiedIncidentFingerprints,
@@ -47,39 +45,28 @@ import type {
 } from '@/plugin'
 import { PI_BUILTIN_TOOL_NAMES, type PiBuiltinToolName } from '@/plugin/core-tool-names'
 import {
-  buildSandboxedCommand,
-  canWriteAgentRootInSandbox,
-  canMountRealProc,
-  cleanupPrivilegedSandboxRuntime,
   commandNeedsRealProc,
-  DEFAULT_SANDBOX_ENV,
-  DEPENDENCY_BIN_SANDBOX_DIR,
   dependencyBinUnavailableHint,
-  ensureBwrapAvailable,
-  ensureHiddenMaskTargets,
   ensureSessionTmpDir,
-  getProcBindSafetyVerdict,
   isGitControlPath,
   mapVirtualTmpPath,
-  reconcileDependencyBinWrappers,
   resolveHiddenPaths,
-  resolvePrivilegedSandboxRuntime,
-  resolveProcBindSafetyWithRetry,
-  resolveProcSelfExe,
-  resolveProtectedZones,
-  resolveSandboxSymlinks,
-  resolveWritableZones,
   SandboxPolicyError,
-  SandboxDegradedProcError,
-  SandboxProcProbeUnverifiedError,
-  type SandboxMount,
-  type DependencyBinReconciliation,
-  subtractMasked,
-  verifyHiddenMaskTargets,
-  verifyPrivilegedSandboxRuntime,
 } from '@/sandbox'
-import { resolveDevSourceMount } from '@/sandbox/dev-source'
-import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
+
+import {
+  prepareBashSandbox,
+  type BashSandboxBoundary,
+  type DeferredBashPreparation,
+  type PreparedBashSandbox,
+} from './bash-sandbox'
+export {
+  buildBashFilesystemPolicy,
+  type BashSandboxBoundary,
+  type DeferredBashPreparation,
+  type DeferredBashPreparationResult,
+} from './bash-sandbox'
+export { buildSandboxEnvPolicy } from './bash-sandbox-env'
 
 import type { InternalGuard } from './guard-types'
 import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-guard'
@@ -113,24 +100,7 @@ export const TYPECLAW_INTERNAL_BASH_PREPARE = '__typeclawBashPrepare'
 
 type BashEnvOverlay = Record<string, string>
 type BashEnvWithhold = string[]
-export type DeferredBashPreparationResult = {
-  command: string
-  env?: Record<string, string>
-  mount: Extract<SandboxMount, { type: 'ro-bind' }>
-  cleanup: () => Promise<void>
-}
-export type DeferredBashPreparation = () => Promise<DeferredBashPreparationResult>
 const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
-
-// Transport classifier for the TRUSTED hook-injected overlay only (e.g.
-// github-cli-auth's per-repo GH_TOKEN). Token/secret-shaped names use `inherit`
-// so their value never renders into the bwrap argv; plain names (GH_REPO) go
-// via `set`. This is NOT a .env exposure filter — the overlay is populated by
-// trusted runtime hooks, not operator .env.
-const OVERLAY_SECRET_NAME_PATTERN = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY|AUTH)$/i
-function isOverlaySecretName(name: string): boolean {
-  return SECRET_BASH_ENV_NAMES.has(name) || OVERLAY_SECRET_NAME_PATTERN.test(name)
-}
 
 type BashSpawnEnvContext = {
   overlay?: BashEnvOverlay
@@ -307,20 +277,6 @@ export type WrapToolOptions = {
   // session whose `agent.abort` this points at. See `fireLoopAbort`.
   getAbort?: () => ((reason?: string) => void) | undefined
   getLoopGuardTurn?: () => number | undefined
-}
-
-export type BashSandboxBoundary = {
-  ensureAvailable: () => Promise<void>
-  buildCommand: typeof buildSandboxedCommand
-  resolveProcStrategy?: () => Promise<ProcStrategyResolution>
-  resolveRuntime?: typeof resolvePrivilegedSandboxRuntime
-  verifyRuntime?: typeof verifyPrivilegedSandboxRuntime
-  cleanupRuntime?: typeof cleanupPrivilegedSandboxRuntime
-}
-
-const DEFAULT_BASH_SANDBOX_BOUNDARY: BashSandboxBoundary = {
-  ensureAvailable: ensureBwrapAvailable,
-  buildCommand: buildSandboxedCommand,
 }
 
 export type WrapSystemToolOptions = {
@@ -658,7 +614,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       let executionError: unknown
       let cleanupError: unknown
       let sandboxedRealProcSucceeded = false
-      const sandboxBoundary = opts.bashSandboxBoundary ?? DEFAULT_BASH_SANDBOX_BOUNDARY
+      const sandboxBoundary = opts.bashSandboxBoundary
       const incidentLedger = opts.incidentLedger ?? new IncidentLedger(opts.agentDir)
       const originalArgs = { ...mutableArgs }
       const executeAttempt = async (): Promise<void> => {
@@ -678,17 +634,19 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
                 'model-driven bash has no permission service; refusing unsandboxed execution',
               )
             }
-            preparedSandboxRuntime = await applyBashSandbox(
-              attemptArgs,
-              opts.permissions,
-              liveOrigin,
-              opts.agentDir,
-              opts.sessionId,
-              bashEnvOverlay,
-              bashEnvWithhold,
-              bashPreparation,
-              sandboxBoundary,
-            )
+            if (typeof attemptArgs.command !== 'string') throw new SandboxPolicyError('bash command must be a string')
+            preparedSandboxRuntime = await prepareBashSandbox({
+              command: attemptArgs.command,
+              permissions: opts.permissions,
+              origin: liveOrigin,
+              agentDir: opts.agentDir,
+              sessionId: opts.sessionId,
+              envOverlay: bashEnvOverlay,
+              envWithhold: bashEnvWithhold,
+              deferredPreparation: bashPreparation,
+              boundary: sandboxBoundary,
+            })
+            attemptArgs.command = preparedSandboxRuntime.commandString
           }
 
           tmpRedirect =
@@ -902,156 +860,6 @@ export function buildBuiltinPiToolOverrides(opts: WrapSystemToolOptions): ToolDe
   return defaultBuiltinPiToolDefinitions(opts.agentDir).map((tool) => wrapBuiltinToolDefinition(tool, opts))
 }
 
-type BashFilesystemPolicyOptions = {
-  agentDir: string
-  canWriteAgentRoot: boolean
-  masks: { dirs: string[]; files: string[] }
-  writable: { dirs: string[]; files: string[] }
-  protected: { dirs: string[]; files: string[] }
-}
-
-type PreparedBashSandbox = {
-  verify: () => Promise<void>
-  cleanup: () => Promise<void>
-  spawnEnv?: Record<string, string>
-  dependencyBins?: DependencyBinReconciliation
-  withheld: {
-    paths: { dirs: string[]; files: string[] }
-    envNames: string[]
-  }
-}
-
-export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) {
-  const { agentDir, canWriteAgentRoot, masks, writable, protected: protectedZones } = options
-  if (canWriteAgentRoot) {
-    return { writableRoot: { dir: agentDir }, masks, protected: protectedZones }
-  }
-  return { masks, writable, protected: protectedZones }
-}
-
-// Rewrites mutableArgs.command in place so the bash builtin runs inside bwrap
-// with role-derived private-directory masks and unconditional canonical-secret
-// file masks. When masks are needed but bwrap is unavailable
-// we throw rather than run unsandboxed — fail closed, never leak the masked
-// surface. Runs after the tool.before guards have inspected the raw command.
-async function applyBashSandbox(
-  mutableArgs: Record<string, unknown>,
-  permissions: PermissionService,
-  origin: SessionOrigin | undefined,
-  agentDir: string,
-  sessionId: string,
-  envOverlay: BashEnvOverlay | undefined,
-  envWithhold: BashEnvWithhold | undefined,
-  deferredPreparation: DeferredBashPreparation | undefined,
-  boundary: BashSandboxBoundary,
-): Promise<PreparedBashSandbox> {
-  const originalCommand = mutableArgs.command
-  if (typeof originalCommand !== 'string') {
-    return {
-      verify: async () => {},
-      cleanup: async () => {},
-      withheld: { paths: { dirs: [], files: [] }, envNames: [] },
-    }
-  }
-
-  let preparation: DeferredBashPreparationResult | undefined
-  let privilegedRuntime: Awaited<ReturnType<typeof resolvePrivilegedSandboxRuntime>> | undefined
-  const cleanup = async (): Promise<void> => {
-    const tasks: Promise<void>[] = []
-    if (privilegedRuntime !== undefined) {
-      tasks.push((boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime))
-    }
-    if (preparation !== undefined) tasks.push(preparation.cleanup())
-    const outcomes = await Promise.allSettled(tasks)
-    const failure = outcomes.find((outcome) => outcome.status === 'rejected')
-    if (failure?.status === 'rejected') throw failure.reason
-  }
-  try {
-    preparation = await deferredPreparation?.()
-    const command = preparation?.command ?? originalCommand
-    const preparedEnvOverlay = preparation?.env === undefined ? envOverlay : { ...envOverlay, ...preparation.env }
-    const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
-    const envNames = resolveExposableBashEnvNames(agentDir)
-    const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, preparedEnvOverlay)
-    const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
-    const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
-    await boundary.ensureAvailable()
-    const sessionTmp = await ensureSessionTmpDir(sessionId)
-    const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
-    const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
-      dirs,
-      files,
-    })
-    const writableRoot = canWriteAgentRootInSandbox(permissions, origin)
-    const baseProtectedZones =
-      writableRoot || writable.dirs.includes(join(agentDir, '.git'))
-        ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
-        : { dirs: [], files: [] }
-    const protectedZones = {
-      dirs: baseProtectedZones.dirs,
-      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
-    }
-    const writableDirSet = new Set(writable.dirs)
-    const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
-    const symlinks = resolveSandboxSymlinks(agentDir, config.sandbox.symlinks, sandboxHome).filter((op) =>
-      writableDirSet.has(op.target),
-    )
-    const { strategy: proc, degradeReason } = await (boundary.resolveProcStrategy ?? resolveProcStrategy)()
-    if (proc === 'tmpfs' && commandNeedsRealProc(command)) {
-      throw degradeReason === 'unverified' ? new SandboxProcProbeUnverifiedError() : new SandboxDegradedProcError()
-    }
-    privilegedRuntime = await (boundary.resolveRuntime ?? resolvePrivilegedSandboxRuntime)({
-      agentDir,
-      command,
-      env: sandboxEnvOverlay,
-    })
-    await verifyHiddenMaskTargets(maskTargets)
-    const devSourceMount = await resolveDevSourceMount(agentDir)
-    const { commandString, spawnEnv } = boundary.buildCommand(command, {
-      mounts: [
-        { type: 'ro-bind', source: agentDir, dest: agentDir },
-        { type: 'bind', source: sessionTmp, dest: '/tmp' },
-        // `/tmp` is writable, but PATH entries must remain runtime-owned for
-        // the lifetime of this command. Last-op-wins makes this narrow re-bind
-        // read-only without adding any broader filesystem exposure.
-        { type: 'ro-bind', source: dependencyBins.wrapperDir, dest: DEPENDENCY_BIN_SANDBOX_DIR },
-        ...(devSourceMount === undefined ? [] : [devSourceMount]),
-        ...(privilegedRuntime?.mounts ?? []),
-        ...(preparation === undefined ? [] : [preparation.mount]),
-      ],
-      ...(writableRoot
-        ? { writableRoot: { dir: agentDir }, masks: maskTargets, protected: protectedZones }
-        : { masks: maskTargets, writable, protected: protectedZones }),
-      symlinks,
-      network: 'inherit',
-      cwd: agentDir,
-      proc,
-      procSelfExe: resolveProcSelfExe(),
-      ...spreadSandboxEnv(
-        buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable, envWithhold),
-      ),
-    })
-    mutableArgs.command = commandString
-    // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
-    // that live in neither process.env nor argv; resolveSpawnEnv snapshots
-    // inherited names from process.env only, so merge the overlay values in here
-    // to complete the exact bwrap-parent env.
-    const mergedSpawnEnv =
-      spawnEnv !== undefined && sandboxEnvOverlay !== undefined ? { ...spawnEnv, ...sandboxEnvOverlay } : spawnEnv
-    const runtimeForResult = privilegedRuntime
-    return {
-      verify: async () => (boundary.verifyRuntime ?? verifyPrivilegedSandboxRuntime)(runtimeForResult),
-      cleanup,
-      spawnEnv: mergedSpawnEnv,
-      dependencyBins,
-      withheld: { paths: maskTargets, envNames: [...new Set([...envNames.withheld, ...effectiveEnvWithhold])] },
-    }
-  } catch (error) {
-    await cleanup()
-    throw error
-  }
-}
-
 function bashResultIsCommandNotFound(result: ToolResult): boolean {
   if (isRecord(result.details) && result.details.exitCode === 127) return true
   return (result.content as ContentPart[]).some(
@@ -1087,164 +895,6 @@ function appendErrorText(error: unknown, text: string): Error {
 
 function appendTextResult(result: ToolResult, text: string): ToolResult {
   return { ...result, content: [...(result.content as ContentPart[]), { type: 'text', text }] }
-}
-
-export function buildSandboxEnvPolicy(
-  overlay: BashEnvOverlay | undefined,
-  runtimeEnv: Record<string, string> | undefined,
-  exposableEnvNames: readonly string[] = [],
-  withhold: readonly string[] = [],
-): { inherit?: string[]; set?: Record<string, string>; withhold?: string[] } {
-  const requestedWithhold = new Set(withhold)
-  const overlayNames = new Set(Object.keys(overlay ?? {}))
-  // The overlay is a deliberate command-scoped replacement, while withholding
-  // only removes ambient values; an overlay therefore wins for the same name.
-  const effectiveWithhold = [...requestedWithhold].filter((name) => !overlayNames.has(name))
-  const effectiveWithholdSet = new Set(effectiveWithhold)
-  const set = Object.fromEntries(Object.entries(runtimeEnv ?? {}).filter(([key]) => !requestedWithhold.has(key)))
-  const inherit: string[] = []
-  const inheritSeen = new Set<string>()
-  const pushInherit = (key: string): void => {
-    if (effectiveWithholdSet.has(key) || Object.hasOwn(set, key) || inheritSeen.has(key)) return
-    inheritSeen.add(key)
-    inherit.push(key)
-  }
-  for (const [key, value] of Object.entries(overlay ?? {})) {
-    if (Object.hasOwn(set, key)) continue
-    if (isOverlaySecretName(key)) pushInherit(key)
-    else set[key] = value
-  }
-  // Operator-declared .env vars pass through by NAME (inherit), keeping values
-  // out of the rendered bwrap argv. Sandbox-integrity names were already dropped
-  // in resolveExposableEnvNames — these are the survivors.
-  for (const key of exposableEnvNames) pushInherit(key)
-  // Pass the entrypoint-exported Xvfb display (start_xvfb: `export DISPLAY=:99`)
-  // through --clearenv, else sandboxed `agent-browser --headed` dies with
-  // "Missing X server or $DISPLAY". Passing the runtime's OWN value (not a fixed
-  // ":99") keeps `docker.file.xvfb=false` advertising no display. Rendered via
-  // `set` (a display number is neither a credential nor shell-injectable), and no
-  // /tmp/.X11-unix bind is needed: Chrome reaches Xvfb over the netns-scoped
-  // abstract X11 socket while bash keeps network:'inherit'.
-  const display = process.env['DISPLAY']
-  if (
-    display !== undefined &&
-    display !== '' &&
-    !effectiveWithholdSet.has('DISPLAY') &&
-    !Object.hasOwn(set, 'DISPLAY') &&
-    !inheritSeen.has('DISPLAY')
-  ) {
-    set['DISPLAY'] = display
-  }
-  return {
-    ...(inherit.length > 0 ? { inherit } : {}),
-    ...(Object.keys(set).length > 0 ? { set } : {}),
-    ...(effectiveWithhold.length > 0 ? { withhold: effectiveWithhold } : {}),
-  }
-}
-
-function spreadSandboxEnv(policy: ReturnType<typeof buildSandboxEnvPolicy>): {
-  env?: ReturnType<typeof buildSandboxEnvPolicy>
-} {
-  return Object.keys(policy).length > 0 ? { env: policy } : {}
-}
-
-function resolveExposableBashEnvNames(agentDir: string): { exposable: string[]; withheld: string[] } {
-  const declaredEnv = readEnvFile(agentDir)
-  const exposable = resolveExposableEnvNames(declaredEnv, process.env)
-  const exposableSet = new Set(exposable)
-  const withheld = [...declaredEnv]
-    .filter(([name, value]) => value.length > 0 && !exposableSet.has(name))
-    .map(([name]) => name)
-  return { exposable, withheld }
-}
-
-function buildRoleScopedConfigEnv(
-  agentDir: string,
-  hiddenDirs: string[],
-  envOverlay: BashEnvOverlay | undefined,
-): BashEnvOverlay | undefined {
-  // Low-trust roles have workspace/ masked. Do not let container-global config
-  // env vars point CLIs back at that private surface: apps that honor XDG should
-  // still run, but their config must land in the sandbox's per-session /tmp.
-  // Trusted/owner have only the unconditional credential-dir masks, not the
-  // workspace root mask, so their command broker decides whether to set GWS.
-  const workspaceHidden = hiddenDirs.includes(join(agentDir, 'workspace'))
-  if (!workspaceHidden) return envOverlay
-
-  return {
-    ...envOverlay,
-    XDG_CONFIG_HOME: '/tmp/.config',
-    GWS_CONFIG_HOME: '/tmp/.config/gws',
-  }
-}
-
-// Picks the /proc strategy for a sandboxed bash call. The branch order is:
-// 'real-proc' ONLY when the operator explicitly opted in (sandbox.realProc) AND
-// the kernel permits the mount (canMountRealProc) — it adds PID isolation but
-// needs CAP_SYS_ADMIN (unshare --mount-proc), so it is a deliberate, narrow
-// opt-in; else 'proc-bind' (--ro-bind /proc, NO CAP_SYS_ADMIN) when its userns
-// leak-block is verified safe; else 'tmpfs'. Because sandbox.realProc DEFAULTS
-// FALSE, the first branch is normally skipped and proc-bind is the de-facto
-// default — which is the point: the common path needs no broad outer capability.
-// 'tmpfs' is the last-resort degraded mode where external packages can't run;
-// reached only when proc-bind is DEFINITIVELY unavailable (a real cross-userns
-// environ leak → fail closed) or its safety stays unverifiable after retries.
-//
-// Read from the boot-time `config` snapshot, NOT live getConfig(): sandbox is
-// restart-required, and the strategy MUST track the boot-time CAP_SYS_ADMIN
-// grant. A `typeclaw reload` flipping realProc would otherwise emit `unshare
-// --mount-proc` in a container booted WITHOUT the cap (or vice versa). Both
-// probes are cached process-globally, so this resolves to one spawn per
-// container lifetime regardless of how many bash calls hit it.
-// A tmpfs degrade carries WHY it happened so the caller can pick a permanent vs
-// retryable error. 'definitive': the probe returned a real cross-userns leak
-// ('unsafe') — the ONLY verdict proven permanent, so it fails closed for good.
-// 'unverified': the safety probe never reached a definitive verdict within its
-// retry budget. That covers BOTH a transient load spike AND a durable
-// incapability (no usable namespaces, a bwrap that starts but cannot set up its
-// sandbox): the probe cannot prove a NEGATIVE capability — only a leak is
-// definitive — so a genuinely incapable host also lands here and simply keeps
-// re-degrading on each call. Since 'inconclusive' is never cached, that costs a
-// re-probe but is correct: the only false case is "capable but briefly
-// saturated", which recovers; an incapable host stays degraded either way.
-// Absent when the strategy is not tmpfs.
-type ProcStrategyResolution =
-  | { strategy: 'real-proc' | 'proc-bind'; degradeReason?: undefined }
-  | { strategy: 'tmpfs'; degradeReason: 'definitive' | 'unverified' }
-
-async function resolveProcStrategy(): Promise<ProcStrategyResolution> {
-  if (config.sandbox.realProc && (await canMountRealProc())) return { strategy: 'real-proc' }
-  // Retry an 'inconclusive' proc-bind probe (transient under load) before
-  // degrading — a single such hiccup must not break external-package runs on a
-  // capable host. 'unsafe' still fails closed with no retry.
-  const verdict = await resolveProcBindSafetyWithRetry(
-    () => getProcBindSafetyVerdict(),
-    (ms) => Bun.sleep(ms),
-  )
-  if (verdict === 'safe') return { strategy: 'proc-bind' }
-  // Degraded last resort: no working /proc strategy. External package runners
-  // (bunx/bun run <pkg-bin>) will fail with Bun's opaque "NotDir" because
-  // /proc/self/{fd,maps} are absent. Only a proven 'unsafe' (a real cross-userns
-  // leak) is DEFINITIVE — warn once (a real operator-facing limit). An
-  // 'inconclusive' is reported as retryable upstream and NOT warned (it would cry
-  // wolf every boot storm); a durably-incapable host re-degrades quietly here,
-  // since the probe cannot distinguish it from transient load.
-  if (verdict === 'unsafe') {
-    warnTmpfsProcFallbackOnce()
-    return { strategy: 'tmpfs', degradeReason: 'definitive' }
-  }
-  return { strategy: 'tmpfs', degradeReason: 'unverified' }
-}
-
-let tmpfsProcFallbackWarned = false
-function warnTmpfsProcFallbackOnce(): void {
-  if (tmpfsProcFallbackWarned) return
-  tmpfsProcFallbackWarned = true
-  console.warn(
-    '[sandbox] degraded /proc mode: neither real-proc nor proc-bind is available on this host, ' +
-      'so sandboxed external package runners (bunx / bun run <pkg-bin>) will fail. ' +
-      'This needs a runtime with working user namespaces.',
-  )
 }
 
 // The builtin file tools that take a single filesystem `path` arg. They run in

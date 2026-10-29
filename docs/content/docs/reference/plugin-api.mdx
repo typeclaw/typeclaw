@@ -117,6 +117,12 @@ Undeclared filesystem-capable strings fail closed even when the referenced entry
 
 `defineTool(tool)` is an identity helper for type inference. Built-in tools are referenced by tagged ref (`readTool`, `bashTool`, `editTool`, `writeTool`, `grepTool`, `findTool`, `lsTool`, `webSearchTool`, `webFetchTool`) — useful when wiring a subagent's `tools` list.
 
+### Optional `eval` tool
+
+`eval` is registered by the runtime when `eval.enabled` and the session's origin permit it, and only if the session already has unrestricted bash. It is not a new `BuiltinToolRef` and does not need to be added to a subagent's declared tools. A subagent's `bashPolicy` still excludes it.
+
+The input is `{ code: string, timeoutMs?: number }`. Inside JavaScript cells, `tool.<activeName>(args)` invokes the same wrapped definition as a direct call, including plugin validation and hooks. `parallel(thunks)` batches independent calls; `print` and `display` return selected text. Recursion, orchestration, posting, lifecycle/role mutation, and MCP dispatch are refused. See [Eval kernel](/docs/internals/eval) for the exact refusal list and limits.
+
 ### Subagent
 
 ```ts

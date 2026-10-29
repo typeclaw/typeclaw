@@ -1,0 +1,88 @@
+---
+title: Eval kernel
+description: Opt-in persistent JavaScript cells with the model-bash sandbox and wrapped tool dispatch
+icon: Code
+---
+
+`eval` batches independent tool calls into one model round trip and keeps intermediate results in a per-session Bun process. It is off by default.
+
+## Configuration and eligibility
+
+In the host-stage `typeclaw.json`:
+
+```json
+{
+  "eval": {
+    "enabled": true,
+    "origins": ["subagent", "cron"]
+  }
+}
+```
+
+The whole block is restart-required. Omitting `origins` permits all named origins: `tui`, `channel`, `cron`, `subagent`, and `system`. An empty list enables none. An unspecified session origin is excluded.
+
+Configuration is necessary but not sufficient. The session must already expose **unrestricted bash**. A session without active `bash`, or with a `bashPolicy` command fence, never gets `eval`. This comes from the same policy passed to the bash wrapper, not subagent names. In particular, the reviewer remains excluded even when `subagent` is enabled or the reviewer is renamed.
+
+Raw JavaScript has native filesystem and subprocess capabilities, just like arbitrary bash. A command allowlist cannot constrain those APIs. The reviewer coverage loss is intentional in v1; eval does not bypass or remove its read-only fence.
+
+## Cells
+
+The tool accepts `{ code: string, timeoutMs?: number }`. It runs JavaScript only:
+
+```js
+const results = await parallel([
+  () => tool.read({ path: 'workspace/report.md' }),
+  () => tool.grep({ pattern: 'TODO', path: 'workspace/project' }),
+])
+print(results.map((result) => result.content.filter((part) => part.type === 'text')))
+```
+
+Top-level bindings, including awaited declarations, persist between successful cells. Use `await import(...)` for imports. `print(...)`, `display(...)`, and console output produce bounded text output. Tool results remain normal `{ content, details }` objects; image data is not automatically displayed. Unprinted intermediate values stay out of the model transcript.
+
+`parallel(thunks)` uses at most eight workers and preserves input order. Await all work. There are no detached/background-cell operations, Python cells, or package-install helpers. Bun's automatic package installation is disabled.
+
+## Boundary and routing
+
+The container-stage kernel is a child process, never an in-process eval in the trusted agent runtime. Both bash and eval use `prepareBashSandbox` in `src/agent/bash-sandbox.ts`. It resolves the same:
+
+- role-derived hidden paths and canonical masks;
+- writable and protected zones through `buildBashFilesystemPolicy`;
+- operator `.env` exposure and withheld tiers through `buildSandboxEnvPolicy` and `resolveExposableEnvNames`;
+- session `/tmp`, dependency-bin protection, source mounts, and proc probes.
+
+The current role-scoped agent-messenger visibility is unchanged. Eval inherits the actual shared resolver; it does not introduce a separate credential policy.
+
+Eval leaves the network namespace isolated. Network operations use wrapped tools such as `tool.bash` or `tool.web_fetch`. The bridge uses framed JSON lines on stdio, not loopback HTTP. The host validates each discriminated message before use, checks the active cell and unique call ID, and bounds framing, concurrency, and call count. Frames are untrusted; knowing the frame format grants no extra tool authority.
+
+`src/eval/dispatch.ts` selects from the **final budget-wrapped tool definitions** passed to the session by `src/agent/index.ts`. It rechecks live active names, uses Pi's direct-call argument validator, and invokes that exact definition with the cell's cancellation signal. Permission hooks, live role resolution, security guards, file pinning, loop detection, result caps, and the bash sandbox therefore remain on the call path. Ordinary active plugin tools are supported.
+
+These calls are refused inside a cell and must remain separate model-visible actions:
+
+- `eval` recursion;
+- `spawn_subagent`, `coding_agent`, and `subagent_cancel`;
+- channel send/reply/edit/react/handoff/disengage, `post_github_review`, and `skip_response`;
+- `restart`, `reload`, and `grant_role`;
+- `mcp_call`, whose nested target is not statically known.
+
+## Lifecycle and limits
+
+| Limit                 | Value                                                        |
+| --------------------- | ------------------------------------------------------------ |
+| Source                | 64 KiB                                                       |
+| Default cell deadline | 30 seconds                                                   |
+| Maximum cell deadline | 60 seconds                                                   |
+| Output body           | 64 KiB or 1,000 lines, plus bounded truncation/state notices |
+| Bridge frame          | 1 MiB                                                        |
+| Tool calls per cell   | 128                                                          |
+| Concurrent tool calls | 8                                                            |
+| Idle kernel lifetime  | 5 minutes                                                    |
+
+Only one cell runs at a time. The deadline includes startup and tool calls. Timeout or cancellation signals cancellation to in-flight tools and kills the kernel process group; bwrap's parent-death and PID-namespace rules terminate its sandbox subtree. Tool implementations retain their normal cancellation semantics. A cell failure also discards the kernel. There is no automatic replay of a failed cell, since its earlier calls may already have had effects.
+
+Before every cell, sandbox preparation runs again. A principal or audience change (author, chat, thread, role, or the spawning origin), authority, environment, rendered sandbox, or filesystem identity change replaces the kernel before executing code. Bind sources, masks, writable/protected paths, and their ancestors participate in this identity check, so atomic credential replacement cannot leave the next cell using a detached old mask. Conversational channel state (participant counters, timestamps, reaction targets, display names) is excluded, so ordinary same-author turns keep their bindings. This preserves bash's per-invocation policy; it does not turn a running cell into a snapshot isolated from simultaneous external filesystem changes. Idle expiry and session disposal kill the kernel too. The next cell starts fresh and reports that previous bindings were lost. State is not persisted across agent restarts.
+
+## Tests and release
+
+`src/eval/` contains protocol, output-limit, real-process kernel, wrapped-dispatch, configuration, and actual session-registration tests. `sandbox.test.ts` uses real bwrap for raw `fs`, `Bun.file`, subprocess reads, environment withholding, normal reads, batching, timeout recovery, and authority changes. Those tests skip on non-Linux hosts or when bwrap is absent; they do not replace isolation with mocks.
+
+The new tool and configuration block are public surfaces and meet the release minor trigger.

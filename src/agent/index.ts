@@ -22,6 +22,16 @@ import {
   type ResolvedProfile,
   type ThinkingLevel,
 } from '@/config'
+import { config } from '@/config/config'
+import { registerEvalTool, EVAL_PROMPT_HINT } from '@/eval/tool'
+
+import { composeSystemPrompt, deriveSystemPromptMode, type SystemPromptMode } from './system-prompt-composition'
+export {
+  composeSystemPrompt,
+  deriveSystemPromptMode,
+  type SystemPromptMode,
+  type SystemPromptComposition,
+} from './system-prompt-composition'
 import { effectiveModels } from '@/config/model-overrides'
 import { defaultThinkingLevelForRef, isOpenAiFamilyRef, providerForModelRef, type ModelRef } from '@/config/providers'
 import { renderMcpCatalog } from '@/mcp/catalog'
@@ -70,12 +80,7 @@ import type { RestartHandoffOrigin } from './restart-handoff'
 import type { SubagentBashPolicy } from './reviewer-bash-policy'
 import { loadSelf } from './self'
 import { SESSION_META_CUSTOM_TYPE, sessionMetaPayload } from './session-meta'
-import {
-  renderInteractiveSessionContext,
-  renderSessionOrigin,
-  type SessionOrigin,
-  type SessionRoleContext,
-} from './session-origin'
+import { renderSessionOrigin, type SessionOrigin, type SessionRoleContext } from './session-origin'
 import { SubagentCacheKeepalive } from './subagent-cache-keepalive'
 import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from './subagents'
 import {
@@ -329,24 +334,6 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
         )
       : null
 
-  const resourceLoader =
-    options.systemPromptOverride !== undefined
-      ? await createOverrideResourceLoader(
-          options.systemPromptOverride,
-          options.origin,
-          options.permissions,
-          options.runtimeVersion,
-        )
-      : await createResourceLoader({
-          ...(options.plugins ? { plugins: options.plugins, materializedSkills } : {}),
-          ...(options.origin ? { origin: options.origin } : {}),
-          ...(options.permissions ? { permissions: options.permissions } : {}),
-          ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
-          ...(options.mcpManager !== undefined ? { mcpManager: options.mcpManager } : {}),
-          ...(options.subagentRegistry !== undefined ? { subagentRegistry: options.subagentRegistry } : {}),
-          ...(isOpenAiFamilyRef(activeRef) ? { proactiveNextStepNudge: true } : {}),
-        })
-
   const getOrigin: () => SessionOrigin | undefined =
     options.originRef !== undefined ? () => options.originRef!.current : () => options.origin
 
@@ -568,6 +555,46 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     ...new Set([...builtinActiveNames, ...[...wrappedCustomSystemTools, ...pluginCustomTools].map((t) => t.name)]),
   ]
 
+  let activeSession: AgentSession | undefined
+  const evalRuntime = registerEvalTool({
+    settings: config.eval,
+    tools: customTools,
+    activeNames: intendedActiveToolNames,
+    getActiveNames: () => activeSession?.getActiveToolNames() ?? intendedActiveToolNames,
+    wrappers: {
+      agentDir: options.plugins?.agentDir ?? process.cwd(),
+      sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
+      hooks: options.plugins?.hooks ?? createHookBus(),
+      guards,
+      getOrigin,
+      getAbort,
+      getLoopGuardTurn,
+      permissions: options.permissions ?? noopPermissionService,
+      bashPolicy: options.bashPolicy,
+    },
+    budget: sessionBudget,
+    budgetState: sessionBudgetState,
+  })
+
+  const resourceLoader =
+    options.systemPromptOverride !== undefined
+      ? await createOverrideResourceLoader(
+          options.systemPromptOverride + (evalRuntime ? `\n\n${EVAL_PROMPT_HINT}` : ''),
+          options.origin,
+          options.permissions,
+          options.runtimeVersion,
+        )
+      : await createResourceLoader({
+          evalEnabled: evalRuntime !== undefined,
+          ...(options.plugins ? { plugins: options.plugins, materializedSkills } : {}),
+          ...(options.origin ? { origin: options.origin } : {}),
+          ...(options.permissions ? { permissions: options.permissions } : {}),
+          ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
+          ...(options.mcpManager !== undefined ? { mcpManager: options.mcpManager } : {}),
+          ...(options.subagentRegistry !== undefined ? { subagentRegistry: options.subagentRegistry } : {}),
+          ...(isOpenAiFamilyRef(activeRef) ? { proactiveNextStepNudge: true } : {}),
+        })
+
   const model = applyModelRuntimeOverrides(resolveModel(activeRef), activeRef)
   // Read live so a reloaded `models` lands on the next session without a
   // container restart.
@@ -587,6 +614,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   })
   // Pi's general warmer also runs without background children. TypeClaw owns
   // the narrower idle-parent policy and never persists synthetic ping results.
+  activeSession = session
   session.setCacheWarmingMode('off')
   const cacheKeepalive = options.liveSubagentRegistry
     ? new SubagentCacheKeepalive(
@@ -601,6 +629,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   })
   const innerDispose = session.dispose.bind(session)
   session.dispose = () => {
+    void evalRuntime?.dispose()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
     innerDispose()
@@ -699,6 +728,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
         )
       : undefined
   const dispose = async () => {
+    await evalRuntime?.dispose()
     stopIdleCompaction()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
@@ -1242,133 +1272,7 @@ export type CreateResourceLoaderOptions = {
   // useful; mostly an escape hatch for ad-hoc debugging).
   mode?: SystemPromptMode
   proactiveNextStepNudge?: boolean
-}
-
-// Origins with a conversation partner waiting on the reply get the full-mode
-// session context: the interactive orchestration context with the live public
-// roster, the MCP catalog, and the git nudge. Unattended origins (cron fires,
-// default subagents, system processes) skip that context and the roster/git/MCP
-// work it needs — their origin block already says what is expected. Every
-// origin gets the same shared policy either way.
-//
-// Exhaustive switch (not a boolean expression) so a future origin kind forces
-// the author to make an explicit full-or-slim decision at compile time. The
-// previous form silently defaulted new origins to slim, which would have
-// stripped the interactive context from a new interactive surface by
-// accident.
-export function deriveSystemPromptMode(origin: SessionOrigin | undefined): SystemPromptMode {
-  if (origin === undefined) return 'full'
-  switch (origin.kind) {
-    case 'tui':
-    case 'channel':
-      return 'full'
-    case 'cron':
-    case 'subagent':
-    case 'system':
-      return 'slim'
-    default: {
-      const _exhaustive: never = origin
-      void _exhaustive
-      return 'full'
-    }
-  }
-}
-
-// Pure inputs for `composeSystemPrompt`. Each field maps 1:1 to a rendered
-// section of the prompt; callers that don't want a section pass `undefined`
-// (or `''` for `gitNudge`). Extracted so the debug dumper in
-// `scripts/dump-system-prompt.ts` can reuse the exact same composition
-// pipeline `createResourceLoader` uses, with no risk of drift if the
-// section order changes.
-//
-// `mode` selects only the optional session context, never the policy: every
-// standard session starts with `buildSystemPolicy(branding)`.
-//   - 'full' (default) — TUI, channel, and origin-less sessions: appends the
-//     interactive context (`renderInteractiveSessionContext`) with the roster.
-//   - 'slim' — cron, default subagents, system processes: no interactive
-//     context; the origin block covers per-kind specifics (no human, side
-//     effects via tools, narrow scope).
-export type SystemPromptMode = 'full' | 'slim'
-
-export type SystemPromptComposition = {
-  mode?: SystemPromptMode
-  // Whether the prompt discloses that the agent runs on TypeClaw. When false,
-  // the policy's opening is phrased generically, the `## Runtime` version
-  // block is dropped, and the runtime-disclosure rule is appended. Defaults to
-  // true. Mirrors `config.branding`.
-  branding?: boolean
-  self: string
-  // Pre-rendered interactive-context roster (from `renderPublicSubagentRoster`).
-  // Kept as a ready string so this composer stays pure and registry-free; the
-  // registry-aware caller renders it. Ignored in slim mode (no interactive
-  // context). Falls back to `DEFAULT_SUBAGENT_ROSTER` when omitted.
-  subagentRoster?: string
-  runtimeVersion?: string
-  origin?: SessionOrigin
-  roleContext?: SessionRoleContext
-  mcpCatalog?: string
-  gitNudge: string
-  proactiveNextStepNudge?: string
-}
-
-// Section-order contract for the system prompt. Kept as a pure string→string
-// transform so it can be exercised without disk, plugin runtime, or auth.
-//
-// Cache-suffix ordering: least-volatile sections first, most-volatile last.
-// This minimises the number of cached prompt bytes invalidated when a
-// section changes (the provider's prompt cache hits up to the first byte
-// that differs).
-//
-// 0. shared policy — identical for every standard session of an agent.
-// 1. self — IDENTITY.md + SOUL.md (plus any plugin `session.prompt` append).
-// 2. runtime block (or the runtime-disclosure rule when branding is off) —
-//    only changes on typeclaw releases.
-// 3. interactive context (full mode) — stable per agent registry, so it
-//    precedes the per-session origin block.
-// 4. origin block + role — stable across sessions of the same kind; channel
-//    origins carry per-conversation details.
-// 5. MCP catalog — changes when servers connect or disconnect.
-// 6. gitNudge — rare changes; agent folders force-commit sessions/ and
-//    memory/ after every turn, so the dirty-files list is empty most of
-//    the time.
-// 7. proactive next-step nudge — deterministic per model family.
-//
-// The wall-clock anchor that used to live here as `## Now` moved out
-// entirely. It is now injected into the user turn at each `session.prompt`
-// site via `renderTurnTimeAnchor` (src/agent/system-prompt.ts) so the
-// stamp reflects the moment of THIS turn, not session creation. Per-turn
-// injection costs zero cached bytes — the user turn is the non-cacheable
-// suffix anyway — and removes the staleness failure mode where a session
-// opened Friday answered "today is Friday" on Thursday. Retrieved memory and
-// the live channel role ride in the user turn for the same reason.
-//
-// pi appends project context (AGENTS.md), the skill catalog, and the cwd
-// after this preamble when it builds the final system message.
-export function composeSystemPrompt(parts: SystemPromptComposition): string {
-  const branding = parts.branding ?? true
-  let prompt = `${buildSystemPolicy(branding)}\n\n${parts.self}`
-  if (branding && parts.runtimeVersion !== undefined) {
-    prompt = `${prompt}\n\n${renderRuntimeBlock(parts.runtimeVersion)}`
-  }
-  if (!branding) {
-    prompt = `${prompt}\n\n${renderRuntimeNondisclosureRule()}`
-  }
-  if (parts.mode !== 'slim') {
-    prompt = `${prompt}\n\n${renderInteractiveSessionContext(parts.subagentRoster ?? DEFAULT_SUBAGENT_ROSTER)}`
-  }
-  if (parts.origin !== undefined) {
-    prompt = `${prompt}\n\n${renderSessionOrigin(parts.origin, Date.now(), parts.roleContext)}`
-  }
-  if (parts.mcpCatalog !== undefined && parts.mcpCatalog !== '') {
-    prompt = `${prompt}\n\n${parts.mcpCatalog}`
-  }
-  if (parts.gitNudge !== '') {
-    prompt = `${prompt}\n\n${parts.gitNudge}`
-  }
-  if (parts.proactiveNextStepNudge !== undefined && parts.proactiveNextStepNudge !== '') {
-    prompt = `${prompt}\n\n${parts.proactiveNextStepNudge}`
-  }
-  return prompt
+  evalEnabled?: boolean
 }
 
 export async function createResourceLoader(options: CreateResourceLoaderOptions = {}): Promise<DefaultResourceLoader> {
@@ -1457,6 +1361,7 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     ...(roleContext !== undefined ? { roleContext } : {}),
     ...(mcpCatalog !== undefined ? { mcpCatalog } : {}),
     gitNudge,
+    ...(options.evalEnabled ? { evalHint: EVAL_PROMPT_HINT } : {}),
     ...(options.proactiveNextStepNudge === true ? { proactiveNextStepNudge: PROACTIVE_NEXT_STEP_NUDGE } : {}),
   })
 
