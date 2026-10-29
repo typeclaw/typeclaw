@@ -8,6 +8,10 @@ The outer typeclaw container is the runtime trust boundary, but model-driven too
 
 The kernel primitive for this is `bwrap(1)` (bubblewrap) — a setuid-less namespace sandboxer that wraps a single subprocess in its own user/pid/mount/net namespace. Per bash call, the wrapper rebuilds an empty rootfs view containing only what the caller's policy declared it needs.
 
+## Persistent eval
+
+The opt-in [eval kernel](/docs/internals/eval) shares bash's policy preparation through `src/agent/bash-sandbox.ts`. It is offered only where bash is active without a command policy; reviewer sessions remain excluded. Its persistent Bun process uses an isolated network namespace and a validated stdio bridge. Each `tool.*` call dispatches through the session's final wrapped definition.
+
 ## Brokered coding delegation
 
 `coding_agent` is a dedicated first-party tool, not an exception in `resolvePrivilegedSandboxRuntime`. A background operator supervises one headless Claude or Codex invocation inside bwrap while a trusted loopback broker outside it authenticates only fixed-upstream inference operations. Claude permits Messages and count-token requests to Anthropic; Codex permits only `POST /v1/responses`, mapped to `https://chatgpt.com/backend-api/codex/responses`. The child gets a random invocation-local capability, never a provider API key, access token, refresh token, or ID token.

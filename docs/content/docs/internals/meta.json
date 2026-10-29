@@ -18,6 +18,7 @@
     "github-decoy-reviewer",
     "web-search",
     "xvfb",
-    "sandbox"
+    "sandbox",
+    "eval"
   ]
 }

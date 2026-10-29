@@ -20,6 +20,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 | `portForward`              | `{ allow, deny? }`                              | restart-required                             | auto port-forward allow/deny lists; default `{ allow: '*' }`                                     |
 | `network`                  | `NetworkPolicy`                                 | restart-required                             | container egress filtering                                                                       |
 | `sandbox`                  | `SandboxPolicy`                                 | restart-required                             | per-tool bwrap sandbox options                                                                   |
+| `eval`                     | `{ enabled, origins? }`                         | restart-required                             | opt-in persistent JavaScript cells; requires active unrestricted bash                            |
 | `tunnels`                  | `Tunnel[]`                                      | restart-required                             | public URLs (see [/concepts/architecture](/docs/concepts/architecture))                          |
 | `roles`                    | `Record<name, Role>`                            | `match` live, `permissions` restart-required | permission roles (see [/concepts/permissions-model](/docs/concepts/permissions-model))           |
 | `docker.file`              | `DockerFileOptions`                             | rebuild via `start`                          | Dockerfile feature toggles + append lines                                                        |
@@ -38,6 +39,21 @@ The `updateCheck` notice is host-stage only — the container never reads it. Ev
 `branding` controls whether the system prompt discloses the runtime. With the default `true`, the prompt tells the agent it runs "inside TypeClaw" and includes a `## Runtime` block stamping the TypeClaw version. Set `"branding": false` to strip both: the shared base prompt opens generically ("a general-purpose AI agent", the same for every standard session origin) and the runtime-version block is omitted — including on the subagent prompt path. It is read fresh per session, so it applies on `typeclaw reload` without a restart. Functional identifiers the agent still needs — the `typeclaw.json` filename and the `typeclaw-render-pdf` / `typeclaw-troubleshooting` skill names — are unaffected; they are system-defined tokens, not runtime disclosure.
 
 `compaction.maxTriggerTokens` sets the agent's own ceiling on the automatic compaction trigger. A session compacts when its context reaches the smaller of 80% of the model's context window and this ceiling; when the field is omitted the ceiling is `64000`, the same as before. Choose it for the agent's workload: a lower ceiling keeps the history re-sent on every turn small, a higher one leaves more working room for long, tool-heavy tasks before a summary interrupts them. The 80% rule always applies, so a small-window model never compacts later than its window allows. The minimum is `60000`, three times the 20,000 recent tokens a compaction keeps, so a compacted session cannot immediately compact again. It is read when a session is created: after `typeclaw reload`, new sessions use the new value and existing sessions keep theirs. Idle compaction warmup uses the same ceiling.
+
+## `eval`
+
+```json
+{
+  "eval": {
+    "enabled": true,
+    "origins": ["subagent", "cron"]
+  }
+}
+```
+
+Default: disabled. When enabled, omitted `origins` permits `tui`, `channel`, `cron`, `subagent`, and `system`; `[]` permits none. Sessions without active bash or with a bash command policy are excluded regardless of configuration. The reviewer is therefore excluded in v1. Restart the agent after changing this block.
+
+See [Eval kernel](/docs/internals/eval) for helpers, limits, guard routing, and lifecycle.
 
 ## `logs`
 
