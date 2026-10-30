@@ -7787,6 +7787,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       live.skippedTurn = null
       armRetainedOutputAckIfEligible(live, successfulSendsBeforePrompt, true)
       logger.info(`[channels] ${live.keyId} skipped_by_tool reason=${JSON.stringify(reason)}`)
+      // The model decided this turn owes the user nothing, so a provider failure
+      // on the request after that decision lost nothing the user was waiting for.
+      // A notice here would be a false alarm, typically stranded under the real
+      // reply an earlier pass of the same logical turn already delivered.
+      const pendingError = live.pendingProviderError
+      if (pendingError !== null && pendingError.turnSeq === live.turnSeq) {
+        live.pendingProviderError = null
+        logger.warn(
+          `[channels] ${live.keyId}: provider_error_notice_suppressed reason=explicit_skip_response notice="${pendingError.safeMessage}"`,
+        )
+      }
       // This session already resolved the thread and the model read the newer
       // reply and deliberately skipped it. Leaving a resolved thread resolved is
       // a close-out decision, so neither the reminder nor the "leaving it open"
