@@ -16596,6 +16596,49 @@ describe('ChannelRouter continuation willingness nudge', () => {
     expect(logs.some((m) => m.includes('empty_turn_fallback cause=no_reply_after_willingness_nudge'))).toBe(true)
   })
 
+  test('stays quiet when the nudge pass skips and then hits a provider error', async () => {
+    // given: the production shape — the first pass replied, the reply read as a
+    // promise so the nudge re-prompted, the model chose skip_response, and the
+    // follow-up provider request after that tool result failed. The user already
+    // has the answer and the model said nothing more is owed, so a failure
+    // notice would be a false alarm under the real reply.
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '언제 시간 돼?' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = async (text) => {
+      attempt++
+      if (attempt === 1) {
+        await replyTurn(sessions[0]!, router, '시간 골라주시면 확인해볼게요.')
+        return
+      }
+      expect(text).toContain(WILLINGNESS_NUDGE)
+      await router.markTurnSkipped({ parentSessionId: 'ses_fake_1', reason: 'waiting on the user to pick' })
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          stopReason: 'error',
+          errorMessage: 'The server had an error while processing your request.',
+        },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sent).toEqual(['시간 골라주시면 확인해볼게요.'])
+    expect(logs.some((m) => /LLM call failed: The server had an error/.test(m))).toBe(true)
+    expect(logs.some((m) => /provider_error_notice_suppressed reason=explicit_skip_response/.test(m))).toBe(true)
+  })
+
   test('does not post a fallback for NO_REPLY from a later unrelated reminder after the promised result', async () => {
     const dir = await tempDir()
     const logs: string[] = []
