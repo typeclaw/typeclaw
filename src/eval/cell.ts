@@ -38,7 +38,7 @@ export class EvalCell {
         this.finished = true
         void Promise.all(this.pending).then(() => {
           if (frame.error === undefined) this.completed.resolve()
-          else this.completed.reject(new EvalError('closed', frame.error))
+          else this.completed.reject(new EvalError('cell', frame.error))
         }, this.completed.reject)
         return
       case 'tool-call': {

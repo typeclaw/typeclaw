@@ -61,15 +61,25 @@ const tool = new Proxy<Record<string, (args: ToolArgs) => Promise<unknown>>>(
 async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> {
   let next = 0
   const values: T[] = []
+  const failures: unknown[] = []
+  // A failed cell keeps the kernel, so every worker must settle before the
+  // failure propagates; a still-sleeping worker would otherwise dispatch tool
+  // calls under the next cell's id.
   await Promise.all(
     Array.from({ length: Math.min(EVAL_LIMITS.concurrency, thunks.length) }, async () => {
-      while (next < thunks.length) {
+      while (next < thunks.length && failures.length === 0) {
         const index = next++
         const thunk = thunks[index]
-        if (thunk !== undefined) values[index] = await thunk()
+        if (thunk === undefined) continue
+        try {
+          values[index] = await thunk()
+        } catch (error) {
+          failures.push(error)
+        }
       }
     }),
   )
+  if (failures.length > 0) throw failures[0]
   return values
 }
 

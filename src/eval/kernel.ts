@@ -108,10 +108,15 @@ export class EvalKernel {
       }
     } catch (error) {
       controller.abort(error)
-      await this.stopWorker()
+      // The child reported a thrown or rejected cell after settling its tool
+      // calls, so the process is healthy and its bindings are still valid.
+      const cellFailed = error instanceof EvalError && error.kind === 'cell'
+      if (!cellFailed) await this.stopWorker()
       cell.output.append('\n' + (error instanceof Error ? error.message : String(error)))
       return {
-        text: cell.output.render() + '\n[eval kernel stopped; bindings lost]',
+        text:
+          cell.output.render() +
+          (cellFailed ? '\n[eval cell failed; kernel and bindings kept]' : '\n[eval kernel stopped; bindings lost]'),
         isError: true,
         truncated: cell.output.truncated,
         restarted,

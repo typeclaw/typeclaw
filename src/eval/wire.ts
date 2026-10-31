@@ -16,7 +16,7 @@ export const FRAME_PREFIX = '@typeclaw-eval '
 export class EvalError extends Error {
   override readonly name = 'EvalError'
   constructor(
-    readonly kind: 'protocol' | 'closed' | 'timeout' | 'busy' | 'refused',
+    readonly kind: 'protocol' | 'closed' | 'timeout' | 'busy' | 'refused' | 'cell',
     message: string,
   ) {
     super(message)
