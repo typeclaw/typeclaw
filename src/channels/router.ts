@@ -8357,6 +8357,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // missing formal review on the model's behalf, and posting the unguarded ack
     // is worse than dropping it — the next inbound re-prompts the model, which
     // can then land the verdict properly.
+    // Real leftover prose is still recovered while a background child runs (an
+    // answer the model already wrote should land), but a lone identifier-shaped
+    // ASCII token is model degeneration, not an answer: a bare `_RGCTX` once
+    // landed as a public PR comment right after a reviewer spawn. The child's
+    // completion turn owns the real reply, so drop it. Scoped to the awaiting
+    // turn so ordinary recovery is untouched; non-Latin short replies never match.
+    if (/^[A-Za-z0-9_]+$/.test(assistantText.trim()) && isAwaitingBackgroundChild(live, 'recovery_leaf')) {
+      logger.info(
+        `[channels] ${live.keyId} recovery_suppressed cause=awaiting_background_child text_len=${assistantText.length}`,
+      )
+      armSilentTurnAck(live, 'awaiting_background_child')
+      return
+    }
+
     const recoveryBlock = await evaluateRecoveryReviewGuards(live, assistantText)
     if (recoveryBlock !== null) {
       logger.warn(
