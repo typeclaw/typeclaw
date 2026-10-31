@@ -5,6 +5,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { format } from 'node:util'
 
 import type { HostFrame, KernelFrame } from './protocol'
+import { topLevelDeclarationsToVar } from './redeclare'
 import { EVAL_LIMITS, EvalError, FrameLines, FRAME_PREFIX, encodeFrame, assertNever } from './wire'
 
 const write = process.stdout.write.bind(process.stdout)
@@ -131,7 +132,14 @@ Object.assign(repl.context, {
 async function run(id: string, code: string): Promise<void> {
   if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
   cellId = id
-  let failure: string | undefined
+  const failure = await evaluate(topLevelDeclarationsToVar(code))
+  // A forgotten await must not detach tool work from the foreground cell.
+  await Promise.allSettled(outstanding)
+  cellId = undefined
+  send({ type: 'done', cellId: id, ...(failure === undefined ? {} : { error: failure.slice(0, 4096) }) })
+}
+
+async function evaluate(code: string): Promise<string | undefined> {
   try {
     await new Promise<void>((resolve, reject) => {
       rejectEvaluation = reject
@@ -140,15 +148,12 @@ async function run(id: string, code: string): Promise<void> {
         else resolve()
       })
     })
+    return undefined
   } catch (error) {
-    failure = error instanceof Error ? error.message : String(error)
+    return error instanceof Error ? error.message : String(error)
   } finally {
     rejectEvaluation = undefined
   }
-  // A forgotten await must not detach tool work from the foreground cell.
-  await Promise.allSettled(outstanding)
-  cellId = undefined
-  send({ type: 'done', cellId: id, ...(failure === undefined ? {} : { error: failure.slice(0, 4096) }) })
 }
 
 const lines = new FrameLines()

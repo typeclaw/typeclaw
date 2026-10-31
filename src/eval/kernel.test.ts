@@ -136,6 +136,17 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(seen.sort()).toEqual(['grep', 'read'])
   })
 
+  test('a later cell can redeclare top-level const and let names', async () => {
+    const instance = kernel()
+    await instance.run('const [a, b] = await Promise.resolve([1, 2]); let n = 1', { dispatch })
+    const again = await instance.run(
+      'const [a, b] = await Promise.resolve([3, 4]); let n = 2; for (const x of [1]) { const a = 9 } print(a + b + n)',
+      { dispatch },
+    )
+    expect(again.isError).toBe(false)
+    expect(again.text.trim()).toBe('9')
+  })
+
   test('idle expiry discards bindings before the next cell', async () => {
     const instance = kernel()
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })
