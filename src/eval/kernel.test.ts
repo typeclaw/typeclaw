@@ -105,6 +105,72 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(result.text).not.toContain('timed out')
   })
 
+  test('a failed cell keeps the kernel and its earlier bindings', async () => {
+    const instance = kernel()
+    await instance.run('const kept = 5', { dispatch })
+    const failed = await instance.run('await tool.grep({pattern:"("})', { dispatch })
+    expect(failed.isError).toBe(true)
+    expect(failed.text).toContain('test has no tools')
+    expect(failed.text).toContain('bindings kept')
+    const next = await instance.run('print(kept)', { dispatch })
+    expect(next.restarted).toBe(false)
+    expect(next.text.trim()).toBe('5')
+  })
+
+  test('a failed parallel batch settles delayed workers before the cell ends', async () => {
+    const instance = kernel()
+    const seen: string[] = []
+    const failed = await instance.run(
+      'await parallel([() => tool.grep({}), async () => { await Bun.sleep(100); return tool.read({}) }])',
+      {
+        dispatch: async ({ name }) => {
+          seen.push(name)
+          if (name === 'grep') throw new EvalError('refused', 'bad regex')
+          return 'late'
+        },
+      },
+    )
+    expect(failed.isError).toBe(true)
+    expect(failed.text).toContain('bad regex')
+    // The delayed worker ran inside the failed cell, not after it.
+    expect(seen.sort()).toEqual(['grep', 'read'])
+  })
+
+  test("a failed cell's leftover work cannot reach the next cell", async () => {
+    const instance = kernel()
+    const failed = await instance.run(
+      'await Promise.all([tool.grep({}), (async () => { await Bun.sleep(100); print("stale"); return tool.read({path:"old-cell"}) })()])',
+      {
+        dispatch: async () => {
+          throw new EvalError('refused', 'bad regex')
+        },
+      },
+    )
+    expect(failed.isError).toBe(true)
+    const seen: string[] = []
+    // The next cell outlives the old continuation's wake-up.
+    const next = await instance.run('await Bun.sleep(400); print("fresh")', {
+      dispatch: async ({ name }) => {
+        seen.push(name)
+        return 'unexpected'
+      },
+    })
+    expect(next.isError).toBe(false)
+    expect(next.text.trim()).toBe('fresh')
+    expect(seen).toEqual([])
+  })
+
+  test('a later cell can redeclare top-level const and let names', async () => {
+    const instance = kernel()
+    await instance.run('const [a, b] = await Promise.resolve([1, 2]); let n = 1', { dispatch })
+    const again = await instance.run(
+      'const [a, b] = await Promise.resolve([3, 4]); let n = 2; for (const x of [1]) { const a = 9 } print(a + b + n)',
+      { dispatch },
+    )
+    expect(again.isError).toBe(false)
+    expect(again.text.trim()).toBe('9')
+  })
+
   test('idle expiry discards bindings before the next cell', async () => {
     const instance = kernel()
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })
