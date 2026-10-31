@@ -1,5 +1,6 @@
 // Container-stage child entry. Never import this into the trusted runtime:
 // arbitrary code, including native Bun APIs, executes only inside bwrap.
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { start } from 'node:repl'
 import { PassThrough, Writable } from 'node:stream'
 import { format } from 'node:util'
@@ -15,10 +16,19 @@ const send = (frame: KernelFrame) => write('\n' + encodeFrame(frame))
 const pending = new Map<string, { resolve(value: unknown): void; reject(error: Error): void }>()
 const outstanding = new Set<Promise<unknown>>()
 let cellId: string | undefined
+// Timers and abandoned promises keep the async context of the cell that
+// created them. Comparing it with the running cell stops a failed cell's
+// leftover work from calling tools or printing under a later cell's id.
+const origin = new AsyncLocalStorage<string>()
+const currentCell = (): string | undefined => {
+  const id = origin.getStore()
+  return id !== undefined && id === cellId ? id : undefined
+}
 let sequence = 0
 let rejectEvaluation: ((error: unknown) => void) | undefined
 
 function print(...values: unknown[]): void {
+  const cellId = currentCell()
   if (cellId === undefined) return
   const text = format(...values) + '\n'
   // Chunk before JSON framing so large printed values still reach the host's
@@ -41,8 +51,8 @@ const tool = new Proxy<Record<string, (args: ToolArgs) => Promise<unknown>>>(
     get(_target, name) {
       if (typeof name !== 'string' || name === 'then') return undefined
       return (args: ToolArgs) => {
-        const activeCellId = cellId
-        if (activeCellId === undefined) return Promise.reject(new EvalError('closed', 'no active eval cell'))
+        const activeCellId = currentCell()
+        if (activeCellId === undefined) return Promise.reject(new EvalError('closed', 'eval cell has already ended'))
         const id = String(++sequence)
         const result = new Promise<unknown>((resolve, reject) => {
           pending.set(id, { resolve, reject })
@@ -132,7 +142,7 @@ Object.assign(repl.context, {
 async function run(id: string, code: string): Promise<void> {
   if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
   cellId = id
-  const failure = await evaluate(topLevelDeclarationsToVar(code))
+  const failure = await origin.run(id, () => evaluate(topLevelDeclarationsToVar(code)))
   // A forgotten await must not detach tool work from the foreground cell.
   await Promise.allSettled(outstanding)
   cellId = undefined

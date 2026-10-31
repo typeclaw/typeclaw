@@ -136,6 +136,30 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(seen.sort()).toEqual(['grep', 'read'])
   })
 
+  test("a failed cell's leftover work cannot reach the next cell", async () => {
+    const instance = kernel()
+    const failed = await instance.run(
+      'await Promise.all([tool.grep({}), (async () => { await Bun.sleep(100); print("stale"); return tool.read({path:"old-cell"}) })()])',
+      {
+        dispatch: async () => {
+          throw new EvalError('refused', 'bad regex')
+        },
+      },
+    )
+    expect(failed.isError).toBe(true)
+    const seen: string[] = []
+    // The next cell outlives the old continuation's wake-up.
+    const next = await instance.run('await Bun.sleep(400); print("fresh")', {
+      dispatch: async ({ name }) => {
+        seen.push(name)
+        return 'unexpected'
+      },
+    })
+    expect(next.isError).toBe(false)
+    expect(next.text.trim()).toBe('fresh')
+    expect(seen).toEqual([])
+  })
+
   test('a later cell can redeclare top-level const and let names', async () => {
     const instance = kernel()
     await instance.run('const [a, b] = await Promise.resolve([1, 2]); let n = 1', { dispatch })
