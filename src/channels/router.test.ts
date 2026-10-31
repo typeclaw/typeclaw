@@ -20257,6 +20257,69 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(logs.some((m) => m.includes('post_send_prose_suppressed cause=awaiting_background_child'))).toBe(true)
   })
 
+  test('a lone identifier token with no reply is not recovered while the spawned child runs', async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: string[] = []
+    const reactions: ReactionRequest[] = []
+    const reactionRef: ReactionRef = { adapter: 'discord-bot', value: 'review-request' }
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef: { value: CHILD_STARTED_AT },
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerPrepareOwnReaction('discord-bot', async (req) => ({
+      accountIdentity: 'test-account',
+      target: req.reactionRef,
+      emoji: req.emoji,
+    }))
+    router.registerReaction('discord-bot', async (req) => {
+      reactions.push(req)
+      return { ok: true }
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: the model spawns a background child, sends nothing, and ends on a stray token
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘', reactionRef }))
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('_RGCTX')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the degenerate token is not posted; the child's completion turn owns the reply
+    expect(sent).toEqual([])
+    expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(false)
+    expect(logs.some((m) => m.includes('recovery_suppressed cause=awaiting_background_child'))).toBe(true)
+    await waitFor(() => reactions.length === 1)
+    expect(reactions[0]).toMatchObject({ emoji: 'eyes', reactionRef })
+  })
+
+  test('a short non-Latin reply with no channel tool is still recovered while the spawned child runs', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir, {
+      nowRef: { value: CHILD_STARTED_AT },
+      newestRunningChildSubagentStartedAt: runningChild,
+    })
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    // given: a single-word Korean ack written as plain text while the child runs
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = async () => {
+      sessions[0]!.setAssistantText('확인중')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: it is a real reply, not a degenerate token, so it lands
+    expect(sent).toEqual(['확인중'])
+  })
+
   test('new inbounds while the child runs carry the deferred request instead of posting a restart notice', async () => {
     const dir = await tempDir()
     const logs: string[] = []
