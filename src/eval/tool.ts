@@ -50,6 +50,8 @@ export function registerEvalTool(options: {
         'Use await tool.read/grep/find/ls/bash/write/edit/web_search/web_fetch with their normal arguments, ' +
         "parallel(thunks) (up to 8 workers), print/display(value), and text(result, maxChars = 4000) to extract a result's text. " +
         'Tool calls return the normal content/details object; print selected text, not whole results. ' +
+        'A failed tool call rejects; wrap risky calls in try/catch so one failure does not discard a batch. ' +
+        'tool.grep patterns are ripgrep regex: escape ( ) [ ] and . as \\\\(, lookaround is unsupported, and literal:true matches plain text. ' +
         'Only active tools are callable; recursion, orchestration, posting, role changes and MCP dispatch are refused. ' +
         '30s default, 60s hard maximum; timeout kills the kernel. Output is capped at 64 KiB / 1000 lines. ' +
         'No background cells, package installation helpers or Python. Use await import(...) for modules.',
