@@ -8,13 +8,18 @@ import { encodeDiscordReactionRef } from './discord-reactions'
 
 export type DiscordInboundMessageEvent = DiscordGatewayMessageCreateEvent
 
-// WORKAROUND: the USER-token SDK type omits `author.bot` and
-// `message_reference`, but the listener spreads the raw Discord payload
-// (`{ ...d }`), so both fields exist at runtime. Narrow locally instead of
+// WORKAROUND: the USER-token SDK type omits `author.bot`, `message_reference`,
+// and `referenced_message`, but the listener spreads the raw Discord payload
+// (`{ ...d }`), so they exist at runtime. Narrow locally instead of
 // augmenting the SDK type globally — do not "simplify" this away.
 export type RawDiscordMessageCreateEvent = DiscordGatewayMessageCreateEvent & {
   author: { bot?: boolean }
   message_reference?: { message_id?: string; channel_id?: string; guild_id?: string }
+  referenced_message?: {
+    id: string
+    content: string
+    author: { id: string; username: string; global_name?: string | null }
+  } | null
 }
 
 export type InboundDropReason = 'self_author' | 'no_user' | 'empty_content' | 'pre_connect'
