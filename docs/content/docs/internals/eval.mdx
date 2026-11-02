@@ -27,15 +27,26 @@ Raw JavaScript has native filesystem and subprocess capabilities, just like arbi
 
 ## Cells
 
-The tool accepts `{ code: string, timeoutMs?: number }`. It runs JavaScript only:
+The tool accepts `{ code: string, timeoutMs?: number }`. It runs JavaScript only. Its value is keeping large tool output out of the model's context: a cell fetches, filters or computes, and prints only the answer. It also runs steps where the next call depends on the last result in one call:
 
 ```js
-const results = await parallel([
-  () => tool.read({ path: 'workspace/report.md' }),
-  () => tool.grep({ pattern: 'TODO', path: 'workspace/project' }),
-])
-print(results.map((result) => text(result, 2000)))
+// grep reports paths relative to the searched directory; read resolves them
+// against the session cwd, so put the search root back in front.
+const root = 'workspace/project'
+const hits = await tool.grep({ pattern: 'TODO', path: root })
+const files = [
+  ...new Set(
+    text(hits)
+      .split('\n')
+      .filter((l) => l.includes(':'))
+      .map((l) => root + '/' + l.split(':')[0]),
+  ),
+].slice(0, 5)
+const bodies = await parallel(files.map((f) => () => tool.read({ path: f })))
+for (const [i, b] of bodies.entries()) print(files[i], text(b, 1500))
 ```
+
+Independent reads alone gain nothing from a cell; the model already issues those as parallel tool calls in one step. The prompt hint (`EVAL_PROMPT_HINT` in `src/eval/tool.ts`) steers toward the filtering and dependent-chain cases.
 
 Top-level bindings, including awaited declarations, persist between cells. A cell that throws or rejects (including a failed tool call) reports its error but keeps the kernel and its bindings; only timeouts, cancellation, process death, and authority changes replace the kernel. Top-level `const` and `let` run as `var`, so a later cell can reuse a name such as `const [a, b] = ...` instead of failing with a duplicate-declaration error. The helper names (`tool`, `parallel`, `print`, `text`, `display`, `console`) cannot be declared at top level: that `var` would replace the helper for the rest of the session, so such a cell is refused before it runs and the kernel keeps its bindings. Declarations inside functions still shadow normally. Use `await import(...)` for imports. `print(...)`, `display(...)`, and console output produce bounded text output. `text(result, maxChars = 2000)` extracts just the text parts of a tool result; print that rather than whole result objects, whose content arrays and details would otherwise land in the transcript. Tool results remain normal `{ content, details }` objects; image data is not automatically displayed. Unprinted intermediate values stay out of the model transcript; everything printed enters it, so output past 16 KiB ends with a notice to filter in the cell, and the truncation notice gives the same advice.
 

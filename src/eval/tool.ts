@@ -13,8 +13,14 @@ import { EVAL_LIMITS, EvalError } from './protocol'
 import { createSandboxedEvalKernel } from './sandbox'
 
 export const EVAL_PROMPT_HINT =
-  'Use eval for independent tool batches and local filtering: const [a, b] = await parallel([() => tool.read({...}), () => tool.grep({...})]); print(text(a, 2000)). ' +
-  "Print only what you need: text(result, maxChars) extracts a tool result's text; never print whole result objects. " +
+  'Use eval to keep large tool output out of your context: fetch, filter or compute in the cell, and print only the answer; unprinted data never reaches you. ' +
+  'It also runs steps where the next call depends on the last result in one call: ' +
+  "const root = 'src'; const hits = await tool.grep({ pattern: 'openDoor', path: root }); " +
+  "const files = [...new Set(text(hits).split('\\n').filter((l) => l.includes(':')).map((l) => root + '/' + l.split(':')[0]))].slice(0, 5); " +
+  'const bodies = await parallel(files.map((f) => () => tool.read({ path: f }))); ' +
+  'for (const [i, b] of bodies.entries()) print(files[i], text(b, 1500)). ' +
+  'Independent reads alone do not need eval; call those tools directly. ' +
+  "text(result, maxChars) extracts a tool result's text; never print whole result objects. " +
   'JavaScript bindings persist in this session until idle expiry, authority changes, or kernel failure. ' +
   'Only printed/displayed output is returned. Await all work; no background cells, install helpers, or Python cells.'
 
