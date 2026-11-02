@@ -13,8 +13,14 @@ import { EVAL_LIMITS, EvalError } from './protocol'
 import { createSandboxedEvalKernel } from './sandbox'
 
 export const EVAL_PROMPT_HINT =
-  'Use eval for independent tool batches and local filtering: const [a, b] = await parallel([() => tool.read({...}), () => tool.grep({...})]); print(text(a, 2000)). ' +
-  "Print only what you need: text(result, maxChars) extracts a tool result's text; never print whole result objects. " +
+  'Use eval to keep large tool output out of your context: fetch, filter or compute in the cell, and print only the answer; unprinted data never reaches you. ' +
+  'It also runs steps where the next call depends on the last result in one call: ' +
+  "const root = 'src'; const hits = await tool.grep({ pattern: 'openDoor', path: root }); " +
+  "const files = [...new Set(text(hits).split('\\n').filter((l) => l.includes(':')).map((l) => root + '/' + l.split(':')[0]))].slice(0, 5); " +
+  'const bodies = await parallel(files.map((f) => () => tool.read({ path: f }))); ' +
+  'for (const [i, b] of bodies.entries()) print(files[i], text(b, 1500)). ' +
+  'Independent reads alone do not need eval; call those tools directly. ' +
+  "text(result, maxChars) extracts a tool result's text; never print whole result objects. " +
   'JavaScript bindings persist in this session until idle expiry, authority changes, or kernel failure. ' +
   'Only printed/displayed output is returned. Await all work; no background cells, install helpers, or Python cells.'
 
@@ -48,7 +54,7 @@ export function registerEvalTool(options: {
       description:
         'Run a foreground JavaScript cell in a persistent, bash-sandboxed Bun kernel. ' +
         'Use await tool.read/grep/find/ls/bash/write/edit/web_search/web_fetch with their normal arguments, ' +
-        "parallel(thunks) (up to 8 workers), print/display(value), and text(result, maxChars = 4000) to extract a result's text. " +
+        "parallel(thunks) (up to 8 workers), print/display(value), and text(result, maxChars = 2000) to extract a result's text. " +
         'Tool calls return the normal content/details object; print selected text, not whole results. ' +
         'A failed tool call rejects; wrap risky calls in try/catch so one failure does not discard a batch. ' +
         'tool.grep patterns are ripgrep regex: escape ( ) [ ] and . as \\\\(, lookaround is unsupported, and literal:true matches plain text. ' +

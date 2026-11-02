@@ -5,11 +5,26 @@
 // create duplicate variable". A var cannot shadow an existing const either, so
 // every cell's top-level const/let becomes var before it runs. Nested scopes
 // keep their block semantics.
+//
+// The scan also reports top-level binding names: a top-level declaration of a
+// helper like `tool` shadows it for the rest of the session, so the kernel
+// refuses those cells. Initializers are skipped and collection resumes at each
+// declarator comma; destructuring keys or defaults may be over-reported, which
+// is acceptable for a refusal that only asks the model to rename.
 const REGEX_PRECEDERS = new Set('(,=:[!&|?{};+-*%<>~^'.split(''))
 const REGEX_KEYWORDS = new Set(['return', 'typeof', 'await', 'yield', 'case', 'in', 'of', 'void', 'delete', 'new'])
 const CONTROL_HEADERS = new Set(['if', 'while', 'for', 'with'])
 
 export function topLevelDeclarationsToVar(code: string): string {
+  return rewriteCell(code).code
+}
+
+export function rewriteCell(code: string): { code: string; declared: string[] } {
+  const declared: string[] = []
+  // A top-level declaration runs until `;` or a line end not following a comma;
+  // binding names are read until each declarator's `=`.
+  let inDeclaration = false
+  let collecting = false
   let out = ''
   let depth = 0
   // Brace depths at which an open `${` returns to its enclosing template.
@@ -103,14 +118,17 @@ export function topLevelDeclarationsToVar(code: string): string {
       let j = i
       while (isIdent(code[j])) j += 1
       const token = code.slice(i, j)
-      if (
+      const declaration =
         depth === 0 &&
-        (token === 'const' || token === 'let') &&
+        (token === 'const' || token === 'let' || token === 'var') &&
         code[i - 1] !== '.' &&
         /^\s*[[{\p{L}_$]/u.test(code.slice(j))
-      ) {
+      if (declaration) {
         out += 'var'
+        inDeclaration = true
+        collecting = true
       } else {
+        if (collecting) declared.push(token)
         out += token
       }
       i = j
@@ -140,6 +158,11 @@ export function topLevelDeclarationsToVar(code: string): string {
         continue
       }
     }
+    if (inDeclaration && depth === 0) {
+      if (c === '=') collecting = false
+      else if (c === ',') collecting = true
+      else if (c === ';' || (c === '\n' && previous !== ',')) inDeclaration = collecting = false
+    }
     out += c
     i += 1
     if (!/\s/.test(c)) {
@@ -147,5 +170,5 @@ export function topLevelDeclarationsToVar(code: string): string {
       word = ''
     }
   }
-  return out
+  return { code: out, declared }
 }

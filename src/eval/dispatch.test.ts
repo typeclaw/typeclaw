@@ -113,6 +113,49 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     expect(result.text.trim()).toBe('refused')
   })
 
+  // Directory grep needs Linux inode anchoring, so this only runs in the
+  // container-stage platform.
+  test.skipIf(process.platform !== 'linux')(
+    'the prompt-hint chain reads nested files from directory grep output',
+    async () => {
+      await mkdir(join(dir, 'workspace', 'nested'))
+      await writeFile(join(dir, 'workspace', 'nested', 'deep.txt'), 'needle body\n')
+      const dispatch = createEvalDispatch({
+        tools: tools(),
+        getActiveNames: () => ['grep', 'read'],
+        context: testContext(dir),
+      })
+      const result = await kernel.run(
+        [
+          "const root = 'workspace'",
+          "const hits = await tool.grep({ pattern: 'needle', path: root })",
+          "const files = [...new Set(text(hits).split('\\n').filter((l) => l.includes(':')).map((l) => root + '/' + l.split(':')[0]))]",
+          'const bodies = await parallel(files.map((f) => () => tool.read({ path: f })))',
+          'for (const [i, b] of bodies.entries()) print(files[i], text(b, 200))',
+        ].join('\n'),
+        { dispatch },
+      )
+      expect(result.isError).toBe(false)
+      expect(result.text).toContain('workspace/nested/deep.txt')
+      expect(result.text).toContain('needle body')
+    },
+  )
+
+  test('a grep regex parse failure names the JS string escape cause', async () => {
+    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['grep'], context: testContext(dir) })
+    const broken = await kernel.run('await tool.grep({pattern:"Text\\(|Label(",path:"workspace/one.txt"})', {
+      dispatch,
+    })
+    const valid = await kernel.run('print(text(await tool.grep({pattern:"selected",path:"workspace/one.txt"})))', {
+      dispatch,
+    })
+    expect(broken.isError).toBe(true)
+    expect(broken.text).toContain('regex parse error')
+    expect(broken.text).toContain('literal: true')
+    expect(valid.isError).toBe(false)
+    expect(valid.text).toContain('selected line')
+  })
+
   test('tool argument validation happens before wrapped execution', async () => {
     const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['read'], context: testContext(dir) })
     await expect(dispatch({ name: 'read', args: {}, callId: 'test' }, new AbortController().signal)).rejects.toThrow()

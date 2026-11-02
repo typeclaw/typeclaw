@@ -6,7 +6,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { format } from 'node:util'
 
 import type { HostFrame, KernelFrame } from './protocol'
-import { topLevelDeclarationsToVar } from './redeclare'
+import { rewriteCell } from './redeclare'
 import { EVAL_LIMITS, EvalError, FrameLines, FRAME_PREFIX, encodeFrame, assertNever } from './wire'
 
 const write = process.stdout.write.bind(process.stdout)
@@ -70,6 +70,12 @@ const tool = new Proxy<Record<string, (args: ToolArgs) => Promise<unknown>>>(
 )
 
 async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> {
+  const notThunk = thunks.findIndex((thunk) => typeof thunk !== 'function')
+  if (notThunk !== -1) {
+    throw new TypeError(
+      `parallel() takes functions, but item ${notThunk} is not one; wrap each call: parallel([() => tool.read({...})])`,
+    )
+  }
   let next = 0
   const values: T[] = []
   const failures: unknown[] = []
@@ -96,7 +102,7 @@ async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> 
 
 // Printing a whole tool result dumps its content array and details into the
 // transcript, defeating the point of a cell. text() pulls just the text parts.
-function text(result: unknown, maxChars = 4000): string {
+function text(result: unknown, maxChars = 2000): string {
   const content = (result as { content?: unknown } | null)?.content
   const joined = Array.isArray(content)
     ? content
@@ -130,19 +136,49 @@ const replOptions = {
   },
 }
 const repl = start(replOptions)
-Object.assign(repl.context, {
+const helpers = {
   tool,
   parallel,
   print,
   text,
   display: print,
   console: { log: print, info: print, warn: print, error: print, debug: print },
-})
+}
+Object.assign(repl.context, helpers)
+
+// Passing parallel()-style thunks to Promise.all resolves to the functions
+// themselves, so the cell "succeeds" with no tool call made. Fail it instead.
+function rejectFunctionItems(promise: PromiseConstructor): void {
+  for (const name of ['all', 'allSettled', 'any', 'race'] as const) {
+    const original = promise[name] as (this: PromiseConstructor, values: unknown[]) => Promise<unknown>
+    Object.defineProperty(promise, name, {
+      configurable: true,
+      writable: true,
+      value(this: PromiseConstructor, values: Iterable<unknown>) {
+        const items = Array.from(values)
+        const index = items.findIndex((item) => typeof item === 'function')
+        if (index !== -1) {
+          return Promise.reject(
+            new TypeError(
+              `Promise.${name}() got a function at item ${index}; call it (tool.read({...})) or use parallel([() => ...])`,
+            ),
+          )
+        }
+        return original.call(this, items)
+      },
+    })
+  }
+}
 
 async function run(id: string, code: string): Promise<void> {
   if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
   cellId = id
-  const failure = await origin.run(id, () => evaluate(topLevelDeclarationsToVar(code)))
+  const cell = rewriteCell(code)
+  const shadowed = cell.declared.filter((name) => Object.hasOwn(helpers, name))
+  const failure =
+    shadowed.length > 0
+      ? `${shadowed.map((name) => `\`${name}\``).join(', ')} is an eval helper and cannot be declared at top level; rename the variable`
+      : await origin.run(id, () => evaluate(cell.code))
   // A forgotten await must not detach tool work from the foreground cell.
   await Promise.allSettled(outstanding)
   cellId = undefined
@@ -216,4 +252,10 @@ process.stdin.on('data', (chunk: Buffer) => {
   }
 })
 process.stdin.on('end', () => process.exit(0))
-send({ type: 'ready' })
+// Cells run in the REPL's own realm, whose Promise is reachable only from
+// inside it; patch that one before accepting the first cell.
+repl.eval('Promise\n', repl.context, 'eval-init', (error: Error | null, value: unknown) => {
+  if (error !== null && error !== undefined) throw error
+  rejectFunctionItems(value as PromiseConstructor)
+  send({ type: 'ready' })
+})

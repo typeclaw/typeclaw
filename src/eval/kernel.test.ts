@@ -171,6 +171,63 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(again.text.trim()).toBe('9')
   })
 
+  test('Promise.all over thunks fails instead of resolving to the functions', async () => {
+    const instance = kernel()
+    const seen: string[] = []
+    const recording = async ({ name }: { name: string }) => {
+      seen.push(name)
+      return 'ran'
+    }
+    const thunks = await instance.run('await Promise.all([() => tool.read({path:"x"})])', { dispatch: recording })
+    const promises = await instance.run('await parallel([tool.read({path:"y"})])', { dispatch: recording })
+    const valid = await instance.run('print((await Promise.all([tool.read({path:"z"})])).length)', {
+      dispatch: recording,
+    })
+    expect(thunks.isError).toBe(true)
+    expect(promises.isError).toBe(true)
+    expect(valid).toMatchObject({ isError: false, text: '1\n' })
+  })
+
+  test('a top-level declaration cannot shadow eval helpers', async () => {
+    const instance = kernel()
+    const shadowing = await instance.run('const [old, tool] = [1, 2]', { dispatch })
+    const nested = await instance.run('function f() { const text = "inner"; return text } print(f())', { dispatch })
+    const after = await instance.run('print(typeof tool.read, typeof old)', { dispatch })
+    expect(shadowing.isError).toBe(true)
+    expect(shadowing.text).toContain('`tool`')
+    expect(nested).toMatchObject({ isError: false, text: 'inner\n' })
+    // The refused cell never ran, so it bound nothing.
+    expect(after).toMatchObject({ isError: false, restarted: false, text: 'function undefined\n' })
+  })
+
+  test('a helper name in a later declarator refuses the whole cell', async () => {
+    const instance = kernel()
+    await instance.run('const value = 1', { dispatch })
+    const refused = await instance.run('const value = 2, text = "x"', { dispatch })
+    const after = await instance.run('print(value, typeof text)', { dispatch })
+    expect(refused.isError).toBe(true)
+    expect(after).toMatchObject({ isError: false, text: '1 function\n' })
+  })
+
+  test('output past the warning size gets a trailing notice; smaller output does not', async () => {
+    const instance = kernel()
+    const small = await instance.run('print("x".repeat(100))', { dispatch })
+    const large = await instance.run(`print("x".repeat(${EVAL_LIMITS.outputWarnBytes + 1}))`, { dispatch })
+    expect(small.text).toBe('x'.repeat(100) + '\n')
+    expect(large.truncated).toBe(false)
+    expect(large.text.startsWith('x'.repeat(EVAL_LIMITS.outputWarnBytes + 1) + '\n')).toBe(true)
+    expect(large.text.trimEnd().split('\n').at(-1)).toStartWith('[eval printed')
+  })
+
+  test('text() caps at 2000 chars by default', async () => {
+    const instance = kernel()
+    const result = await instance.run('print(text(await tool.read({path:"x"})).length)', {
+      dispatch: async () => ({ content: [{ type: 'text', text: 'y'.repeat(5000) }] }),
+    })
+    expect(result.isError).toBe(false)
+    expect(Number(result.text.trim())).toBeLessThan(2100)
+  })
+
   test('idle expiry discards bindings before the next cell', async () => {
     const instance = kernel()
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })
