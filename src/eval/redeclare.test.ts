@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { topLevelDeclarationsToVar } from './redeclare'
+import { rewriteCell, topLevelDeclarationsToVar } from './redeclare'
 
 describe('topLevelDeclarationsToVar', () => {
   test('rewrites top-level const and let, including destructuring', () => {
@@ -31,5 +31,16 @@ describe('topLevelDeclarationsToVar', () => {
 
   test('leaves property access named let or const alone', () => {
     expect(topLevelDeclarationsToVar('o.const = 1; o.let = 2')).toBe('o.const = 1; o.let = 2')
+  })
+
+  test('reports top-level binding names but not initializers, nested scopes or strings', () => {
+    const code =
+      'const [old, tool] = await f(text); let n\nprint(n); var {a, b} = g()\nfunction h() { const inner = 1 } const s = "const q = 1"'
+    expect(rewriteCell(code).declared).toEqual(['old', 'tool', 'n', 'a', 'b', 's'])
+  })
+
+  test('resumes after each declarator comma, including across a line break', () => {
+    const code = 'const result = await f({a: 1, b}), text = result\nlet x = g(1, 2),\n  print = 3\nh(y, z)'
+    expect(rewriteCell(code).declared).toEqual(['result', 'text', 'x', 'print'])
   })
 })

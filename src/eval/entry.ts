@@ -6,7 +6,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { format } from 'node:util'
 
 import type { HostFrame, KernelFrame } from './protocol'
-import { topLevelDeclarationsToVar } from './redeclare'
+import { rewriteCell } from './redeclare'
 import { EVAL_LIMITS, EvalError, FrameLines, FRAME_PREFIX, encodeFrame, assertNever } from './wire'
 
 const write = process.stdout.write.bind(process.stdout)
@@ -130,19 +130,25 @@ const replOptions = {
   },
 }
 const repl = start(replOptions)
-Object.assign(repl.context, {
+const helpers = {
   tool,
   parallel,
   print,
   text,
   display: print,
   console: { log: print, info: print, warn: print, error: print, debug: print },
-})
+}
+Object.assign(repl.context, helpers)
 
 async function run(id: string, code: string): Promise<void> {
   if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
   cellId = id
-  const failure = await origin.run(id, () => evaluate(topLevelDeclarationsToVar(code)))
+  const cell = rewriteCell(code)
+  const shadowed = cell.declared.filter((name) => Object.hasOwn(helpers, name))
+  const failure =
+    shadowed.length > 0
+      ? `${shadowed.map((name) => `\`${name}\``).join(', ')} is an eval helper and cannot be declared at top level; rename the variable`
+      : await origin.run(id, () => evaluate(cell.code))
   // A forgotten await must not detach tool work from the foreground cell.
   await Promise.allSettled(outstanding)
   cellId = undefined

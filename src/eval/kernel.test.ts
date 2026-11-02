@@ -171,6 +171,27 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(again.text.trim()).toBe('9')
   })
 
+  test('a top-level declaration cannot shadow eval helpers', async () => {
+    const instance = kernel()
+    const shadowing = await instance.run('const [old, tool] = [1, 2]', { dispatch })
+    const nested = await instance.run('function f() { const text = "inner"; return text } print(f())', { dispatch })
+    const after = await instance.run('print(typeof tool.read, typeof old)', { dispatch })
+    expect(shadowing.isError).toBe(true)
+    expect(shadowing.text).toContain('`tool`')
+    expect(nested).toMatchObject({ isError: false, text: 'inner\n' })
+    // The refused cell never ran, so it bound nothing.
+    expect(after).toMatchObject({ isError: false, restarted: false, text: 'function undefined\n' })
+  })
+
+  test('a helper name in a later declarator refuses the whole cell', async () => {
+    const instance = kernel()
+    await instance.run('const value = 1', { dispatch })
+    const refused = await instance.run('const value = 2, text = "x"', { dispatch })
+    const after = await instance.run('print(value, typeof text)', { dispatch })
+    expect(refused.isError).toBe(true)
+    expect(after).toMatchObject({ isError: false, text: '1 function\n' })
+  })
+
   test('idle expiry discards bindings before the next cell', async () => {
     const instance = kernel()
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })
