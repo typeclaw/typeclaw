@@ -13,10 +13,11 @@ const NUDGE_TEXT =
   '`gh api` does not accept `-R/--repo`; TypeClaw consumes it as the mint hint and ' +
   'strips it before running the command with the right token injected.'
 
-// The shell strips quotes/escapes, so we match the raw `gh ... graphql` substring
-// rather than parse — the nudge is advisory, so a loose match is acceptable and a
-// false positive only appends a hint to an unrelated failure. Captured through to
-// end of line so we can inspect the SAME invocation's flags (see REPO_FLAG).
+// Matched against the command the agent ran, not the tool output: a bash result
+// carries only the process output, so gh's "gh auth login" stderr never names the
+// graphql call that produced it. The nudge is advisory, so a loose substring match
+// is acceptable. Captured through to end of line so we can inspect the SAME
+// invocation's flags (see REPO_FLAG).
 const GRAPHQL_INVOCATION = /\bgh\b[^\n]*\bapi\b[^\n]*\bgraphql\b[^\n]*/
 
 // `-R foo`, `-R=foo`, `--repo foo`, `--repo=foo`. Word-boundary anchored so a
@@ -37,8 +38,12 @@ const AUTH_FAILURE_SIGNATURES = [
   'gh auth login',
 ]
 
-export function checkGraphqlAuthNudge(options: { tool: string; result: ToolResult }): void {
-  if (options.tool !== 'bash') return
+export function checkGraphqlAuthNudge(options: {
+  tool: string
+  command: string | undefined
+  result: ToolResult
+}): void {
+  if (options.tool !== 'bash' || options.command === undefined) return
 
   // Only meaningful when no usable process token exists. An operator token or a
   // runtime-seeded PAT means graphql already authenticates, so the advice would
@@ -47,7 +52,7 @@ export function checkGraphqlAuthNudge(options: { tool: string; result: ToolResul
   if (tokenClass !== 'none') return
 
   const text = collectText(options.result.content)
-  const invocation = GRAPHQL_INVOCATION.exec(text)
+  const invocation = GRAPHQL_INVOCATION.exec(options.command)
   if (invocation === null) return
   if (!AUTH_FAILURE_SIGNATURES.some((sig) => text.includes(sig))) return
   if (text.includes(GRAPHQL_AUTH_NUDGE_TAG)) return
