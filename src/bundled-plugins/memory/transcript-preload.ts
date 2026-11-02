@@ -15,6 +15,11 @@ const TRUNCATION_MARKER_BYTES = 128
 // covers tool schemas and the preload header; each model's output allowance is
 // reserved separately.
 export const PRELOAD_OVERHEAD_TOKENS = 8192
+// The header lines and <transcript> tags rendered around the slice. They sit in
+// the same user message as the slice, so the slice budget must leave room for
+// them; otherwise a line-granular slice that lands just under its budget
+// overflows the tightest window by the frame's size.
+export const PRELOAD_FRAME_BYTES = 512
 
 export type PreloadModelLimits = { contextWindow: number; outputTokens: number }
 
