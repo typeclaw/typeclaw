@@ -15,11 +15,15 @@ export const COMPACTION_TRIGGER_PERCENT = 0.8
 // ~800K (1M window) tokens of history that get re-shipped as `cacheRead` every
 // turn before compaction ever fires. Capping the trigger bounds that
 // steady-state re-read on big-window models; `min()` keeps the 80% behavior on
-// small ones. 64K is 3x keepRecent (invariant asserted in the test), leaving
-// growth room after a compaction so it does not retrigger immediately. Each
-// agent can set its own ceiling for its workload with
-// `compaction.maxTriggerTokens` in typeclaw.json; this value is the default.
-export const COMPACTION_ABSOLUTE_TRIGGER_TOKENS = 64_000
+// small ones. The ceiling was 64K and is now 200K: at 64K a long investigation
+// compacted every few turns (six times in forty minutes in one production
+// channel session), and each summary dropped the raw evidence later turns had
+// to reason over. Cached re-reads are cheap; losing the working set costs
+// correctness. 200K stays 10x keepRecent (the >=3x invariant is asserted in
+// the test), so a compaction never retriggers immediately. Each agent can set
+// its own ceiling for its workload with `compaction.maxTriggerTokens` in
+// typeclaw.json; this value is the default.
+export const COMPACTION_ABSOLUTE_TRIGGER_TOKENS = 200_000
 
 // Tokens to keep in the recent window after compaction. Fixed (not a
 // percentage) because "recent context" is a property of conversation shape, not

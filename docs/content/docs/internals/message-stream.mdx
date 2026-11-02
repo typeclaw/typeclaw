@@ -94,8 +94,8 @@ A confirmed block aborts the active SDK run because returning a tool error alone
 pi's `agent_settled` after its queued continuations and automatic compaction have
 finished. This shared boundary covers TUI, channel, cron, and subagent sessions.
 A cancellable next-tick task lets immediately disposed sessions skip the work.
-At 90% of `compactionTriggerTokens(model, maxTriggerTokens)` (normally 57,600 tokens against
-the default 64,000-token cap, or 90% of `compaction.maxTriggerTokens` when configured), it
+At 90% of `compactionTriggerTokens(model, maxTriggerTokens)` (normally 180,000 tokens against
+the default 200,000-token cap, or 90% of `compaction.maxTriggerTokens` when configured), it
 generates a summary during the idle gap. Disabling pi auto-compaction also disables idle warmup.
 
 Pi's live `session.compact()` rejects concurrent prompts, so warmup calls that
