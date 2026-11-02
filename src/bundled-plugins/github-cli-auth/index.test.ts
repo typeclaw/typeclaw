@@ -682,6 +682,35 @@ describe('github-cli-auth plugin', () => {
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
   })
 
+  test('App auth: a repo-less graphql that fails unauthenticated gets the -R repo hint', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('gh api graphql -f query=\'{repository(owner:"acme",name:"widgets"){id}}\'')
+    const result = {
+      content: [{ type: 'text' as const, text: 'To get started with GitHub CLI, please run:  gh auth login' }],
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content[0]?.text).toContain('gh api graphql -R owner/repo')
+  })
+
+  test('App auth: a graphql call with -R is minted and its output is left alone', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent("gh api graphql -R acme/widgets -f query='{viewer{login}}'")
+    const result = { content: [{ type: 'text' as const, text: 'gh: Resource not accessible by integration' }] }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+    expect(result.content[0]?.text).toBe('gh: Resource not accessible by integration')
+  })
+
   test('PAT: a non-gh command that merely contains "gh" falls through without the PAT', async () => {
     process.env.GH_TOKEN = 'github_pat_xyz'
     const hook = await hookFor(tokenResolver('ghs_minted'), false, { permissions: privilegedPermissions })

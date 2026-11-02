@@ -83,6 +83,9 @@ export default definePlugin({
     const hasAppTokenResolver = ctx.github.hasAppTokenResolver
     const trustedGitTransportEnv: NodeJS.ProcessEnv = { ...process.env }
     const reviewCredentials = new Map<string, GithubTokenCredential>()
+    // tool.after only sees the bash output, so the graphql nudge needs the command
+    // that ran; keyed by callId like gitAuthDiagnostics.
+    const passThroughGraphqlCommands = new Map<string, string>()
     const resolveGitAuthLogin = createGitAuthLoginResolver()
     const gitAuthDiagnostics = new Map<
       string,
@@ -436,6 +439,7 @@ export default definePlugin({
           const overlay = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
           event.args[TYPECLAW_INTERNAL_BASH_ENV] = { ...overlay, ...patOverlay }
         }
+        if (usesGhApiGraphqlEndpoint(command)) passThroughGraphqlCommands.set(event.callId, command)
         return 'fall-through'
       }
 
@@ -724,7 +728,9 @@ export default definePlugin({
           if (event.tool === 'bash' && gitAuth !== undefined) {
             await appendGitAuthDiagnostic({ result: event.result, ...gitAuth, resolveLogin: resolveGitAuthLogin })
           }
-          checkGraphqlAuthNudge({ tool: event.tool, result: event.result })
+          const graphqlCommand = passThroughGraphqlCommands.get(event.callId)
+          passThroughGraphqlCommands.delete(event.callId)
+          checkGraphqlAuthNudge({ tool: event.tool, command: graphqlCommand, result: event.result })
           const dismissal = pendingDismissals.get(event.callId)
           pendingDismissals.delete(event.callId)
           if (dismissal !== undefined) {
