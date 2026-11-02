@@ -171,6 +171,23 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(again.text.trim()).toBe('9')
   })
 
+  test('Promise.all over thunks fails instead of resolving to the functions', async () => {
+    const instance = kernel()
+    const seen: string[] = []
+    const recording = async ({ name }: { name: string }) => {
+      seen.push(name)
+      return 'ran'
+    }
+    const thunks = await instance.run('await Promise.all([() => tool.read({path:"x"})])', { dispatch: recording })
+    const promises = await instance.run('await parallel([tool.read({path:"y"})])', { dispatch: recording })
+    const valid = await instance.run('print((await Promise.all([tool.read({path:"z"})])).length)', {
+      dispatch: recording,
+    })
+    expect(thunks.isError).toBe(true)
+    expect(promises.isError).toBe(true)
+    expect(valid).toMatchObject({ isError: false, text: '1\n' })
+  })
+
   test('a top-level declaration cannot shadow eval helpers', async () => {
     const instance = kernel()
     const shadowing = await instance.run('const [old, tool] = [1, 2]', { dispatch })

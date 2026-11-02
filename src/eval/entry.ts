@@ -70,6 +70,12 @@ const tool = new Proxy<Record<string, (args: ToolArgs) => Promise<unknown>>>(
 )
 
 async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> {
+  const notThunk = thunks.findIndex((thunk) => typeof thunk !== 'function')
+  if (notThunk !== -1) {
+    throw new TypeError(
+      `parallel() takes functions, but item ${notThunk} is not one; wrap each call: parallel([() => tool.read({...})])`,
+    )
+  }
   let next = 0
   const values: T[] = []
   const failures: unknown[] = []
@@ -139,6 +145,30 @@ const helpers = {
   console: { log: print, info: print, warn: print, error: print, debug: print },
 }
 Object.assign(repl.context, helpers)
+
+// Passing parallel()-style thunks to Promise.all resolves to the functions
+// themselves, so the cell "succeeds" with no tool call made. Fail it instead.
+function rejectFunctionItems(promise: PromiseConstructor): void {
+  for (const name of ['all', 'allSettled', 'any', 'race'] as const) {
+    const original = promise[name] as (this: PromiseConstructor, values: unknown[]) => Promise<unknown>
+    Object.defineProperty(promise, name, {
+      configurable: true,
+      writable: true,
+      value(this: PromiseConstructor, values: Iterable<unknown>) {
+        const items = Array.from(values)
+        const index = items.findIndex((item) => typeof item === 'function')
+        if (index !== -1) {
+          return Promise.reject(
+            new TypeError(
+              `Promise.${name}() got a function at item ${index}; call it (tool.read({...})) or use parallel([() => ...])`,
+            ),
+          )
+        }
+        return original.call(this, items)
+      },
+    })
+  }
+}
 
 async function run(id: string, code: string): Promise<void> {
   if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
@@ -222,4 +252,10 @@ process.stdin.on('data', (chunk: Buffer) => {
   }
 })
 process.stdin.on('end', () => process.exit(0))
-send({ type: 'ready' })
+// Cells run in the REPL's own realm, whose Promise is reachable only from
+// inside it; patch that one before accepting the first cell.
+repl.eval('Promise\n', repl.context, 'eval-init', (error: Error | null, value: unknown) => {
+  if (error !== null && error !== undefined) throw error
+  rejectFunctionItems(value as PromiseConstructor)
+  send({ type: 'ready' })
+})
