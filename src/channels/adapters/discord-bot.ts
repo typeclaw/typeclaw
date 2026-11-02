@@ -1275,6 +1275,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       const hintedText = addDiscordMentionHints(verdict.payload.text, mentionUserMap(event.mentions), { botUserId })
       const replyMessageId = event.message_reference?.message_id
       const referenceResult = await enrichDiscordMessageReferences({
+        adapter: 'discord-bot',
         text: hintedText,
         ...(replyMessageId !== undefined
           ? { reply: { channelId: event.message_reference?.channel_id ?? event.channel_id, messageId: replyMessageId } }

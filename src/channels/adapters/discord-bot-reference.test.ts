@@ -27,6 +27,7 @@ describe('enrichDiscordMessageReferences', () => {
     )
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'actual reply',
       reply: { channelId: '111111111111111111', messageId: '222222222222222222' },
       fetchMessage: fetch,
@@ -50,6 +51,7 @@ describe('enrichDiscordMessageReferences', () => {
     }
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'actual reply',
       reply: { channelId: '111111111111111111', messageId: '222222222222222222' },
       fetchMessage: fetch,
@@ -67,6 +69,7 @@ describe('enrichDiscordMessageReferences', () => {
     )
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'see https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333',
       fetchMessage: fetch,
     })
@@ -90,6 +93,7 @@ describe('enrichDiscordMessageReferences', () => {
     )
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'links https://discordapp.com/channels/111111111111111111/222222222222222222/333333333333333333 https://canary.discord.com/channels/@me/444444444444444444/555555555555555555 https://ptb.discord.com/channels/111111111111111111/666666666666666666/777777777777777777',
       fetchMessage: fetch,
     })
@@ -115,6 +119,7 @@ describe('enrichDiscordMessageReferences', () => {
     )
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333 https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333 https://discord.com/channels/111111111111111111/444444444444444444/555555555555555555 https://discord.com/channels/111111111111111111/666666666666666666/777777777777777777',
       fetchMessage: fetch,
       linkLimit: 2,
@@ -134,6 +139,7 @@ describe('enrichDiscordMessageReferences', () => {
     const { fetch, calls } = fakeFetch(new Map())
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'not a message https://discord.com/developers/docs/resources/channel',
       fetchMessage: fetch,
     })
@@ -146,6 +152,7 @@ describe('enrichDiscordMessageReferences', () => {
     const { fetch } = fakeFetch(new Map([['222222222222222222:333333333333333333', null]]))
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'see https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333',
       fetchMessage: fetch,
     })
@@ -165,6 +172,7 @@ describe('enrichDiscordMessageReferences', () => {
     )
 
     const result = await enrichDiscordMessageReferences({
+      adapter: 'discord-bot',
       text: 'see https://discord.com/channels/111111111111111111/333333333333333333/444444444444444444',
       reply: { channelId: '111111111111111111', messageId: '222222222222222222' },
       fetchMessage: fetch,

@@ -182,6 +182,100 @@ describe('createDiscordAdapter', () => {
     expect(r.unregistered).toContain('remove-reaction:discord')
   })
 
+  test('a reply carries the inline parent message as reference context without refetching it', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const fetched: string[] = []
+    const adapter = createDiscordAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        fakeClient({
+          getMessage: async (_channelId: string, messageId: string) => {
+            fetched.push(messageId)
+            throw new Error('unexpected fetch')
+          },
+        }),
+      createListener: () => listener as unknown as DiscordListener,
+    })
+
+    await adapter.start()
+    listener.emit('message_create', {
+      type: 'MESSAGE_CREATE',
+      id: '400000000000000004',
+      channel_id: '300000000000000003',
+      guild_id: '200000000000000002',
+      author: { id: '500000000000000005', username: 'alice' },
+      content: '6.1이 더 낫지 않니',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      mentions: [{ id: '100000000000000001', username: 'self' }],
+      message_reference: { message_id: '400000000000000001', channel_id: '300000000000000003' },
+      referenced_message: {
+        id: '400000000000000001',
+        content: '5.6 Sol을 말씀드린 거예요',
+        author: { id: '100000000000000001', username: 'self', global_name: 'Self' },
+      },
+    } as unknown as DiscordGatewayMessageCreateEvent)
+    await adapter.stop()
+
+    expect(r.routed[0]?.text).toBe('6.1이 더 낫지 않니')
+    expect(r.routed[0]?.replyToBotMessageId).toBe('400000000000000001')
+    expect(r.routed[0]?.referenceContext).toEqual({
+      kind: 'reply',
+      sources: [
+        { adapter: 'discord', authorId: '100000000000000001', authorName: 'Self', text: '5.6 Sol을 말씀드린 거예요' },
+      ],
+    })
+    expect(fetched).toEqual([])
+  })
+
+  test('a reply without an inline parent fetches it for reference context', async () => {
+    const r = router()
+    const listener = new FakeListener()
+    const fetched: Array<[string, string]> = []
+    const adapter = createDiscordAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () =>
+        fakeClient({
+          getMessage: async (channelId: string, messageId: string) => {
+            fetched.push([channelId, messageId])
+            return {
+              id: messageId,
+              channel_id: channelId,
+              content: 'earlier question',
+              author: { id: '600000000000000006', username: 'bob' },
+              timestamp: '2026-01-01T00:00:00.000Z',
+            }
+          },
+        }),
+      createListener: () => listener as unknown as DiscordListener,
+    })
+
+    await adapter.start()
+    listener.emit('message_create', {
+      type: 'MESSAGE_CREATE',
+      id: '400000000000000004',
+      channel_id: '300000000000000003',
+      guild_id: '200000000000000002',
+      author: { id: '500000000000000005', username: 'alice' },
+      content: 'typeclaw what about this?',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      message_reference: { message_id: '400000000000000002', channel_id: '300000000000000003' },
+    } as unknown as DiscordGatewayMessageCreateEvent)
+    await adapter.stop()
+
+    expect(fetched).toEqual([['300000000000000003', '400000000000000002']])
+    expect(r.routed[0]?.referenceContext).toEqual({
+      kind: 'reply',
+      sources: [{ adapter: 'discord', authorId: '600000000000000006', authorName: 'bob', text: 'earlier question' }],
+    })
+  })
+
   test('captures Discord thread parent id and name before routing', async () => {
     const r = router()
     const listener = new FakeListener()

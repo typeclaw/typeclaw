@@ -40,11 +40,13 @@ import type { DiscordAccountRecord } from '@/secrets/schema'
 
 import { describeError } from '../describe-error'
 import { createDiscordAuthorResolver } from './discord-author-resolver'
+import { enrichDiscordMessageReferences, type DiscordResolvedReference } from './discord-bot-reference'
 import { createDiscordChannelResolver } from './discord-channel-resolver'
 import {
   classifyInbound,
   type DiscordAttachmentCarrier,
   type InboundDropReason,
+  type RawDiscordMessageCreateEvent,
   splitDiscordAttachments,
 } from './discord-classify'
 import { createDiscordUserEditMessageCallback } from './discord-edit'
@@ -356,8 +358,24 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
         mimetype: file.content_type,
       }))
       const room = verdict.payload.isDm ? undefined : await channelResolver.resolveRoom(verdict.payload.chat)
+      const raw = event as RawDiscordMessageCreateEvent
+      const replyMessageId = raw.message_reference?.message_id
+      const { referenceContext } = await enrichDiscordMessageReferences({
+        adapter: 'discord',
+        text: verdict.payload.text,
+        ...(replyMessageId !== undefined
+          ? { reply: { channelId: raw.message_reference?.channel_id ?? event.channel_id, messageId: replyMessageId } }
+          : {}),
+        // Reply gateway events already carry the parent inline; only links and
+        // replies Discord did not expand (deleted/inaccessible parents) cost a fetch.
+        fetchMessage: async (channelId, messageId) =>
+          raw.referenced_message?.id === messageId
+            ? toResolvedReference(raw.referenced_message)
+            : toResolvedReference(await client.getMessage(channelId, messageId)),
+      })
       const payload = {
         ...verdict.payload,
+        ...(referenceContext !== undefined ? { referenceContext } : {}),
         authorName: await authorResolver.resolve(verdict.payload.authorId),
         ...(room !== undefined ? { room } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
@@ -578,6 +596,17 @@ function mapDiscordHistoryMessage(msg: DiscordMessage): ChannelHistoryMessage {
 function parseDiscordTimestamp(timestamp: string): number {
   const millis = Date.parse(timestamp)
   return Number.isFinite(millis) ? millis : 0
+}
+
+function toResolvedReference(message: {
+  content: string
+  author: { id: string; username: string; global_name?: string | null }
+}): DiscordResolvedReference {
+  return {
+    authorId: message.author.id,
+    authorName: message.author.global_name ?? message.author.username,
+    text: message.content,
+  }
 }
 
 const DISCORD_ATTACHMENT_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net'])
