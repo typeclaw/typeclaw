@@ -5,6 +5,7 @@ export const EVAL_LIMITS = {
   frameBytes: 1024 * 1024,
   outputBytes: 64 * 1024,
   outputLines: 1000,
+  outputWarnBytes: 16 * 1024,
   timeoutMs: 30_000,
   maxTimeoutMs: 60_000,
   idleMs: 5 * 60_000,
@@ -58,6 +59,8 @@ export class FrameLines {
   }
 }
 
+const FILTER_ADVICE = 'filter in the cell and print only what you need'
+
 export class CellOutput {
   private text = ''
   private bytes = 0
@@ -79,6 +82,12 @@ export class CellOutput {
   }
 
   render(): string {
-    return this.text + (this.truncated ? '\n[eval output truncated: byte or line limit reached]\n' : '')
+    // Everything printed lands in the model's context; past the warning size
+    // the cell is no longer saving tokens over a direct tool call.
+    if (this.truncated) return `${this.text}\n[eval output truncated: limit reached; ${FILTER_ADVICE}]\n`
+    if (this.bytes > EVAL_LIMITS.outputWarnBytes) {
+      return `${this.text}\n[eval printed ${Math.round(this.bytes / 1024)} KB; ${FILTER_ADVICE}]\n`
+    }
+    return this.text
   }
 }

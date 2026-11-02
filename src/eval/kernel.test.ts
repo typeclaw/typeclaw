@@ -209,6 +209,25 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(after).toMatchObject({ isError: false, text: '1 function\n' })
   })
 
+  test('output past the warning size gets a trailing notice; smaller output does not', async () => {
+    const instance = kernel()
+    const small = await instance.run('print("x".repeat(100))', { dispatch })
+    const large = await instance.run(`print("x".repeat(${EVAL_LIMITS.outputWarnBytes + 1}))`, { dispatch })
+    expect(small.text).toBe('x'.repeat(100) + '\n')
+    expect(large.truncated).toBe(false)
+    expect(large.text.startsWith('x'.repeat(EVAL_LIMITS.outputWarnBytes + 1) + '\n')).toBe(true)
+    expect(large.text.trimEnd().split('\n').at(-1)).toStartWith('[eval printed')
+  })
+
+  test('text() caps at 2000 chars by default', async () => {
+    const instance = kernel()
+    const result = await instance.run('print(text(await tool.read({path:"x"})).length)', {
+      dispatch: async () => ({ content: [{ type: 'text', text: 'y'.repeat(5000) }] }),
+    })
+    expect(result.isError).toBe(false)
+    expect(Number(result.text.trim())).toBeLessThan(2100)
+  })
+
   test('idle expiry discards bindings before the next cell', async () => {
     const instance = kernel()
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })

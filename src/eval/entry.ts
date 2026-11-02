@@ -102,7 +102,7 @@ async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> 
 
 // Printing a whole tool result dumps its content array and details into the
 // transcript, defeating the point of a cell. text() pulls just the text parts.
-function text(result: unknown, maxChars = 4000): string {
+function text(result: unknown, maxChars = 2000): string {
   const content = (result as { content?: unknown } | null)?.content
   const joined = Array.isArray(content)
     ? content
