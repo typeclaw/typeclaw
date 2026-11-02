@@ -14,6 +14,7 @@ export type DiscordMessagePointer = {
 }
 
 export async function enrichDiscordMessageReferences(args: {
+  adapter: 'discord' | 'discord-bot'
   text: string
   reply?: DiscordMessagePointer
   fetchMessage: DiscordReferenceFetch
@@ -25,7 +26,7 @@ export async function enrichDiscordMessageReferences(args: {
   if (args.reply !== undefined) {
     const parent = await fetchSafely(args.fetchMessage, args.reply)
     if (parent !== null) {
-      sources.push(toSource(parent))
+      sources.push(toSource(args.adapter, parent))
       hasReply = true
     }
   }
@@ -33,7 +34,7 @@ export async function enrichDiscordMessageReferences(args: {
   const links = extractDiscordMessageLinks(args.text).slice(0, args.linkLimit ?? 3)
   for (const link of links) {
     const message = await fetchSafely(args.fetchMessage, link)
-    if (message !== null) sources.push(toSource(message))
+    if (message !== null) sources.push(toSource(args.adapter, message))
   }
 
   if (sources.length === 0) return { text: args.text }
@@ -68,9 +69,9 @@ async function fetchSafely(
   }
 }
 
-function toSource(message: DiscordResolvedReference): QuoteAnchorSource {
+function toSource(adapter: 'discord' | 'discord-bot', message: DiscordResolvedReference): QuoteAnchorSource {
   return {
-    adapter: 'discord-bot',
+    adapter,
     authorId: message.authorId,
     authorName: message.authorName,
     text: message.text,
