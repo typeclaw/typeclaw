@@ -115,6 +115,14 @@ The `session.turn.start` hook renders memory into `event.retrievalContext.result
 
 For the vector store, embedder, and parent-child hybrid-search internals, see the [memory README](https://github.com/typeclaw/typeclaw/blob/main/src/bundled-plugins/memory/README.md).
 
+### Vector relevance bands
+
+Only eligible **topic** rows define the query-local topic gate: the top score must clear the non-head median by `0.06` (`0.04` for a cross-script head), then the half-contrast knee selects topic neighbours. Fewer than ten topic rows keep the existing ungated behavior. Reference chunks never influence that verdict, its script selection, or the stream baseline.
+
+Streams still need individual `0.06` contrast against the adaptive, head-trimmed topic baseline; fewer than two topic rows provide no baseline and admit no semantic-only streams. References must individually clear **both** that topic baseline and the same adaptive baseline computed over reference-chunk scores, using the strict `0.06` margin. This rejects a flat, elevated cluster of verbatim artifacts that otherwise acts as a semantic hub on content-free turns. A single reference chunk has no reference-side baseline and uses the topic baseline alone. With fewer than two topics, references instead retain their own floor-gated verdict, preserving tiny reference-only indexes. Multiple genuinely related reference chunks can also compress this contrast; the independent keyword lane remains available rather than weakening the no-match guard.
+
+Every vector verdict leaves genuine keyword hits intact. The policy adds no language-specific query blacklist, model calls, or stored-vector migration.
+
 ## Provenance-aware lexical recall and scoping
 
 `ProvenanceIndex` (`provenance-index.ts`) is rebuilt from the authoritative `readAllStreamDays` stream view plus each shard's canonical active `fragments:` citations. It is a child-posting index: a topic's searchable origin text, scope eligibility, and returned provenance all come from the same resolved active cited children. `superseded:` children never participate. A citation whose stream event is unavailable remains an explicit `{ citation, resolved: false }` result; the runtime never fabricates an origin for it.

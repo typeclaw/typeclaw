@@ -830,6 +830,84 @@ describe('hybridSearch keyword lane', () => {
 })
 
 describe('hybridSearch relevance gate', () => {
+  it.each(['topic', 'reference'] as const)(
+    'does not inject %s rows for 뭔소리야 when reference chunks inflate the topic contrast',
+    async (source) => {
+      const { agentDir, store } = createFixture()
+      try {
+        seedReferenceHub(agentDir, store)
+
+        const results = await hybridSearch('뭔소리야', store, agentDir, 10, embedFrom({ 0: 1 }))
+
+        expect(results.filter((result) => result.source === source)).toEqual([])
+      } finally {
+        store.close()
+      }
+    },
+  )
+
+  it('keeps a semantic reference match above both bands when no topic matches', async () => {
+    const { agentDir, store } = createFixture()
+    try {
+      seedReferenceHub(agentDir, store)
+      writeReference(agentDir, 'deployment-guide', 'Deployment guide', 'A specific release procedure.')
+      store.upsert(row('reference:deployment-guide#0', 'deployment-guide', bandedVector(0.92), 'reference'))
+
+      const results = await hybridSearch('배포 절차', store, agentDir, 10, embedFrom({ 0: 1 }))
+
+      expect(results.map((result) => result.key)).toEqual(['deployment-guide'])
+    } finally {
+      store.close()
+    }
+  })
+
+  it('keeps a keyword reference hit when its vector chunks are suppressed', async () => {
+    const { agentDir, store } = createFixture()
+    try {
+      seedReferenceHub(agentDir, store)
+
+      const results = await hybridSearch('보관 문서', store, agentDir, 10, embedFrom({ 0: 1 }))
+
+      expect(results.map((result) => result.key)).toEqual(['archive'])
+      expect(results[0]?.rrfScore).toBeCloseTo(1 / 61, 10)
+    } finally {
+      store.close()
+    }
+  })
+
+  it('admits a sole reference against the topic band without requiring reference siblings', async () => {
+    const { agentDir, store } = createFixture()
+    try {
+      for (let i = 0; i < 30; i++) {
+        writeTopic(agentDir, `band-${i}`, `Band ${i}`, 'Unrelated note.')
+        store.upsert(row(`topic:band-${i}`, `band-${i}`, bandedVector(0.7)))
+      }
+      writeReference(agentDir, 'deployment-guide', 'Deployment guide', 'A specific release procedure.')
+      store.upsert(row('reference:deployment-guide#0', 'deployment-guide', bandedVector(0.9), 'reference'))
+
+      const results = await hybridSearch('배포 절차', store, agentDir, 10, embedFrom({ 0: 1 }))
+
+      expect(results.map((result) => result.key)).toEqual(['deployment-guide'])
+    } finally {
+      store.close()
+    }
+  })
+
+  it('preserves semantic retrieval in a tiny reference-only index', async () => {
+    const { agentDir, store } = createFixture()
+    try {
+      writeReference(agentDir, 'deployment-guide', 'Deployment guide', 'A specific release procedure.')
+      store.upsert(row('reference:deployment-guide#0', 'deployment-guide', bandedVector(0.78), 'reference'))
+      store.upsert(row('reference:deployment-guide#1', 'deployment-guide', bandedVector(0.77), 'reference'))
+
+      const results = await hybridSearch('배포 절차', store, agentDir, 10, embedFrom({ 0: 1 }))
+
+      expect(results.map((result) => result.key)).toEqual(['deployment-guide'])
+    } finally {
+      store.close()
+    }
+  })
+
   it('computes the relevance baseline only from authorized candidates', async () => {
     const { agentDir, store } = createFixture()
     try {
@@ -1254,6 +1332,22 @@ function createFixture(): { agentDir: string; store: VectorStore } {
   mkdirSync(join(agentDir, 'memory', 'references'), { recursive: true })
   const store = VectorStore.open(join(agentDir, 'memory', '.vectors', 'index.db'))
   return { agentDir, store }
+}
+
+function seedReferenceHub(agentDir: string, store: VectorStore): void {
+  for (let i = 0; i < 30; i++) {
+    writeTopic(agentDir, `band-${i}`, `기록 ${i}`, 'Unrelated note.')
+    store.upsert(row(`topic:band-${i}`, `band-${i}`, bandedVector(0.7 + (i % 3) * 0.001)))
+  }
+  writeTopic(agentDir, 'nearby', '주변 기록', 'An unrelated nearest neighbour.')
+  store.upsert(row('topic:nearby', 'nearby', bandedVector(0.75)))
+  writeReference(agentDir, 'archive', '보관 문서', 'An archived payload.')
+  // Several chunks from one verbatim artifact form an elevated, flat cluster.
+  // The pooled gate lets that cluster carry the unrelated nearby topic over its
+  // knee, even though the topics alone have no match.
+  for (let i = 0; i < 6; i++) {
+    store.upsert(row(`reference:archive#${i}`, 'archive', bandedVector(0.78 - i * 0.001), 'reference'))
+  }
 }
 
 function writeTopic(agentDir: string, slug: string, heading: string, body: string): void {

@@ -136,11 +136,9 @@ export async function hybridSearch(
   return fuseLanes(vectorRows, keywordMatches, index, parentSlugsByFragmentId).slice(0, topK)
 }
 
-// The vector lane, gated by per-query relevance. Both row kinds are judged
-// against ONE query-local no-match band, derived from the TOPIC score
-// distribution alone (topics are the only stable-enough corpus to estimate the
-// ambient band; sparse streams consume the band but never define it, so a
-// nearest-neighbour cluster of fragments can't move the bar).
+// Only topics define the topic gate and the stream admission band. Reference
+// chunks can form an elevated, flat cluster even on a content-free query;
+// pooling that cluster with topics would let it admit unrelated topic neighbours.
 //
 //   - Topic rows: the gate keeps the knee above the band, or empties the topic
 //     partition entirely when no topic clears it.
@@ -148,16 +146,17 @@ export async function hybridSearch(
 //     the shared margin. A genuine fresh fragment (well above the band) survives
 //     the freshness window; an irrelevant in-band neighbour is dropped, so a
 //     no-match query can't leak closest-neighbours-regardless through streams.
+//   - Reference rows: must clear both the topic band and the reference chunk
+//     band by the strict margin. A uniformly elevated reference cluster is not
+//     evidence of a match, even when it stands above the topic band. Unlike
+//     gateRelevance, this admission check has no small-reference-set exemption.
 //
 // Topic suppression uses the floor-gated verdict (gateRelevance): below the
 // floor topics pass ungated, since a tiny index can't form a reliable band and
-// a false negative is cheaper than suppressing the only memory. Stream
-// admission uses streamAdmissionBaseline, which tolerates a below-floor topic
-// set — even a few topics give the contrast a vector-only fragment match needs,
-// and it returns null (dropping uncorroborated streams) only when NO topics
-// exist at all. A lexically-corroborated fragment still reaches RRF via the
-// separate keyword lane. An empty merged lane composes with RRF exactly like a
-// lane that found nothing, so a genuine keyword hit survives a full no-match.
+// a false negative is cheaper than suppressing the only memory. With fewer
+// than two topics there is no topic admission baseline: streams remain closed,
+// while references use their own floor-gated verdict so a tiny reference-only
+// index is not hidden. Keyword hits remain independent of every vector verdict.
 function gatedVectorLane(
   queryEmbeddings: Float32Array[],
   queryChunks: string[],
@@ -169,7 +168,8 @@ function gatedVectorLane(
   const allScored = maxScoreAcrossChunks(queryEmbeddings, store)
   const scored = allScored.scored.filter(({ row }) => vectorRowIsAuthorized(row, index, parentSlugsByFragmentId))
   const { winnerChunkByRowId } = allScored
-  const bandDefiningRows = scored.filter(({ row }) => row.source === 'topic' || row.source === 'reference')
+  const bandDefiningRows = scored.filter(({ row }) => row.source === 'topic')
+  const referenceRows = scored.filter(({ row }) => row.source === 'reference')
   const streamRows = scored.filter(({ row }) => row.source === 'stream')
 
   // The cross-script verdict is judged against the HEAD of the scored band — the
@@ -199,7 +199,18 @@ function gatedVectorLane(
   const streamBaseline = streamAdmissionBaseline(bandScores)
   const keptStreams = streamRows.filter(({ score }) => clearsBaseline(score, streamBaseline)).slice(0, topK * 2)
 
-  return [...keptBandDefiningRows, ...keptStreams].sort((a, b) => b.score - a.score).map(({ row }) => row)
+  const referenceScores = referenceRows.map(({ score }) => score)
+  const referenceBaseline = streamAdmissionBaseline(referenceScores)
+  const keptReferences =
+    streamBaseline === null
+      ? referenceRows.slice(0, gateRelevance(referenceScores, topK * 2))
+      : referenceRows
+          .filter(({ score }) => clearsBaseline(score, Math.max(streamBaseline, referenceBaseline ?? streamBaseline)))
+          .slice(0, topK * 2)
+
+  return [...keptBandDefiningRows, ...keptStreams, ...keptReferences]
+    .sort((a, b) => b.score - a.score)
+    .map(({ row }) => row)
 }
 
 function vectorRowIsAuthorized(
