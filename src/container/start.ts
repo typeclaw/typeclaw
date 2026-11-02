@@ -127,6 +127,7 @@ export type StartPlan = {
   hostPort: number
   tuiToken: string | null
   memoryLimitBytes: number
+  mountWarnings: string[]
 }
 
 export type PlanStartOptions = {
@@ -659,6 +660,11 @@ async function runStart({
       hostIdentity,
       totalMemoryBytes,
     })
+
+    for (const warning of plan.mountWarnings) {
+      if (onWarning !== undefined) onWarning(warning)
+      else if (streamOutput) process.stderr.write(`typeclaw: warning: ${warning}\n`)
+    }
 
     if (!skipMemoryOversubscriptionCheck) {
       await warnOnMemoryOversubscription({
@@ -1222,6 +1228,7 @@ export async function planStart({
     runArgs.push(...dockerBindMount({ src: devSourcePath, dst: DEV_SOURCE_CONTAINER_PATH, readonly: true }))
   }
 
+  const mountWarnings: string[] = []
   for (const mount of mounts) {
     const hostPath = expandMountPath(mount.path, cwd)
     const target = `${MOUNT_TARGET_PREFIX}/${mount.name}`
@@ -1251,6 +1258,7 @@ export async function planStart({
     hostPort,
     tuiToken,
     memoryLimitBytes: memoryLimit.bytes,
+    mountWarnings,
   }
 }
 

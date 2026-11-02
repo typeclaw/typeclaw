@@ -197,6 +197,7 @@ function startOk(opts: StartOptions): Extract<StartResult, { ok: true }> {
       hostPort: opts.preferredHostPort,
       tuiToken: 'fake-tui-token',
       memoryLimitBytes: 6442450944,
+      mountWarnings: [],
     },
     containerId: 'container-id',
     built: false,

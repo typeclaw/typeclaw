@@ -2284,6 +2284,7 @@ describe('defaultRunHatching', () => {
           hostPort: 19173,
           tuiToken: 'fake-tui-token',
           memoryLimitBytes: 6442450944,
+          mountWarnings: [],
         },
         containerId: 'fake-id',
         built: false,

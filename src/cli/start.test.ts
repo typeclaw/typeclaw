@@ -76,6 +76,7 @@ function successfulStart(dockerfileWarnings: string[]): Extract<StartResult, { o
       hostPort: 8973,
       tuiToken: null,
       memoryLimitBytes: 6442450944,
+      mountWarnings: [],
     },
     containerId: 'container-id',
     built: false,
