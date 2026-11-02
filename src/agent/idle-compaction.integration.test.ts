@@ -9,6 +9,7 @@ import FakeTimers from '@sinonjs/fake-timers'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 
 import { invalidateProviderAuthCache } from './auth'
+import { COMPACTION_ABSOLUTE_TRIGGER_TOKENS } from './compaction'
 import { createSessionWithDispose } from './index'
 
 const previousCwd = process.cwd()
@@ -55,7 +56,8 @@ test('session creation wires idle compaction through the real provider request p
   globalThis.fetch = Object.assign(
     async () => {
       requests++
-      const tokens = requests === 1 ? 60_000 : 100
+      // Past the 90% idle-warmup threshold, still under the trigger itself.
+      const tokens = requests === 1 ? Math.round(COMPACTION_ABSOLUTE_TRIGGER_TOKENS * 0.94) : 100
       const events = [
         [
           'message_start',

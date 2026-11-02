@@ -50,8 +50,8 @@ describe('compactionTriggerTokens', () => {
   })
 
   test('large windows cap the trigger at the absolute budget instead of 80%', () => {
-    // given: 80% of 256K (204_800) is well above the absolute cap
-    const model = fakeModel(256_000)
+    // given: 80% of 1.05M (840_000) is well above the absolute cap
+    const model = fakeModel(1_050_000)
 
     // when
     const trigger = compactionTriggerTokens(model)
@@ -86,14 +86,14 @@ describe('compactionTriggerTokens', () => {
 describe('reserveTokensForModel', () => {
   test('derives reserve as window minus the (capped) trigger', () => {
     // given
-    const model = fakeModel(256_000)
+    const model = fakeModel(1_050_000)
 
     // when
     const reserve = reserveTokensForModel(model)
 
-    // then: 256K - 64K cap = 192K reserved, so compaction fires at 64K not 80%
-    expect(reserve).toBe(256_000 - COMPACTION_ABSOLUTE_TRIGGER_TOKENS)
-    expect(reserve).toBe(192_000)
+    // then: 1.05M - 200K cap = 850K reserved, so compaction fires at 200K not 80%
+    expect(reserve).toBe(1_050_000 - COMPACTION_ABSOLUTE_TRIGGER_TOKENS)
+    expect(reserve).toBe(850_000)
   })
 
   test('clamps to at least 1 so a degenerate zero-window model never produces a non-positive reserve', () => {
@@ -337,10 +337,10 @@ describe('compaction request thinking', () => {
     }
 
     const defaultReserve = await reserveFor({})
-    const configuredReserve = await reserveFor({ compaction: { maxTriggerTokens: 160_000 } })
+    const configuredReserve = await reserveFor({ compaction: { maxTriggerTokens: 300_000 } })
 
     expect(defaultReserve).toBe(window - Math.min(Math.round(window * 0.8), COMPACTION_ABSOLUTE_TRIGGER_TOKENS))
-    expect(configuredReserve).toBe(window - Math.min(Math.round(window * 0.8), 160_000))
+    expect(configuredReserve).toBe(window - Math.min(Math.round(window * 0.8), 300_000))
     expect(configuredReserve).toBeLessThan(defaultReserve)
   })
 })

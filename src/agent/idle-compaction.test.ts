@@ -11,16 +11,20 @@ import FakeTimers from '@sinonjs/fake-timers'
 
 import { resolveModel } from '@/config'
 
-import { createCompactionSettingsManager } from './compaction'
+import { compactionTriggerTokens, createCompactionSettingsManager } from './compaction'
 import { attachIdleCompaction } from './idle-compaction'
 
 const model = resolveModel('anthropic/claude-sonnet-5')
+// Above the 90% warmup threshold but below the trigger itself, so pi's own
+// threshold compaction stays out of the way and only idle warmup can act.
+const NEAR_TRIGGER_TOKENS = Math.round(compactionTriggerTokens(model) * 0.94)
+const BELOW_WARMUP_TOKENS = Math.round(compactionTriggerTokens(model) * 0.6)
 const cleanups: (() => void)[] = []
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup()
 })
 
-function response(text: string, tokens = 60_000): AssistantMessage {
+function response(text: string, tokens = NEAR_TRIGGER_TOKENS): AssistantMessage {
   return {
     role: 'assistant',
     api: model.api,
@@ -40,7 +44,7 @@ function response(text: string, tokens = 60_000): AssistantMessage {
   }
 }
 
-async function fixture(tokens = 60_000) {
+async function fixture(tokens = NEAR_TRIGGER_TOKENS) {
   const manager = SessionManager.inMemory()
   for (let i = 0; i < 8; i++) {
     manager.appendMessage({ role: 'user', content: 'history '.repeat(2_500), timestamp: i * 2 })
@@ -167,7 +171,7 @@ describe('idle compaction', () => {
   })
 
   test('does not schedule below the warmup threshold', async () => {
-    const f = await fixture(40_000)
+    const f = await fixture(BELOW_WARMUP_TOKENS)
 
     await f.session.prompt('small turn')
 
@@ -228,7 +232,7 @@ describe('idle compaction', () => {
   })
 
   test('the next turn does not compact again using stale pre-compaction usage', async () => {
-    const f = await fixture(58_000)
+    const f = await fixture(Math.round(compactionTriggerTokens(model) * 0.91))
     await f.session.prompt('first turn')
     await f.runWarmup()
     const summaries = f.summaryCalls()

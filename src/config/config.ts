@@ -903,7 +903,7 @@ export const configSchema = z
     branding: z.boolean().default(true),
     // Auto-compaction budget. `maxTriggerTokens` sets the agent's own ceiling
     // on the compaction trigger, so each agent can trade per-turn re-read cost
-    // against working room for its workload; omitted, the 64K default in
+    // against working room for its workload; omitted, the 200K default in
     // src/agent/compaction.ts applies. The 80% window-relative trigger still
     // applies. The floor is 3x the 20K recent window that compaction keeps, so
     // a compaction cannot immediately retrigger. Read per session, so a reload

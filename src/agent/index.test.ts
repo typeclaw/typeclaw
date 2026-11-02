@@ -20,6 +20,7 @@ import { emptyRegistry } from '@/plugin/registry'
 import { createStream } from '@/stream'
 
 import { invalidateProviderAuthCache } from './auth'
+import { COMPACTION_ABSOLUTE_TRIGGER_TOKENS } from './compaction'
 import {
   buildChannelTools,
   buildSubagentOrchestrationTools,
@@ -2022,7 +2023,7 @@ describe('local context-preparation failures', () => {
   }
 
   // Above pi's 20K keep-recent window, so there is history to summarize, but
-  // below TypeClaw's 64K compaction trigger.
+  // below TypeClaw's 200K compaction trigger.
   const compactableBelowTrigger = (sessionManager: SessionManager) => seedHistory(sessionManager, 6, 10_000)
 
   test('a local failure whose text reads as a provider overflow neither compacts nor replays the session', async () => {
@@ -2082,7 +2083,9 @@ describe('local context-preparation failures', () => {
 
   test('history over the compaction trigger still compacts on threshold after a non-overflow error', async () => {
     const run = await runTwoPrompts(
-      (sessionManager) => seedHistory(sessionManager, 6, 24_000),
+      // ~4 chars per token: 12 messages of this size estimate to ~1.2x the trigger.
+      (sessionManager) =>
+        seedHistory(sessionManager, 6, Math.ceil((COMPACTION_ABSOLUTE_TRIGGER_TOKENS * 4 * 1.2) / 12)),
       'placeholder bad request',
     )
 
