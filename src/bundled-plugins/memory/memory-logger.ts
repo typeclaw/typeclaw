@@ -16,6 +16,7 @@ import { createStoreReferenceTool, type ReferenceStoredHook } from './references
 import { readEvents } from './stream-io'
 import {
   buildTranscriptPreload,
+  PRELOAD_FRAME_BYTES,
   preloadBudgetBytes,
   type PreloadModelLimits,
   type TranscriptPreload,
@@ -403,7 +404,9 @@ export function createMemoryLoggerSubagent(
           return null
         }
         const promptBytes =
-          Buffer.byteLength(MEMORY_LOGGER_SYSTEM_PROMPT, 'utf8') + Buffer.byteLength(basePrompt, 'utf8')
+          Buffer.byteLength(MEMORY_LOGGER_SYSTEM_PROMPT, 'utf8') +
+          Buffer.byteLength(basePrompt, 'utf8') +
+          PRELOAD_FRAME_BYTES
         const maxBytes = preloadBudgetBytes(models, promptBytes)
         return maxBytes === null ? null : buildTranscriptPreload(path, mark, { maxBytes })
       }
