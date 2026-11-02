@@ -236,6 +236,7 @@ function successfulStart() {
       hostPort: 8973,
       tuiToken: null,
       memoryLimitBytes: 6 * 1024 * 1024 * 1024,
+      mountWarnings: [],
     },
     containerId: 'a'.repeat(64),
     built: false,

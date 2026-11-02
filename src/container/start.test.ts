@@ -817,6 +817,73 @@ describe('planStart mounts', () => {
     }
   })
 
+  test('skips a mount whose leftover target is a file while the source is a directory, and warns', async () => {
+    const messagesDir = await mkdtemp(join(tmpdir(), 'typeclaw-mount-target-'))
+    const notesDir = await mkdtemp(join(tmpdir(), 'typeclaw-mount-target-'))
+    try {
+      // given: an earlier file mount left an empty placeholder file at the target
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      await mkdir(join(root, 'mounts'), { recursive: true })
+      await writeFile(join(root, 'mounts', 'messages-db'), '')
+      await writeTypeclawConfig(root, {
+        mounts: [
+          { name: 'messages-db', path: messagesDir, readOnly: true },
+          { name: 'notes', path: notesDir },
+        ],
+      })
+
+      // when
+      const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+      // then: only the conflicting mount is dropped, the file is left alone
+      const userMounts = bindMounts(plan.runArgs).filter((m) => m.dst.startsWith('/agent/mounts/'))
+      expect(userMounts).toEqual([{ src: notesDir, dst: '/agent/mounts/notes', readonly: false }])
+      expect(plan.mountWarnings).toHaveLength(1)
+      expect(plan.mountWarnings[0]).toContain('"messages-db"')
+      expect(existsSync(join(root, 'mounts', 'messages-db'))).toBe(true)
+    } finally {
+      await rm(messagesDir, { recursive: true, force: true })
+      await rm(notesDir, { recursive: true, force: true })
+    }
+  })
+
+  test('skips a mount whose leftover target is a directory while the source is a file', async () => {
+    const sourceDir = await mkdtemp(join(tmpdir(), 'typeclaw-mount-target-'))
+    try {
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      const sourceFile = join(sourceDir, 'chat.db')
+      await writeFile(sourceFile, 'db')
+      await mkdir(join(root, 'mounts', 'chat'), { recursive: true })
+      await writeTypeclawConfig(root, { mounts: [{ name: 'chat', path: sourceFile, readOnly: true }] })
+
+      const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+      expect(bindMounts(plan.runArgs).filter((m) => m.dst.startsWith('/agent/mounts/'))).toHaveLength(0)
+      expect(plan.mountWarnings).toHaveLength(1)
+    } finally {
+      await rm(sourceDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps a mount whose existing target matches the source kind', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'typeclaw-mount-target-'))
+    try {
+      await writeDockerfile(root)
+      await writePackageJson(root, { typeclaw: '^0.1.0' })
+      await mkdir(join(root, 'mounts', 'projects'), { recursive: true })
+      await writeTypeclawConfig(root, { mounts: [{ name: 'projects', path: projectDir }] })
+
+      const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+      expect(hasBindMount(plan.runArgs, { src: projectDir, dst: '/agent/mounts/projects', readonly: false })).toBe(true)
+      expect(plan.mountWarnings).toEqual([])
+    } finally {
+      await rm(projectDir, { recursive: true, force: true })
+    }
+  })
+
   test('adds host font mounts only when hostFonts is true', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
@@ -4947,6 +5014,47 @@ describe('start (composition)', () => {
       expect(stderrWrites.some((text) => text.includes('no new snapshot was captured'))).toBe(false)
     } finally {
       write.mockRestore()
+    }
+  })
+
+  test('routes a skipped-mount warning to onWarning on the streaming CLI default', async () => {
+    // given: a leftover file target for a directory mount, streamOutput at its
+    // default, and a collector supplied (the CLI and hostd restart shape)
+    const messagesDir = await mkdtemp(join(tmpdir(), 'typeclaw-mount-target-'))
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await mkdir(join(root, 'mounts'), { recursive: true })
+    await writeFile(join(root, 'mounts', 'messages-db'), '')
+    await writeTypeclawConfig(root, { mounts: [{ name: 'messages-db', path: messagesDir, readOnly: true }] })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const warnings: string[] = []
+    const stderrWrites: string[] = []
+    const write = spyOn(process.stderr, 'write')
+    write.mockImplementation((chunk: unknown) => {
+      stderrWrites.push(String(chunk))
+      return true
+    })
+
+    try {
+      // when
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+      })
+
+      // then
+      expect(result.ok).toBe(true)
+      expect(warnings).toEqual([expect.stringContaining('mount "messages-db" skipped')])
+      expect(stderrWrites.some((text) => text.includes('messages-db'))).toBe(false)
+    } finally {
+      write.mockRestore()
+      await rm(messagesDir, { recursive: true, force: true })
     }
   })
 

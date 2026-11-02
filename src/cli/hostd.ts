@@ -191,6 +191,9 @@ export function buildHostdRestart(
       cliEntry,
       reuseCurrentHostDaemon: true,
       operationLease,
+      // No terminal is attached to an agent-requested restart, so the hostd log
+      // is the only place its start warnings can reach the operator.
+      onWarning: (warning) => writeLogLine(`[hostd] restart ${containerName}: ${warning}`),
       ...(currentHostDaemon ? { currentHostDaemon } : {}),
     })
     if (!restartResult.ok) return restartResult

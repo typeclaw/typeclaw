@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { accessSync, constants as fsConstants, existsSync, realpathSync } from 'node:fs'
+import { accessSync, constants as fsConstants, existsSync, realpathSync, statSync } from 'node:fs'
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { isAbsolute, join, posix, relative, resolve } from 'node:path'
@@ -127,6 +127,7 @@ export type StartPlan = {
   hostPort: number
   tuiToken: string | null
   memoryLimitBytes: number
+  mountWarnings: string[]
 }
 
 export type PlanStartOptions = {
@@ -659,6 +660,11 @@ async function runStart({
       hostIdentity,
       totalMemoryBytes,
     })
+
+    for (const warning of plan.mountWarnings) {
+      if (onWarning !== undefined) onWarning(warning)
+      else if (streamOutput) process.stderr.write(`typeclaw: warning: ${warning}\n`)
+    }
 
     if (!skipMemoryOversubscriptionCheck) {
       await warnOnMemoryOversubscription({
@@ -1222,8 +1228,14 @@ export async function planStart({
     runArgs.push(...dockerBindMount({ src: devSourcePath, dst: DEV_SOURCE_CONTAINER_PATH, readonly: true }))
   }
 
+  const mountWarnings: string[] = []
   for (const mount of mounts) {
     const hostPath = expandMountPath(mount.path, cwd)
+    const conflict = describeMountTargetConflict(cwd, mount.name, hostPath)
+    if (conflict !== null) {
+      mountWarnings.push(conflict)
+      continue
+    }
     const target = `${MOUNT_TARGET_PREFIX}/${mount.name}`
     runArgs.push(...dockerBindMount({ src: hostPath, dst: target, readonly: mount.readOnly }))
   }
@@ -1251,7 +1263,31 @@ export async function planStart({
     hostPort,
     tuiToken,
     memoryLimitBytes: memoryLimit.bytes,
+    mountWarnings,
   }
+}
+
+// Docker leaves the bind target it created under the agent folder after the
+// container is gone, so a mount whose source switched between file and directory
+// collides with that leftover and fails the whole `docker run` ("not a
+// directory"). Skip just that mount so the agent still boots; deleting the
+// target is left to the operator because it lives in their agent folder.
+function describeMountTargetConflict(cwd: string, name: string, hostPath: string): string | null {
+  const target = join(cwd, 'mounts', name)
+  let targetIsDirectory: boolean
+  let sourceIsDirectory: boolean
+  try {
+    targetIsDirectory = statSync(target).isDirectory()
+    sourceIsDirectory = statSync(hostPath).isDirectory()
+  } catch {
+    return null
+  }
+  if (targetIsDirectory === sourceIsDirectory) return null
+  const kind = (isDirectory: boolean): string => (isDirectory ? 'a directory' : 'a file')
+  return (
+    `mount "${name}" skipped: ${hostPath} is ${kind(sourceIsDirectory)} but its target ${target} is ` +
+    `${kind(targetIsDirectory)}, so Docker cannot bind it. Remove ${target} and restart to restore the mount.`
+  )
 }
 
 // Surfaces the arithmetic when every agent's cap together exceeds what Docker
