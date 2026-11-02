@@ -56,8 +56,9 @@ const consoleLogger: SubagentCompletionBridgeLogger = {
 //
 //   - The parent session was GC'd by the idle-eviction tick
 //     (SESSION_IDLE_MS) while the subagent was running.
-//   - The parent session rolled over (SESSION_FRESHNESS_TTL_MS) when a
-//     new inbound arrived during a long-running subagent.
+//   - The parent session rolled over after 60 minutes idle
+//     (SESSION_FRESHNESS_TTL_MS) when a new inbound arrived during a
+//     long-running subagent.
 //
 // A reminder still reaching this branch means there is no live session
 // for the key at all (the whole conversation went idle), or the parent

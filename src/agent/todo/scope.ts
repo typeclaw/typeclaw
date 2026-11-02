@@ -3,7 +3,7 @@ import type { SessionOrigin } from '@/agent/session-origin'
 // A todo scope is the durable identity a todo list hangs off. It is
 // deliberately NOT the raw sessionId: sessionIds churn across TUI reconnects
 // and every cron fire, and a channel session can roll to a fresh sessionId on
-// stale-rollover (see src/channels/router.ts SESSION_FRESHNESS_TTL_MS). Keying
+// stale-rollover after 60 minutes idle (router.ts SESSION_FRESHNESS_TTL_MS). Keying
 // on origin identity instead lets a todo list survive those transitions so
 // interrupted work can be resumed.
 //

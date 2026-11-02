@@ -273,7 +273,15 @@ the next applicable in-lane lifecycle or consume decision resumes that frozen
 transfer unchanged. Cached identities stay reachable until ownership completes,
 including across failed reloads and handoff discard attempts. A later input
 never joins that frozen coverage, and recovery does not replay the model or tools.
-Stale-session rollover instead passes coverage through the bounded reload
+Channel sessions reuse their transcript through an idle gap of exactly 60 minutes
+and roll over only after a longer gap (`SESSION_FRESHNESS_TTL_MS` in
+`src/channels/router.ts`). Conversation continuity outweighs one cold prefix
+resend, whose size is bounded by compaction. The separate 30-minute in-memory
+eviction (`SESSION_IDLE_MS`) rehydrates the same session file on the next inbound
+within that window. Draining turns and running children still prevent rollover,
+subject to the stuck-child backstop.
+
+Stale-session rollover, unlike idle eviction, passes coverage through the bounded reload
 handoff to its successor, whose first in-lane consume moves deferred coverage
 or transfers abandoned coverage. A refused handoff reports a live-turn-ended
 transfer and retains its retry identities if that transfer fails.

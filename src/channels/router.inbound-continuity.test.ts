@@ -24,7 +24,7 @@ import {
 import { InboundJournal } from './inbound-journal'
 import { RecoveryDispatcher } from './recovery-dispatcher'
 import { RecoveryOutbox } from './recovery-outbox'
-import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS, SESSION_IDLE_MS, TURN_FAILED_REACTION_EMOJI } from './router'
+import { createChannelRouter, SESSION_FRESHNESS_TTL_MS, SESSION_IDLE_MS, TURN_FAILED_REACTION_EMOJI } from './router'
 import { defaultHistoryConfig } from './schema'
 import type { ChannelKey, InboundMessage, OutboundCallback } from './types'
 
@@ -2125,7 +2125,7 @@ test('stale rollover hands abandoned debt to its successor, which ends it withou
     const request = await f.route('Please research the incident.')
     await f.flush()
     f.running.delete('parent-1')
-    f.state.now += SESSION_GRACE_HARD_TTL_MS + 1
+    f.state.now += SESSION_FRESHNESS_TTL_MS + 1
     f.state.onSessionCreated = (successor) => {
       successor.onPrompt = async () => f.reply(successor, 'It is noon.', 'parent-2')
     }
@@ -2384,7 +2384,7 @@ for (const boundary of ['account replacement', 'stale rollover', 'reload', 'refu
       if (boundary === 'account replacement') f.state.account = 'account-b'
       if (boundary === 'stale rollover') {
         await f.router.__testing!.runIdleGc()
-        f.state.now += SESSION_GRACE_HARD_TTL_MS + 1
+        f.state.now += SESSION_FRESHNESS_TTL_MS + 1
         f.state.onSessionCreated = (session) => {
           session.onPrompt = async () => f.reply(session, 'Fresh answer.', 'parent-2')
         }

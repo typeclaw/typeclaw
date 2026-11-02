@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { statSync } from 'node:fs'
 import { basename } from 'node:path'
 
 import { createAssistantMessageEventStream, type AssistantMessage, type ToolResultMessage } from '@earendil-works/pi-ai'
@@ -561,38 +560,16 @@ export const SEND_RATE_WARN_THRESHOLD = 3
 export const OUTBOUND_FLOOD_ERROR = 'outbound message denied: content looks like a repeated-character flood'
 
 /**
- * Soft freshness boundary: the age of the last engaged inbound past which the
- * provider's server-side KV prompt-cache for this session's prefix is assumed
- * cold. Set to the LLM provider's KV-cache TTL (5 min) so a session reused
- * WITHIN this window is guaranteed a cache hit on the provider side.
+ * Roll over only after more than 60 minutes without an engaged inbound.
+ * Continuity of an active conversation outweighs one cold prefix resend;
+ * compaction bounds the transcript carried by that resend.
  *
- * Reaching this boundary no longer forces an immediate rollover. Between the
- * soft boundary and SESSION_GRACE_HARD_TTL_MS, the live path defers to a
- * cost-aware grace decision (see `isGraceWorthReusing`): a session whose fixed
- * base context (rendered system prompt + injected memory + prefetched channel
- * context) still costs more to rebuild than its accumulated transcript is
- * reused for one more turn rather than torn down. This targets the common
- * channel shape — a human replying a few minutes past the cache TTL — where a
- * full cold-start rebuild of a large memory/index-mode base context dominates
- * the cost of carrying a modest transcript forward.
- *
- * Unlike SESSION_IDLE_MS (which evicts the in-memory entry without rollover), a
- * rollover triggers a full tearDownLive + recreate on the next engaged inbound.
- * The old session's transcript is preserved on disk; only the in-memory live
- * entry and sessions.json pointer are replaced.
+ * SESSION_IDLE_MS (30 minutes) only evicts the in-memory entry: the next inbound
+ * within this freshness window rehydrates the same session file without rollover.
+ * A rollover tears down the live entry and replaces the sessions.json pointer;
+ * the old transcript remains on disk.
  */
-export const SESSION_FRESHNESS_TTL_MS = 5 * 60 * 1000
-
-/**
- * Hard ceiling on the cost-aware grace window. Past this age the live session is
- * rolled over unconditionally regardless of base-vs-transcript cost: the grace
- * decision only defers rollover, it never makes the session immortal. Bounding
- * grace at 2x the soft TTL keeps a never-quite-idle session from accumulating an
- * ever-growing, fully-uncached prefix (every turn past the soft boundary re-sends
- * the whole prefix at no provider-cache discount) and prevents grace from
- * silently becoming an unbounded TTL increase.
- */
-export const SESSION_GRACE_HARD_TTL_MS = 10 * 60 * 1000
+export const SESSION_FRESHNESS_TTL_MS = 60 * 60 * 1000
 
 /**
  * Leak guard — NOT a freshness cap. A running background subagent pins its parent
@@ -615,37 +592,6 @@ export const SESSION_GRACE_HARD_TTL_MS = 10 * 60 * 1000
  * "this child is wedged," not "this child is busy".
  */
 export const SESSION_CHILD_STUCK_BACKSTOP_MS = 6 * 60 * 60 * 1000
-
-/**
- * Cost-aware grace decision for the soft→hard TTL band. Returns true when reusing
- * the (now cache-cold) live session is cheaper than a fresh cold-start.
- *
- * After the soft TTL the provider prefix is cold either way, so the choice is:
- *   - rollover: pay to rebuild the fixed base context (system prompt + memory +
- *     prefetched context) plus a fresh first model call, OR
- *   - reuse: re-send the cold base context PLUS the accumulated transcript.
- *
- * Rollover only wins once the transcript a reused session would carry forward
- * exceeds the base context a rollover would rebuild. We approximate both with the
- * session transcript file: `baseContextBytes` is its size captured right after
- * cold-start (the rendered prompt before any user turn), and the live delta is
- * the growth since. While `baseContextBytes > transcriptDeltaBytes`, the fixed
- * rebuild is the larger cost and grace is worth it. A `baseContextBytes` of 0
- * (no transcript path available) disables grace — fail closed to the prior
- * roll-over-at-soft-TTL behavior.
- */
-export function isGraceWorthReusing(baseContextBytes: number, transcriptDeltaBytes: number): boolean {
-  if (baseContextBytes <= 0) return false
-  return baseContextBytes > transcriptDeltaBytes
-}
-
-function defaultMeasureTranscriptBytes(path: string): number {
-  try {
-    return statSync(path).size
-  } catch {
-    return 0
-  }
-}
 
 // Watchdog ceiling for ensureLive's full async chain (resolve names →
 // fetch membership → open session manager → persist mapping → prefetch
@@ -1003,12 +949,6 @@ type LiveSession = {
   promptInFlight: boolean
   lastInboundAt: number
   recentMessages: SessionActivity[]
-  // Transcript-file size (bytes) captured immediately after cold-start, before
-  // any user turn — a proxy for the fixed base-context rebuild cost (rendered
-  // system prompt + injected memory + prefetched channel context). Read by the
-  // soft-TTL grace decision against the current transcript size to weigh reuse
-  // vs rollover. 0 when no transcript path is available, which disables grace.
-  baseContextBytes: number
   firstUnprocessedAt: number
   currentTurnAuthorId: string | null
   currentTurnAuthorAdapter: AdapterId
@@ -1884,10 +1824,6 @@ export type CreateChannelRouterOptions = {
   // random/timer mutation. Production defaults remain Math.random and no hook.
   retryRandom?: () => number
   onRetryBackoffStart?: () => void
-  // Test seam: measure a transcript file's byte size for the soft-TTL grace
-  // decision. Defaults to a stat()-based reader returning 0 for a missing or
-  // unreadable file (grace then fails closed to roll-over-at-soft-TTL).
-  measureTranscriptBytes?: (path: string) => number
   // Test seam: the idle/todo continuation driver, invoked from
   // maybeContinueTodosChannel AFTER validateChannelTurn. Defaults to the real
   // runIdleContinuation. Injecting it lets a test deliver the continuation at the
@@ -2033,7 +1969,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const recoveryOutbox =
     options.recoveryOutbox ?? new RecoveryOutbox(options.agentDir, { epoch: backgroundObligations.epoch })
   void ready.catch((error) => logger.error(`[channels] inbound journal initialization failed: ${describeError(error)}`))
-  const measureTranscriptBytes = options.measureTranscriptBytes ?? defaultMeasureTranscriptBytes
   const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
   const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
   const handoffRetryItemLimit = options.handoffRetryItemLimit ?? MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY
@@ -2461,22 +2396,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (live.draining) return false
     if (isPinnedByRunningChild(live.sessionId, live.keyId, 'stale-rollover')) return false
     if (idleMs <= SESSION_FRESHNESS_TTL_MS) return false
-    if (idleMs > SESSION_GRACE_HARD_TTL_MS) {
-      logger.info(`[channels] ${live.keyId}: stale-rollover (live: ${idleMs}ms idle, past grace cap)`)
-      return true
-    }
-    const transcriptPath = live.getTranscriptPath?.()
-    const transcriptBytes = transcriptPath !== undefined ? measureTranscriptBytes(transcriptPath) : 0
-    const transcriptDeltaBytes = Math.max(0, transcriptBytes - live.baseContextBytes)
-    if (isGraceWorthReusing(live.baseContextBytes, transcriptDeltaBytes)) {
-      logger.info(
-        `[channels] ${live.keyId}: grace-reuse (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
-      )
-      return false
-    }
-    logger.info(
-      `[channels] ${live.keyId}: stale-rollover (live: ${idleMs}ms idle, base=${live.baseContextBytes}B delta=${transcriptDeltaBytes}B)`,
-    )
+    logger.info(`[channels] ${live.keyId}: stale-rollover (live: ${idleMs}ms idle)`)
     return true
   }
 
@@ -3004,7 +2924,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Restart-resume only: force rehydration of this exact (sessionId,
     // sessionFile) and bypass stale-rollover, so the originating session's
     // `typeclaw.restart-self` entry is reopened rather than rolled into a fresh
-    // session (a restart easily outlasts SESSION_FRESHNESS_TTL_MS). The mapping
+    // session, even if the restart outlasts SESSION_FRESHNESS_TTL_MS. The mapping
     // is persisted only through the normal success path below — no pre-mutation
     // — so a reopen failure leaves the durable mapping untouched.
     resumeTarget?: { sessionId: string; sessionFile: string },
@@ -3026,7 +2946,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         adoptPendingReloadHandoff(existing)
         return existing
       }
-      // Rollover decision (soft TTL → cost-aware grace → hard cap) lives in
+      // The 60-minute idle rollover decision lives in
       // shouldRolloverLive, which also skips draining sessions so a mid-prompt
       // turn is never aborted by a follow-up's idle check (PR #359 incident).
       const idleMs = now() - existing.lastInboundAt
@@ -3316,7 +3236,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         typingEpoch: 0,
         promptInFlight: false,
         lastInboundAt: now(),
-        baseContextBytes: 0,
         firstUnprocessedAt: 0,
         currentTurnAuthorId: null,
         recentMessages: [],
@@ -3512,15 +3431,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
         }
         liveSessions.set(keyId, live)
-      }
-
-      // Snapshot the rendered base context size now, after prefetch and before
-      // any user turn, so the soft-TTL grace decision can later compare it
-      // against transcript growth. Only meaningful on cold-start (a rehydrated
-      // session's file already holds prior conversation, not a clean base).
-      const transcriptPathForBase = live.getTranscriptPath?.()
-      if (isColdStart && transcriptPathForBase !== undefined) {
-        live.baseContextBytes = measureTranscriptBytes(transcriptPathForBase)
       }
 
       if (!isLatestCreation()) {
@@ -9232,9 +9142,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     // The exact parent session is gone. If the subagent was spawned from a
     // channel session, the conversation may have rolled over
-    // (SESSION_FRESHNESS_TTL_MS) or been idle-evicted onto a fresh sessionId
-    // for the same channel key while the subagent ran. Fall back to the live
-    // successor for that key so a finished review/result still surfaces
+    // after 60 minutes idle (SESSION_FRESHNESS_TTL_MS), or been idle-evicted
+    // and rehydrated for the same channel key while the subagent ran. Fall back
+    // to the live successor for that key so a finished review/result still surfaces
     // instead of being silently dropped.
     if (args.channelKey !== undefined) {
       const targetKeyId = channelKeyId(args.channelKey)

@@ -25,7 +25,7 @@ import { bootBackgroundObligations } from ${moduleUrl('../run/background-handoff
 import { createRecoveryNotice } from ${moduleUrl('./recovery-notice.ts')};
 import { RecoveryOutbox } from ${moduleUrl('./recovery-outbox.ts')};
 import { RecoveryDispatcher } from ${moduleUrl('./recovery-dispatcher.ts')};
-import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS, SESSION_IDLE_MS } from ${moduleUrl('./router.ts')};
+import { createChannelRouter, SESSION_FRESHNESS_TTL_MS, SESSION_IDLE_MS } from ${moduleUrl('./router.ts')};
 import { defaultHistoryConfig } from ${moduleUrl('./schema.ts')};
 import { noopPermissionService } from ${moduleUrl('../permissions/index.ts')};
 const [dir,mode]=process.argv.slice(-2);
@@ -141,7 +141,7 @@ if(initial){
   // The child disappears without a completion (e.g. a wedged runtime lost it).
   runningChild=null;
   if(mode==='idle-gc'){skew+=SESSION_IDLE_MS+1000;await router.__testing.runIdleGc();}
-  else{skew+=SESSION_GRACE_HARD_TTL_MS+1000;const c=await router.route(event('C','Thanks!'));await appendFile(dir+'/C-receipt',JSON.stringify(c));await router.__testing.flushDebounce(key);}
+  else{skew+=SESSION_FRESHNESS_TTL_MS+1000;const c=await router.route(event('C','Thanks!'));await appendFile(dir+'/C-receipt',JSON.stringify(c));await router.__testing.flushDebounce(key);}
   await appendFile(dir+'/lifecycle',JSON.stringify(await snapshot()));
   await boundary();
  }
