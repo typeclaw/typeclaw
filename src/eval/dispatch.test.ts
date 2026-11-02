@@ -113,6 +113,21 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     expect(result.text.trim()).toBe('refused')
   })
 
+  test('a grep regex parse failure names the JS string escape cause', async () => {
+    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['grep'], context: testContext(dir) })
+    const broken = await kernel.run('await tool.grep({pattern:"Text\\(|Label(",path:"workspace/one.txt"})', {
+      dispatch,
+    })
+    const valid = await kernel.run('print(text(await tool.grep({pattern:"selected",path:"workspace/one.txt"})))', {
+      dispatch,
+    })
+    expect(broken.isError).toBe(true)
+    expect(broken.text).toContain('regex parse error')
+    expect(broken.text).toContain('literal: true')
+    expect(valid.isError).toBe(false)
+    expect(valid.text).toContain('selected line')
+  })
+
   test('tool argument validation happens before wrapped execution', async () => {
     const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['read'], context: testContext(dir) })
     await expect(dispatch({ name: 'read', args: {}, callId: 'test' }, new AbortController().signal)).rejects.toThrow()

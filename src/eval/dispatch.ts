@@ -49,6 +49,19 @@ export function createEvalDispatch(options: {
       name: request.name,
       arguments: request.args,
     })
-    return await tool.execute(request.callId, args, signal, undefined, options.context)
+    try {
+      return await tool.execute(request.callId, args, signal, undefined, options.context)
+    } catch (error) {
+      if (request.name === 'grep' && error instanceof Error && error.message.includes('regex parse error')) {
+        throw new Error(error.message + GREP_REGEX_HINT, { cause: error })
+      }
+      throw error
+    }
   }
 }
+
+// Cells keep failing on patterns like '\(' even with the rules in the tool
+// description: inside a JS string literal that is just '(', so rg sees an
+// unclosed group. Name the cause where the failure surfaces.
+const GREP_REGEX_HINT =
+  "\nHint: in a JS string '\\(' is just '(' - write '\\\\(' or String.raw`\\(`, or pass literal: true for plain text. Lookaround is unsupported."
