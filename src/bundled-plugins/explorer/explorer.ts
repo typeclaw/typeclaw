@@ -100,7 +100,7 @@ export function createExplorerSubagent(): Subagent<ExplorerPayload> {
     payloadSchema: explorerPayloadSchema,
     visibility: 'public',
     rosterDescription:
-      'read-only local recon — code, sessions, memory, git, config; returns the paths and excerpts you need without you grepping the tree yourself; fire liberally',
+      'read-only local recon — code, sessions, memory, git, config, mounted data; finds where the evidence lives and returns paths and excerpts. It locates, it does not judge: read the decisive records yourself before concluding',
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     toolResultBudget: {
       maxTotalBytes: 256_000,
