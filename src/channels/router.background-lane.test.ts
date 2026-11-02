@@ -13,7 +13,7 @@ import { BackgroundObligationStore } from './background-obligations'
 import { recoveryNoticeCause } from './continuity-types'
 import { InboundJournal } from './inbound-journal'
 import { RecoveryOutbox } from './recovery-outbox'
-import { createChannelRouter, SESSION_GRACE_HARD_TTL_MS } from './router'
+import { createChannelRouter, SESSION_FRESHNESS_TTL_MS } from './router'
 import { defaultHistoryConfig } from './schema'
 import type { ChannelKey, InboundMessage } from './types'
 
@@ -212,7 +212,7 @@ async function fixture(
     reply,
     independent,
     advance: () => {
-      now += SESSION_GRACE_HARD_TTL_MS + 1
+      now += SESSION_FRESHNESS_TTL_MS + 1
     },
   }
 }

@@ -31,6 +31,12 @@ Production registry is built from plugin contributions. The bundled memory plugi
 
 ### Background result continuity
 
+Channel stale rollover requires more than 60 minutes without an engaged inbound;
+the 30-minute in-memory eviction alone keeps the same persisted session file.
+Draining turns and running children retain their rollover guards, including the
+stuck-child backstop. See [engagement](/docs/internals/engagement) for the session
+continuity policy.
+
 For direct channel-background tool launches, the router durably accepts an owed response before the child starts. `src/channels/background-obligations.ts` owns those JSON records; `LiveSubagentRegistry` owns execution status, and transcripts own result content. The completion bridge awaits the result-ready write against an existing obligation before enqueueing a wake. Missing live parents or provider failures do not erase the obligation.
 
 The parent claims exact completion IDs and generations before prompt consumption. Successful final-result fetches attach task coverage as well; running polls do not. Only a router settlement decision closes consumed or fetched coverage: a confirmed terminal reply, recognized formal review, substantive non-terminal `channel_send` to the invoking session's exact origin coordinate, explicit skip or `/stop`. Progress, `continue_after_reply`, willingness, assistant `stop`, `NO_REPLY`, no-op, failed or off-target sends and unrelated output leave the response owed. Siblings are not implicitly covered.

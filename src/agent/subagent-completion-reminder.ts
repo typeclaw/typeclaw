@@ -101,8 +101,8 @@ export type SubagentCompletedPayload = {
   hasRecoverableOutput?: boolean
   // Present when the parent was a channel session. Lets the router fall back
   // to the live successor session for the same channel key when the parent
-  // rolled over (SESSION_FRESHNESS_TTL_MS) or was idle-evicted while the
-  // subagent ran — otherwise the completion is silently dropped.
+  // rolled over after 60 minutes idle (SESSION_FRESHNESS_TTL_MS) or was
+  // idle-evicted while the subagent ran — otherwise the completion is silently dropped.
   channelKey?: SubagentCompletedChannelKey
 }
 

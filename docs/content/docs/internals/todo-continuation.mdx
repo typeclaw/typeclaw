@@ -22,7 +22,7 @@ Every tool resolves a scope first and **fails closed**: a session with no resolv
 
 ## Scope: the durable identity a list hangs off
 
-A todo list is not keyed on `sessionId`. SessionIds churn — every TUI reconnect, every cron fire, and a channel session can roll to a fresh id on stale-rollover (`SESSION_FRESHNESS_TTL_MS`, `src/channels/router.ts`). Keying on the **origin identity** instead lets a list survive those transitions so interrupted work resumes. `resolveTodoScope` (`src/agent/todo/scope.ts`) maps a `SessionOrigin` to a `TodoScope` or `null`:
+A todo list is not keyed on `sessionId`. SessionIds churn — every TUI reconnect, every cron fire, and a channel session can roll to a fresh id after more than 60 minutes idle (`SESSION_FRESHNESS_TTL_MS`, `src/channels/router.ts`). Keying on the **origin identity** instead lets a list survive those transitions so interrupted work resumes. `resolveTodoScope` (`src/agent/todo/scope.ts`) maps a `SessionOrigin` to a `TodoScope` or `null`:
 
 | Origin     | Scope                                           | Why                                                                                                      |
 | ---------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------- |

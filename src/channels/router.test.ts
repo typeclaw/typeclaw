@@ -97,11 +97,9 @@ import {
   SEND_RATE_WINDOW_MS,
   SEND_WILLINGNESS_NUDGE,
   STRANDED_TOOLUSE_CONTINUATION_NUDGE,
-  isGraceWorthReusing,
   SESSION_GC_INTERVAL_MS,
   SESSION_FRESHNESS_TTL_MS,
   OBSERVED_MESSAGE_MAX_CHARS,
-  SESSION_GRACE_HARD_TTL_MS,
   SESSION_IDLE_MS,
   SESSION_CHILD_STUCK_BACKSTOP_MS,
   sliceHeadTail,
@@ -544,7 +542,6 @@ function makeRouter(
     originRefs?: SessionOriginRef[]
     factoryCalls?: SessionFactoryArgs[]
     transcriptPathFor?: (sessionId: string) => string | undefined
-    measureTranscriptBytes?: (path: string) => number
     configuredAliases?: () => readonly string[]
     ensureLiveTimeoutMs?: number
     permissions?: PermissionService
@@ -582,7 +579,6 @@ function makeRouter(
     ...(options.ensureLiveTimeoutMs !== undefined ? { ensureLiveTimeoutMs: options.ensureLiveTimeoutMs } : {}),
     ...(options.retryRandom !== undefined ? { retryRandom: options.retryRandom } : {}),
     ...(options.onRetryBackoffStart !== undefined ? { onRetryBackoffStart: options.onRetryBackoffStart } : {}),
-    ...(options.measureTranscriptBytes !== undefined ? { measureTranscriptBytes: options.measureTranscriptBytes } : {}),
     ...(options.claimHandler !== undefined ? { claimHandler: options.claimHandler } : {}),
     ...(options.onReload !== undefined ? { onReload: options.onReload } : {}),
     ...(options.onRestart !== undefined ? { onRestart: options.onRestart } : {}),
@@ -1017,77 +1013,26 @@ describe('ChannelRouter session lifecycle', () => {
     expect(sessions).toHaveLength(2)
   })
 
-  test('grace reuse: in soft→hard band, large base + small transcript reuses the live session', async () => {
-    // given: a session whose base context (10KB) dwarfs its transcript growth
+  test.each([6, 30])('large transcript is reused after %i minutes idle', async (idleMinutes) => {
     const dir = await tempDir()
+    const transcriptPath = join(dir, 'conversation.jsonl')
+    await writeFileFs(transcriptPath, 'b'.repeat(10_000))
     const nowRef = { value: 1000 }
-    const bytesFor = new Map<string, number>()
     const { router, sessions } = makeRouter(dir, {
       nowRef,
-      transcriptPathFor: (sessionId) => `/fake/${sessionId}.jsonl`,
-      measureTranscriptBytes: (path) => bytesFor.get(path) ?? 0,
+      transcriptPathFor: () => transcriptPath,
     })
-    bytesFor.set('/fake/ses_fake_1.jsonl', 10_000) // base context at cold-start
     await router.route(inbound({ externalMessageId: 'm1' }))
     await router.__testing!.flushDebounce(KEY)
-    bytesFor.set('/fake/ses_fake_1.jsonl', 11_000) // +1KB transcript < 10KB base
+    await writeFileFs(transcriptPath, 'b'.repeat(10_000) + 't'.repeat(100_000))
 
-    // when: a follow-up lands just inside the grace band (soft TTL + 1ms)
-    nowRef.value = 1000 + SESSION_FRESHNESS_TTL_MS + 1
-    await router.route(inbound({ externalMessageId: 'm2', text: 'still there?' }))
+    nowRef.value = 1000 + idleMinutes * 60 * 1000
+    await router.route(inbound({ externalMessageId: 'm2', text: 'continue the investigation' }))
     await router.__testing!.flushDebounce(KEY)
 
-    // then: the live session is reused, not rolled over
     expect(sessions).toHaveLength(1)
-    expect(router.liveCount()).toBe(1)
-  })
-
-  test('grace decline: in soft→hard band, transcript exceeding base rolls over', async () => {
-    // given: a session whose transcript growth (15KB) now exceeds its base (10KB)
-    const dir = await tempDir()
-    const nowRef = { value: 1000 }
-    const bytesFor = new Map<string, number>()
-    const { router, sessions } = makeRouter(dir, {
-      nowRef,
-      transcriptPathFor: (sessionId) => `/fake/${sessionId}.jsonl`,
-      measureTranscriptBytes: (path) => bytesFor.get(path) ?? 0,
-    })
-    bytesFor.set('/fake/ses_fake_1.jsonl', 10_000)
-    await router.route(inbound({ externalMessageId: 'm1' }))
-    await router.__testing!.flushDebounce(KEY)
-    bytesFor.set('/fake/ses_fake_1.jsonl', 25_000) // delta 15KB > 10KB base
-
-    // when: a follow-up lands in the grace band
-    nowRef.value = 1000 + SESSION_FRESHNESS_TTL_MS + 1
-    await router.route(inbound({ externalMessageId: 'm2', text: 'long convo' }))
-    await router.__testing!.flushDebounce(KEY)
-
-    // then: the bloated transcript makes rebuild cheaper, so it rolls over
-    expect(sessions).toHaveLength(2)
-  })
-
-  test('grace is bounded: past the hard cap, a large base still rolls over', async () => {
-    // given: a large base that would otherwise win the grace comparison
-    const dir = await tempDir()
-    const nowRef = { value: 1000 }
-    const bytesFor = new Map<string, number>()
-    const { router, sessions } = makeRouter(dir, {
-      nowRef,
-      transcriptPathFor: (sessionId) => `/fake/${sessionId}.jsonl`,
-      measureTranscriptBytes: (path) => bytesFor.get(path) ?? 0,
-    })
-    bytesFor.set('/fake/ses_fake_1.jsonl', 10_000)
-    await router.route(inbound({ externalMessageId: 'm1' }))
-    await router.__testing!.flushDebounce(KEY)
-    bytesFor.set('/fake/ses_fake_1.jsonl', 10_100) // tiny delta — grace would apply
-
-    // when: the follow-up lands PAST the hard cap
-    nowRef.value = 1000 + SESSION_GRACE_HARD_TTL_MS + 1
-    await router.route(inbound({ externalMessageId: 'm2', text: 'much later' }))
-    await router.__testing!.flushDebounce(KEY)
-
-    // then: the hard cap forces rollover regardless of base vs delta
-    expect(sessions).toHaveLength(2)
+    expect(sessions[0]!.disposed).toBe(0)
+    expect((await loadChannelSessions(dir))[0]?.sessionId).toBe('ses_fake_1')
   })
 
   test('lastInboundAt persisted to sessions.json after every engaged inbound', async () => {
@@ -1168,7 +1113,7 @@ describe('ChannelRouter session lifecycle', () => {
   // Regression for the Huxley Slack channel incident on 2026-05-26
   // (session 019e62c2-179b-734a-9340-b9dd28254636, addressed at the
   // contract layer by PR #359). The model's second turn was running
-  // longer than SESSION_FRESHNESS_TTL_MS (5 min) because it was
+  // longer than the former 5-minute freshness threshold because it was
   // composing a reply off a backgrounded subagent's result. The user
   // sent a "why is it stopping mid-answer" follow-up at minute 8, which
   // triggered ensureLive's stale-rollover branch and called
@@ -13148,22 +13093,6 @@ function historyMessage(over: Partial<ChannelHistoryMessage> = {}): ChannelHisto
   }
 }
 
-describe('isGraceWorthReusing', () => {
-  test('reuses when base context exceeds transcript delta', () => {
-    expect(isGraceWorthReusing(10_000, 1_000)).toBe(true)
-  })
-
-  test('rolls over when transcript delta meets or exceeds base context', () => {
-    expect(isGraceWorthReusing(10_000, 10_000)).toBe(false)
-    expect(isGraceWorthReusing(10_000, 15_000)).toBe(false)
-  })
-
-  test('fails closed when base context is unknown (0 or negative)', () => {
-    expect(isGraceWorthReusing(0, 0)).toBe(false)
-    expect(isGraceWorthReusing(-1, 0)).toBe(false)
-  })
-})
-
 describe('sliceHeadTail', () => {
   const m = (id: string): ChannelHistoryMessage => historyMessage({ externalMessageId: id, text: id })
 
@@ -14115,14 +14044,23 @@ describe('ChannelRouter idle session GC', () => {
     expect(logs.some((l) => l.includes('idle_gc evicting') && l.includes('suspected stuck running child'))).toBe(true)
   })
 
-  test('next inbound after eviction creates a fresh session and rehydrates the persisted sessionId', async () => {
+  test.each([
+    { idleMs: SESSION_IDLE_MS + 1, reuses: true },
+    { idleMs: SESSION_FRESHNESS_TTL_MS, reuses: true },
+    { idleMs: SESSION_FRESHNESS_TTL_MS + 1, reuses: false },
+  ])('after eviction, idle $idleMs ms has persisted reuse=$reuses', async ({ idleMs, reuses }) => {
     // given: session is evicted
     const dir = await tempDir()
     const nowRef = { value: 1000 }
-    const { router, sessions } = makeRouter(dir, { nowRef })
+    const factoryCalls: SessionFactoryArgs[] = []
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      factoryCalls,
+      transcriptPathFor: (sessionId) => join(dir, `${sessionId}.jsonl`),
+    })
     await router.route(inbound({ text: 'hi bot' }))
     await router.__testing!.flushDebounce(KEY)
-    nowRef.value = 1000 + SESSION_IDLE_MS + 1
+    nowRef.value = 1000 + idleMs
     await router.__testing!.runIdleGc!()
     expect(router.liveCount()).toBe(0)
 
@@ -14135,7 +14073,10 @@ describe('ChannelRouter idle session GC', () => {
     expect(router.liveCount()).toBe(1)
     const persisted = await loadChannelSessions(dir)
     expect(persisted).toHaveLength(1)
-    expect(persisted[0]?.sessionId).toBeDefined()
+    expect(persisted[0]?.sessionId).toBe(reuses ? 'ses_fake_1' : 'ses_fake_2')
+    expect(factoryCalls[1]).toEqual(
+      reuses ? { existingSessionId: 'ses_fake_1', existingSessionFile: 'ses_fake_1.jsonl' } : {},
+    )
   })
 
   test('fires session.end hook on the evicted session before disposing', async () => {
@@ -20768,16 +20709,17 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
   async function routePendingRoundSiblings(
     router: ChannelRouter,
     sessions: FakeSession[],
+    round: NonNullable<InboundMessage['githubReviewRound']> = replyRound,
   ): Promise<{ carrier: FakeSession; sibling: FakeSession }> {
     await router.route(
       closeoutInbound({
         ...carrierKey,
         externalMessageId: 'carrier-inbound',
-        githubReviewRound: replyRound,
+        githubReviewRound: round,
         githubReviewThreadCloseout: undefined,
       }),
     )
-    await router.route(closeoutInbound({ externalMessageId: 'sibling-inbound', githubReviewRound: replyRound }))
+    await router.route(closeoutInbound({ externalMessageId: 'sibling-inbound', githubReviewRound: round }))
     return { carrier: sessions[0]!, sibling: sessions[1]! }
   }
 
@@ -21423,14 +21365,16 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
         sent.push(message)
         return { ok: true }
       })
-      const initial = await routePendingRoundSiblings(router, sessions)
+      // Reply rounds expire after 30 minutes, before a session can roll over.
+      // A two-hour push round can still be pending at the rollover boundary.
+      const initial = await routePendingRoundSiblings(router, sessions, { ...replyRound, kind: 'push' })
       initial.sibling.onPrompt = async () => {
         await router.markTurnSkipped({ parentSessionId: 'ses_fake_2', reason: 'waiting for carrier' })
         initial.sibling.setAssistantText('NO_REPLY')
       }
       await router.__testing!.flushDebounce(GITHUB_KEY)
 
-      nowRef.value += SESSION_GRACE_HARD_TTL_MS + 1
+      nowRef.value += SESSION_FRESHNESS_TTL_MS + 1
       await router.route(
         closeoutInbound({
           externalMessageId: `live-rollover-${release}`,
@@ -21461,7 +21405,7 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
           }),
         ).toEqual({ kind: 'completed' })
       } else {
-        nowRef.value += REPLY_REVIEW_ROUND_TTL_MS
+        nowRef.value += REVIEW_ROUND_TTL_MS
       }
       await router.__testing!.runIdleGc()
       await router.__testing!.flushDebounce(GITHUB_KEY)
