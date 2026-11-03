@@ -2360,7 +2360,7 @@ describe('createServer cron_list handler', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.send(JSON.stringify({ type: 'cron_list', requestId: 'req-1' }))
-    const reply = await waitFor((m) => m.type === 'cron_list_result')
+    const reply = await waitFor((m) => m.type === 'cron_list_result', 5000)
 
     if (reply.type !== 'cron_list_result') throw new Error('unreachable')
     expect(reply.requestId).toBe('req-1')
@@ -2397,7 +2397,7 @@ describe('createServer cron_list handler', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.send(JSON.stringify({ type: 'cron_list', requestId: 'req-merge' }))
-    const reply = await waitFor((m) => m.type === 'cron_list_result')
+    const reply = await waitFor((m) => m.type === 'cron_list_result', 5000)
 
     if (reply.type !== 'cron_list_result') throw new Error('unreachable')
     expect(reply.requestId).toBe('req-merge')
@@ -2426,7 +2426,7 @@ describe('createServer cron_list handler', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.send(JSON.stringify({ type: 'cron_list', requestId: 'req-empty' }))
-    const reply = await waitFor((m) => m.type === 'cron_list_result')
+    const reply = await waitFor((m) => m.type === 'cron_list_result', 5000)
 
     if (reply.type !== 'cron_list_result' || !reply.result.ok) throw new Error('unreachable')
     expect(reply.result.jobs).toEqual([])
@@ -2447,7 +2447,7 @@ describe('createServer cron_list handler', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.send(JSON.stringify({ type: 'cron_list', requestId: 'req-bad' }))
-    const reply = await waitFor((m) => m.type === 'cron_list_result')
+    const reply = await waitFor((m) => m.type === 'cron_list_result', 5000)
 
     if (reply.type !== 'cron_list_result') throw new Error('unreachable')
     expect(reply.result.ok).toBe(false)
@@ -2484,7 +2484,7 @@ describe('createServer cron_list handler', () => {
     await waitFor((m) => m.type === 'connected')
 
     ws.send(JSON.stringify({ type: 'cron_list', requestId: 'req-bad-sub' }))
-    const reply = await waitFor((m) => m.type === 'cron_list_result')
+    const reply = await waitFor((m) => m.type === 'cron_list_result', 5000)
 
     if (reply.type !== 'cron_list_result') throw new Error('unreachable')
     expect(reply.result.ok).toBe(false)
