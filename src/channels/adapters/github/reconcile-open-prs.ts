@@ -102,7 +102,12 @@ const submittedReviewsSchema = z.array(
 // This path deliberately does not consult the scan age or launch cooldown. Each
 // boot needs a fresh identity: the previous admission may be the interrupted one.
 export async function replayPendingReviews(
-  options: ReconcileOpenPrsOptions & { pendingStore: PendingReviewStore; replayId: string },
+  options: ReconcileOpenPrsOptions & {
+    pendingStore: PendingReviewStore
+    replayId: string
+    // Work this process already admitted is still live in the router; only lost work replays.
+    admittedThisProcess?: (entry: PendingReview) => boolean
+  },
 ): Promise<void> {
   if (options.reviewOn === 'off' || options.selfLogin === null) return
   const repos = new Set(options.repos.map(canonicalGithubRepo))
@@ -110,6 +115,7 @@ export async function replayPendingReviews(
   for (const entry of await options.pendingStore.list()) {
     if (options.isCancelled?.() === true) return
     if (!repos.has(canonicalGithubRepo(entry.repo))) continue
+    if (options.admittedThisProcess?.(entry) === true) continue
     try {
       const target = parseRepo(entry.repo)
       if (target === null) continue
