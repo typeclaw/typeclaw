@@ -43,6 +43,11 @@ export const CORE_PERMISSIONS = {
   // channels). Granted with fsSeePrivate because the browser's file exchange
   // lives under workspace/, which that same tier already sees.
   browserShared: 'browser.shared',
+  // With typevault enabled, the session's bash receives a live TypeVault grant
+  // for its role's tier (and every tier that tier includes). A grant can still
+  // read a value with `typevault get --reveal`, so the tier, not this
+  // permission, is what keeps one role's secrets from a lower role.
+  vaultUse: 'vault.use',
 } as const
 
 // Sentinel that `expandOwnerWildcard` swaps for the concrete union of
@@ -93,6 +98,7 @@ export const BUILTIN_ROLES: Readonly<Record<BuiltinRoleName, BuiltinRoleSpec>> =
       CORE_PERMISSIONS.fsSeePrivate,
       CORE_PERMISSIONS.browserShared,
       CORE_PERMISSIONS.fsSeeSecrets,
+      CORE_PERMISSIONS.vaultUse,
       'security.bypass.low',
       'security.bypass.medium',
       'security.bypass.high',
@@ -113,6 +119,7 @@ export const BUILTIN_ROLES: Readonly<Record<BuiltinRoleName, BuiltinRoleSpec>> =
       CORE_PERMISSIONS.fsSeePrivate,
       CORE_PERMISSIONS.browserShared,
       CORE_PERMISSIONS.fsSeeSecrets,
+      CORE_PERMISSIONS.vaultUse,
       'security.bypass.low',
       'security.bypass.medium',
     ],
@@ -127,6 +134,7 @@ export const BUILTIN_ROLES: Readonly<Record<BuiltinRoleName, BuiltinRoleSpec>> =
       CORE_PERMISSIONS.subagentOutput,
       CORE_PERMISSIONS.fsSeePrivate,
       CORE_PERMISSIONS.browserShared,
+      CORE_PERMISSIONS.vaultUse,
       'security.bypass.low',
     ],
   },

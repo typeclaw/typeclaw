@@ -41,6 +41,7 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
       'subagent.output',
       'subagent.spawn',
       'subagent.spawn.operator',
+      'vault.use',
     ])
   })
 
@@ -59,7 +60,13 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
       'subagent.cancel',
       'subagent.output',
       'subagent.spawn',
+      'vault.use',
     ])
+  })
+
+  test('guest does not carry vault.use, so guest bash never receives a vault grant', () => {
+    expect([...BUILTIN_ROLES.guest.permissions]).not.toContain('vault.use')
+    expect([...BUILTIN_ROLES.owner.permissions]).toContain('vault.use')
   })
 
   test('member carries fs.see.private but NOT fs.see.secrets (private working surface, never credentials)', () => {
