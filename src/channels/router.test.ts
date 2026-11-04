@@ -69,6 +69,7 @@ import {
 import { InboundJournal } from './inbound-journal'
 import type { ChannelSessionRecord } from './persistence'
 import { channelsSessionsPath, loadChannelSessions, saveChannelSessions } from './persistence'
+import { RecoveryDispatcher } from './recovery-dispatcher'
 import type { CreateChannelRouterOptions } from './router'
 import {
   CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS,
@@ -565,6 +566,7 @@ function makeRouter(
     handoffRetryItemLimit?: number
     handoffRetryByteLimit?: number
     backgroundObligations?: BackgroundObligationStore
+    inboundJournal?: InboundJournal
     reviewOutbound?: CreateChannelRouterOptions['reviewOutbound']
     outboundReviewerActive?: () => boolean
   } = {},
@@ -578,6 +580,7 @@ function makeRouter(
     ...(options.reviewOutbound ? { reviewOutbound: options.reviewOutbound } : {}),
     ...(options.outboundReviewerActive ? { outboundReviewerActive: options.outboundReviewerActive } : {}),
     ...(options.backgroundObligations !== undefined ? { backgroundObligations: options.backgroundObligations } : {}),
+    ...(options.inboundJournal !== undefined ? { inboundJournal: options.inboundJournal } : {}),
     configForAdapter: () => options.config ?? baseConfig,
     ...(options.configuredAliases !== undefined ? { configuredAliases: options.configuredAliases } : {}),
     ...(options.ensureLiveTimeoutMs !== undefined ? { ensureLiveTimeoutMs: options.ensureLiveTimeoutMs } : {}),
@@ -21946,6 +21949,153 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
 })
 
 describe('ChannelRouter durable background response coverage', () => {
+  test('restored session without children receives no lost task context', async () => {
+    const dir = await tempDir()
+    await saveChannelSessions(dir, [{ ...KEY, sessionId: 'childless-session', lastInboundAt: 1000, participants: [] }])
+    const { router, sessions } = makeRouter(dir, {
+      backgroundObligations: new BackgroundObligationStore(dir, { epoch: 'new-process' }),
+      onSessionCreated: (session) => {
+        session.onPrompt = () => session.setAssistantText('NO_REPLY')
+      },
+    })
+    const sent: OutboundMessage[] = []
+    router.registerOutbound(KEY.adapter, async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    try {
+      await router.route(inbound())
+      await router.__testing?.flushDebounce(KEY)
+      expect(sessions[0]?.prompts[0]).not.toContain('**[SYSTEM MESSAGE')
+      expect(sent).toEqual([])
+    } finally {
+      await router.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  for (const reopen of ['inbound', 'restart-resume'] as const) {
+    test(`restored ${reopen} reports lost children once without channel output`, async () => {
+      const dir = await tempDir()
+      const before = new BackgroundObligationStore(dir, { epoch: 'before-restart' })
+      const beforeJournal = new InboundJournal(dir, { backgroundObligations: before })
+      await beforeJournal.initialize()
+      const first = makeRouter(dir, {
+        backgroundObligations: before,
+        inboundJournal: beforeJournal,
+        transcriptPathFor: () => join(dir, 'sessions', 'parent.jsonl'),
+        onSessionCreated: (session) => {
+          session.onPrompt = () => session.setAssistantText('NO_REPLY')
+        },
+      })
+      try {
+        await first.router.route(inbound())
+        await first.router.__testing?.flushDebounce(KEY)
+        const accept = (taskId: string, parentSessionId = 'ses_fake_1') =>
+          before.accept({ taskId, parentSessionId, target: KEY, accountIdentity: 'proof-account' })
+        await accept('bg_lost')
+        await accept('bg_other_parent', 'other-session')
+        for (const reason of ['delivered', 'user-stop', 'user_stop', 'background launch cancelled before execution']) {
+          const row = await accept(`bg_${reason}`)
+          await before.settle([row], {
+            kind: reason === 'delivered' ? 'delivered' : 'intentionally-suppressed',
+            decisionId: `decision-${reason}`,
+            reason,
+          })
+        }
+        await first.router.stop()
+        await beforeJournal.close()
+
+        for (const epoch of ['after-restart', 'second-restart']) {
+          const store = new BackgroundObligationStore(dir, { epoch })
+          const journal = new InboundJournal(dir, { backgroundObligations: store })
+          await journal.initialize()
+          const outbox = new RecoveryOutbox(dir, { epoch })
+          await journal.importOldEpoch(outbox)
+          await store.importOldEpoch(outbox)
+          // Same-process children must remain eligible for their real completion.
+          if (epoch === 'after-restart')
+            await store.accept({
+              taskId: 'bg_running',
+              parentSessionId: 'ses_fake_1',
+              target: KEY,
+              accountIdentity: 'proof-account',
+            })
+          const calls: SessionFactoryArgs[] = []
+          const sent: string[] = []
+          const state = makeRouter(dir, {
+            backgroundObligations: store,
+            inboundJournal: journal,
+            nowRef: { value: 1000 + 6 * 60_000 },
+            factoryCalls: calls,
+            transcriptPathFor: () => join(dir, 'sessions', 'parent.jsonl'),
+            onSessionCreated: (session) => {
+              session.onPrompt = () => session.setAssistantText('NO_REPLY')
+            },
+          })
+          state.router.registerOutbound(KEY.adapter, async (message) => {
+            sent.push(message.text ?? '')
+            return { ok: true }
+          })
+          const recoveryErrors: unknown[] = []
+          const dispatcher = new RecoveryDispatcher(outbox, state.router, {
+            backgroundObligations: store,
+            inboundJournal: journal,
+            onError: (error) => recoveryErrors.push(error),
+          })
+          await dispatcher.wake()
+          await waitFor(async () => {
+            if (recoveryErrors.length > 0) throw recoveryErrors[0]
+            return (await store.lookup('ses_fake_1', 'bg_lost'))?.phase === 'closed'
+          })
+          await dispatcher.stop()
+          const recovered = await store.list()
+          expect(recovered.find((row) => row.taskId === 'bg_lost')?.outcome?.reason).toBe('operator-log-only')
+          try {
+            expect(state.sessions).toHaveLength(0)
+            if (reopen === 'restart-resume') {
+              await state.router.resumeRestartHandoff({
+                schemaVersion: 2,
+                restartedAt: '2026-11-04T00:00:00.000Z',
+                origin: { kind: 'channel', key: KEY },
+                originatingSessionId: 'ses_fake_1',
+                originatingSessionFile: 'parent.jsonl',
+              })
+              await waitFor(() => state.sessions[0]?.prompts.length === 1)
+            } else {
+              await state.router.route(inbound())
+              await state.router.__testing?.flushDebounce(KEY)
+            }
+            expect(calls[0]?.existingSessionId).toBe('ses_fake_1')
+            const prompt = state.sessions[0]?.prompts[0]
+            expect(prompt?.includes('bg_lost')).toBe(epoch === 'after-restart')
+            for (const taskId of [
+              'bg_other_parent',
+              'bg_delivered',
+              'bg_user-stop',
+              'bg_user_stop',
+              'bg_background launch cancelled before execution',
+            ])
+              expect(prompt).not.toContain(taskId)
+            if (epoch === 'after-restart') expect(prompt).not.toContain('bg_running')
+            await state.router.route(inbound())
+            await state.router.__testing?.flushDebounce(KEY)
+            expect(state.sessions[0]?.prompts.at(-1)).not.toContain('bg_lost')
+            expect(sent).toEqual([])
+            expect(await store.list()).toEqual(recovered)
+          } finally {
+            await state.router.stop()
+            await journal.close()
+          }
+        }
+      } finally {
+        await first.router.stop()
+        await beforeJournal.close()
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+  }
+
   async function fixture(key: ChannelKey = KEY, onSessionCreated?: (session: FakeSession) => void) {
     const dir = await tempDir()
     const store = new BackgroundObligationStore(dir, { epoch: 'router-proof' })
