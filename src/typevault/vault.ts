@@ -179,7 +179,7 @@ async function listTiers(agentDir: string): Promise<Map<string, Set<string>>> {
   return tiers
 }
 
-function openVault(agentDir: string): Promise<Access> {
+export function openVault(agentDir: string): Promise<Access> {
   return createClient({ direct: true, global: true, dir: typevaultDir(agentDir), env: typevaultEnv(agentDir) })
 }
 

@@ -65,7 +65,7 @@ export function writeEnvelopeTextSync(agentDir: string, text: string): void {
 
 // Every entry file's name, size and mtime, not just the directory's mtime, so
 // a rewrite within one coarse directory timestamp still changes the stamp.
-function entriesStamp(agentDir: string): string {
+export function entriesStamp(agentDir: string): string {
   const entries = join(typevaultDir(agentDir), 'entries')
   if (!existsSync(entries)) return 'absent'
   return readdirSync(entries)

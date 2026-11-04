@@ -6124,6 +6124,16 @@ describe('buildSandboxEnvPolicy exposable .env names', () => {
     expect(policy.set?.SERVICE_CONFIG_DIR).toBe('/runtime')
   })
 
+  test('a TypeVault grant travels by inheritance and never appears in the bwrap argv', () => {
+    const grant = 'tvl1.grant-token-value'
+    const policy = buildSandboxEnvPolicy({ TYPEVAULT_GRANT: grant, TYPEVAULT_GLOBAL: '1' }, undefined, [])
+    const built = buildSandboxedCommand('true', { env: policy })
+
+    expect(policy.inherit).toEqual(['TYPEVAULT_GRANT'])
+    expect(policy.set).toEqual({ TYPEVAULT_GLOBAL: '1' })
+    expect(built.commandString).not.toContain(grant)
+  })
+
   test('deduplicates a name that is both a secret-pattern overlay and an exposable name', () => {
     const policy = buildSandboxEnvPolicy({ FOO_TOKEN: 'x' }, undefined, ['FOO_TOKEN'])
     expect(policy.inherit).toEqual(['FOO_TOKEN'])
