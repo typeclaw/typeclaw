@@ -28,6 +28,10 @@ export type BuildDockerfileOptions = {
   // hosts without buildx. `start` sets this to false when buildx is absent so
   // the legacy `docker build` can still build the agent image.
   buildKit?: boolean
+  // `typeclaw.json#typevault.enabled`: an enabled vault serves its one-time
+  // secret pages through a cloudflare-quick tunnel, so it needs cloudflared
+  // even when `docker.file.cloudflared` is off.
+  typevault?: boolean
 }
 
 // Apt packages that EVERY image must have — git for the agent runtime,
@@ -781,7 +785,7 @@ export function buildDockerfile(
   const cjkFonts = resolveCjkFonts(config.cjkFonts, options.cjkFontsAuto ?? false)
   const toggleAptArgs = collectToggleAptArgs(config, cjkFonts)
   const ghKeyringLayer = renderGhKeyringLayer(config.gh, buildKit)
-  const cloudflaredLayer = renderCloudflaredLayer(config.cloudflared)
+  const cloudflaredLayer = renderCloudflaredLayer(config.cloudflared || options.typevault === true)
   const customLines = renderCustomDockerfileLines(config.append)
   const baseImageVersion = options.baseImageVersion ?? null
 

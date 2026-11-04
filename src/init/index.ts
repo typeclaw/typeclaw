@@ -819,6 +819,7 @@ export async function writeDockerAssets(root: string): Promise<DockerAssetsResul
         // `null` selects the inline `oven/bun:1-slim` path in buildDockerfile.
         baseImageVersion: devMode ? null : resolveBaseImageVersion(root),
         cjkFontsAuto: hostLocaleIsCjk(),
+        typevault: typeclawConfig.typevault.enabled,
       }),
       { flag: 'wx' },
     ).catch(ignoreExists)
