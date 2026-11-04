@@ -21,11 +21,14 @@ const browser = await connect(url, {
   client: { authorizer: { resolveAuthorization: async () => `Bearer ${token}` } },
 })
 const tabs = createAgentTabs(browser) // background tabs that never steal focus
-const page = await tabs.open('https://example.com')
+const { targetId, page } = await tabs.create('https://example.com')
+console.log(targetId) // keep it: later scripts reattach with browser.attachPage(targetId)
 console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
 process.exit(0) // leaves the tab and browser running
 ```
+
+A later script continues in the same tab with `const page = await browser.attachPage(targetId)`; take a fresh `page.snapshot()` before using refs. `browser.listTargets()` lists open tabs when the id is lost.
 
 - Prefer `compactSnapshot(await page.snapshot())` over screenshots; re-snapshots come back as a diff.
 - Long lists: `createNetworkSnoop` + `collectWhileScrolling` read the page's JSON instead of scraping rows.
