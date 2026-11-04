@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import lockfile from 'proper-lockfile'
 
 import { parseSecretsFile, SECRETS_FILE_VERSION } from '@/secrets/schema'
+import { isTypevaultMarker } from '@/typevault/envelope-store'
 
 // PR #638 removed the in-memory v1->v2 upgrade that `parseSecretsFile` used to
 // perform, so a `secrets.json` still in v1 now fails to parse:
@@ -115,6 +116,7 @@ function upgradeFileInPlace(path: string): SecretsMigrationResult {
     return { changed: false, summary: 'secrets file unreadable; skipped' }
   }
   if (raw.trim() === '') return { changed: false, summary: 'secrets file empty; skipped' }
+  if (isTypevaultMarker(raw)) return { changed: false, summary: 'secrets kept in TypeVault; skipped' }
 
   let parsed: unknown
   try {
