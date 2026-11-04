@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import * as FakeTimers from '@sinonjs/fake-timers'
 
@@ -7,6 +10,7 @@ import type { PluginContext, PluginExports } from '@/plugin'
 
 import backupPlugin, { backupCommitted } from './index'
 import type { BackupResult } from './runner'
+import { type CommitMessagePayload, createCommitMessageSubagent } from './subagents'
 
 type SpawnCall = { name: string; payload: unknown }
 
@@ -180,6 +184,100 @@ describe('backup plugin', () => {
     await idle({ sessionId: 's2', parentTranscriptPath: undefined, idleMs: 0 }, hookCtx())
     await advance(80)
     expect(spawnCalls.length).toBe(1)
+  })
+})
+
+describe('backup commit message reuse', () => {
+  const IDENTITY_ENV = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL']
+  let repo: string
+  let savedEnv: Record<string, string | undefined>
+
+  async function git(...args: string[]): Promise<void> {
+    const proc = Bun.spawn(['git', ...args], { cwd: repo, stdout: 'ignore', stderr: 'pipe' })
+    if ((await proc.exited) !== 0) throw new Error(`git ${args.join(' ')}: ${await new Response(proc.stderr).text()}`)
+  }
+
+  beforeEach(async () => {
+    // The backup runner shells out with real timeouts; virtual time would never fire them.
+    clock?.uninstall()
+    clock = null
+    savedEnv = Object.fromEntries(
+      [...IDENTITY_ENV, 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'].map((k) => [k, process.env[k]]),
+    )
+    for (const k of IDENTITY_ENV) delete process.env[k]
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null'
+    process.env.GIT_CONFIG_NOSYSTEM = '1'
+    repo = await mkdtemp(join(tmpdir(), 'typeclaw-backup-memo-'))
+    await git('init', '-q')
+    await writeFile(join(repo, 'seed.md'), 'seed\n')
+    await git('add', 'seed.md')
+    await git('-c', 'user.name=Seed', '-c', 'user.email=seed@example.com', 'commit', '-q', '-m', 'seed')
+    // No identity from now on, so every backup commit fails the way an unconfigured agent's does.
+    await git('config', 'user.useConfigOnly', 'true')
+  })
+
+  afterEach(async () => {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    await rm(repo, { recursive: true, force: true })
+  })
+
+  test('a commit that keeps failing on the same changes reuses a generated message, never a fallback', async () => {
+    // given a backup plugin driving the real commit-message subagent, whose model can fail
+    const messageSubagent = createCommitMessageSubagent()
+    let generationFails = true
+    const messageSpawns: unknown[] = []
+    const { ctx } = makeCtx({ config: { ...tinyConfig, maintenance: false } })
+    const repoCtx: PluginContext<any> = {
+      ...ctx,
+      agentDir: repo,
+      spawnSubagent: async (name, payload) => {
+        if (name !== 'backup-message') return
+        messageSpawns.push(payload)
+        await messageSubagent.handler!(
+          { userPrompt: '', agentDir: repo, payload: payload as CommitMessagePayload },
+          (async (override?: { onFinalMessage?: (text: string) => void }) => {
+            if (generationFails) throw new Error('model unavailable')
+            override?.onFinalMessage?.('chore: update notes')
+          }) as never,
+        )
+      },
+    }
+    const runner = (await loadPlugin(repoCtx)).subagents?.backup
+    if (!runner?.handler) throw new Error('backup runner subagent missing')
+    const runBackup = () =>
+      runner.handler!(
+        { userPrompt: '', agentDir: repo, payload: { agentDir: repo, pushToOrigin: false, maintenance: false } },
+        async () => {
+          throw new Error('the backup runner never starts an LLM session')
+        },
+      )
+    await writeFile(join(repo, 'notes.md'), 'one\n')
+
+    // A failed run leaves intent-to-add entries behind, so the status settles after it.
+    await runBackup()
+    await runBackup()
+    const settled = messageSpawns.length
+
+    // when generation fails on the settled dirty set, the fallback is not remembered
+    await runBackup()
+    expect(messageSpawns).toHaveLength(settled + 1)
+
+    // when generation recovers, the generated message is picked and then reused
+    generationFails = false
+    await runBackup()
+    await runBackup()
+    await runBackup()
+    expect(messageSpawns).toHaveLength(settled + 2)
+
+    // when the dirty set changes
+    await writeFile(join(repo, 'more.md'), 'two\n')
+    await runBackup()
+
+    // then a fresh message is picked
+    expect(messageSpawns).toHaveLength(settled + 3)
   })
 })
 

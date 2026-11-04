@@ -73,6 +73,7 @@ export default definePlugin({
     const maintenance = ctx.config.maintenance
 
     const activeTurns = new Set<string>()
+    const commitMessages: CommitMessageMemo = {}
     let idleTimer: ReturnType<typeof setTimeout> | null = null
     let pendingFire = false
     let inFlight = false
@@ -133,7 +134,7 @@ export default definePlugin({
       payloadSchema: runnerPayloadSchema,
       inFlightKey: (payload) => payload.agentDir,
       handler: async (sctx) => {
-        const result = await runBackupOnce(sctx.payload, ctx)
+        const result = await runBackupOnce(sctx.payload, ctx, commitMessages)
         const summary = describeResult(result)
         ctx.logger.info(`[backup] ${summary}`)
       },
@@ -180,6 +181,7 @@ async function runBackupOnce(
     spawnSubagent: PluginContext['spawnSubagent']
     github: PluginContext['github']
   },
+  commitMessages: CommitMessageMemo,
 ): Promise<BackupResult> {
   const messagePath = messageFilePath(payload.agentDir)
   await ensureMessageDir(messagePath)
@@ -205,6 +207,8 @@ async function runBackupOnce(
     gitSpawn,
     pushEnv,
     pickCommitMessage: async ({ status, diffstat }: { status: string; diffstat: string }): Promise<string> => {
+      const key = `${status}\0${diffstat}`
+      if (commitMessages.last?.key === key) return commitMessages.last.message
       await cleanupMessageFile(messagePath)
       const messagePayload: CommitMessagePayload = {
         agentDir: payload.agentDir,
@@ -221,7 +225,11 @@ async function runBackupOnce(
       }
       const written = await readMessageFile(messagePath)
       await cleanupMessageFile(messagePath)
-      return written ?? 'chore: backup'
+      if (written === null) return FALLBACK_COMMIT_MESSAGE
+      // The message subagent writes this same fallback when its own session
+      // fails, so it is never remembered: the next run retries generation.
+      if (written.trim() !== FALLBACK_COMMIT_MESSAGE) commitMessages.last = { key, message: written }
+      return written
     },
     diagnoseFailure: async (input: {
       cwd: string
@@ -264,6 +272,13 @@ async function runBackupOnce(
   await cleanupMessageFile(messagePath)
   return result
 }
+
+// A commit that keeps failing (e.g. no git identity) leaves the same dirty set
+// behind, and every idle window would otherwise pay another uncacheable LLM call
+// for the same message. Reused only for byte-identical status + diffstat.
+type CommitMessageMemo = { last?: { key: string; message: string } }
+
+const FALLBACK_COMMIT_MESSAGE = 'chore: backup'
 
 // True when a local commit was created this run, regardless of the push outcome.
 // The commit is made before push recovery, so `push-failed`/`rebase-failed` still

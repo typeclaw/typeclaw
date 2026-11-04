@@ -70,14 +70,13 @@ describe('renderSessionOrigin', () => {
     expect(out).toContain('No human is watching this turn')
   })
 
-  test('subagent origin names the subagent and parent', () => {
+  test('subagent origin names the subagent', () => {
     const out = renderSessionOrigin({
       kind: 'subagent',
       subagent: 'memory-logger',
       parentSessionId: 'ses_parent',
     })
     expect(out).toContain('`memory-logger` subagent')
-    expect(out).toContain('ses_parent')
     expect(out).toContain('Stay narrowly within')
   })
 
@@ -673,6 +672,13 @@ describe('renderSessionOrigin', () => {
 
     expect(out).not.toContain('Role: `owner`')
     expect(out).not.toContain('`security.bypass.secretExfilBash`')
+  })
+
+  test('subagent origin renders identically across parent sessions so siblings share a cached prefix', () => {
+    const first = renderSessionOrigin({ kind: 'subagent', subagent: 'explorer', parentSessionId: 'ses_a' })
+    const second = renderSessionOrigin({ kind: 'subagent', subagent: 'explorer', parentSessionId: 'ses_b' })
+
+    expect(first).toBe(second)
   })
 
   test('subagent origin appends the role block', () => {

@@ -54,12 +54,11 @@ describe('dumpSystemPrompt', () => {
     expect(out).toContain('- Job kind: prompt')
   })
 
-  test('subagent origin names the subagent and parent session', () => {
+  test('subagent origin names the subagent but not the parent session', () => {
     const out = dumpSystemPrompt('subagent')
 
-    expect(out).toContain('subagent spawned by parent session')
     expect(out).toContain('<PLACEHOLDER-subagent-name>')
-    expect(out).toContain('ses_<PLACEHOLDER-parent>')
+    expect(out).not.toContain('ses_<PLACEHOLDER-parent>')
   })
 
   test('--no-git-nudge equivalent omits the uncommitted changes block on a full-mode origin', () => {
