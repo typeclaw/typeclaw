@@ -54,6 +54,10 @@ export async function commitSystemFile(cwd: string, file: string | readonly stri
   await commit.exited
 }
 
+// A git child that never exits would otherwise block the caller's thread for
+// good, since a synchronous spawn cannot be interrupted from JavaScript.
+const SPAWN_SYNC_TIMEOUT_MS = 30_000
+
 // Synchronous variant for callers that already hold a synchronous codepath
 // — specifically `persistMigratedConfig` in src/config/config.ts. The
 // migration write is itself synchronous (writeFileSync) and the call sites
@@ -83,6 +87,7 @@ export function commitSystemFileSync(cwd: string, file: string | readonly string
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: SPAWN_SYNC_TIMEOUT_MS,
   })
   if (status.exitCode !== 0) return
   if (new TextDecoder().decode(status.stdout).trim().length === 0) return
@@ -92,6 +97,7 @@ export function commitSystemFileSync(cwd: string, file: string | readonly string
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: SPAWN_SYNC_TIMEOUT_MS,
   })
   if (add.exitCode !== 0) return
 
@@ -100,6 +106,7 @@ export function commitSystemFileSync(cwd: string, file: string | readonly string
     cwd,
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: SPAWN_SYNC_TIMEOUT_MS,
   })
 }
 
