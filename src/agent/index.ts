@@ -25,7 +25,12 @@ import {
 import { config } from '@/config/config'
 import { registerEvalTool, EVAL_PROMPT_HINT } from '@/eval/tool'
 
-import { composeSystemPrompt, deriveSystemPromptMode, type SystemPromptMode } from './system-prompt-composition'
+import {
+  composeSessionTail,
+  composeSystemPrompt,
+  deriveSystemPromptMode,
+  type SystemPromptMode,
+} from './system-prompt-composition'
 export {
   composeSystemPrompt,
   deriveSystemPromptMode,
@@ -81,6 +86,7 @@ import type { SubagentBashPolicy } from './reviewer-bash-policy'
 import { loadSelf } from './self'
 import { SESSION_META_CUSTOM_TYPE, sessionMetaPayload } from './session-meta'
 import { renderSessionOrigin, type SessionOrigin, type SessionRoleContext } from './session-origin'
+import { appendSessionTail, persistedPromptHasInlineSessionTail } from './session-tail'
 import { SubagentCacheKeepalive } from './subagent-cache-keepalive'
 import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } from './subagents'
 import {
@@ -576,6 +582,11 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     budgetState: sessionBudgetState,
   })
 
+  // New sessions render their origin/role/git suffix after pi's sections at
+  // request time (see session-tail.ts); a resumed session keeps the layout its
+  // persisted prompt already has.
+  let sessionTail = ''
+  const detachSessionTail = !persistedPromptHasInlineSessionTail(sessionManager.getEntries())
   const resourceLoader =
     options.systemPromptOverride !== undefined
       ? await createOverrideResourceLoader(
@@ -593,6 +604,13 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           ...(options.mcpManager !== undefined ? { mcpManager: options.mcpManager } : {}),
           ...(options.subagentRegistry !== undefined ? { subagentRegistry: options.subagentRegistry } : {}),
           ...(isOpenAiFamilyRef(activeRef) ? { proactiveNextStepNudge: true } : {}),
+          ...(detachSessionTail
+            ? {
+                onSessionTail: (tail: string) => {
+                  sessionTail = tail
+                },
+              }
+            : {}),
         })
 
   const model = applyModelRuntimeOverrides(resolveModel(activeRef), activeRef)
@@ -702,7 +720,16 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // stay unwrapped: their failures can be genuine provider/auth failures.
   // Overflow recovery stays enabled; a local failure whose text would read as a
   // provider overflow is stamped with fixed text and its raw text is logged here.
-  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(session.agent.transformContext, {
+  const innerTransformContext = session.agent.transformContext
+  const transformWithSessionTail: typeof innerTransformContext =
+    sessionTail === ''
+      ? innerTransformContext
+      : async (messages, signal) =>
+          appendSessionTail(
+            innerTransformContext ? await innerTransformContext(messages, signal) : messages,
+            sessionTail,
+          )
+  session.agent.transformContext = wrapTransformContextWithLocalFailureMarker(transformWithSessionTail, {
     getProvider: () => session.agent.state.model?.provider,
     logWithheld: (line) =>
       console.error(`[agent] ${options.plugins?.sessionId ?? sessionManager.getSessionId()}: ${line}`),
@@ -1278,6 +1305,9 @@ export type CreateResourceLoaderOptions = {
   mode?: SystemPromptMode
   proactiveNextStepNudge?: boolean
   evalEnabled?: boolean
+  // When set, the origin/role/git suffix is left out of the preamble and handed
+  // here instead, for the session to append after pi's sections.
+  onSessionTail?: (tail: string) => void
 }
 
 export async function createResourceLoader(options: CreateResourceLoaderOptions = {}): Promise<DefaultResourceLoader> {
@@ -1356,16 +1386,24 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     mcpCatalog = renderMcpCatalog(options.mcpManager.listServers())
   }
 
+  const detached = options.onSessionTail !== undefined
+  options.onSessionTail?.(
+    composeSessionTail({
+      ...(options.origin !== undefined ? { origin: options.origin } : {}),
+      ...(roleContext !== undefined ? { roleContext } : {}),
+      gitNudge,
+    }),
+  )
   const systemPrompt = composeSystemPrompt({
     mode,
     branding,
     self,
     subagentRoster,
     ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
-    ...(options.origin !== undefined ? { origin: options.origin } : {}),
-    ...(roleContext !== undefined ? { roleContext } : {}),
+    ...(options.origin !== undefined && !detached ? { origin: options.origin } : {}),
+    ...(roleContext !== undefined && !detached ? { roleContext } : {}),
     ...(mcpCatalog !== undefined ? { mcpCatalog } : {}),
-    gitNudge,
+    gitNudge: detached ? '' : gitNudge,
     ...(options.evalEnabled ? { evalHint: EVAL_PROMPT_HINT } : {}),
     ...(options.proactiveNextStepNudge === true ? { proactiveNextStepNudge: PROACTIVE_NEXT_STEP_NUDGE } : {}),
   })

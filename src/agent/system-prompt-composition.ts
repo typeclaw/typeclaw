@@ -112,6 +112,13 @@ export type SystemPromptComposition = {
 //
 // pi appends project context (AGENTS.md), the skill catalog, and the cwd
 // after this preamble when it builds the final system message.
+//
+// New sessions leave `origin`/`roleContext`/`gitNudge` out of this preamble and
+// render them with `composeSessionTail`, which the session appends after pi's
+// sections at request time. The preamble then matches across every session of
+// an origin kind, so the ~30K chars of project context and skills that follow
+// it stay in the cross-session cached prefix. Passing them here keeps the
+// inline layout for sessions whose persisted prompt already carries them.
 export function composeSystemPrompt(parts: SystemPromptComposition): string {
   const branding = parts.branding ?? true
   let prompt = `${buildSystemPolicy(branding)}\n\n${parts.self}`
@@ -138,4 +145,15 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   }
   if (parts.evalHint) prompt = `${prompt}\n\n${parts.evalHint}`
   return prompt
+}
+
+// The per-session suffix: origin (with its role block) and the git nudge, in
+// the same relative order the inline layout uses. Empty when neither applies.
+export function composeSessionTail(
+  parts: Pick<SystemPromptComposition, 'origin' | 'roleContext' | 'gitNudge'>,
+): string {
+  const sections: string[] = []
+  if (parts.origin !== undefined) sections.push(renderSessionOrigin(parts.origin, Date.now(), parts.roleContext))
+  if (parts.gitNudge !== '') sections.push(parts.gitNudge)
+  return sections.join('\n\n')
 }
