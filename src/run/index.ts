@@ -86,6 +86,7 @@ import { createSessionFactory, type SessionFactory } from '@/sessions'
 import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
+import { setActiveTunnelManager } from '@/tunnels/active'
 
 import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
@@ -451,6 +452,7 @@ async function startAgentRuntime(
       return null
     },
   })
+  setActiveTunnelManager(tunnelManager)
 
   const legacyBackgroundHandoffs = new LegacyBackgroundHandoffReader(cwd, {
     onError: (error) => console.warn(`[run] legacy background upgrade failed: ${error}`),
