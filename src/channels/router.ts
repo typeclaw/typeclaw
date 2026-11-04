@@ -84,6 +84,7 @@ import {
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
 import { InboundJournal, type InboundRecord, type InboundRef } from './inbound-journal'
+import { takeLostBackgroundContext } from './lost-background-context'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
   type MembershipCount,
@@ -1036,6 +1037,8 @@ type LiveSession = {
   // the drain loop's run condition checks BOTH queues so a system
   // reminder alone is enough to trigger a turn.
   pendingSystemReminders: PendingSystemReminder[]
+  // Passive context only: it must never become work in the reminder queue.
+  restoredBackgroundContextPending: boolean
   // Identity-only cache; every durable transition resolves ownership in its lane.
   backgroundCoverage: string[]
   inboundCoverage: string[]
@@ -3217,6 +3220,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingGithubReviewRoundCloseout: null,
         promptQueue: [],
         pendingSystemReminders: [],
+        restoredBackgroundContextPending: !isColdStart,
         backgroundCoverage: [],
         inboundCoverage: [],
         backgroundStopVersion: 0,
@@ -5646,7 +5650,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           )
         })
         if (!accountMayPrompt || live.backgroundStopVersion !== stopVersion) continue
-        const promptText = retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text
+        // Taken only once this turn will prompt: the receipt is at-most-once.
+        const restoredContext = live.restoredBackgroundContextPending
+          ? await takeLostBackgroundContext(options.agentDir, backgroundObligations, live.sessionId)
+          : []
+        live.restoredBackgroundContextPending = false
+        const promptText = [
+          ...restoredContext,
+          text,
+          ...(retrievalContext.results ? [retrievalContext.results] : []),
+        ].join('\n\n')
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
         try {
