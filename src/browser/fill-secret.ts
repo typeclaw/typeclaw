@@ -4,6 +4,9 @@
 
 const COMMAND_TIMEOUT_MS = 10_000
 const DEFAULT_NAVIGATION_TIMEOUT_MS = 15_000
+// How long a real Enter gets to start a navigation before the form is
+// submitted directly instead.
+const ENTER_GRACE_MS = 2_000
 
 export type FillSecretOptions = {
   cdpUrl: string
@@ -44,13 +47,40 @@ export async function fillSecretIntoFocusedField(options: FillSecretOptions): Pr
       if (!options.submit) return { status: 'filled', url: target.url, field: focused.field }
 
       await cdp.send('Page.enable', {}, sessionId)
+      const timeoutMs = options.navigationTimeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT_MS
+      const { frameTree } = (await cdp.send('Page.getFrameTree', {}, sessionId)) as {
+        frameTree: { frame: { id: string } }
+      }
       const navigated = cdp.waitForEvent(
         'Page.frameNavigated',
         sessionId,
         (params) => (params as { frame?: { parentId?: string } }).frame?.parentId === undefined,
-        options.navigationTimeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT_MS,
+        timeoutMs,
       )
-      await submitField(cdp, sessionId, focused.objectId)
+      const startedLoading = cdp.waitForEvent(
+        'Page.frameStartedLoading',
+        sessionId,
+        (params) => (params as { frameId?: string }).frameId === frameTree.frame.id,
+        Math.min(ENTER_GRACE_MS, timeoutMs / 2),
+      )
+      // Enter first: script-driven logins (encrypt-then-submit from a keyup or
+      // button handler) cancel a direct form submit, while a real keystroke
+      // runs their handlers and still triggers implicit submission elsewhere.
+      // Once a load starts the old document (and the field handle) may be gone,
+      // so it is only probed after the grace period passes with no load. The
+      // submit-seen check and the fallback submit run in one browser-side call
+      // so a handler that submits late in the grace period is not doubled.
+      await callOnField(cdp, sessionId, focused.objectId, WATCH_SUBMIT_FUNCTION)
+      await pressEnter(cdp, sessionId)
+      if (!(await startedLoading)) {
+        try {
+          await callOnField(cdp, sessionId, focused.objectId, SUBMIT_UNLESS_SEEN_FUNCTION)
+        } catch (error) {
+          // A navigation that began right after the grace period destroys the
+          // handle; that is a successful submit, not a failure.
+          if (!(await navigated)) throw error
+        }
+      }
       if (await navigated) return { status: 'submitted', url: target.url, field: focused.field }
     } catch (error) {
       // The value may already be in the field; a failed step must not leave it there.
@@ -177,27 +207,34 @@ async function pressCommand(cdp: CdpConnection, sessionId: string, command: stri
   await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp' }, sessionId)
 }
 
+const WATCH_SUBMIT_FUNCTION = `function () {
+  const form = this.form
+  if (!form) return
+  form.__typeclawSubmitSeen = false
+  form.addEventListener('submit', () => { form.__typeclawSubmitSeen = true }, { capture: true, once: true })
+}`
+
 // A form without a submit button and with several fields ignores Enter (HTML
-// implicit submission), so submit the owning form directly when there is one;
-// script-driven logins with no form still get the Enter keystroke.
-async function submitField(cdp: CdpConnection, sessionId: string, objectId: string | undefined): Promise<void> {
-  if (objectId !== undefined) {
-    const submitted = (await cdp.send(
-      'Runtime.callFunctionOn',
-      {
-        objectId,
-        functionDeclaration: `function () {
-          if (!this.form) return false
-          this.form.requestSubmit()
-          return true
-        }`,
-        returnByValue: true,
-      },
-      sessionId,
-    )) as { result: { value?: boolean } }
-    if (submitted.result.value === true) return
-  }
-  await pressEnter(cdp, sessionId)
+// implicit submission), so it is submitted directly when Enter did nothing.
+const SUBMIT_UNLESS_SEEN_FUNCTION = `function () {
+  const form = this.form
+  if (!this.isConnected || !form || form.__typeclawSubmitSeen === true) return
+  form.requestSubmit()
+}`
+
+async function callOnField(
+  cdp: CdpConnection,
+  sessionId: string,
+  objectId: string | undefined,
+  functionDeclaration: string,
+): Promise<unknown> {
+  if (objectId === undefined) return undefined
+  const result = (await cdp.send(
+    'Runtime.callFunctionOn',
+    { objectId, functionDeclaration, returnByValue: true },
+    sessionId,
+  )) as { result?: { value?: unknown } }
+  return result.result?.value
 }
 
 async function pressEnter(cdp: CdpConnection, sessionId: string): Promise<void> {
