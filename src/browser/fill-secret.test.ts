@@ -8,7 +8,13 @@ type Focus = { kind: string; field?: string }
 type FakeOptions = {
   targets: { url: string }[]
   focus: Focus
-  navigatesOnSubmit: boolean
+  // What makes the page navigate: a real Enter keystroke (script-driven logins
+  // that cancel a direct form submit), only a direct form submit, or nothing.
+  navigatesOn: 'enter' | 'form-submit' | 'never'
+  // The Enter keystroke fires the form's submit event (SPA logins that handle
+  // it in script and never navigate): at once, or this many ms later (a
+  // handler that validates asynchronously before submitting).
+  enterSubmits?: 'now' | 'late'
   failOn?: 'Page.enable' | 'submit'
 }
 type Call = { method: string; params: Record<string, unknown>; sessionId?: string }
@@ -21,9 +27,18 @@ afterEach(() => {
 })
 
 // Hand-rolled Chrome stand-in: answers the CDP commands the fill flow sends and
-// fires a main-frame navigation when the page "submits".
-function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[] } {
+// fires a main-frame navigation when the page "submits". Like Chrome, a
+// navigation destroys the old document, so calls on its element handle fail.
+function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[]; submits: () => number } {
   const calls: Call[] = []
+  let submitSeen = false
+  let submits = 0
+  let handleAlive = true
+  let lateSubmitPending = false
+  const submit = (): void => {
+    submitSeen = true
+    submits++
+  }
   server = Bun.serve({
     port: 0,
     fetch: (req, srv) => (srv.upgrade(req, { data: undefined }) ? undefined : new Response('no', { status: 400 })),
@@ -37,6 +52,11 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[] } {
         const fail = (): void => {
           ws.send(JSON.stringify({ id, error: { message: `${method} failed` } }))
         }
+        const navigate = (): void => {
+          handleAlive = false
+          ws.send(JSON.stringify({ method: 'Page.frameStartedLoading', sessionId: 'S', params: { frameId: 'main' } }))
+          ws.send(JSON.stringify({ method: 'Page.frameNavigated', sessionId: 'S', params: { frame: { id: 'main' } } }))
+        }
         if (method === 'Page.enable' && options.failOn === 'Page.enable') return fail()
         switch (method) {
           case 'Target.getTargets':
@@ -45,18 +65,40 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[] } {
             })
           case 'Target.attachToTarget':
             return reply({ sessionId: 'S' })
+          case 'Page.getFrameTree':
+            return reply({ frameTree: { frame: { id: 'main' } } })
+          case 'Input.dispatchKeyEvent':
+            reply({})
+            if (params['type'] === 'keyUp' && params['key'] === 'Enter') {
+              if (options.navigatesOn === 'enter') navigate()
+              if (options.enterSubmits === 'now') submit()
+              else if (options.enterSubmits === 'late') lateSubmitPending = true
+            }
+            return
           case 'Runtime.evaluate':
             return reply(
               params['returnByValue'] ? { result: { value: options.focus } } : { result: { objectId: 'el-1' } },
             )
           case 'Runtime.callFunctionOn': {
             const fn = String(params['functionDeclaration'])
+            if (!handleAlive) {
+              ws.send(JSON.stringify({ id, error: { message: 'Cannot find context with specified id' } }))
+              return
+            }
+            // A late submit lands after Enter returns, but before the page can
+            // run the fallback submit.
+            if (fn.includes('requestSubmit') && lateSubmitPending) {
+              lateSubmitPending = false
+              submit()
+            }
             if (fn.includes('requestSubmit') && options.failOn === 'submit') return fail()
-            reply({ result: { value: true } })
-            if (fn.includes('requestSubmit') && options.navigatesOnSubmit) {
-              ws.send(
-                JSON.stringify({ method: 'Page.frameNavigated', sessionId: 'S', params: { frame: { id: 'main' } } }),
-              )
+            reply({ result: { value: fn.includes('__typeclawSubmitSeen === true') ? submitSeen : true } })
+            // requestSubmit() always fires another submit; only a browser-side
+            // check of the submit-seen marker can skip it.
+            const guarded = fn.includes('__typeclawSubmitSeen === true')
+            if (fn.includes('requestSubmit') && !(guarded && submitSeen)) {
+              submit()
+              if (options.navigatesOn === 'form-submit') navigate()
             }
             return
           }
@@ -66,7 +108,7 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[] } {
       },
     },
   })
-  return { cdpUrl: `ws://127.0.0.1:${server.port}/devtools/browser/x`, calls }
+  return { cdpUrl: `ws://127.0.0.1:${server.port}/devtools/browser/x`, calls, submits: () => submits }
 }
 
 const password: Focus = { kind: 'editable', field: 'input[type=password]' }
@@ -76,11 +118,11 @@ const clearCalls = (calls: Call[]) =>
   calls.filter((c) => c.method === 'Runtime.callFunctionOn' && c.params['functionDeclaration'] === CLEAR_FIELD_FUNCTION)
 
 describe('fillSecretIntoFocusedField', () => {
-  test('types the value into the focused field, submits its form, and reports the navigation without the value', async () => {
-    const { cdpUrl, calls } = fakeChrome({
+  test('submits with a real Enter so a script-driven login runs, and reports the navigation without the value', async () => {
+    const { cdpUrl, calls, submits } = fakeChrome({
       targets: [{ url: 'https://example.com/login' }],
       focus: password,
-      navigatesOnSubmit: true,
+      navigatesOn: 'enter',
     })
 
     const outcome = await fillSecretIntoFocusedField({ cdpUrl, value: 'hunter2', submit: true })
@@ -88,14 +130,60 @@ describe('fillSecretIntoFocusedField', () => {
     expect(outcome).toEqual({ status: 'submitted', url: 'https://example.com/login', field: 'input[type=password]' })
     expect(JSON.stringify(outcome)).not.toContain('hunter2')
     expect(insertedText(calls)).toEqual(['hunter2'])
+    expect(submits()).toBe(0)
     expect(clearCalls(calls)).toEqual([])
   })
+
+  test('submits the form directly when Enter does nothing, as in a form without a submit button', async () => {
+    const { cdpUrl, submits } = fakeChrome({
+      targets: [{ url: 'https://example.com/login' }],
+      focus: password,
+      navigatesOn: 'form-submit',
+    })
+
+    const outcome = await fillSecretIntoFocusedField({
+      cdpUrl,
+      value: 'hunter2',
+      submit: true,
+      // The fallback waits out the whole Enter grace period, so the navigation
+      // budget must comfortably exceed it on a loaded machine.
+      navigationTimeoutMs: 10_000,
+    })
+
+    expect(outcome).toMatchObject({ status: 'submitted' })
+    expect(submits()).toBe(1)
+  })
+
+  test.each([
+    ['at once', 'now'],
+    ['late in the grace period', 'late'],
+  ] as const)(
+    'does not submit the form a second time when Enter fires its submit event %s',
+    async (_when, enterSubmits) => {
+      const { cdpUrl, submits } = fakeChrome({
+        targets: [{ url: 'https://app.example/login' }],
+        focus: password,
+        navigatesOn: 'never',
+        enterSubmits,
+      })
+
+      const outcome = await fillSecretIntoFocusedField({
+        cdpUrl,
+        value: 'hunter2',
+        submit: true,
+        navigationTimeoutMs: 60,
+      })
+
+      expect(outcome).toMatchObject({ status: 'not-navigated', cleared: true })
+      expect(submits()).toBe(1)
+    },
+  )
 
   test('clears the field when the submit does not navigate, so the value is not left on the page', async () => {
     const { cdpUrl, calls } = fakeChrome({
       targets: [{ url: 'https://example.com/login' }],
       focus: password,
-      navigatesOnSubmit: false,
+      navigatesOn: 'never',
     })
 
     const outcome = await fillSecretIntoFocusedField({
@@ -113,7 +201,7 @@ describe('fillSecretIntoFocusedField', () => {
     const { cdpUrl, calls } = fakeChrome({
       targets: [{ url: 'https://shop.example/checkout' }],
       focus: { kind: 'editable', field: 'textarea' },
-      navigatesOnSubmit: false,
+      navigatesOn: 'never',
     })
 
     const outcome = await fillSecretIntoFocusedField({ cdpUrl, value: '1 Main St', submit: false })
@@ -126,7 +214,7 @@ describe('fillSecretIntoFocusedField', () => {
     const { cdpUrl, calls } = fakeChrome({
       targets: [{ url: 'https://example.com/' }],
       focus: { kind: 'none', field: 'button' },
-      navigatesOnSubmit: false,
+      navigatesOn: 'never',
     })
 
     const outcome = await fillSecretIntoFocusedField({ cdpUrl, value: 'hunter2', submit: false })
@@ -137,14 +225,14 @@ describe('fillSecretIntoFocusedField', () => {
 
   test('asks for a url when several tabs are open, and uses the one it names', async () => {
     const targets = [{ url: 'https://a.example/login' }, { url: 'https://b.example/' }]
-    const ambiguous = fakeChrome({ targets, focus: password, navigatesOnSubmit: false })
+    const ambiguous = fakeChrome({ targets, focus: password, navigatesOn: 'never' })
     expect(await fillSecretIntoFocusedField({ cdpUrl: ambiguous.cdpUrl, value: 'x', submit: false })).toMatchObject({
       status: 'refused',
     })
     expect(insertedText(ambiguous.calls)).toEqual([])
     server?.stop(true)
 
-    const picked = fakeChrome({ targets, focus: password, navigatesOnSubmit: false })
+    const picked = fakeChrome({ targets, focus: password, navigatesOn: 'never' })
     const outcome = await fillSecretIntoFocusedField({
       cdpUrl: picked.cdpUrl,
       value: 'x',
@@ -161,11 +249,13 @@ describe('fillSecretIntoFocusedField', () => {
       const { cdpUrl, calls } = fakeChrome({
         targets: [{ url: 'https://example.com/login' }],
         focus: password,
-        navigatesOnSubmit: false,
+        navigatesOn: 'never',
         failOn,
       })
 
-      await expect(fillSecretIntoFocusedField({ cdpUrl, value: 'hunter2', submit: true })).rejects.toThrow('failed')
+      await expect(
+        fillSecretIntoFocusedField({ cdpUrl, value: 'hunter2', submit: true, navigationTimeoutMs: 50 }),
+      ).rejects.toThrow('failed')
 
       expect(insertedText(calls)).toEqual(['hunter2'])
       expect(clearCalls(calls)).toHaveLength(1)

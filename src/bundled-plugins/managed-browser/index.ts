@@ -106,7 +106,7 @@ export function createFillSecretTool(
       'Focus the field first with your browser engine (click it), then call this. Pass `url` (exact or prefix) when several tabs are open.',
       `Accepts any ordinary .env variable and the ${SECRET_ENV_PREFIX}* tier, which is hidden from bash and reachable only through this tool.`,
       `With TypeVault enabled, \`name\` can also be a vault reference such as ${VAULT_REF_PREFIX}github/bot#password, read through this session's grant.`,
-      'With `submit: true` it submits the field (form submit, else Enter) and waits for the page to navigate; if it does not, the field is cleared so the value is not left on the page.',
+      'With `submit: true` it presses Enter (submitting the form directly only if Enter did nothing) and waits for the page to navigate; if it does not, the field is cleared so the value is not left on the page.',
       'The result names the tab and field, never the value. Never read the field back, screenshot a non-password field after filling, or echo the variable.',
     ].join(' '),
     parameters: z.object({
