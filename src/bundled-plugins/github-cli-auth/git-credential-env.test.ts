@@ -21,11 +21,13 @@ test.skipIf(unsupportedHost)('blocks local https-to-ext rewrites from inheriting
   const run = (args: string[], credentialEnv?: Record<string, string>) => {
     const env = { ...process.env, ...credentialEnv }
     if (credentialEnv !== undefined && !('GIT_ALLOW_PROTOCOL' in credentialEnv)) delete env.GIT_ALLOW_PROTOCOL
-    return Bun.spawnSync([gitExecutable, ...args], { cwd: repo, env, stderr: 'pipe', stdout: 'pipe' })
+    return Bun.spawnSync([gitExecutable, ...args], { timeout: 30_000, cwd: repo, env, stderr: 'pipe', stdout: 'pipe' })
   }
 
   try {
-    expect(Bun.spawnSync([gitExecutable, 'init', repo], { stderr: 'pipe', stdout: 'pipe' }).exitCode).toBe(0)
+    expect(
+      Bun.spawnSync([gitExecutable, 'init', repo], { timeout: 30_000, stderr: 'pipe', stdout: 'pipe' }).exitCode,
+    ).toBe(0)
     expect(run(['config', '--local', 'protocol.ext.allow', 'always']).exitCode).toBe(0)
     expect(
       run(['config', '--local', `url.ext::sh -c echo% PWNED% >% ${pwned} ignored-.insteadOf`, 'https://github.com/'])
@@ -54,6 +56,7 @@ test.skipIf(unsupportedHost)(
     const repo = join(root, 'repo')
     const run = (args: string[], env: Record<string, string> = {}) =>
       Bun.spawnSync([gitExecutable, ...args], {
+        timeout: 30_000,
         cwd: repo,
         env: { ...process.env, ...env },
         stderr: 'pipe',
@@ -62,7 +65,9 @@ test.skipIf(unsupportedHost)(
     const text = (result: ReturnType<typeof run>): string => new TextDecoder().decode(result.stdout).trim()
 
     try {
-      expect(Bun.spawnSync([gitExecutable, 'init', repo], { stderr: 'pipe', stdout: 'pipe' }).exitCode).toBe(0)
+      expect(
+        Bun.spawnSync([gitExecutable, 'init', repo], { timeout: 30_000, stderr: 'pipe', stdout: 'pipe' }).exitCode,
+      ).toBe(0)
       const url = 'https://github.com/acme/widgets.git'
       expect(run(['config', '--local', `http.${url}.proxy`, 'http://attacker.invalid:8080']).exitCode).toBe(0)
       expect(run(['config', '--local', `http.${url}.sslVerify`, 'false']).exitCode).toBe(0)
@@ -75,6 +80,7 @@ test.skipIf(unsupportedHost)(
 
       const credentialInput = Buffer.from('protocol=https\nhost=github.com\npath=acme/widgets.git\n\n')
       Bun.spawnSync([gitExecutable, 'credential', 'fill'], {
+        timeout: 30_000,
         cwd: repo,
         env: { ...process.env, TYPECLAW_GIT_TOKEN: 'control-token', GIT_TERMINAL_PROMPT: '0' },
         stdin: credentialInput,
@@ -96,6 +102,7 @@ test.skipIf(unsupportedHost)(
       )
       expect(text(run(['config', '--get', 'remote.origin.proxy'], env))).toBe('')
       Bun.spawnSync([gitExecutable, 'credential', 'fill'], {
+        timeout: 30_000,
         cwd: repo,
         env: { ...process.env, ...env },
         stdin: credentialInput,
@@ -116,6 +123,7 @@ test.skipIf(unsupportedHost)(
     const repo = join(root, 'repo')
     const run = (args: string[], env: Record<string, string> = {}) =>
       Bun.spawnSync([gitExecutable, ...args], {
+        timeout: 30_000,
         cwd: repo,
         env: { ...process.env, ...env },
         stderr: 'pipe',
@@ -125,7 +133,9 @@ test.skipIf(unsupportedHost)(
       new TextDecoder().decode(run(args, env).stdout).trim()
 
     try {
-      expect(Bun.spawnSync([gitExecutable, 'init', repo], { stderr: 'pipe', stdout: 'pipe' }).exitCode).toBe(0)
+      expect(
+        Bun.spawnSync([gitExecutable, 'init', repo], { timeout: 30_000, stderr: 'pipe', stdout: 'pipe' }).exitCode,
+      ).toBe(0)
       const url = 'https://github.com/acme/widgets.git'
       expect(run(['config', '--local', `http.${url}.proxy`, 'http://repo.invalid:8080']).exitCode).toBe(0)
       expect(run(['config', '--local', `http.${url}.sslVerify`, 'false']).exitCode).toBe(0)
@@ -165,6 +175,7 @@ test.skipIf(unsupportedHost)(
     const repo = join(root, 'repo')
     const run = (args: string[], env: Record<string, string> = {}) =>
       Bun.spawnSync([gitExecutable, ...args], {
+        timeout: 30_000,
         cwd: repo,
         env: { ...process.env, ...env },
         stderr: 'pipe',
@@ -174,7 +185,9 @@ test.skipIf(unsupportedHost)(
       new TextDecoder().decode(run(args, env).stdout).trim()
 
     try {
-      expect(Bun.spawnSync([gitExecutable, 'init', repo], { stderr: 'pipe', stdout: 'pipe' }).exitCode).toBe(0)
+      expect(
+        Bun.spawnSync([gitExecutable, 'init', repo], { timeout: 30_000, stderr: 'pipe', stdout: 'pipe' }).exitCode,
+      ).toBe(0)
       const mixedCaseUrl = 'https://github.com/Acme/Widgets.git'
       for (const key of ['proxy', 'sslCAInfo', 'sslVerify']) {
         const hostile = key === 'sslVerify' ? 'false' : key === 'proxy' ? 'http://repo.invalid:8080' : '/repo/ca.pem'

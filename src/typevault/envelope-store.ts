@@ -77,14 +77,21 @@ export function entriesStamp(agentDir: string): string {
     .join('|')
 }
 
+// A synchronous spawn cannot be interrupted from JavaScript, so a helper that
+// never exits would block the caller's thread for good.
+const HELPER_TIMEOUT_MS = 30_000
+
 export function runHelperSync(agentDir: string, op: 'read' | 'write', input?: string): string {
   const result = Bun.spawnSync([process.execPath, join(import.meta.dir, 'envelope-helper.ts'), op, agentDir], {
     stdin: input === undefined ? 'ignore' : Buffer.from(input, 'utf8'),
     stdout: 'pipe',
     stderr: 'pipe',
+    timeout: HELPER_TIMEOUT_MS,
   })
   if (result.exitCode !== 0) {
-    const reason = result.stderr.toString().trim() || `exit code ${result.exitCode}`
+    const reason = result.exitedDueToTimeout
+      ? `timed out after ${HELPER_TIMEOUT_MS}ms`
+      : result.stderr.toString().trim() || `exit code ${result.exitCode}`
     throw new Error(`TypeVault ${op} of the secrets envelope failed: ${reason}`)
   }
   return result.stdout.toString()

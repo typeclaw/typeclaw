@@ -128,7 +128,7 @@ describe('granted push handoff', () => {
 // remote whose repo config tries to widen it, then inspects the remote's refs.
 describe.skipIf(process.platform === 'win32')('buildGrantedPushCommand against real git', () => {
   function git(cwd: string, ...args: string[]): string {
-    const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+    const result = spawnSync('git', args, { timeout: 30_000, cwd, encoding: 'utf8' })
     if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`)
     return result.stdout
   }
@@ -159,7 +159,7 @@ describe.skipIf(process.platform === 'win32')('buildGrantedPushCommand against r
   }
 
   function run(command: string): number {
-    return spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8' }).status ?? -1
+    return spawnSync('/bin/sh', ['-c', command], { timeout: 30_000, encoding: 'utf8' }).status ?? -1
   }
 
   test('publishes only refs/heads/<branch>, ignoring configured force-retarget mappings and follow-tags', () => {

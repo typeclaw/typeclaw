@@ -330,10 +330,11 @@ for (const platform of ['native', 'win32'] as const) {
         if (advanced || path !== journal || typeof content !== 'string') return content
         const record = JSON.parse(content)
         if (record.phase !== 'removing') return content
-        const writer = Bun.spawnSync([
-          process.execPath,
-          '-e',
-          `
+        const writer = Bun.spawnSync(
+          [
+            process.execPath,
+            '-e',
+            `
           import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
           const path = ${JSON.stringify(journal)}
           const record = JSON.parse(readFileSync(path, 'utf8'))
@@ -351,7 +352,9 @@ for (const platform of ['native', 'win32'] as const) {
             try { fsyncSync(directory) } finally { closeSync(directory) }
           }
         `,
-        ])
+          ],
+          { timeout: 30_000 },
+        )
         expect(writer.exitCode).toBe(0)
         advanced = true
         advancedGeneration = record.generation + 1

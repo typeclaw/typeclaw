@@ -25,7 +25,7 @@ let askpassRoot: string
 let callSeq = 0
 
 function git(cwd: string, ...args: string[]): void {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  const result = spawnSync('git', args, { timeout: 30_000, cwd, encoding: 'utf8' })
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`)
 }
 

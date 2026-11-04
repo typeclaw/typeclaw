@@ -280,6 +280,7 @@ describe('github-cli-auth plugin', () => {
       if (reader === undefined) throw new Error('expected reader stage')
       const sanitizer = reader.slice(0, reader.indexOf('/usr/bin/grep'))
       const result = spawnSync('/bin/sh', ['-c', `${sanitizer}/usr/bin/env`], {
+        timeout: 30_000,
         encoding: 'utf8',
         env: {
           ...process.env,
@@ -2179,8 +2180,11 @@ describe('github-cli-auth plugin — git in the sandbox /tmp bind', () => {
 
     rmSync(sessionTmp, { recursive: true, force: true })
     mkdirSync(repoDir, { recursive: true })
-    spawnSync('git', ['init', '-q'], { cwd: repoDir })
-    spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { cwd: repoDir })
+    spawnSync('git', ['init', '-q'], { timeout: 30_000, cwd: repoDir })
+    spawnSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], {
+      timeout: 30_000,
+      cwd: repoDir,
+    })
   })
 
   afterEach(() => {
@@ -2247,6 +2251,7 @@ describe.skipIf(process.platform === 'win32')('github-cli-auth plugin — host g
 
   const runGit = (cwd: string, args: string[]): void => {
     const result = spawnSync('git', args, {
+      timeout: 30_000,
       cwd,
       env: { ...process.env, GIT_MASTER: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -2263,9 +2268,10 @@ describe.skipIf(process.platform === 'win32')('github-cli-auth plugin — host g
       GIT_COMMITTER_NAME: 'Alice',
       GIT_COMMITTER_EMAIL: 'alice@example.com',
     }
-    const tree = spawnSync('git', ['mktree'], { cwd: path, input: '', encoding: 'utf8', env })
+    const tree = spawnSync('git', ['mktree'], { timeout: 30_000, cwd: path, input: '', encoding: 'utf8', env })
     if (tree.status !== 0) throw new Error('failed to create test tree')
     const commit = spawnSync('git', ['commit-tree', tree.stdout.trim(), '-m', 'test'], {
+      timeout: 30_000,
       cwd: path,
       encoding: 'utf8',
       env,

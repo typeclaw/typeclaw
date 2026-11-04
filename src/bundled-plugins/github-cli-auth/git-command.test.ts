@@ -63,7 +63,7 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false
   }
-  const state = Bun.spawnSync(['ps', '-o', 'stat=', '-p', String(pid)])
+  const state = Bun.spawnSync(['ps', '-o', 'stat=', '-p', String(pid)], { timeout: 30_000 })
     .stdout.toString()
     .trim()
   return state !== '' && !state.startsWith('Z')
