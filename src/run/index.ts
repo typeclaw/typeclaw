@@ -87,6 +87,7 @@ import { createStream, type Stream } from '@/stream'
 import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 import { setActiveTunnelManager } from '@/tunnels/active'
+import { runtimeTunnels } from '@/typevault/prompt-tunnel'
 
 import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
@@ -445,7 +446,7 @@ async function startAgentRuntime(
   })
 
   const tunnelManager: TunnelManager = createTunnelManagerFor({
-    tunnels: getConfig().tunnels,
+    tunnels: runtimeTunnels(getConfig()),
     stream,
     resolveChannelUpstreamPort: (name) => {
       if (name === 'github') return getConfig().channels.github?.webhookPort ?? null

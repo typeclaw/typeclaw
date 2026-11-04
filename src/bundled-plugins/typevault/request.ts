@@ -3,17 +3,12 @@ import { z } from 'zod'
 import { getConfig } from '@/config'
 import { defineTool } from '@/plugin'
 import { activeTunnelUrl } from '@/tunnels/active'
+import { typevaultPromptTunnel } from '@/typevault/prompt-tunnel'
 import { agentSocketPath, isRoleTier, runtimeConfigRoot } from '@/typevault/vault'
 
 import { vaultRuntime } from './runtime'
 
 export const VAULT_REQUEST_TOOL = 'vault_request'
-
-// Container-internal port the daemon serves one-time `request` pages on. A
-// manual tunnel to it is what makes the page reachable from a user's phone.
-export const TYPEVAULT_PROMPT_PORT = 8975
-
-const TUNNEL_SNIPPET = `{ "name": "typevault", "provider": "cloudflare-quick", "for": { "kind": "manual" }, "upstreamPort": ${TYPEVAULT_PROMPT_PORT} }`
 
 const OpenedSchema = z.object({ id: z.string(), url: z.string(), code: z.string() })
 const ErrorSchema = z.object({ error: z.object({ message: z.string() }) })
@@ -21,9 +16,7 @@ const ErrorSchema = z.object({ error: z.object({ message: z.string() }) })
 export type RequestStatus = 'opened' | 'tunnel-missing' | 'tunnel-starting' | 'failed'
 
 export function promptTunnelUrl(): { status: 'ready'; url: string } | { status: 'tunnel-missing' | 'tunnel-starting' } {
-  const tunnel = getConfig().tunnels.find(
-    (entry) => entry.for.kind === 'manual' && entry.upstreamPort === TYPEVAULT_PROMPT_PORT,
-  )
+  const tunnel = typevaultPromptTunnel(getConfig())
   if (tunnel === undefined) return { status: 'tunnel-missing' }
   const url = activeTunnelUrl(tunnel.name)
   return url === null ? { status: 'tunnel-starting' } : { status: 'ready', url }
@@ -53,7 +46,7 @@ export function createVaultRequestTool(tunnelUrl: typeof promptTunnelUrl = promp
         return tunnel.status === 'tunnel-missing'
           ? result(
               'tunnel-missing',
-              `The secret page needs a public URL and no tunnel is configured for it. Ask the user to add this entry to "tunnels" in typeclaw.json, set docker.file.cloudflared to true, and restart the agent (no account needed): ${TUNNEL_SNIPPET}`,
+              'The secret page has no public URL because TypeVault is not enabled at boot. Ask the operator to restart the agent.',
             )
           : result('tunnel-starting', 'The tunnel for the secret page has no public URL yet; try again in a moment.')
       }
