@@ -152,6 +152,10 @@ class FakeSession {
   public contextRefreshes = 0
   public isCompacting = false
   public streamCalls = 0
+  public loopGuardResets = 0
+  resetLoopGuard = (): void => {
+    this.loopGuardResets++
+  }
 
   // Mirrors the real `AgentSession.agent` surface the router touches:
   // `agent.abort()` flips `agent.signal.aborted`. The router uses this as the
@@ -7267,6 +7271,39 @@ describe('ChannelRouter channel-turn protocol', () => {
     expect(sent).toEqual([{ chat: 'c1', thread: null, text: 'hi from invisible assistant text' }])
     expect(logs.some((m) => m.includes('recovering assistant_text_without_channel_tool'))).toBe(true)
     expect(logs.some((m) => m.includes('blocked assistant_text_without_channel_tool'))).toBe(false)
+  })
+
+  test('resets the loop guard for each inbound request but not for its stranded tool-use retry', async () => {
+    // given
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound({ text: '레그컬 25kg 15회' }))
+    let attempt = 0
+    sessions[0]!.onPrompt = () => {
+      attempt++
+      if (attempt === 1) {
+        sessions[0]!.setAssistantMidTurn('Logging the set. Next I will update the file.')
+        return
+      }
+      sessions[0]!.setAssistantText('기록했어.')
+    }
+
+    // when
+    await router.__testing!.flushDebounce(KEY)
+
+    // then
+    expect(sessions[0]!.prompts).toHaveLength(2)
+    expect(sessions[0]!.prompts[1]).toContain(STRANDED_TOOLUSE_CONTINUATION_NUDGE)
+    expect(sessions[0]!.loopGuardResets).toBe(1)
+
+    // when
+    await router.route(inbound({ text: '2세트도 15회' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then
+    expect(sessions[0]!.prompts).toHaveLength(3)
+    expect(sessions[0]!.loopGuardResets).toBe(2)
   })
 
   test('mid-turn recovery: retries unfinished toolUse prose instead of publishing it as the reply', async () => {
