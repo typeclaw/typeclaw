@@ -769,7 +769,7 @@ type ObservedInbound = {
 
 type TimedAttachment = { ts: number; attachment: InboundAttachment; current?: boolean }
 
-type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | undefined }
+type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | undefined; resetLoopGuard?: () => void }
 
 // Provenance of a queued system reminder, which decides whether the
 // reminder-only drain iteration it drives CONTINUES the current logical turn or
@@ -5620,6 +5620,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.policyDeniedToolSendsThisTurn.clear()
         resetReviewTurn(live.sessionId)
         const isRealUserTurn = batch.length > 0
+        // Only a fresh inbound batch is a new request. Retry and wakeup turns
+        // (empty batch, reminders only) keep the loop guard's history so a
+        // stranded or aborted cycle cannot clear itself through a retry.
+        if (isRealUserTurn) live.session.resetLoopGuard?.()
         await awaitLatestTodoOutcomeWrite(live)
         await recordTodoTurnStart(live, isRealUserTurn)
         const retrievalQuery = composeRetrievalQuery(batch)

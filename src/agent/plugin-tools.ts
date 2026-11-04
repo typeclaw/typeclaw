@@ -1108,6 +1108,13 @@ export function forgetSharedLoopGuardTool(sessionId: string, tool: string): void
   sharedLoopGuard.forgetTool(sessionId, tool)
 }
 
+// Drops a session's whole loop-guard history when a new user request starts
+// (see `attachLoopGuardUserRunTracking`), so per-request repetition is not
+// mistaken for a cycle that spans requests.
+export function resetSharedLoopGuardSession(sessionId: string): void {
+  sharedLoopGuard.reset(sessionId)
+}
+
 // Test-only seam: swaps the shared loop guard for a fresh instance so tests
 // that reuse sessionIds across cases don't see cross-test streak counts.
 // Production code never calls this; the guard's LRU bound handles

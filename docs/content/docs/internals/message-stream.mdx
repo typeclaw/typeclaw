@@ -82,6 +82,8 @@ field or persisted keepalive state.
 
 `src/agent/loop-guard.ts` combines exact repeated-call detection with a sliding target window. Reads are classified at the awaited SDK `turn_start` boundary: calls for one canonical path emitted in the same assistant tool batch count once. Successful non-empty textual results contribute bounded observed intervals; recorded pages establish the frontier, and exact-adjacent sibling intervals extend it even when parallel calls finish out of order. Suppressed siblings do not count as independent loop observations. Recorded images, overlap, backtracking, gaps, empty results, and malformed ranges retain the coarse path signature and accumulate toward a block.
 
+Both detectors look for a cycle inside one user request. The turn drivers call `session.resetLoopGuard()` when a real user request starts (a fresh inbound batch in the channel router, a TUI-typed prompt in the server), so repeating the same work once per message, such as appending each reported set to one log file, never accumulates. Runtime retries, reminder-only turns, subagent-completion wakeups, todo continuations, and same-request `agent.continue()` retries keep the history, so an aborted cycle cannot clear itself by being retried.
+
 A confirmed block aborts the active SDK run because returning a tool error alone lets a looping model retry indefinitely. `loop_guard:block` and `loop_guard:deferred_block` are lifecycle failures for subagents; `startSubagent` reports `ok: false` and preserves any assistant result captured before the abort only as recoverable output. Required-result repair retries never convert that forced termination back into success.
 
 ## Bundled plugins

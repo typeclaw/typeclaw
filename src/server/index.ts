@@ -197,7 +197,7 @@ type QueuedPrompt = {
 }
 
 type SessionState = {
-  session: AgentSession
+  session: AgentSession & { resetLoopGuard?: () => void }
   activeModelRef: ReturnType<typeof resolveFallbackChain>[number]
   // The session's creation-time thinking level, captured once. An escalated turn
   // moves `session.thinkingLevel` to `high`, so neither turn-driving path (drain
@@ -836,6 +836,7 @@ export function createServer({
               return
             }
             send(ws, { type: 'prompt_started', messageId: `local-${crypto.randomUUID()}`, text: msg.text })
+            state.session.resetLoopGuard?.()
             const fallbackHooks = state.runtimeSnapshot?.hooks
             const retrievalContext: { results: string } = { results: '' }
             if (fallbackHooks !== undefined && agentDir !== undefined) {
@@ -1195,6 +1196,9 @@ async function drain(
       if (!item) break
       pushQueueState(ws, state)
       send(ws, { type: 'prompt_started', messageId: item.streamMessageId, text: item.text })
+      // Only a prompt typed in the TUI is a new request; continuations,
+      // subagent completions, and restart handoffs keep the loop guard's history.
+      if (item.source === 'tui') state.session.resetLoopGuard?.()
 
       if (agentDir !== undefined) {
         // recordTurnStart is a read-modify-write of the same state file; let
