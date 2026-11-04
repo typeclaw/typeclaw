@@ -35,6 +35,16 @@ export function vaultExists(agentDir: string): boolean {
   return existsSync(join(typevaultDir(agentDir), 'owner.json'))
 }
 
+// typevault lets one machine at a time use a vault's private state, and names
+// the machine that holds it in a `daemon.holder` claim that survives the
+// daemon. Its default name is the hostname, but for TypeClaw the host-stage CLI
+// and every container recreated for this agent are one owner: a new container
+// gets a new hostname, so a claim left by the previous one (or held by the live
+// container while the host CLI writes secrets) would refuse every vault open
+// with `in_use`. One stable identity per agent lets typevault replace a claim
+// its own flock proves stale; a claim from any other identity is still refused.
+export const TYPEVAULT_HOST_ID = 'typeclaw-agent'
+
 // The environment every typevault call runs under. The agent's vault is opened
 // as typevault's "global" vault at an explicit TYPEVAULT_DIR, so nothing
 // depends on the process cwd, and every ambient TYPEVAULT_* variable is
@@ -47,6 +57,7 @@ export function typevaultEnv(agentDir: string, base: NodeJS.ProcessEnv = process
   env.XDG_CONFIG_HOME = runtimeConfigRoot(agentDir)
   env.TYPEVAULT_DIR = typevaultDir(agentDir)
   env.TYPEVAULT_GLOBAL = '1'
+  env.TYPEVAULT_HOST_ID = TYPEVAULT_HOST_ID
   return env
 }
 
