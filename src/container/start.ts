@@ -8,7 +8,7 @@ import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } fro
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
-import { resolveGitIdentity, type GitIdentity } from '@/git/resolve-identity'
+import { ensureGitIdentity, resolveGitIdentity, isFallbackGitIdentity, type GitIdentity } from '@/git/resolve-identity'
 import { commitSystemFile as commitSystemFileShared } from '@/git/system-commit'
 import { send as sendToDaemon } from '@/hostd/client'
 import { ensureModels as ensureHostModels } from '@/hostd/models'
@@ -370,6 +370,9 @@ async function runStart({
     // Dockerfile/.gitignore/package.json refreshes it is safe before the running
     // return — no surprise for `compose start` against a partially-up tree.
     await applyBoundGcConfig(cwd)
+    // Same machine-local category: runtime commits read this config through the
+    // /agent bind mount, so a filled-in identity also unblocks a running agent.
+    await ensureGitIdentity(cwd)
 
     if (state.kind === 'malformed') {
       return {
@@ -1174,7 +1177,7 @@ export async function planStart({
     runArgs.push('--env-file', join(cwd, ENV_FILE))
   }
   const resolvedGitIdentity = gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity
-  if (resolvedGitIdentity !== null) {
+  if (resolvedGitIdentity !== null && !(await isFallbackGitIdentity(cwd, resolvedGitIdentity))) {
     runArgs.push(
       '-e',
       `GIT_AUTHOR_NAME=${resolvedGitIdentity.name}`,

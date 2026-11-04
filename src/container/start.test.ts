@@ -6,6 +6,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
+import { ensureGitIdentity } from '@/git/resolve-identity'
 import { startDaemon, type Daemon } from '@/hostd/daemon'
 import { buildDockerfile, BUN_BASE_IMAGE } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
@@ -292,6 +293,93 @@ describe('planStart', () => {
     const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true, gitIdentity: null })
 
     expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([])
+  })
+
+  test('forwards a configured identity that matches the folder name over stale .env values', async () => {
+    // given: folder Paul, configured name Paul with a custom email, stale .env identity
+    const cwd = join(root, 'Paul')
+    await mkdir(cwd)
+    await writeDockerfile(cwd)
+    await writePackageJson(cwd, { typeclaw: '^0.1.0' })
+    await writeFile(join(cwd, '.env'), 'GIT_AUTHOR_NAME=stale\nGIT_COMMITTER_EMAIL=stale@example.com\n')
+    const gitEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !/^GIT_(AUTHOR|COMMITTER|CONFIG)/i.test(name)),
+    )
+    for (const args of [
+      ['init', '-q'],
+      ['config', 'user.name', 'Paul'],
+      ['config', 'user.email', 'paul@example.com'],
+    ]) {
+      const proc = Bun.spawn({
+        cmd: ['git', ...args],
+        cwd,
+        env: { ...gitEnv, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      expect(await proc.exited).toBe(0)
+    }
+    await ensureGitIdentity(cwd)
+
+    // when
+    const plan = await planStart({ cwd, hostPort: 8973, imageExists: true })
+
+    // then
+    const envFileIndex = plan.runArgs.indexOf('--env-file')
+    for (const value of [
+      'GIT_AUTHOR_NAME=Paul',
+      'GIT_AUTHOR_EMAIL=paul@example.com',
+      'GIT_COMMITTER_NAME=Paul',
+      'GIT_COMMITTER_EMAIL=paul@example.com',
+    ]) {
+      const index = plan.runArgs.indexOf(value)
+      expect(plan.runArgs[index - 1]).toBe('-e')
+      expect(index).toBeGreaterThan(envFileIndex)
+    }
+  })
+
+  test('does not freeze the folder fallback identity over one chosen while running', async () => {
+    // given: a fresh agent repo whose only identity is the start-time fallback
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const gitEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => !/^GIT_(AUTHOR|COMMITTER|CONFIG)/i.test(name)),
+    )
+    const git = async (...args: string[]): Promise<string> => {
+      const proc = Bun.spawn({
+        cmd: ['git', '-c', 'core.hooksPath=/dev/null', ...args],
+        cwd: root,
+        env: { ...gitEnv, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      })
+      const stdout = await new Response(proc.stdout).text()
+      expect(await proc.exited).toBe(0)
+      return stdout.trim()
+    }
+    await git('init', '-q')
+    await ensureGitIdentity(root)
+    const identityArgs = (args: readonly string[]) =>
+      args.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))
+
+    // when: the container starts, then hatching picks a different name
+    const first = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    await git('config', 'user.name', 'Hatched Name')
+    await git('config', 'user.email', 'hatched@example.com')
+    await git('commit', '-q', '--allow-empty', '-m', 'Hatched')
+    const next = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    // then: the fallback was never forwarded, so the hatch commit and later starts use the chosen identity
+    expect(identityArgs(first.runArgs)).toEqual([])
+    expect(await git('log', '-1', '--format=%an <%ae>|%cn <%ce>')).toBe(
+      'Hatched Name <hatched@example.com>|Hatched Name <hatched@example.com>',
+    )
+    expect(identityArgs(next.runArgs)).toEqual([
+      'GIT_AUTHOR_NAME=Hatched Name',
+      'GIT_AUTHOR_EMAIL=hatched@example.com',
+      'GIT_COMMITTER_NAME=Hatched Name',
+      'GIT_COMMITTER_EMAIL=hatched@example.com',
+    ])
   })
 
   test('publishes the TUI websocket port on host loopback by default', async () => {
