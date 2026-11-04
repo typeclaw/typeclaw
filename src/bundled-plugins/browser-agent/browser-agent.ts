@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { z } from 'zod'
 
 import type { BrowserEngineId, BrowserExtensionId } from '@/browser/registry'
+import { FILL_SECRET_TOOL } from '@/bundled-plugins/managed-browser'
 import { bashTool, findTool, grepTool, lsTool, readTool, type Subagent, writeTool } from '@/plugin'
 
 const BUNDLED_PLUGINS_DIR = join(import.meta.dir, '..')
@@ -38,6 +39,8 @@ Before your first browser command, read the skill for the driver you will use. E
 ${skills}
 
 Drive the browser with \`bash\`. Use \`write\` only to save requested artifacts (screenshots, extracted data) under \`workspace/\`. Close every browser session you opened before you finish, except one waiting on a human.
+
+To enter a password or other secret, click the field with your driver, then call \`${FILL_SECRET_TOOL}\` with the \`.env\` variable name or \`tv://\` vault reference you were given and the tab's \`url\`; pass \`submit: true\` on the last field. The value never reaches you. Never type, read back, or screenshot a secret yourself.
 
 If a step needs a human (login, 2FA, CAPTCHA, payment confirmation), follow the skill's human-handoff instructions (e.g. start the dashboard), leave that session open, and stop. Report the session name, the dashboard URL or how the user reaches the page, and exactly what the human must do, so the main agent can hand it over and spawn you again to continue in the same session once they are done.
 
@@ -76,6 +79,9 @@ export function createBrowserSubagent(drivers: BrowserDrivers): Subagent<Browser
     thinkingLevel: 'low',
     timeoutMs: BROWSER_TIMEOUT_MS,
     tools: [readTool, grepTool, findTool, lsTool, bashTool, writeTool],
+    // Lets a login finish inside this subagent instead of bouncing the
+    // focused tab back to the parent for every secret field.
+    pluginTools: [FILL_SECRET_TOOL],
     payloadSchema: browserPayloadSchema,
     visibility: 'public',
     rosterDescription:

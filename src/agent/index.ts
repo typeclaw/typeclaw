@@ -148,6 +148,7 @@ export type PluginSubagentSelection = {
   toolRefs?: BuiltinToolRef[]
   customTools?: PluginTool<any>[]
   toolNamePrefix: string
+  pluginToolNames?: readonly string[]
 }
 
 // Mutable holder for the live session origin. Pass this when the origin
@@ -378,16 +379,20 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     : []
   const subagentBuiltinNames = resolvedSubagentBuiltins.map((t) => t.name)
   const subagentTypeclawToolDefinitions = resolvedSubagentBuiltins.filter((t) => !isPiCodingBuiltinName(t.name))
+  const registryTools = wrapRegistryTools(options.plugins, getOrigin, getAbort, getLoopGuardTurn, options.permissions)
   const pluginCustomTools = options.pluginSubagent
-    ? wrapSubagentCustomTools(
-        options.pluginSubagent,
-        options.plugins,
-        getOrigin,
-        getAbort,
-        getLoopGuardTurn,
-        options.permissions,
-      )
-    : wrapRegistryTools(options.plugins, getOrigin, getAbort, getLoopGuardTurn, options.permissions)
+    ? [
+        ...wrapSubagentCustomTools(
+          options.pluginSubagent,
+          options.plugins,
+          getOrigin,
+          getAbort,
+          getLoopGuardTurn,
+          options.permissions,
+        ),
+        ...registryTools.filter((tool) => options.pluginSubagent?.pluginToolNames?.includes(tool.name) === true),
+      ]
+    : registryTools
 
   // Per-run budget state for the tool-result byte ceiling. Allocated once per
   // session creation and threaded into every wrapped tool so they share the
