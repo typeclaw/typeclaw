@@ -24,7 +24,7 @@ export const TRULY_IGNORED_PATTERNS = [
 // The reconciler MUST fail-closed and never untrack these, even if a custom
 // git.ignore.append pattern (e.g. `**`) matches them — doing so would drop
 // runtime-owned state out of git.
-export const SYSTEM_MANAGED_ROOTS = ['sessions/', 'memory/', 'channels/', 'todo/', 'cron/'] as const
+export const SYSTEM_MANAGED_ROOTS = ['sessions/', 'memory/', 'channels/', 'todo/', 'cron/', '.typevault/'] as const
 
 export function buildGitignore(config: GitignoreConfig = { append: [] }): string {
   const customEntries = renderCustomGitignoreEntries(config.append)
@@ -51,8 +51,8 @@ ${TRULY_IGNORED_PATTERNS.join('\n')}
 
 # System-managed: gitignored by default so the agent never stages them by hand,
 # but TypeClaw force-commits them on its own schedule (sessions/ + todo/ via
-# auto-backup, memory/ via the dreaming subagent). Treat them as runtime-owned,
-# not agent-owned.
+# auto-backup, memory/ via the dreaming subagent, .typevault/ ciphertext via
+# auto-backup). Treat them as runtime-owned, not agent-owned.
 ${SYSTEM_MANAGED_ROOTS.join('\n')}
 `
 }

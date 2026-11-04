@@ -35,7 +35,8 @@ const BOUNDED_PACK_FLAGS = [
 ] as const
 
 const RUNTIME_OWNED_PREFIXES = ['memory/'] as const
-const FORCE_ADD_PREFIXES = ['sessions/', 'todo/'] as const
+const TYPEVAULT_ROOT = '.typevault'
+const FORCE_ADD_PREFIXES = ['sessions/', 'todo/', `${TYPEVAULT_ROOT}/`] as const
 
 const NONINTERACTIVE_ENV = {
   GIT_TERMINAL_PROMPT: '0',
@@ -102,7 +103,10 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     timeoutMs: COMMIT_TIMEOUT_MS,
   })
   if (status.exitCode !== 0) return { ok: false, kind: 'aborted', reason: `git status failed: ${shortErr(status)}` }
-  const entries = parsePorcelain(status.stdout)
+  const vaultFiles = await listUntrackedVaultFiles(cwd, deps, repo.gitArgs)
+  if (!vaultFiles.ok)
+    return { ok: false, kind: 'aborted', reason: `git ls-files failed: ${shortErr(vaultFiles.result)}` }
+  const entries = [...parsePorcelain(status.stdout), ...vaultFiles.entries]
   // Only index-known, absent worktree paths that were NEVER in HEAD are
   // stale additions (including removed intent-to-add entries). A tracked
   // deletion still in HEAD is backup work; memory/ belongs to another writer.
@@ -489,6 +493,25 @@ export function parsePorcelain(stdout: string): PorcelainEntry[] {
     })
   }
   return entries
+}
+
+// `.typevault/` is gitignored, so porcelain never reports a vault file until it
+// is tracked, and new entries get new file names. List the untracked ignored
+// files under that root explicitly; `.typeclaw/typevault/` (the key) is never
+// matched by this pathspec.
+async function listUntrackedVaultFiles(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  gitArgs: readonly string[],
+): Promise<{ ok: true; entries: PorcelainEntry[] } | { ok: false; result: GitSpawnResult }> {
+  if (!hasDirectoryEntry(join(cwd, TYPEVAULT_ROOT))) return { ok: true, entries: [] }
+  const result = await deps.gitSpawn(
+    [...gitArgs, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', `${TYPEVAULT_ROOT}/`],
+    { cwd, timeoutMs: COMMIT_TIMEOUT_MS },
+  )
+  if (result.exitCode !== 0) return { ok: false, result }
+  const paths = result.stdout.split('\0').filter((path) => path.startsWith(`${TYPEVAULT_ROOT}/`))
+  return { ok: true, entries: paths.map((path) => ({ status: '??', kind: 'untracked', paths: [path] })) }
 }
 
 type StagingSnapshot = {
