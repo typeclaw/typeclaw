@@ -4218,9 +4218,33 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const isReviewStateUnknownDeferralActive = (closeout: GithubReviewThreadCloseout): boolean =>
     closeout.deferUntil?.kind === 'review-state-unknown' && closeout.deferUntil.expiresAt > now()
 
+  // The carrier of a pending round may spawn its reviewer before a participant's
+  // reply opens the thread close-out. That reviewer is still the one that will
+  // close the thread, so wait from the round's start, not the obligation's.
+  const closeoutChildWaitStartedAt = (
+    live: LiveSession,
+    closeout: GithubReviewThreadCloseout & { startedAt: number },
+  ): number => {
+    const round = live.githubReviewRound
+    if (
+      round === null ||
+      round.carrierThread !== live.key.thread ||
+      round.workspace !== closeout.workspace ||
+      round.prNumber !== closeout.prNumber
+    ) {
+      return closeout.startedAt
+    }
+    const state = githubReviewRoundPersistence(round, now)
+    if (state?.status !== 'pending') return closeout.startedAt
+    return Math.min(closeout.startedAt, state.createdAt)
+  }
+
   const enforceGithubReviewThreadCloseout = async (live: LiveSession): Promise<void> => {
     const closeout = live.githubReviewThreadCloseout
-    if (closeout === null || isAwaitingBackgroundChild(live, 'github-thread-closeout', closeout.startedAt)) {
+    if (
+      closeout === null ||
+      isAwaitingBackgroundChild(live, 'github-thread-closeout', closeoutChildWaitStartedAt(live, closeout))
+    ) {
       return
     }
     if (isReviewStateUnknownDeferralActive(closeout)) {

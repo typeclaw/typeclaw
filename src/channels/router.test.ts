@@ -21035,6 +21035,62 @@ describe('ChannelRouter GitHub review-thread closeout obligation', () => {
     await router.stop()
   })
 
+  test('a reply that opens the carrier close-out waits on the reviewer the round already spawned', async () => {
+    // given: the push round wakes the carrier thread, which spawns a reviewer and ends silent
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const sent: OutboundMessage[] = []
+    const nowRef = { value: Date.now() }
+    let reviewerStartedAt: number | null = null
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: (sessionId) => (sessionId === 'ses_fake_1' ? reviewerStartedAt : null),
+    })
+    router.registerOutbound('github', async (message) => {
+      sent.push(message)
+      return { ok: true }
+    })
+    const pushRound = { ...replyRound, kind: 'push', roundId: 'push-round', carrierThread: GITHUB_KEY.thread } as const
+    await router.route(
+      closeoutInbound({
+        externalMessageId: 'push-wake',
+        githubReviewRound: pushRound,
+        githubReviewThreadCloseout: undefined,
+      }),
+    )
+    const session = sessions[0]!
+    session.onPrompt = () => {
+      if (session.prompts.length === 1) reviewerStartedAt = nowRef.value
+      session.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    // when: the author's reply opens the thread close-out while that reviewer still runs
+    nowRef.value += 2_000
+    await router.route(closeoutInbound({ externalMessageId: '790', text: '배포 경로에 패키지를 추가했습니다.' }))
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    // then: the close-out waits for the reviewer instead of racing its verdict
+    expect(logs.some((line) => line.includes('github_thread_closeout_retry'))).toBe(false)
+    expect(logs.some((line) => line.includes('github_thread_closeout_fallback'))).toBe(false)
+    expect(sent).toEqual([])
+    expect(router.hasOutstandingGithubReviewThreadCloseout?.('ses_fake_1')).toBe(true)
+
+    // when: the reviewer is gone and the next turn is still silent
+    reviewerStartedAt = null
+    nowRef.value += 2_000
+    await router.route(closeoutInbound({ externalMessageId: '791' }))
+    await router.__testing!.flushDebounce(GITHUB_KEY)
+
+    // then: the anti-strand fallback still fires
+    expect(logs.filter((line) => line.includes('github_thread_closeout_retry'))).toHaveLength(1)
+    expect(sent.map((message) => message.text)).toEqual([GITHUB_REVIEW_THREAD_CLOSEOUT_FALLBACK_TEXT])
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('wakes a deferred sibling once on round completion for one exact-thread close-out', async () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
