@@ -72,6 +72,7 @@ import { defaultOutputAllowance } from './output-allowance'
 import {
   buildBuiltinPiToolOverrides,
   isPiCodingBuiltinName,
+  resetSharedLoopGuardSession,
   resolveBuiltinToolRefs,
   wrapPluginTool,
   wrapSystemTool,
@@ -268,7 +269,7 @@ export type CreateSessionOptions = {
 }
 
 export type CreateSessionResult = {
-  session: AgentSession & { getAbortReason?: () => string | undefined }
+  session: AgentSession & { getAbortReason?: () => string | undefined; resetLoopGuard?: () => void }
   dispose: () => Promise<void>
   getAbortReason?: () => string | undefined
 }
@@ -692,7 +693,14 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // marked local failures are kept out of overflow recovery at the marker below.
   session.setAutoRetryEnabled(false)
   const getAbortReason = () => abortHolder.reason
-  const sessionWithAbortReason = Object.assign(session, { getAbortReason })
+  // The loop guard detects a model cycling inside one request. Repeating work
+  // across separate user messages (e.g. appending each reported workout set to
+  // the same log file) is progress, so turn drivers call this when a real user
+  // request starts. Runtime retries and reminders of the same request must not,
+  // or an aborted cycle could clear itself by being retried.
+  const loopGuardSessionId = options.plugins?.sessionId ?? sessionManager.getSessionId()
+  const resetLoopGuard = () => resetSharedLoopGuardSession(loopGuardSessionId)
+  const sessionWithAbortReason = Object.assign(session, { getAbortReason, resetLoopGuard })
   const unsubLoopGuardTurn = attachLoopGuardTurnTracking(session.agent, () => {
     loopGuardTurnId += 1
   })

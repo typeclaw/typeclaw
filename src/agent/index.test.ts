@@ -38,6 +38,7 @@ import {
   wrapSystemTools,
 } from './index'
 import { LiveSubagentRegistry } from './live-subagents'
+import { resetSharedLoopGuardSession, wrapSystemTool } from './plugin-tools'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
 import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { renderInteractiveSessionContext, type SessionOrigin } from './session-origin'
@@ -122,6 +123,112 @@ describe('attachLoopGuardTurnTracking', () => {
     unsubscribe()
     expect(unsubscribed).toBe(true)
   })
+})
+
+describe('loop guard across user requests', () => {
+  // Mirrors a per-message logging workflow: every user request writes the same
+  // log target once and then posts a differently-worded reply, the interleaved
+  // shape the windowed detector counts.
+  function createRunHarness(sessionId: string) {
+    const listeners: Array<(event: unknown) => void> = []
+    const agent = {
+      subscribe: (listener: (event: unknown) => void) => {
+        listeners.push(listener)
+        return () => {}
+      },
+    }
+    const emit = (event: unknown) => listeners.forEach((listener) => listener(event))
+    let turnId = 0
+    attachLoopGuardTurnTracking(agent, () => {
+      turnId += 1
+    })
+
+    let aborts = 0
+    const record = wrapSystemTool(
+      definePiTool({
+        name: 'record',
+        label: 'record',
+        description: '',
+        parameters: Type.Object({ entry: Type.String() }),
+        async execute() {
+          return { content: [{ type: 'text' as const, text: 'ok' }], details: undefined }
+        },
+      }),
+      {
+        agentDir: '/agent',
+        sessionId,
+        hooks: createHookBus(),
+        getLoopGuardTurn: () => turnId,
+        getAbort: () => () => {
+          aborts += 1
+        },
+      },
+    )
+    let callId = 0
+    const call = (entry: string) => {
+      callId += 1
+      return record.execute(`c${callId}`, { entry }, undefined, undefined, {} as never)
+    }
+    return {
+      // What a turn driver does for a real user request (session.resetLoopGuard).
+      startUserRequest: () => {
+        resetSharedLoopGuardSession(sessionId)
+        emit({ type: 'turn_start' })
+      },
+      // A runtime retry or reminder of the same request: a new run, no reset.
+      startRetryRun: () => emit({ type: 'turn_start' }),
+      logAndReply: async (step: number) => {
+        await call('workout log')
+        emit({ type: 'turn_start' })
+        await call(`reply ${step}`)
+        emit({ type: 'turn_start' })
+      },
+      aborts: () => aborts,
+    }
+  }
+
+  test('writing the same log once per user message never trips the guard', async () => {
+    // given
+    const harness = createRunHarness('loop-user-runs-log')
+
+    // when
+    for (let step = 1; step <= 8; step++) {
+      harness.startUserRequest()
+      await harness.logAndReply(step)
+    }
+
+    // then
+    expect(harness.aborts()).toBe(0)
+  }, 20_000)
+
+  test('still blocks cycling on the same target within one user request', async () => {
+    // given
+    const harness = createRunHarness('loop-user-runs-cycle')
+    harness.startUserRequest()
+
+    // when
+    const steps = (async () => {
+      for (let step = 1; step <= 6; step++) await harness.logAndReply(step)
+    })()
+
+    // then
+    await expect(steps).rejects.toThrow(/loop-guard/)
+    expect(harness.aborts()).toBe(1)
+  }, 20_000)
+
+  test('a retry of the same request keeps the history so an aborted cycle cannot reset itself', async () => {
+    // given
+    const harness = createRunHarness('loop-user-runs-retry')
+    harness.startUserRequest()
+    for (let step = 1; step <= 5; step++) await harness.logAndReply(step)
+
+    // when
+    harness.startRetryRun()
+    const retried = harness.logAndReply(6)
+
+    // then
+    await expect(retried).rejects.toThrow(/loop-guard/)
+  }, 20_000)
 })
 
 describe('wrapSystemTools', () => {
