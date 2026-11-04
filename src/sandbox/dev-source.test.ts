@@ -8,7 +8,7 @@ import { resolveDevSourceMount } from './dev-source'
 
 const bwrapPresent = (() => {
   try {
-    return Bun.spawnSync(['bwrap', '--version'], { stdout: 'ignore', stderr: 'ignore' }).success
+    return Bun.spawnSync(['bwrap', '--version'], { timeout: 30_000, stdout: 'ignore', stderr: 'ignore' }).success
   } catch {
     return false
   }

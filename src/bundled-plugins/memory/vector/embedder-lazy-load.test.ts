@@ -66,7 +66,12 @@ describe('embedder lazy transformers load', () => {
         process.exit(1)
       }
     `
-    const result = Bun.spawnSync({ cmd: [process.execPath, '--eval', script], stdout: 'pipe', stderr: 'pipe' })
+    const result = Bun.spawnSync({
+      timeout: 30_000,
+      cmd: [process.execPath, '--eval', script],
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
     const output = new TextDecoder().decode(result.stderr) || new TextDecoder().decode(result.stdout)
     expect(result.exitCode, output).toBe(0)
   })

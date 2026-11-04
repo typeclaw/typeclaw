@@ -396,7 +396,7 @@ describe('buildSandboxedCommand masks', () => {
 // this. bwrap ships in the typeclaw container but not on the macOS dev host.
 const bwrapPresent = (() => {
   try {
-    return Bun.spawnSync(['bwrap', '--version'], { stdout: 'ignore', stderr: 'ignore' }).success
+    return Bun.spawnSync(['bwrap', '--version'], { timeout: 30_000, stdout: 'ignore', stderr: 'ignore' }).success
   } catch {
     return false
   }

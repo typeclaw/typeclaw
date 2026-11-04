@@ -14,7 +14,12 @@ import { describe, expect, test } from 'bun:test'
 const HEAVY_SPECIFIERS = ['jsdom', '@mozilla/readability', 'turndown', 'cheerio', 'jq-wasm'] as const
 
 function runChild(script: string): { exitCode: number | null; output: string } {
-  const result = Bun.spawnSync({ cmd: [process.execPath, '--eval', script], stdout: 'pipe', stderr: 'pipe' })
+  const result = Bun.spawnSync({
+    timeout: 30_000,
+    cmd: [process.execPath, '--eval', script],
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
   const output = new TextDecoder().decode(result.stderr) || new TextDecoder().decode(result.stdout)
   return { exitCode: result.exitCode, output }
 }
