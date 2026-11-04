@@ -37,14 +37,21 @@ function unboundedPromptCacheKey(origin: SessionOrigin | undefined): string | un
 // fresh connections got 0% reuse with per-session ids and the same body key,
 // and ~96% once the session id was shared. Short-lived subagent and system
 // sessions therefore send their origin key as the session id on every
-// provider. Long-lived tui/channel/cron sessions keep their own id so one hot
-// shared key cannot spill their long histories onto overflow machines.
+// provider, and each cron fire (a fresh session that repeats its job's prompt)
+// shares one id per job. Long-lived tui/channel sessions keep their own id so
+// one hot shared key cannot spill their long histories onto overflow machines.
 // The id travels in HTTP headers, whose values must be Latin-1, so characters
 // outside printable ASCII are percent-encoded. ASCII names stay identical to
 // their body cache key.
 export function sharedSessionIdForOrigin(origin: SessionOrigin | undefined): string | undefined {
-  if (origin?.kind !== 'subagent' && origin?.kind !== 'system') return undefined
-  const key = unboundedPromptCacheKey(origin)!.replace(/[^\x20-\x7e]/gu, (char) => encodeURIComponent(char))
+  const shared =
+    origin?.kind === 'subagent' || origin?.kind === 'system'
+      ? unboundedPromptCacheKey(origin)!
+      : origin?.kind === 'cron'
+        ? `typeclaw:cron:${origin.jobId}`
+        : undefined
+  if (shared === undefined) return undefined
+  const key = shared.replace(/[^\x20-\x7e]/gu, (char) => encodeURIComponent(char))
   return key.slice(0, PROMPT_CACHE_KEY_MAX_LENGTH)
 }
 

@@ -45,8 +45,14 @@ describe('sharedSessionIdForOrigin', () => {
 
     expect(sharedSessionIdForOrigin(channel)).toBeUndefined()
     expect(sharedSessionIdForOrigin({ kind: 'tui', sessionId: 'tui-1' })).toBeUndefined()
-    expect(sharedSessionIdForOrigin({ kind: 'cron', jobId: 'daily', jobKind: 'prompt' })).toBeUndefined()
     expect(sharedSessionIdForOrigin(undefined)).toBeUndefined()
+  })
+
+  test('each fire of one cron job shares that job session id', () => {
+    expect(sharedSessionIdForOrigin({ kind: 'cron', jobId: 'daily', jobKind: 'prompt' })).toBe('typeclaw:cron:daily')
+    expect(sharedSessionIdForOrigin({ kind: 'cron', jobId: '아침', jobKind: 'prompt' })).toBe(
+      'typeclaw:cron:%EC%95%84%EC%B9%A8',
+    )
   })
 })
 
