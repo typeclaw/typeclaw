@@ -36,6 +36,16 @@ DATABASE_URL=tv://postgres/prod#url typevault run --reason "run migrations" -- b
 - `run` loads every entry of your own tier; entries from lower tiers load only when `--only` names them exactly.
 - TOTP fields hold the current code, never the seed.
 
+## Fill a web form
+
+Call `browser_fill_secret` with a vault reference as `name` (e.g. `tv://github/bot#password`) after focusing the field. The value is typed into the page and never comes back to you.
+
+## Ask the user for a secret
+
+When a secret you need is not in the vault, call `vault_request` with the entry name, a preset (`api_key`, `password`, ...) and a reason. Send the user the returned link **and** match code, and tell them to check the code on the page before submitting. Never ask them to paste a secret into chat. The value is stored in your role's tier when they submit; check with `typevault ls`.
+
+If `vault_request` says no tunnel is configured, pass on its instructions: the user adds one `tunnels` entry to `typeclaw.json` and restarts the agent. No account is needed.
+
 ## Store secrets
 
 ```sh
