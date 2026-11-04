@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { _internal, resolveGitIdentity } from './resolve-identity'
+import { _internal, ensureGitIdentity, isFallbackGitIdentity, resolveGitIdentity } from './resolve-identity'
 
 const roots: string[] = []
 
@@ -94,6 +94,58 @@ describe('resolveGitIdentity', () => {
 
     await expect(resolveGitIdentity(partial)).resolves.toBeNull()
     await expect(resolveGitIdentity(plain)).resolves.toBeNull()
+  })
+
+  test('ensureGitIdentity persists a folder-name identity when none is configured', async () => {
+    const repo = join(await tempDir('typeclaw-git-identity-ensure-'), 'Paul Agent')
+    await mkdir(repo)
+    await git(repo, ['init', '-q'])
+
+    const expected = { name: 'Paul Agent', email: 'paul-agent@typeclaw.local' }
+    await expect(ensureGitIdentity(repo)).resolves.toEqual(expected)
+    await expect(resolveGitIdentity(repo)).resolves.toEqual(expected)
+  })
+
+  test('ensureGitIdentity keeps configured values and fills only the missing key', async () => {
+    const complete = await tempDir('typeclaw-git-identity-keep-')
+    await git(complete, ['init', '-q'])
+    await git(complete, ['config', '--local', 'user.name', 'Agent Smith'])
+    await git(complete, ['config', '--local', 'user.email', 'agent@example.com'])
+    const partial = join(await tempDir('typeclaw-git-identity-partial-fill-'), '폴')
+    await mkdir(partial)
+    await git(partial, ['init', '-q'])
+    await git(partial, ['config', '--local', 'user.name', '폴 (Paul)'])
+
+    await expect(ensureGitIdentity(complete)).resolves.toEqual({ name: 'Agent Smith', email: 'agent@example.com' })
+    await expect(ensureGitIdentity(partial)).resolves.toEqual({ name: '폴 (Paul)', email: 'agent@typeclaw.local' })
+    await expect(resolveGitIdentity(partial)).resolves.toEqual({ name: '폴 (Paul)', email: 'agent@typeclaw.local' })
+  })
+
+  test('isFallbackGitIdentity matches only the identity ensureGitIdentity synthesized', async () => {
+    const synthesized = join(await tempDir('typeclaw-git-identity-marker-'), 'Paul')
+    await mkdir(synthesized)
+    await git(synthesized, ['init', '-q'])
+    const configured = join(await tempDir('typeclaw-git-identity-configured-'), 'Paul')
+    await mkdir(configured)
+    await git(configured, ['init', '-q'])
+    await git(configured, ['config', '--local', 'user.name', 'Paul'])
+    await git(configured, ['config', '--local', 'user.email', 'paul@example.com'])
+
+    const fallback = await ensureGitIdentity(synthesized)
+    const kept = await ensureGitIdentity(configured)
+
+    expect(fallback).toEqual({ name: 'Paul', email: 'paul@typeclaw.local' })
+    await expect(isFallbackGitIdentity(synthesized, fallback!)).resolves.toBe(true)
+    await expect(isFallbackGitIdentity(synthesized, { name: 'Hatched', email: 'paul@typeclaw.local' })).resolves.toBe(
+      false,
+    )
+    await expect(isFallbackGitIdentity(configured, kept!)).resolves.toBe(false)
+  })
+
+  test('ensureGitIdentity leaves a non-repository untouched', async () => {
+    const plain = await tempDir('typeclaw-git-identity-ensure-plain-')
+
+    await expect(ensureGitIdentity(plain)).resolves.toBeNull()
   })
 
   test('ignores ambient Git config injection when resolving repository identity', async () => {
