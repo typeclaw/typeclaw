@@ -182,6 +182,18 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     if (stagedCheck.exitCode !== 1)
       return { ok: false, kind: 'commit-failed', reason: `git diff failed: ${shortErr(stagedCheck)}` }
 
+    // `git var` applies commit's strict ident rules, so a commit that would fail
+    // for a missing identity stops here instead of paying for a message first.
+    for (const ident of ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']) {
+      const check = await privateGit(['var', ident])
+      if (check.exitCode !== 0)
+        return {
+          ok: false,
+          kind: 'commit-failed',
+          reason: `git identity unavailable; set user.name and user.email in the agent repo or run typeclaw start: ${shortErr(check)}`,
+        }
+    }
+
     const diffstat = await privateGit(['diff', '--cached', '--stat'])
     const message = await deps.pickCommitMessage({
       status: status.stdout.replaceAll('\0', '\n').slice(0, 4096),
