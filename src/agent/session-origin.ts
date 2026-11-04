@@ -409,12 +409,14 @@ function describeTrigger(origin: SessionOrigin): string {
   }
 }
 
-function renderSubagentOrigin(origin: { subagent: string; parentSessionId: string }): string {
+// The parent session id stays out of the prompt: sibling sessions of one
+// subagent otherwise diverge here and cannot reuse each other's cached prefix.
+function renderSubagentOrigin(origin: { subagent: string }): string {
   return [
     '## Session origin',
     '',
-    `You are a \`${origin.subagent}\` subagent spawned by parent session`,
-    `\`${origin.parentSessionId}\`. Stay narrowly within the task you were given.`,
+    `You are a \`${origin.subagent}\` subagent spawned by a parent session.`,
+    'Stay narrowly within the task you were given.',
     'Return cleanly when done; do not sprawl into unrelated work.',
   ].join('\n')
 }
