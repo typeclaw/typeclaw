@@ -3,7 +3,9 @@ import { join } from 'node:path'
 import { readEnvFile } from '@/init/env-file'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 type BashEnvOverlay = Record<string, string>
-const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN'])
+// TYPEVAULT_GRANT is a bearer credential whose name the pattern below misses;
+// in argv another sandboxed session could read it from proc cmdline.
+const SECRET_BASH_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'TYPEVAULT_GRANT'])
 // Transport classifier for the TRUSTED hook-injected overlay only (e.g.
 // github-cli-auth's per-repo GH_TOKEN). Token/secret-shaped names use `inherit`
 // so their value never renders into the bwrap argv; plain names (GH_REPO) go

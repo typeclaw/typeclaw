@@ -57,6 +57,7 @@ import {
   sanitizeBashSpawnEnvironment,
   TYPECLAW_INTERNAL_BASH_ENV,
   TYPECLAW_INTERNAL_BASH_PREPARE,
+  TYPECLAW_INTERNAL_BASH_REVEAL,
   TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
   wrapPluginTool,
@@ -5455,6 +5456,72 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     expect(args[TYPECLAW_INTERNAL_BASH_PREPARE]).toBeUndefined()
   })
 
+  test('a client-supplied reveal list is stripped before hooks run', async () => {
+    let seenInHook: unknown = 'unset'
+    const hooks = createHookBus()
+    hooks.registerAll('observer', '/agent', noopLogger, {
+      'tool.before': (event) => {
+        seenInHook = (event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_REVEAL]
+      },
+    })
+    const args: Record<string, unknown> = {
+      command: 'echo hi',
+      [TYPECLAW_INTERNAL_BASH_REVEAL]: [{ type: 'ro-bind', source: '/agent/.env', dest: '/tmp/env' }],
+    }
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir: '/agent',
+      sessionId: 's',
+      hooks,
+      getOrigin: () => tui,
+    })
+
+    await expect(wrapped.execute('c', args as never, undefined, undefined, {} as never)).rejects.toThrow(
+      /permission service/i,
+    )
+    expect(seenInHook).toBeUndefined()
+    expect(args[TYPECLAW_INTERNAL_BASH_REVEAL]).toBeUndefined()
+  })
+
+  test('a reveal list set by a trusted hook reaches the sandbox policy', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-reveal-bash-'))
+    let capturedPolicy: SandboxPolicy | undefined
+    const hooks = createHookBus()
+    hooks.registerAll('revealer', agentDir, noopLogger, {
+      'tool.before': (event) => {
+        ;(event.args as Record<string, unknown>)[TYPECLAW_INTERNAL_BASH_REVEAL] = [
+          { type: 'tmpfs', dest: '/run/typevault' },
+          { type: 'ro-bind', source: path.join(agentDir, '.typevault'), dest: path.join(agentDir, '.typevault') },
+        ]
+      },
+    })
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'reveal',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+        buildCommand(command, options) {
+          if (options === undefined) throw new Error('sandbox options missing')
+          capturedPolicy = options
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      await wrapped.execute('c', { command: 'true' }, undefined, undefined, {} as never)
+      expect(capturedPolicy?.reveal).toEqual([
+        { type: 'tmpfs', dest: '/run/typevault' },
+        { type: 'ro-bind', source: path.join(agentDir, '.typevault'), dest: path.join(agentDir, '.typevault') },
+      ])
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('subagent policy rejection happens before deferred preparation', async () => {
     let prepared = 0
     const hooks = createHookBus()
@@ -6055,6 +6122,16 @@ describe('buildSandboxEnvPolicy exposable .env names', () => {
     const policy = buildSandboxEnvPolicy(undefined, { SERVICE_CONFIG_DIR: '/runtime' }, ['SERVICE_CONFIG_DIR'])
     expect(policy.inherit ?? []).not.toContain('SERVICE_CONFIG_DIR')
     expect(policy.set?.SERVICE_CONFIG_DIR).toBe('/runtime')
+  })
+
+  test('a TypeVault grant travels by inheritance and never appears in the bwrap argv', () => {
+    const grant = 'tvl1.grant-token-value'
+    const policy = buildSandboxEnvPolicy({ TYPEVAULT_GRANT: grant, TYPEVAULT_GLOBAL: '1' }, undefined, [])
+    const built = buildSandboxedCommand('true', { env: policy })
+
+    expect(policy.inherit).toEqual(['TYPEVAULT_GRANT'])
+    expect(policy.set).toEqual({ TYPEVAULT_GLOBAL: '1' })
+    expect(built.commandString).not.toContain(grant)
   })
 
   test('deduplicates a name that is both a secret-pattern overlay and an exposable name', () => {

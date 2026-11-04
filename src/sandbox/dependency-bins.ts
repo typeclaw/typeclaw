@@ -23,6 +23,9 @@ export async function reconcileDependencyBinWrappers(options: {
   agentDir: string
   sessionTmp: string
   baselineDirs?: readonly string[]
+  // Runtime-provided commands (bin name -> entrypoint), e.g. the TypeVault CLI
+  // TypeClaw itself ships. Never derived from the agent's package.json.
+  runtimeBins?: Readonly<Record<string, string>>
 }): Promise<DependencyBinReconciliation> {
   const dir = join(options.sessionTmp, DEPENDENCY_BIN_DIR_NAME)
   const previous = reconciliationLocks.get(dir) ?? Promise.resolve()
@@ -42,7 +45,12 @@ export async function reconcileDependencyBinWrappers(options: {
 }
 
 async function reconcileDependencyBinWrappersUnlocked(
-  options: { agentDir: string; sessionTmp: string; baselineDirs?: readonly string[] },
+  options: {
+    agentDir: string
+    sessionTmp: string
+    baselineDirs?: readonly string[]
+    runtimeBins?: Readonly<Record<string, string>>
+  },
   dir: string,
 ): Promise<DependencyBinReconciliation> {
   const validation = await validateDependencyBins(options.agentDir, options.baselineDirs)
@@ -51,6 +59,9 @@ async function reconcileDependencyBinWrappersUnlocked(
   for (const resolution of validation.resolutions) {
     if (resolution.kind !== 'package' || wrappers.has(resolution.declaration.bin)) continue
     wrappers.set(resolution.declaration.bin, renderWrapper(resolution.containerEntrypoint))
+  }
+  for (const [bin, entrypoint] of Object.entries(options.runtimeBins ?? {})) {
+    if (!wrappers.has(bin)) wrappers.set(bin, renderWrapper(entrypoint))
   }
   for (const entry of await readdir(dir).catch(() => [])) {
     if (entry.startsWith('.')) continue

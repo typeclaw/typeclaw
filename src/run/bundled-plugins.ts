@@ -16,6 +16,7 @@ import reviewerPlugin from '@/bundled-plugins/reviewer'
 import scoutPlugin from '@/bundled-plugins/scout'
 import securityPlugin from '@/bundled-plugins/security'
 import toolResultCapPlugin from '@/bundled-plugins/tool-result-cap'
+import typevaultPlugin from '@/bundled-plugins/typevault'
 import type { ResolvedPlugin } from '@/plugin'
 
 // Consumed by both `startAgent` (auto-loaded before user plugins) AND
@@ -48,6 +49,11 @@ import type { ResolvedPlugin } from '@/plugin'
 // ordering security first still matters so a blocked command never reaches the
 // mint path at all.
 //
+// `typevault` is registered right after `security` so its `tool.after`
+// redaction sees the full tool output: if `tool-result-cap` truncated first, a
+// secret cut at the cap boundary would no longer match and part of it could
+// survive into the transcript.
+//
 // `memory` is registered before `backup` so memory's dreaming commits always
 // land in the same git index window before backup's commit-and-push cycle.
 // They commit disjoint paths today (memory/ vs sessions/ + agent changes),
@@ -55,6 +61,7 @@ import type { ResolvedPlugin } from '@/plugin'
 // contention easier to reason about.
 export const BUNDLED_PLUGINS: ResolvedPlugin[] = [
   { name: 'security', version: undefined, source: '<bundled>', defined: securityPlugin },
+  { name: 'typevault', version: undefined, source: '<bundled>', defined: typevaultPlugin },
   { name: 'tool-result-cap', version: undefined, source: '<bundled>', defined: toolResultCapPlugin },
   { name: 'guard', version: undefined, source: '<bundled>', defined: guardPlugin },
   { name: 'bun-hygiene', version: undefined, source: '<bundled>', defined: bunHygienePlugin },

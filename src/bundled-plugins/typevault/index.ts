@@ -1,0 +1,121 @@
+import { join } from 'node:path'
+
+import { createRedactor } from 'typevault/redact'
+
+import { TYPECLAW_INTERNAL_BASH_ENV, TYPECLAW_INTERNAL_BASH_REVEAL } from '@/agent/plugin-tools'
+import { getConfig } from '@/config'
+import type { PermissionService } from '@/permissions'
+import { BUILTIN_ROLE_NAMES, CORE_PERMISSIONS } from '@/permissions/builtins'
+import { definePlugin, type Hooks } from '@/plugin'
+import { isTypevaultMarkerFile } from '@/typevault/envelope-store'
+import { vaultSecretValues } from '@/typevault/redaction'
+import { ensureRoleTiers, isRoleTier, vaultAdmin } from '@/typevault/vault'
+
+import { bashVaultAccess, createSessionGrants, GRANT_TTL } from './grants'
+
+const SKILLS_ROOT = join(import.meta.dir, 'skills')
+
+type SessionGrants = ReturnType<typeof createSessionGrants>
+
+export default definePlugin({
+  plugin: async (ctx) => {
+    // Boot snapshot: typevault is restart-required, and start() settles whether
+    // secrets.json moved into the vault before the container boots.
+    const config = getConfig()
+    if (!config.typevault.enabled || !isTypevaultMarkerFile(join(ctx.agentDir, 'secrets.json'))) return {}
+
+    try {
+      const skipped = await ensureRoleTiers(ctx.agentDir, [...BUILTIN_ROLE_NAMES, ...Object.keys(config.roles ?? {})])
+      for (const role of skipped) {
+        ctx.logger.warn(`typevault: role "${role}" gets no vault tier (its name is reserved or not a valid tier name)`)
+      }
+    } catch (error) {
+      ctx.logger.error(`typevault: could not prepare role tiers; bash gets no vault grants: ${String(error)}`)
+      return {}
+    }
+
+    const admin = vaultAdmin(ctx.agentDir)
+    const grants = createSessionGrants({
+      issue: ({ tier, label }) => admin.grant({ tiers: [tier], ttl: GRANT_TTL, label }),
+      revoke: async (label) => {
+        await admin.revoke({ label })
+      },
+    })
+
+    return {
+      skillsDirs: [SKILLS_ROOT],
+      hooks: {
+        'tool.before': vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger),
+        'tool.after': vaultRedactHook(() => vaultSecretValues(ctx.agentDir), ctx.logger),
+        'session.end': async (event) => {
+          await grants.end(event.sessionId).catch((error: unknown) => {
+            ctx.logger.warn(`typevault: could not revoke the grant of session ${event.sessionId}: ${String(error)}`)
+          })
+        },
+      },
+    }
+  },
+})
+
+export function vaultBashHook(
+  agentDir: string,
+  permissions: PermissionService,
+  grants: SessionGrants,
+  logger: { warn: (msg: string) => void },
+): NonNullable<Hooks['tool.before']> {
+  return async (event) => {
+    if (event.tool !== 'bash' || !permissions.has(event.origin, CORE_PERMISSIONS.vaultUse)) return
+    const tier = permissions.resolveRole(event.origin)
+    if (!isRoleTier(tier)) return
+    let token: string
+    try {
+      token = await grants.tokenFor(event.sessionId, tier)
+    } catch (error) {
+      // The command still runs: without a grant `typevault` reports that it
+      // has none, which names the cause instead of failing unrelated bash.
+      logger.warn(`typevault: could not issue a grant for tier ${tier}: ${String(error)}`)
+      return
+    }
+    const access = bashVaultAccess(agentDir, token)
+    const existingEnv = event.args[TYPECLAW_INTERNAL_BASH_ENV]
+    event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
+      ...(existingEnv !== null && typeof existingEnv === 'object' ? (existingEnv as Record<string, string>) : {}),
+      ...access.env,
+    }
+    const existingReveal = event.args[TYPECLAW_INTERNAL_BASH_REVEAL]
+    event.args[TYPECLAW_INTERNAL_BASH_REVEAL] = [
+      ...(Array.isArray(existingReveal) ? existingReveal : []),
+      ...access.reveal,
+    ]
+  }
+}
+
+export const REDACTION_UNAVAILABLE =
+  '[typevault: output withheld because the secrets it may contain could not be redacted; retry once the vault is reachable]'
+
+// `typevault run` already redacts its child's output; this second pass scrubs
+// every secret the vault holds from every tool result, including a deliberate
+// `get --reveal`, before it reaches the transcript. It fails closed: if the
+// vault cannot be read, the output is withheld rather than passed through.
+export function vaultRedactHook(
+  readValues: () => Promise<readonly string[]>,
+  logger: { warn: (msg: string) => void },
+): NonNullable<Hooks['tool.after']> {
+  return async (event) => {
+    let values: readonly string[] | undefined
+    try {
+      values = await readValues()
+    } catch (error) {
+      logger.warn(
+        `typevault: withheld a tool result because vault secrets could not be read for redaction: ${String(error)}`,
+      )
+      event.result.content = [{ type: 'text', text: REDACTION_UNAVAILABLE }]
+      return
+    }
+    if (values.length === 0) return
+    const redactor = createRedactor(values)
+    for (const part of event.result.content) {
+      if (part.type === 'text') part.text = redactor.redact(part.text)
+    }
+  }
+}

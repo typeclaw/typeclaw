@@ -30,6 +30,7 @@ import {
   type DependencyBinReconciliation,
 } from '@/sandbox'
 import { resolveDevSourceMount } from '@/sandbox/dev-source'
+import { typevaultCliPath } from '@/typevault/cli-path'
 
 import {
   buildRoleScopedConfigEnv,
@@ -89,6 +90,8 @@ export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) 
   return { masks, writable, protected: protectedZones }
 }
 
+export type BashSandboxReveal = NonNullable<SandboxPolicy['reveal']>
+
 export type BashSandboxRequest = {
   readonly command: string
   readonly permissions: PermissionService
@@ -98,6 +101,7 @@ export type BashSandboxRequest = {
   readonly envOverlay?: Record<string, string>
   readonly envWithhold?: string[]
   readonly deferredPreparation?: DeferredBashPreparation
+  readonly reveal?: BashSandboxReveal
   readonly boundary?: BashSandboxBoundary
   readonly network?: SandboxNetwork
 }
@@ -139,7 +143,11 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
     await boundary.ensureAvailable()
     const sessionTmp = await ensureSessionTmpDir(sessionId)
-    const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
+    const dependencyBins = await reconcileDependencyBinWrappers({
+      agentDir,
+      sessionTmp,
+      ...(config.typevault.enabled ? { runtimeBins: { typevault: typevaultCliPath() } } : {}),
+    })
     const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
       dirs,
       files,
@@ -192,6 +200,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
         writable,
         protected: protectedZones,
       }),
+      ...(options.reveal === undefined ? {} : { reveal: options.reveal }),
       symlinks,
       network: options.network ?? 'inherit',
       cwd: agentDir,

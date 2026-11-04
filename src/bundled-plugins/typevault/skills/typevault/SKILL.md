@@ -1,0 +1,45 @@
+---
+name: typevault
+description: Use secrets from this agent's TypeVault vault without putting them in the transcript. Use when a task needs an API key, password, token, OAuth credential, SSH key or TOTP code that lives in the vault, when `TYPEVAULT_GRANT` is set in bash, or when the user mentions TypeVault, the vault, or storing a secret.
+---
+
+# TypeVault
+
+This agent keeps secrets in its own TypeVault vault. Your bash already holds a live grant (`TYPEVAULT_GRANT`) for your role's tier and every tier below it (`owner` > `trusted` > `member` > `guest`), so you can use what your role may use without asking for a key. Every read is audited with your session.
+
+## Rules
+
+- **Never print a secret.** Use `typevault run` so values go into the child's environment and its output is redacted. Values your grant has read are also scrubbed from tool output, so a printed value shows up as `[redacted]`; that is not a bug to work around.
+- **Never put a secret on the command line or in a file you then read.** Pass values on stdin.
+- **Always give a `--reason`.** It is written to the audit trail.
+- If a secret you need is not listed, your role cannot reach it, or nobody stored it yet. Tell the user; don't look for it elsewhere.
+
+## Look around
+
+```sh
+typevault ls                     # entries your grant reaches
+typevault whoami                 # your grant, its tiers and expiry
+```
+
+Entries are named `tv://<service>[/<account>][#<field>]`, e.g. `tv://openai`, `tv://github/bot#password`.
+
+## Use secrets
+
+```sh
+typevault run --only tv://openai --reason "summarize the report" -- sh -c 'curl -H "Authorization: Bearer $OPENAI" https://api.openai.com/v1/models'
+typevault run --only tv://github/bot --reason "log in to GitHub" -- ./login.sh
+DATABASE_URL=tv://postgres/prod#url typevault run --reason "run migrations" -- bun run migrate
+```
+
+- Env names come from the entry name: `tv://github/bot#password` -> `GITHUB_BOT_PASSWORD`, `tv://openai` -> `OPENAI`. To choose the name, set a variable to a `tv://` reference as above.
+- Quote `$VAR` references in single quotes so your shell does not expand them before `run` sets them.
+- `run` loads every entry of your own tier; entries from lower tiers load only when `--only` names them exactly.
+- TOTP fields hold the current code, never the seed.
+
+## Store secrets
+
+```sh
+printf '%s' "$VALUE_FROM_ENV" | typevault set tv://service/account --preset api_key --stdin
+```
+
+A secret is stored in your role's tier, so roles below yours cannot read it. Never type a secret value into a command yourself, even piped.

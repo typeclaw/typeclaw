@@ -132,6 +132,11 @@ export type SandboxPolicy = {
   masks?: SandboxMaskPolicy
   writable?: SandboxWritablePolicy
   protected?: SandboxProtectedPolicy
+  // Read-only binds rendered AFTER masks and protected zones, so they deliberately
+  // re-expose one path a mask covers. Only trusted runtime hooks set these (the
+  // TypeVault plugin re-exposes the ciphertext-only vault and its grant socket
+  // to a session holding vault.use); never derive one from model input.
+  reveal?: Extract<SandboxMount, { type: 'ro-bind' | 'tmpfs' }>[]
   symlinks?: SandboxSymlinkOp[]
   network?: SandboxNetwork
   env?: SandboxEnvPolicy
