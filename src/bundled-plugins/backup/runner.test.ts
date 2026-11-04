@@ -841,6 +841,36 @@ describe('runBackup', () => {
     await runBackup({ cwd, pushToOrigin: true }, baseDeps(spawn, '   '))
     expect(captured).toBe('Backup')
   })
+
+  test('skips the commit-message picker when git has no commit identity', async () => {
+    // given: dirty files, but git cannot resolve an author identity
+    const cwd = await makeRepo()
+    let picked = false
+    const { spawn, calls } = makeSpawn((args) => {
+      if (args[0] === 'status') return okResult(' M foo\n')
+      if (args[0] === 'diff' && args[2] === '--quiet') return failResult('', 1)
+      if (args[0] === 'var') return failResult('Author identity unknown', 128)
+      return okResult()
+    })
+
+    // when
+    const result = await runBackup(
+      { cwd, pushToOrigin: false },
+      {
+        gitSpawn: spawn,
+        pickCommitMessage: async () => {
+          picked = true
+          return 'never'
+        },
+      },
+    )
+
+    // then
+    expect(result).toMatchObject({ ok: false, kind: 'commit-failed' })
+    expect(result.ok ? '' : result.reason).toContain('Author identity unknown')
+    expect(picked).toBe(false)
+    expect(calls.some((call) => call.args[0] === 'commit')).toBe(false)
+  })
   test('skips an ordinary untracked path that vanished before staging', async () => {
     const cwd = await makeRepo()
     const { spawn, calls } = makeSpawn((args) => {
