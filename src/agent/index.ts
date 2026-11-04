@@ -73,7 +73,7 @@ import {
   zodToToolParameters,
 } from './plugin-tools'
 import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
-import { promptCacheKeyForOrigin, withPromptCacheKey } from './prompt-cache-key'
+import { promptCacheKeyForOrigin, sharedSessionIdForOrigin, withPromptCacheKey } from './prompt-cache-key'
 import { wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { createReloadTool } from './reload-tool'
 import type { RestartHandoffOrigin } from './restart-handoff'
@@ -643,20 +643,25 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   const innerStreamFunction = session.agent.streamFunction
   session.agent.streamFunction = async (requestModel, context, streamOptions) => {
     const maxTokens = streamOptions?.maxTokens ?? defaultOutputAllowance(requestModel)
-    const promptCacheKey = promptCacheKeyForOrigin(getOrigin())
+    const origin = getOrigin()
+    const promptCacheKey = promptCacheKeyForOrigin(origin)
+    const sharedSessionId = sharedSessionIdForOrigin(origin)
+    const requestOptions = {
+      ...streamOptions,
+      ...(sharedSessionId !== undefined && streamOptions?.sessionId !== undefined
+        ? { sessionId: sharedSessionId }
+        : {}),
+      maxTokens,
+    }
     const onPayload = async (payload: unknown, payloadModel: typeof requestModel) => {
       const next = (await streamOptions?.onPayload?.(payload, payloadModel)) ?? payload
       const final = promptCacheKey === undefined ? next : withPromptCacheKey(next, promptCacheKey)
       if (streamOptions?.sessionId === session.sessionId) {
-        cacheKeepalive?.capture(payloadModel, context, { ...streamOptions, maxTokens }, final)
+        cacheKeepalive?.capture(payloadModel, context, requestOptions, final)
       }
       return final
     }
-    return await innerStreamFunction(requestModel, context, {
-      ...streamOptions,
-      maxTokens,
-      onPayload,
-    })
+    return await innerStreamFunction(requestModel, context, { ...requestOptions, onPayload })
   }
 
   // typeclaw owns retry/fallback in its turn drivers, so the SDK's own
