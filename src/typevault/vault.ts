@@ -1,7 +1,9 @@
 import { existsSync, readdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 
 import { type Access, createClient, parseEntryName, TypeVaultError } from 'typevault'
+
+import { typevaultCliPath } from './cli-path'
 
 // The agent's vault and its private state both live inside the agent folder,
 // so copying the folder moves the whole vault. `.typevault/` holds only
@@ -121,8 +123,4 @@ async function runTypevaultCli(agentDir: string, args: string[]): Promise<void> 
   if (exitCode !== 0) {
     throw new Error(`typevault ${args.join(' ')} failed: ${stderr.trim() || `exit code ${exitCode}`}`)
   }
-}
-
-function typevaultCliPath(): string {
-  return join(dirname(Bun.resolveSync('typevault', import.meta.dir)), 'cli', 'index.ts')
 }

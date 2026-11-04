@@ -30,6 +30,7 @@ import {
   type DependencyBinReconciliation,
 } from '@/sandbox'
 import { resolveDevSourceMount } from '@/sandbox/dev-source'
+import { typevaultCliPath } from '@/typevault/cli-path'
 
 import {
   buildRoleScopedConfigEnv,
@@ -142,7 +143,11 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
     await boundary.ensureAvailable()
     const sessionTmp = await ensureSessionTmpDir(sessionId)
-    const dependencyBins = await reconcileDependencyBinWrappers({ agentDir, sessionTmp })
+    const dependencyBins = await reconcileDependencyBinWrappers({
+      agentDir,
+      sessionTmp,
+      ...(config.typevault.enabled ? { runtimeBins: { typevault: typevaultCliPath() } } : {}),
+    })
     const writable = subtractMasked(await resolveWritableZones(agentDir, getSandboxWritablePathSpecs(config)), {
       dirs,
       files,

@@ -102,6 +102,25 @@ describe('reconcileDependencyBinWrappers', () => {
     },
   )
 
+  test('wraps runtime-provided bins that are not agent dependencies, without overriding a direct dependency', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-runtime-'))
+    const sessionTmp = join(root, 'session')
+    await writeRootDependencies(root, { opensoma: '^1.0.0' })
+    const packageRoot = await writePackage(root, 'opensoma', { opensoma: 'cli.js' })
+    await writeFile(join(packageRoot, 'cli.js'), '')
+
+    await reconcileDependencyBinWrappers({
+      agentDir: root,
+      sessionTmp,
+      baselineDirs: [],
+      runtimeBins: { typevault: '/runtime/typevault/cli.ts', opensoma: '/runtime/should-not-win.ts' },
+    })
+
+    const dir = join(sessionTmp, DEPENDENCY_BIN_DIR_NAME)
+    expect(await readFile(join(dir, 'typevault'), 'utf8')).toContain("exec bun '/runtime/typevault/cli.ts'")
+    expect(await readFile(join(dir, 'opensoma'), 'utf8')).not.toContain('should-not-win')
+  })
+
   test('renders the structured operator-install hint for a known unavailable dependency bin', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-'))
     await writeRootDependencies(root, { opensoma: '^1.0.0' })
