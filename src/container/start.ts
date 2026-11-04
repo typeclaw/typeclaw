@@ -40,6 +40,7 @@ import {
 import { SecretsBackend } from '@/secrets/storage'
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
+import { reconcileTypevault } from '@/typevault/lifecycle'
 
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
 import { acquireManagedBuildCache, type ManagedBuildCacheLease } from './build-cache'
@@ -416,6 +417,14 @@ async function runStart({
     }
 
     const githubCliConfig = await loadTypeclawConfig(cwd)
+    // Before anything else touches secrets.json, so the GitHub CLI refresh
+    // below already writes to whichever store this start settles on.
+    const typevaultReconcile = await reconcileTypevault(cwd, githubCliConfig.typevault.enabled)
+    if (typevaultReconcile.action === 'skipped') {
+      const warning = `TypeVault: ${typevaultReconcile.warning}`
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
     if (!githubCliConfig.githubCli.importHostAuth) {
       const removalFailure = removeGithubCliStore(cwd)
       if (removalFailure !== null) return { ok: false, reason: removalFailure }
