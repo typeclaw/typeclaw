@@ -289,6 +289,25 @@ describe('buildSandboxedCommand masks', () => {
     expect(argv.join(' ')).toContain('--tmpfs /agent/workspace')
   })
 
+  test('reveal binds render after masks and protected zones, so they win over the mask', () => {
+    const argv = argvOf('true', {
+      masks: { dirs: ['/agent/.typevault'] },
+      protected: { dirs: ['/agent/node_modules'], files: [] },
+      reveal: [
+        { type: 'tmpfs', dest: '/run/typevault' },
+        { type: 'ro-bind', source: '/agent/.typevault', dest: '/agent/.typevault' },
+      ],
+    })
+    const joined = argv.join(' ')
+    const maskAt = joined.indexOf('--tmpfs /agent/.typevault')
+    const protectedAt = joined.indexOf('--ro-bind /agent/node_modules /agent/node_modules')
+    const revealAt = joined.indexOf('--ro-bind /agent/.typevault /agent/.typevault')
+    expect(maskAt).toBeGreaterThanOrEqual(0)
+    expect(revealAt).toBeGreaterThan(maskAt)
+    expect(revealAt).toBeGreaterThan(protectedAt)
+    expect(joined).toContain('--tmpfs /run/typevault')
+  })
+
   test('hides a file with --ro-bind-data over fd 3', () => {
     const argv = argvOf('true', { masks: { files: ['/agent/.env'] } })
     expect(argv.join(' ')).toContain('--ro-bind-data 3 /agent/.env')

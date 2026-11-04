@@ -212,6 +212,7 @@ function buildArgv(command: string, policy: SandboxPolicy): string[] {
   appendWritable(argv, policy)
   appendMasks(argv, policy)
   appendProtected(argv, policy)
+  for (const mount of policy.reveal ?? []) appendMount(argv, mount)
   appendSymlinks(argv, policy)
 
   if (policy.cwd !== undefined) {
