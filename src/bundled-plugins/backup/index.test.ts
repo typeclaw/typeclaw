@@ -212,8 +212,12 @@ describe('backup commit message reuse', () => {
     await writeFile(join(repo, 'seed.md'), 'seed\n')
     await git('add', 'seed.md')
     await git('-c', 'user.name=Seed', '-c', 'user.email=seed@example.com', 'commit', '-q', '-m', 'seed')
-    // No identity from now on, so every backup commit fails the way an unconfigured agent's does.
-    await git('config', 'user.useConfigOnly', 'true')
+    // An identity passes the runner's preflight, but a signer that always fails
+    // makes every backup commit fail after the message is picked.
+    await git('config', 'user.name', 'Backup Test')
+    await git('config', 'user.email', 'backup@example.com')
+    await git('config', 'commit.gpgSign', 'true')
+    await git('config', 'gpg.program', 'false')
   })
 
   afterEach(async () => {
