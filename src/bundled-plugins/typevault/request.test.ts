@@ -70,7 +70,7 @@ describe.skipIf(process.platform === 'win32')('vault_request', () => {
     expect(details.code.length).toBeGreaterThan(0)
   })
 
-  test('without a tunnel for the prompt port it opens nothing and reports what to configure', async () => {
+  test('without a tunnel for the prompt port it opens nothing', async () => {
     const tool = createVaultRequestTool(() => ({ status: 'tunnel-missing' }))
 
     const result = await tool.execute(tool.parameters.parse({ name: 'tv://resend', reason: 'send the digest' }), ctx())

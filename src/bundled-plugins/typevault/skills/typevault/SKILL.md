@@ -44,7 +44,7 @@ Call `browser_fill_secret` with a vault reference as `name` (e.g. `tv://github/b
 
 When a secret you need is not in the vault, call `vault_request` with the entry name, a preset (`api_key`, `password`, ...) and a reason. Send the user the returned link **and** match code, and tell them to check the code on the page before submitting. Never ask them to paste a secret into chat. The value is stored in your role's tier when they submit; check with `typevault ls`.
 
-If `vault_request` says no tunnel is configured, pass on its instructions: the user adds one `tunnels` entry to `typeclaw.json` and restarts the agent. No account is needed.
+If `vault_request` says the page has no public URL yet, its tunnel is still starting; try again in a moment.
 
 ## Store secrets
 

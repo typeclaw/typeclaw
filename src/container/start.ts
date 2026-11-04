@@ -1358,6 +1358,7 @@ export async function refreshDockerfile(
     baseImageVersion: devMode ? null : resolveBaseImageVersion(cwd),
     cjkFontsAuto: hostLocaleIsCjk(),
     buildKit: opts.buildKit,
+    typevault: cfg.typevault.enabled,
   })
   // Reuse the renderer's classifier so reported warnings match exactly what was
   // stripped/kept in the Dockerfile above (single source of truth).

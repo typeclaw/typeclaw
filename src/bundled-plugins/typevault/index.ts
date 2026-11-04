@@ -8,11 +8,12 @@ import type { PermissionService } from '@/permissions'
 import { BUILTIN_ROLE_NAMES, CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin, type Hooks } from '@/plugin'
 import { isTypevaultMarkerFile } from '@/typevault/envelope-store'
+import { TYPEVAULT_PROMPT_PORT } from '@/typevault/prompt-tunnel'
 import { vaultSecretValues } from '@/typevault/redaction'
 import { ensureRoleTiers, isRoleTier, vaultAdmin } from '@/typevault/vault'
 
 import { bashVaultAccess, createSessionGrants, GRANT_TTL } from './grants'
-import { createVaultRequestTool, TYPEVAULT_PROMPT_PORT, VAULT_REQUEST_TOOL } from './request'
+import { createVaultRequestTool, VAULT_REQUEST_TOOL } from './request'
 import { activateVaultRuntime } from './runtime'
 
 const SKILLS_ROOT = join(import.meta.dir, 'skills')

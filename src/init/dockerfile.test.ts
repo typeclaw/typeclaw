@@ -609,6 +609,12 @@ describe('cloudflared layer', () => {
     expect(out).toContain('/usr/local/bin/cloudflared --version')
   })
 
+  test('an enabled TypeVault emits the layer even with cloudflared off, for its secret-page tunnel', () => {
+    const out = buildDockerfile(dockerfileSchema.parse({ cloudflared: false }), { typevault: true })
+
+    expect(out).toContain('/usr/local/bin/cloudflared --version')
+  })
+
   test('cloudflared: false omits the layer entirely', () => {
     const out = buildDockerfile(dockerfileSchema.parse({ cloudflared: false }))
 

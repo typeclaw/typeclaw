@@ -336,15 +336,9 @@ This is an ordinary operator config change, not a security request to push back 
 
 Follow **Editing `typeclaw.json` safely**: set `typevault.enabled` to `true`, commit, and tell them: "Edited `typevault` — restart-required. Run `typeclaw restart` (host stage)." Mention that it is experimental. If the installed TypeClaw predates `typevault` (the field is missing from `typeclaw.schema.json`), say it needs an upgrade first.
 
-### When `vault_request` reports no tunnel
+### The `vault_request` secret page
 
-The one-time secret page is served on container port `8975` and needs a public URL. Add this entry to `tunnels` (a free Cloudflare quick tunnel, no account), then tell the user it is restart-required:
-
-```json
-{ "name": "typevault", "provider": "cloudflare-quick", "for": { "kind": "manual" }, "upstreamPort": 8975 }
-```
-
-It also needs `docker.file.cloudflared: true` so the image ships `cloudflared`.
+The one-time secret page is served on container port `8975`. With `typevault.enabled`, TypeClaw opens a free Cloudflare quick tunnel to it at boot and builds `cloudflared` into the image, so nothing needs configuring. An operator who wants a stable URL can add their own `manual` tunnel with `upstreamPort: 8975`, or a `cloudflare-named` one named `typevault` (its upstream is set in Cloudflare, so it has no `upstreamPort`); either replaces the implicit one.
 
 ## Network and model HTTP internal destinations
 

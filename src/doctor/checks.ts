@@ -544,7 +544,11 @@ function buildExpectedDockerfile(cwd: string): string | null {
   try {
     const cfg = loadConfigStrictForTemplate(cwd)
     if (cfg === null) return null
-    return buildDockerfile(cfg.dockerfile, { browser: cfg.browser, baseImageVersion: resolveBaseImageVersion(cwd) })
+    return buildDockerfile(cfg.dockerfile, {
+      browser: cfg.browser,
+      baseImageVersion: resolveBaseImageVersion(cwd),
+      typevault: cfg.typevault,
+    })
   } catch {
     return null
   }
@@ -563,12 +567,18 @@ function buildExpectedGitignore(cwd: string): string | null {
 function loadConfigStrictForTemplate(cwd: string): {
   dockerfile: Parameters<typeof buildDockerfile>[0]
   browser: Config['browser']
+  typevault: boolean
   gitignore: Parameters<typeof buildGitignore>[0]
 } | null {
   const result = validateConfig(cwd)
   if (!result.ok) return null
   const cfg = loadConfigSync(cwd)
-  return { dockerfile: cfg.docker.file, browser: cfg.browser, gitignore: cfg.git.ignore }
+  return {
+    dockerfile: cfg.docker.file,
+    browser: cfg.browser,
+    typevault: cfg.typevault.enabled,
+    gitignore: cfg.git.ignore,
+  }
 }
 
 // Normalizes CRLF to LF: the managed templates are emitted with `\n`, but a

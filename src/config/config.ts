@@ -219,7 +219,8 @@ const dockerfileObjectSchema = z.object({
   // restart, so the happy path still works; only hand-edited configs need to
   // set it explicitly. When the binary is absent at tunnel start, the
   // provider fails with a clear "enable docker.file.cloudflared and restart"
-  // message rather than a cryptic spawn error.
+  // message rather than a cryptic spawn error. An enabled `typevault` installs
+  // it regardless, for the secret-page tunnel it opens at boot.
   cloudflared: z.boolean().default(false),
   // Install xvfb so the entrypoint shim can spawn an Xvfb virtual X
   // server and export DISPLAY, giving headed Chrome (agent-browser
