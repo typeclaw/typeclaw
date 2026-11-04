@@ -57,6 +57,7 @@ import {
 import {
   prepareBashSandbox,
   type BashSandboxBoundary,
+  type BashSandboxReveal,
   type DeferredBashPreparation,
   type PreparedBashSandbox,
 } from './bash-sandbox'
@@ -97,6 +98,7 @@ let sharedLoopGuard: LoopGuard = createLoopGuard()
 export const TYPECLAW_INTERNAL_BASH_ENV = '__typeclawBashEnv'
 export const TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV = '__typeclawBashWithholdEnv'
 export const TYPECLAW_INTERNAL_BASH_PREPARE = '__typeclawBashPrepare'
+export const TYPECLAW_INTERNAL_BASH_REVEAL = '__typeclawBashReveal'
 
 type BashEnvOverlay = Record<string, string>
 type BashEnvWithhold = string[]
@@ -130,6 +132,20 @@ function readBashEnvWithhold(args: Record<string, unknown>): BashEnvWithhold | u
   if (!Array.isArray(raw) || !raw.every((name) => typeof name === 'string')) return undefined
   const names = [...new Set(raw)]
   return names.length > 0 ? names : undefined
+}
+
+function readBashReveal(args: Record<string, unknown>): BashSandboxReveal | undefined {
+  const raw = args[TYPECLAW_INTERNAL_BASH_REVEAL]
+  if (!Array.isArray(raw)) return undefined
+  const reveal: BashSandboxReveal = []
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue
+    const { type, source, dest } = entry as Record<string, unknown>
+    if (typeof dest !== 'string') continue
+    if (type === 'tmpfs') reveal.push({ type, dest })
+    else if (type === 'ro-bind' && typeof source === 'string') reveal.push({ type, source, dest })
+  }
+  return reveal.length > 0 ? reveal : undefined
 }
 
 function readBashPreparation(args: Record<string, unknown>): DeferredBashPreparation | undefined {
@@ -562,6 +578,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_REVEAL]
       const blockResult = await opts.hooks.runToolBefore(
         {
           tool: tool.name,
@@ -589,9 +606,11 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       const bashEnvOverlay = readBashEnvOverlay(mutableArgs)
       const bashEnvWithhold = readBashEnvWithhold(mutableArgs)
       const bashPreparation = readBashPreparation(mutableArgs)
+      const bashReveal = readBashReveal(mutableArgs)
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV]
       delete mutableArgs[TYPECLAW_INTERNAL_BASH_PREPARE]
+      delete mutableArgs[TYPECLAW_INTERNAL_BASH_REVEAL]
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
@@ -644,6 +663,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               envOverlay: bashEnvOverlay,
               envWithhold: bashEnvWithhold,
               deferredPreparation: bashPreparation,
+              reveal: bashReveal,
               boundary: sandboxBoundary,
             })
             attemptArgs.command = preparedSandboxRuntime.commandString
