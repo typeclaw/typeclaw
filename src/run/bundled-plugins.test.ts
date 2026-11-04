@@ -17,6 +17,7 @@ describe('BUNDLED_PLUGINS', () => {
     // hooks) at the tail. See the header comment in bundled-plugins.ts.
     expect(BUNDLED_PLUGINS.map((p) => p.name)).toEqual([
       'security',
+      'typevault',
       'tool-result-cap',
       'guard',
       'bun-hygiene',
