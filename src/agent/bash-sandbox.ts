@@ -29,7 +29,7 @@ import {
   type SandboxPolicy,
   type DependencyBinReconciliation,
 } from '@/sandbox'
-import { resolveDevSourceMount } from '@/sandbox/dev-source'
+import { resolveDevSourceMounts } from '@/sandbox/dev-source'
 import { typevaultCliPath } from '@/typevault/cli-path'
 
 import {
@@ -176,7 +176,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
       env: sandboxEnvOverlay,
     })
     await verifyHiddenMaskTargets(maskTargets)
-    const devSourceMount = await resolveDevSourceMount(agentDir)
+    const devSourceMounts = await resolveDevSourceMounts(agentDir)
     const policy: SandboxPolicy = {
       mounts: [
         { type: 'ro-bind', source: agentDir, dest: agentDir },
@@ -189,7 +189,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
         // Dev/CI installations may place it outside /usr; expose only the
         // executable, never its parent directory, under every proc strategy.
         { type: 'ro-bind', source: process.execPath, dest: process.execPath },
-        ...(devSourceMount === undefined ? [] : [devSourceMount]),
+        ...devSourceMounts,
         ...(privilegedRuntime?.mounts ?? []),
         ...(preparation === undefined ? [] : [preparation.mount]),
       ],
