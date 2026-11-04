@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+
+import { isTypevaultMarker, readEnvelopeTextSync } from '@/typevault/envelope-store'
 
 import { channelFieldDefaultEnv } from './defaults'
 import { resolveSecret, secretFieldSchema, type Secret } from './resolve'
@@ -71,6 +73,7 @@ function readChannelSecrets(secretsPath: string): Record<string, Record<string, 
   let raw: string
   try {
     raw = readFileSync(secretsPath, 'utf8')
+    if (isTypevaultMarker(raw)) raw = readEnvelopeTextSync(dirname(secretsPath))
   } catch {
     return {}
   }

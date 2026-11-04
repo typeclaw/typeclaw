@@ -324,6 +324,18 @@ Off switch — the broker is constructed but never opens a WS, no LISTEN gets fo
 
 This is an ordinary operator config change, not a security request to push back on. Follow **Editing `typeclaw.json` safely**: set `eval.enabled` to `true`, and set `origins` to what they named (drop the key for "all origins"). Write, commit, and tell them: "Edited `eval` — restart-required. Run `typeclaw restart` (host stage)." If the installed TypeClaw predates `eval` (the field is missing from `typeclaw.schema.json`), say it needs a TypeClaw upgrade first instead of writing a field that would be dropped.
 
+## typevault (experimental)
+
+```json
+"typevault": { "enabled": true }
+```
+
+`enabled` (default `false`) keeps the agent's `secrets.json` (provider keys, channel tokens, MCP logins) in the agent's own TypeVault vault instead of a plaintext file. **Restart-required**: the move happens in `typeclaw start`. Setting it back to `false` and restarting restores `secrets.json` from the vault; anything else stored in the vault stays there for the next time it is enabled. `.env` is never touched. While enabled, `secrets.json` only holds a marker; never edit it or `.typevault/` by hand.
+
+### When the user asks "turn on TypeVault" / "move my secrets into the vault"
+
+Follow **Editing `typeclaw.json` safely**: set `typevault.enabled` to `true`, commit, and tell them: "Edited `typevault` — restart-required. Run `typeclaw restart` (host stage)." Mention that it is experimental. If the installed TypeClaw predates `typevault` (the field is missing from `typeclaw.schema.json`), say it needs an upgrade first.
+
 ## Network and model HTTP internal destinations
 
 These are two independent gates:

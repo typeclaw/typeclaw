@@ -92,6 +92,42 @@ describe('runBackup', () => {
     }
   })
 
+  test('commits a newly created, ignored .typevault/ but never the key under .typeclaw/typevault/', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-typevault-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, '.gitignore'), buildGitignore())
+      await git('add', '.gitignore')
+      await git('commit', '-qm', 'initial')
+      for (const name of [
+        '.typevault/owner.json',
+        '.typevault/entries/runtime.0123.json',
+        '.typeclaw/typevault/config/typevault/identity.json',
+      ]) {
+        const target = join(cwd, name)
+        await mkdir(target.slice(0, target.lastIndexOf('/')), { recursive: true })
+        await writeFile(target, '{}\n')
+      }
+
+      expect(
+        await runBackup({ cwd, pushToOrigin: false }, { gitSpawn, pickCommitMessage: async () => 'backup vault' }),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe(
+        '.typevault/entries/runtime.0123.json\n.typevault/owner.json\n',
+      )
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('default runner commits without executing a planted hook', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'autobackup-hookless-'))
     try {

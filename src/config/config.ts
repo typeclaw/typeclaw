@@ -321,6 +321,18 @@ export const githubCliSchema = githubCliObjectSchema.default(() => githubCliObje
 
 export type GithubCliConfig = z.infer<typeof githubCliSchema>
 
+// Experimental. When enabled, `typeclaw start` moves secrets.json into the
+// agent's own TypeVault vault (.typevault/); disabling restores the file.
+const typevaultObjectSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+  })
+  .strict()
+
+export const typevaultSchema = typevaultObjectSchema.default(() => typevaultObjectSchema.parse({}))
+
+export type TypevaultConfig = z.infer<typeof typevaultSchema>
+
 export const DEFAULT_LOG_RETENTION_DAYS = 14
 export const MAX_LOG_RETENTION_DAYS = 3650
 
@@ -890,6 +902,7 @@ export const configSchema = z
     browser: browserSchema,
     git: gitSchema,
     githubCli: githubCliSchema,
+    typevault: typevaultSchema,
     logs: logsSchema,
     roles: rolesConfigSchema.optional(),
     tunnels: tunnelsArraySchema,
@@ -1183,6 +1196,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   browser: 'restart-required',
   'git.ignore': 'restart-required',
   githubCli: 'restart-required',
+  typevault: 'restart-required',
   logs: 'ignored',
   // Split: `match` lists are reload-safe (typeclaw role claim, hand-edits
   // adding/removing match rules apply without a container restart);
@@ -1283,6 +1297,7 @@ export function extractPluginConfigs(raw: unknown): Record<string, unknown> {
     'docker',
     'git',
     'githubCli',
+    'typevault',
     'logs',
     'roles',
     'permissions',

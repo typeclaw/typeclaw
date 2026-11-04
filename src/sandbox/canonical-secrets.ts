@@ -16,6 +16,12 @@ export const RUNTIME_OWNED_SECRET_DIRS = [
   '.typeclaw/home',
   '.typeclaw/logs',
   BROWSER_PROFILE_RELATIVE_DIR,
+  // TypeVault (typevault.enabled): the agent's machine key and typevault's
+  // private state, and the vault itself, which holds the secrets.json envelope.
+  // Mirrors src/typevault/vault.ts; kept as literals so the sandbox does not
+  // load the typevault SDK.
+  '.typeclaw/typevault',
+  '.typevault',
 ] as const
 
 // SECURITY / classification: operator-provisioned CLI credential stores. TypeClaw

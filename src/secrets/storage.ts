@@ -5,6 +5,8 @@ import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore 
 import { operationSignal, raceWithAbortSignal } from '@earendil-works/pi-ai/utils/abort'
 import lockfile from 'proper-lockfile'
 
+import { isTypevaultMarker, readEnvelopeTextSync, writeEnvelopeTextSync } from '@/typevault/envelope-store'
+
 import { providerKeyDefaultEnv } from './defaults'
 import { resolveSecret } from './resolve'
 import {
@@ -511,7 +513,8 @@ export class SecretsBackend implements CredentialStore {
   }
 
   private readEnvelope(): SecretsFile {
-    const raw = existsSync(this.secretsPath) ? readFileSync(this.secretsPath, 'utf8') : ''
+    const onDisk = existsSync(this.secretsPath) ? readFileSync(this.secretsPath, 'utf8') : ''
+    const raw = isTypevaultMarker(onDisk) ? readEnvelopeTextSync(dirname(this.secretsPath)) : onDisk
     if (!raw.trim()) return newEmptyEnvelope()
     let parsed: unknown
     try {
@@ -527,6 +530,12 @@ export class SecretsBackend implements CredentialStore {
   }
 
   private writeEnvelopeAtomic(envelope: SecretsFile): void {
+    // With typevault enabled, secrets.json is only the marker; the envelope
+    // itself is written into the vault and the marker is never rewritten.
+    if (existsSync(this.secretsPath) && isTypevaultMarker(readFileSync(this.secretsPath, 'utf8'))) {
+      writeEnvelopeTextSync(dirname(this.secretsPath), stringifyEnvelope(envelope))
+      return
+    }
     const tmp = `${this.secretsPath}.${process.pid}.${Date.now()}.${tempSequence++}.tmp`
     writeFileSync(tmp, stringifyEnvelope(envelope), { encoding: 'utf8', mode: FILE_MODE })
     try {

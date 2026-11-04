@@ -39,6 +39,8 @@ const canonicalSecretDirs = (agentDir: string) => [
   join(agentDir, '.typeclaw', 'home'),
   join(agentDir, '.typeclaw', 'logs'),
   join(agentDir, '.typeclaw', 'browser-profile'),
+  join(agentDir, '.typeclaw', 'typevault'),
+  join(agentDir, '.typevault'),
 ]
 const secretFiles = (agentDir: string) => [
   join(agentDir, '.env'),
