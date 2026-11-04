@@ -6,6 +6,7 @@ import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
 import { fillSecretIntoFocusedField, type FillSecretOutcome } from '@/browser/fill-secret'
 import { type ManagedBrowser, startManagedBrowser } from '@/browser/managed-browser'
 import { BROWSER_ENGINES, type BrowserConfig, needsManagedBrowser } from '@/browser/registry'
+import { readVaultValue } from '@/bundled-plugins/typevault/runtime'
 import { getConfig } from '@/config'
 import { readEnvFile } from '@/init/env-file'
 import type { PermissionService } from '@/permissions'
@@ -62,6 +63,7 @@ export function sharedBrowserBashHook(
 }
 
 export const FILL_SECRET_TOOL = 'browser_fill_secret'
+const VAULT_REF_PREFIX = 'tv://'
 
 // The tool drives the shared browser, so it needs `browser.shared` like bash's
 // CDP URL does. Typing the withheld TYPECLAW_SECRET_* tier is runtime-owned
@@ -76,6 +78,11 @@ export function fillSecretGuardHook(permissions: PermissionService): NonNullable
       return { block: true, reason: `${FILL_SECRET_TOOL} needs the ${CORE_PERMISSIONS.browserShared} permission` }
     }
     const name = event.args['name']
+    if (typeof name === 'string' && name.startsWith(VAULT_REF_PREFIX)) {
+      return permissions.has(event.origin, CORE_PERMISSIONS.vaultUse)
+        ? undefined
+        : { block: true, reason: `${VAULT_REF_PREFIX} values need the ${CORE_PERMISSIONS.vaultUse} permission` }
+    }
     if (
       typeof name === 'string' &&
       name.startsWith(SECRET_ENV_PREFIX) &&
@@ -98,16 +105,32 @@ export function createFillSecretTool(
       'Type the value of a .env variable into the focused field of a shared-browser tab without the value ever entering your context.',
       'Focus the field first with your browser engine (click it), then call this. Pass `url` (exact or prefix) when several tabs are open.',
       `Accepts any ordinary .env variable and the ${SECRET_ENV_PREFIX}* tier, which is hidden from bash and reachable only through this tool.`,
+      `With TypeVault enabled, \`name\` can also be a vault reference such as ${VAULT_REF_PREFIX}github/bot#password, read through this session's grant.`,
       'With `submit: true` it submits the field (form submit, else Enter) and waits for the page to navigate; if it does not, the field is cleared so the value is not left on the page.',
       'The result names the tab and field, never the value. Never read the field back, screenshot a non-password field after filling, or echo the variable.',
     ].join(' '),
     parameters: z.object({
-      name: z.string().describe('The .env variable name, e.g. TYPECLAW_SECRET_GITHUB_PASSWORD'),
+      name: z
+        .string()
+        .describe(
+          'The .env variable name, e.g. TYPECLAW_SECRET_GITHUB_PASSWORD, or a vault reference like tv://github/bot#password',
+        ),
       url: z.string().optional().describe('Exact URL or prefix of the target tab'),
       submit: z.boolean().default(false),
     }),
     fileOperands: { nonFile: ['name', 'url'] },
     execute: async (args, ctx) => {
+      if (args.name.startsWith(VAULT_REF_PREFIX)) {
+        const read = await readVaultValue(ctx.sessionId, args.name, 'fill a browser field')
+        if (!read.ok) return text(`Not filled: ${read.reason}.`)
+        const outcome = await fill({
+          cdpUrl,
+          value: read.value,
+          submit: args.submit,
+          ...(args.url === undefined ? {} : { url: args.url }),
+        })
+        return text(describeOutcome(args.name, outcome))
+      }
       const fillable = new Set(resolveFillableEnvNames(readEnvFile(ctx.agentDir), process.env))
       if (!fillable.has(args.name)) {
         return text(
