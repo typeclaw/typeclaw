@@ -6702,6 +6702,38 @@ describe('setupSession integration: builtin pi tools route through customTools w
     session.dispose()
   })
 
+  test('subagent naming a plugin tool gets that registered tool under its own name, and no other plugin tool', async () => {
+    // The registered name is what `tool.before` permission guards key on (e.g.
+    // browser_fill_secret's browser.shared gate), so the subagent must see the
+    // registry tool itself, not a renamed copy that would slip past them.
+    const { createSession } = await import('./index')
+    const hooks = createHookBus()
+    const registry: PluginRegistry = emptyRegistry()
+    const tool = {
+      description: 'fixture',
+      parameters: z.object({}),
+      execute: async () => ({ content: [{ type: 'text' as const, text: 'ok' }] }),
+    }
+    registry.tools.push(
+      { pluginName: 'p1', toolName: 'browser_fill_secret', tool, logger: noopLogger },
+      { pluginName: 'p1', toolName: 'other_tool', tool, logger: noopLogger },
+    )
+
+    const session = await createSession({
+      plugins: { registry, hooks, sessionId: 'test-session', agentDir },
+      pluginSubagent: {
+        pluginName: 'p2',
+        toolRefs: [{ __builtinTool: 'read' }],
+        toolNamePrefix: 's',
+        pluginToolNames: ['browser_fill_secret', 'not_registered'],
+      },
+    })
+
+    expect(session.getActiveToolNames().sort()).toEqual(['browser_fill_secret', 'read'])
+
+    session.dispose()
+  })
+
   test('TUI session (no options.tools) activates all seven typeclaw-owned pi builtins (read/bash/edit/write/grep/find/ls)', async () => {
     // A non-subagent session leaves `options.tools` unset, so the active set is
     // the full builtin override list (all 7) union the typeclaw customSystemTools.

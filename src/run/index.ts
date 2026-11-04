@@ -601,6 +601,7 @@ async function startAgentRuntime(
           ...(entry.pluginSubagent.tools ? { toolRefs: entry.pluginSubagent.tools } : {}),
           ...(entry.pluginSubagent.customTools ? { customTools: entry.pluginSubagent.customTools } : {}),
           toolNamePrefix: `__plugin_${entry.pluginName}_${entry.subagentName}`,
+          ...(entry.pluginSubagent.pluginTools ? { pluginToolNames: entry.pluginSubagent.pluginTools } : {}),
         },
         // Orchestration wiring is opt-in per subagent (canSpawnSubagents) so
         // only operator/reviewer can delegate; explorer/scout/etc. stay leaves.

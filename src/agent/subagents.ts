@@ -88,6 +88,11 @@ export type SubagentShared<P = unknown> = {
   // registry scoping. Default (unset/false) keeps the subagent a leaf — the
   // historical contract for explorer/scout/memory-logger/etc.
   canSpawnSubagents?: boolean
+  // Plugin-registered tools (by registered name, e.g. `browser_fill_secret`)
+  // this subagent's session also exposes. They keep their registered name, so
+  // every `tool.before` hook keyed on it (permission guards included) still
+  // applies. A name no loaded plugin registered is skipped.
+  pluginTools?: readonly string[]
   // Opt-in: allow this subagent to spawn background children AND drain their
   // completions back into its own session (requires canSpawnSubagents). Default
   // (unset/false) keeps background spawns denied from this subagent — it must
