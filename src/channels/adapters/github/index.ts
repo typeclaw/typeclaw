@@ -134,6 +134,16 @@ const MAX_RECOVERED_PER_SWEEP = 50
 // durable cooldown store, so a tick is cheap when nothing new needs review.
 const DEFAULT_RECONCILE_INTERVAL_MS = 30 * 60 * 1000
 
+// Pending reviews admitted during this process, keyed by its router. A tunnel URL change
+// rebuilds and restarts the adapter seconds after boot, but the router and the review
+// turns it already admitted keep running. The boot replay exists for work an earlier
+// process lost, so a later start in the same process must not admit that work again.
+const pendingAdmissionsByRouter = new WeakMap<object, Set<string>>()
+
+function pendingAdmissionKey(repo: string, prNumber: number, work: { headSha: string; kind: string }): string {
+  return `${canonicalGithubRepo(repo)}#${prNumber}@${work.headSha}:${work.kind}`
+}
+
 export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapter {
   const logger = options.logger ?? consoleLogger
   const fetchImpl = options.fetchImpl ?? fetch
@@ -157,6 +167,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let lifecycleGeneration = 0
   let unregisterTokenBridge: (() => void) | null = null
   const workspaceByChat = new Map<string, string>()
+  const pendingAdmissions = pendingAdmissionsByRouter.get(options.router) ?? new Set<string>()
+  pendingAdmissionsByRouter.set(options.router, pendingAdmissions)
   const setIntervalFn =
     options.setInterval ??
     ((handler: () => void, ms: number) => {
@@ -285,7 +297,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     const pending = message.githubPendingReview
     const prNumber = /^pr:(\d+)$/.exec(message.chat)?.[1]
     // The webhook handler schedules this outside its acknowledgment path.
-    return options.router.route(
+    const receipt = await options.router.route(
       {
         ...message,
         accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
@@ -305,6 +317,11 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
             })
         : undefined,
     )
+    // Only newly accepted work runs in this process. The router also invokes the admission
+    // callback for an open duplicate, such as a redelivered trigger from a process that died.
+    if (receipt.kind === 'accepted' && pending !== undefined && prNumber !== undefined)
+      pendingAdmissions.add(pendingAdmissionKey(message.workspace, Number(prNumber), pending))
+    return receipt
   }
   const handlerOptions: GithubWebhookHandlerOptions = {
     webhookSecret,
@@ -604,6 +621,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           fetchImpl,
           pendingStore: loadedPendingReviewStore,
           replayId,
+          admittedThisProcess: (entry) => pendingAdmissions.has(pendingAdmissionKey(entry.repo, entry.prNumber, entry)),
           isCancelled: () => reconcileGeneration !== lifecycleGeneration,
         })
           .catch((error: unknown) => {

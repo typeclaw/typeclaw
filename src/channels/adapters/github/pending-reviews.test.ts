@@ -49,8 +49,9 @@ const pull = {
   updated_at: '2026-01-01T00:00:00Z',
 }
 
-async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), 'github-pending-reviews-'))
+// Passing an existing dir starts the next process on the same agent folder.
+async function fixture(existingDir?: string, options: { prompt?: () => Promise<void> } = {}) {
+  const dir = existingDir ?? (await mkdtemp(join(tmpdir(), 'github-pending-reviews-')))
   const store = await loadPendingReviewStore(dir, logger)
   const calls: string[] = []
   const reviews: Array<Record<string, unknown>> = []
@@ -59,10 +60,20 @@ async function fixture() {
   const scanRead = Promise.withResolvers<void>()
   const currentPull = { ...pull }
   let comparison = 'behind'
+  let fetchWaiters: Array<{ match: (url: string) => boolean; resolve: () => void }> = []
+  let fetchHolds: Array<{ match: (url: string) => boolean; reached: () => void; released: Promise<void> }> = []
   const fetchImpl = Object.assign(
     async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
       calls.push(url)
+      for (const waiter of fetchWaiters) if (waiter.match(url)) waiter.resolve()
+      fetchWaiters = fetchWaiters.filter((waiter) => !waiter.match(url))
+      const hold = fetchHolds.find((candidate) => candidate.match(url))
+      if (hold !== undefined) {
+        fetchHolds = fetchHolds.filter((candidate) => candidate !== hold)
+        hold.reached()
+        await hold.released
+      }
       if (url.endsWith('/user')) return Response.json({ login: 'bot', id: 1 })
       if (url.includes('/timeline?')) return Response.json(timeline)
       if (url.includes('/compare/')) return Response.json({ status: comparison })
@@ -119,7 +130,7 @@ async function fixture() {
         tools: [],
         customTools: [],
       })
-      session.session.prompt = async () => {}
+      session.session.prompt = options.prompt ?? (async () => {})
       return { ...session, sessionId: session.session.sessionId }
     },
   })
@@ -147,6 +158,7 @@ async function fixture() {
     tokenRefreshIntervalMs: 0,
     deliveryRecoveryIntervalMs: 0,
     reconcileIntervalMs: 0,
+    webhookRegistrationDelayMs: 0,
   })
   cleanups.push(async () => {
     await adapter.stop()
@@ -173,6 +185,17 @@ async function fixture() {
     nextRoute: () => {
       routeSignal = Promise.withResolvers<RouteReceipt>()
       return routeSignal.promise
+    },
+    nextFetch: (match: (url: string) => boolean) => {
+      const signal = Promise.withResolvers<void>()
+      fetchWaiters.push({ match, resolve: signal.resolve })
+      return signal.promise
+    },
+    holdFetch: (match: (url: string) => boolean) => {
+      const reached = Promise.withResolvers<void>()
+      const released = Promise.withResolvers<void>()
+      fetchHolds.push({ match, reached: reached.resolve, released: released.promise })
+      return { reached: reached.promise, release: released.resolve }
     },
     deliver: async (action: string, event = 'pull_request', extra: Record<string, unknown> = {}) => {
       if (handler === undefined) throw new Error('Adapter not listening')
@@ -237,10 +260,74 @@ test('a permitted requester on an external contributor PR replays under the admi
   expect((await admitted).kind).toBe('accepted')
   expect(await f.store.list()).toMatchObject([{ authorId: '20', authorName: 'maintainer', authorIsBot: false }])
   await f.adapter.stop()
-  admitted = f.nextRoute()
+  await f.router.stop()
+  const next = await fixture(f.dir)
+  next.allowedAuthors.add('20')
+  next.config.review.on = 'review_requested'
+  admitted = next.nextRoute()
+  await next.adapter.start()
+  expect((await admitted).kind).toBe('accepted')
+  expect(next.routed.at(-1)).toMatchObject({ authorId: '20', authorName: 'maintainer', authorIsBot: false })
+})
+
+test('an adapter restart in the same process does not replay pending work it already re-admitted', async () => {
+  const f = await fixture()
+  await f.store.record(pending)
+  const admitted = f.nextRoute()
   await f.adapter.start()
   expect((await admitted).kind).toBe('accepted')
-  expect(f.routed.at(-1)).toMatchObject({ authorId: '20', authorName: 'maintainer', authorIsBot: false })
+  await f.scanRead
+  await f.adapter.stop()
+  // The reconcile scan lists open PRs only after the pending replay pass settles.
+  const rescanned = f.nextFetch((url) => url.includes('/pulls?'))
+  await f.adapter.start()
+  await rescanned
+  expect(f.routed.map((message) => message.chat)).toEqual(['pr:7'])
+})
+
+test('a redelivered trigger from a dead process does not suppress its boot replay', async () => {
+  // given a review the previous process admitted and never finished
+  const turn = Promise.withResolvers<void>()
+  const f = await fixture(undefined, { prompt: () => turn.promise })
+  cleanups.push(async () => turn.resolve())
+  await f.adapter.start()
+  await f.scanRead
+  let admitted = f.nextRoute()
+  await f.deliver('opened')
+  expect((await admitted).kind).toBe('accepted')
+  await f.adapter.stop()
+  await f.router.stop()
+
+  // when the next process gets GitHub's redelivery before its boot replay runs
+  const next = await fixture(f.dir)
+  next.config.webhookUrl = 'https://example.com/hook'
+  const registering = next.holdFetch((url) => url.includes('/hooks'))
+  const starting = next.adapter.start()
+  await registering.reached
+  admitted = next.nextRoute()
+  await next.deliver('opened')
+  expect((await admitted).kind).toBe('duplicate')
+  const replayed = next.nextRoute()
+  registering.release()
+  await starting
+
+  // then the boot replay still re-admits the interrupted review
+  expect((await replayed).kind).toBe('accepted')
+  expect(next.routed.at(-1)?.eventKind).toBe('pull_request:reconcile')
+})
+
+test('an adapter restart in the same process leaves a live admission to its running turn', async () => {
+  const f = await fixture()
+  await f.adapter.start()
+  await f.scanRead
+  const admitted = f.nextRoute()
+  await f.deliver('opened')
+  expect((await admitted).kind).toBe('accepted')
+  await f.adapter.stop()
+  const rescanned = f.nextFetch((url) => url.includes('/pulls?'))
+  await f.adapter.start()
+  await rescanned
+  expect(f.routed.map((message) => message.eventKind)).toEqual(['pull_request:opened'])
 })
 
 test('replay rechecks permissions and does not authorize the unpermitted PR author', async () => {
@@ -415,12 +502,15 @@ test.each(['review', 'rereview'] as const)(
     expect((await admitted).kind).toBe('accepted')
     const first = f.routed[0]
     await f.adapter.stop()
-    admitted = f.nextRoute()
-    await f.adapter.start()
+    await f.router.stop()
+    const next = await fixture(f.dir)
+    admitted = next.nextRoute()
+    await next.adapter.start()
     expect((await admitted).kind).toBe('accepted')
-    expect(f.routed.map((m) => m.chat)).toEqual(['pr:7', 'pr:7'])
-    expect(f.routed[1]?.externalMessageId).not.toBe(first?.externalMessageId)
-    if (kind === 'rereview') expect(f.routed[1]?.githubReviewRound).toMatchObject({ kind: 'push', headSha: 'head-one' })
+    expect(next.routed.map((m) => m.chat)).toEqual(['pr:7'])
+    expect(next.routed[0]?.externalMessageId).not.toBe(first?.externalMessageId)
+    if (kind === 'rereview')
+      expect(next.routed[0]?.githubReviewRound).toMatchObject({ kind: 'push', headSha: 'head-one' })
     const scanRoutes: string[] = []
     await reconcileOpenPrs({
       repos: [pending.repo],
@@ -447,9 +537,9 @@ test.each(['review', 'rereview'] as const)(
       recoveryGeneration: 'boot',
       transferId: 'test',
     })
-    expect(f.router.recoveryRedelivery?.(notice, ['pull_request:synchronize:review-followup'])).toBe('redelivered')
-    expect(f.router.recoveryRedelivery?.(notice, ['pull_request:reconcile:rereview'])).toBe('redelivered')
-    expect(f.router.recoveryRedelivery?.(notice, ['issue_comment:created'])).toBe('not-redelivered')
+    expect(next.router.recoveryRedelivery?.(notice, ['pull_request:synchronize:review-followup'])).toBe('redelivered')
+    expect(next.router.recoveryRedelivery?.(notice, ['pull_request:reconcile:rereview'])).toBe('redelivered')
+    expect(next.router.recoveryRedelivery?.(notice, ['issue_comment:created'])).toBe('not-redelivered')
   },
 )
 
