@@ -113,6 +113,17 @@ describe('browser_fill_secret permissions', () => {
     expect(await call(guard(), 'SHOP_ADDRESS', undefined)).toMatchObject({ block: true })
   })
 
+  test('vault references need vault.use: a member may type one, a browser-only role may not', async () => {
+    const roles = rolesConfigSchema.parse({
+      member: { match: ['slack:*'] },
+      shopper: { match: ['slack:*'], permissions: ['channel.respond', 'browser.shared'] },
+    })
+    const member = guard({ roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }) })
+    const shopper = guard({ roles })
+    expect(await call(member, 'tv://github/bot#password', slack)).toBeUndefined()
+    expect(await call(shopper, 'tv://github/bot#password', slack)).toMatchObject({ block: true })
+  })
+
   test('lets a member type ordinary variables but not the secret tier, which needs fs.see.secrets', async () => {
     const member = guard({ roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }) })
     expect(await call(member, 'SHOP_ADDRESS', slack)).toBeUndefined()

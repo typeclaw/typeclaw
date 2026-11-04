@@ -137,8 +137,12 @@ export async function ensureRoleTiers(agentDir: string, roles: readonly string[]
   return skipped
 }
 
-export function vaultAdmin(agentDir: string): AdminClient {
-  return createAdmin({ env: typevaultEnv(agentDir), global: true, dir: typevaultDir(agentDir) })
+// `promptPort` reaches the daemon only when this call is what starts it; the
+// runtime's first grant does, so the daemon serves `request` pages there.
+export function vaultAdmin(agentDir: string, options: { promptPort?: number } = {}): AdminClient {
+  const env = typevaultEnv(agentDir)
+  if (options.promptPort !== undefined) env.TYPEVAULT_PROMPT_PORT = String(options.promptPort)
+  return createAdmin({ env, global: true, dir: typevaultDir(agentDir) })
 }
 
 export function grantAccess(agentDir: string, grant: string): Promise<Access> {
