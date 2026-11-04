@@ -12,6 +12,8 @@ import { vaultSecretValues } from '@/typevault/redaction'
 import { ensureRoleTiers, isRoleTier, vaultAdmin } from '@/typevault/vault'
 
 import { bashVaultAccess, createSessionGrants, GRANT_TTL } from './grants'
+import { createVaultRequestTool, TYPEVAULT_PROMPT_PORT, VAULT_REQUEST_TOOL } from './request'
+import { activateVaultRuntime } from './runtime'
 
 const SKILLS_ROOT = join(import.meta.dir, 'skills')
 
@@ -34,20 +36,30 @@ export default definePlugin({
       return {}
     }
 
-    const admin = vaultAdmin(ctx.agentDir)
+    const admin = vaultAdmin(ctx.agentDir, { promptPort: TYPEVAULT_PROMPT_PORT })
     const grants = createSessionGrants({
       issue: ({ tier, label }) => admin.grant({ tiers: [tier], ttl: GRANT_TTL, label }),
       revoke: async (label) => {
         await admin.revoke({ label })
       },
     })
+    const roles = new Map<string, string>()
+    activateVaultRuntime({ agentDir: ctx.agentDir, grants, roles })
+    const bashHook = vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger)
 
     return {
       skillsDirs: [SKILLS_ROOT],
+      tools: { [VAULT_REQUEST_TOOL]: createVaultRequestTool() },
       hooks: {
-        'tool.before': vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger),
+        'tool.before': async (event, hookCtx) => {
+          // Tool contexts carry no origin, so remember the role each session
+          // last acted as for vault tools that run outside bash.
+          roles.set(event.sessionId, ctx.permissions.resolveRole(event.origin))
+          return bashHook(event, hookCtx)
+        },
         'tool.after': vaultRedactHook(() => vaultSecretValues(ctx.agentDir), ctx.logger),
         'session.end': async (event) => {
+          roles.delete(event.sessionId)
           await grants.end(event.sessionId).catch((error: unknown) => {
             ctx.logger.warn(`typevault: could not revoke the grant of session ${event.sessionId}: ${String(error)}`)
           })
