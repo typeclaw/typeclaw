@@ -35,6 +35,45 @@ A later script continues in the same tab with `const page = await browser.attach
 - Canvas or custom widgets: `createCua(page)` gives coordinate-level clicks and scrolls.
 - `connectPipe()` and `connectBrowserSkill()` launch or find other browsers; do not use them here.
 
+## Sites with anti-macro checks
+
+Some sites (ticketing and banking sites such as Korail, often behind DynaPath) score how input arrives and reject requests that look scripted. On Korail the rejection is a dialog like "매크로, 개발자도구 등 미허가 도구 사용 시 이용이 제한될 수 있습니다" or a `CODE : -8002`. That dialog is a block of the request, not a notice to click away; the login or search did not go through.
+
+`locator(ref).click()` jumps the pointer straight to the element and `keyboard.type(text)` types with no delay between keys, which these checks reject. Both a moving pointer and a typing delay are needed; either alone is still rejected. On such sites, click and type like this instead:
+
+```js
+const rand = (min, max) => min + Math.random() * (max - min)
+const pause = (min, max) => new Promise((resolve) => setTimeout(resolve, rand(min, max)))
+
+async function humanClick(page, ref, [fromX, toX] = [0.3, 0.7]) {
+  await page.locator(ref).scrollIntoViewIfNeeded()
+  const box = await page.locator(ref).boundingBox()
+  const x = box.x + box.width * rand(fromX, toX)
+  const y = box.y + box.height * rand(0.3, 0.7)
+  await page.mouse.move(x, y, { steps: Math.round(rand(12, 25)) })
+  await pause(80, 250)
+  await page.mouse.down()
+  await pause(40, 110)
+  await page.mouse.up()
+}
+
+async function humanType(page, ref, text) {
+  // Aim at the left of the field: the right edge often holds an overlay
+  // (password reveal, virtual-keypad toggle) that swallows the keystrokes.
+  await humanClick(page, ref, [0.1, 0.35])
+  await pause(300, 700)
+  // Clear what a previous attempt left in the field so a retry does not append.
+  await page.keyboard.press('Control+A')
+  await page.keyboard.press('Backspace')
+  await pause(150, 400)
+  await page.keyboard.type(text, { delay: 120 })
+}
+```
+
+- Before submitting, take a fresh snapshot and check every field holds what you typed; if one is empty, a click hit an overlay instead of the field.
+- After a block, dismiss the dialog and redo the same step with `humanClick`/`humanType`. Do not report the site as unusable until that retry also fails.
+- Do not call the site's endpoints yourself with `page.evaluate(() => fetch(...))`. The check signs the page's own requests, so a hand-made request is rejected even when the UI flow would pass. Drive the UI.
+
 ## Shared browser rules
 
 - One TypeClaw-managed Chrome serves every engine and every session that has `browser.shared`. Logins and tabs persist across bash calls and sessions.
