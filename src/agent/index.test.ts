@@ -43,7 +43,7 @@ import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
 import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { renderInteractiveSessionContext, type SessionOrigin } from './session-origin'
 import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
-import { buildSystemPolicy, DEFAULT_SUBAGENT_ROSTER } from './system-prompt'
+import { buildSystemPolicy, DEFAULT_SUBAGENT_ROSTER, USER_INTENT_RULE } from './system-prompt'
 import { renderPublicSubagentRoster } from './tools/spawn-subagent'
 
 // Every origin kind the standard composer serves, plus the origin-less
@@ -1105,6 +1105,13 @@ describe('createOverrideResourceLoader', () => {
 
     const prompt = loader.getSystemPrompt() ?? ''
     expect(prompt.startsWith('SUBAGENT PROMPT')).toBe(true)
+  })
+
+  test('carries the same user-intent rule as the policy it skips', async () => {
+    const loader = await createOverrideResourceLoader('SUBAGENT PROMPT')
+
+    expect(buildSystemPolicy()).toContain(USER_INTENT_RULE)
+    expect(loader.getSystemPrompt() ?? '').toContain(USER_INTENT_RULE)
   })
 
   test('does not append a wall-clock anchor: the per-turn `<current-time>` block lives in the user message instead', async () => {
