@@ -7,7 +7,14 @@ import { parseSecretsFile } from '@/secrets/schema'
 import { ASYNC_LOCK_OPTIONS } from '@/secrets/storage'
 
 import { isTypevaultMarker, typevaultMarkerText } from './envelope-store'
-import { provisionVault, readSecretsEntry, requireSecretsEntry, vaultExists, writeSecretsEntry } from './vault'
+import {
+  clearLegacyDaemonClaims,
+  provisionVault,
+  readSecretsEntry,
+  requireSecretsEntry,
+  vaultExists,
+  writeSecretsEntry,
+} from './vault'
 
 export type TypevaultReconcileResult =
   | { action: 'unchanged' }
@@ -28,6 +35,7 @@ export async function reconcileTypevault(agentDir: string, enabled: boolean): Pr
   if (!enabled && !isMarkerFile(secretsPath)) return { action: 'unchanged' }
   const release = await lockfile.lock(secretsPath, ASYNC_LOCK_OPTIONS)
   try {
+    clearLegacyDaemonClaims(agentDir)
     return enabled ? await enable(agentDir, secretsPath) : await disable(agentDir, secretsPath)
   } finally {
     await release()
