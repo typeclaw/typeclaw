@@ -30,7 +30,7 @@ beforeEach(async () => {
   const direct = await createClient({ direct: true, global: true, dir: typevaultDir(dir), env: typevaultEnv(dir) })
   for (const tier of ['owner', 'member']) {
     await direct.set({
-      name: parseEntryName(`tv://${tier}/login`),
+      name: parseEntryName(`typevault://${tier}/login`),
       tier,
       fields: { password: { type: 'secret', value: `${tier}-password-value` } },
     })
@@ -62,7 +62,10 @@ describe.skipIf(process.platform === 'win32')('vault_request', () => {
   test('opens a one-time page and serves its link from the tunnel origin', async () => {
     const tool = createVaultRequestTool(() => ({ status: 'ready', url: 'https://agent.example.com' }))
 
-    const result = await tool.execute(tool.parameters.parse({ name: 'tv://resend', reason: 'send the digest' }), ctx())
+    const result = await tool.execute(
+      tool.parameters.parse({ name: 'typevault://resend', reason: 'send the digest' }),
+      ctx(),
+    )
 
     const details = result.details as { status: string; link: string; code: string }
     expect(details.status).toBe('opened')
@@ -73,7 +76,10 @@ describe.skipIf(process.platform === 'win32')('vault_request', () => {
   test('without a tunnel for the prompt port it opens nothing', async () => {
     const tool = createVaultRequestTool(() => ({ status: 'tunnel-missing' }))
 
-    const result = await tool.execute(tool.parameters.parse({ name: 'tv://resend', reason: 'send the digest' }), ctx())
+    const result = await tool.execute(
+      tool.parameters.parse({ name: 'typevault://resend', reason: 'send the digest' }),
+      ctx(),
+    )
 
     expect((result.details as { status: string }).status).toBe('tunnel-missing')
   })
@@ -81,12 +87,12 @@ describe.skipIf(process.platform === 'win32')('vault_request', () => {
 
 describe.skipIf(process.platform === 'win32')('vault references', () => {
   test("a session reads fields in its role's reach and is refused the rest", async () => {
-    expect(await readVaultValue('s1', 'tv://member/login#password', 'test')).toEqual({
+    expect(await readVaultValue('s1', 'typevault://member/login#password', 'test')).toEqual({
       ok: true,
       value: 'member-password-value',
     })
-    expect((await readVaultValue('s1', 'tv://owner/login#password', 'test')).ok).toBe(false)
-    expect((await readVaultValue('unknown-session', 'tv://member/login#password', 'test')).ok).toBe(false)
+    expect((await readVaultValue('s1', 'typevault://owner/login#password', 'test')).ok).toBe(false)
+    expect((await readVaultValue('unknown-session', 'typevault://member/login#password', 'test')).ok).toBe(false)
   })
 
   test('browser_fill_secret types a vault reference without it entering the result', async () => {
@@ -96,7 +102,7 @@ describe.skipIf(process.platform === 'win32')('vault references', () => {
       return { status: 'filled', url: 'https://example.com/login', field: 'input[type=password]' }
     })
 
-    const result = await tool.execute(tool.parameters.parse({ name: 'tv://member/login#password' }), ctx())
+    const result = await tool.execute(tool.parameters.parse({ name: 'typevault://member/login#password' }), ctx())
 
     expect(calls.map((call) => call.value)).toEqual(['member-password-value'])
     expect(JSON.stringify(result)).not.toContain('member-password-value')

@@ -63,7 +63,7 @@ export function sharedBrowserBashHook(
 }
 
 export const FILL_SECRET_TOOL = 'browser_fill_secret'
-const VAULT_REF_PREFIX = 'tv://'
+const VAULT_REF_PREFIX = 'typevault://'
 
 // The tool drives the shared browser, so it needs `browser.shared` like bash's
 // CDP URL does. Typing the withheld TYPECLAW_SECRET_* tier is runtime-owned
@@ -113,7 +113,7 @@ export function createFillSecretTool(
       name: z
         .string()
         .describe(
-          'The .env variable name, e.g. TYPECLAW_SECRET_GITHUB_PASSWORD, or a vault reference like tv://github/bot#password',
+          'The .env variable name, e.g. TYPECLAW_SECRET_GITHUB_PASSWORD, or a vault reference like typevault://github/bot#password',
         ),
       url: z.string().optional().describe('Exact URL or prefix of the target tab'),
       submit: z.boolean().default(false),
