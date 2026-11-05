@@ -1,5 +1,5 @@
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import type { ChannelRouter } from '@/channels/router'
 import type { AdapterId } from '@/channels/schema'

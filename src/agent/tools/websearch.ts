@@ -1,5 +1,5 @@
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import { CurlImpersonateError, isCurlExitTimeout } from './curl-impersonate'
 import { ddgSearch, DdgCaptchaError, type DdgResult } from './ddg'

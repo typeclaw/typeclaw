@@ -1,5 +1,5 @@
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import { MEMBERSHIP_FRESHNESS_MS, type MembershipCount } from '@/channels/membership'
 import {

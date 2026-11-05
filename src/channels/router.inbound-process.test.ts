@@ -14,7 +14,7 @@ const source = `
 import { appendFile, readdir, readFile } from 'node:fs/promises';
 import { appendFileSync } from 'node:fs';
 import { SessionManager } from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-coding-agent'))};
-import { Type } from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-ai'))};
+import { Type } from ${JSON.stringify(import.meta.resolve('typebox'))};
 import { createSessionWithDispose } from ${moduleUrl('../agent/index.ts')};
 import { createChannelReplyTool } from ${moduleUrl('../agent/tools/channel-reply.ts')};
 import { reloadConfig } from ${moduleUrl('../config/config.ts')};

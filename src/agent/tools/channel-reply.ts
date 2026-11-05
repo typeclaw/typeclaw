@@ -1,5 +1,5 @@
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import type { BackgroundObligationRef } from '@/channels/background-obligations'
 import { checkCompletionClaim } from '@/channels/completion-claim'

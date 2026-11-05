@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import { githubReviewerWorkKey } from '@/channels/github-repo'
 import { githubReviewChecks, type ReviewerSettlement } from '@/channels/github-review-check'
