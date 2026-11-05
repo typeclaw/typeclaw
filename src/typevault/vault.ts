@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { type Access, createClient, parseEntryName, TypeVaultError } from 'typevault'
@@ -37,13 +37,37 @@ export function vaultExists(agentDir: string): boolean {
 
 // typevault lets one machine at a time use a vault's private state, and names
 // the machine that holds it in a `daemon.holder` claim that survives the
-// daemon. Its default name is the hostname, but for TypeClaw the host-stage CLI
+// daemon. Its default name comes from the machine ID or hostname, but for TypeClaw the host-stage CLI
 // and every container recreated for this agent are one owner: a new container
-// gets a new hostname, so a claim left by the previous one (or held by the live
+// can get a new name, so a claim left by the previous one (or held by the live
 // container while the host CLI writes secrets) would refuse every vault open
 // with `in_use`. One stable identity per agent lets typevault replace a claim
 // its own flock proves stale; a claim from any other identity is still refused.
 export const TYPEVAULT_HOST_ID = 'typeclaw-agent'
+
+// typevault 0.4 requires `name` in `daemon.holder` and refuses every vault open
+// on a claim without one. The runtime never stops its detached daemon, so each
+// container stop under 0.3 leaves such a claim behind. typevault keys a checkout
+// by the vault's absolute path, so the container's claim sits under the hash of
+// /agent/.typevault, not the host path: scan every checkout in this agent's
+// config root. Call this only while the container is down: a claim under this
+// agent's identity then has no live owner. Any other claim stays, for typevault
+// to refuse with its own error.
+export function clearLegacyDaemonClaims(agentDir: string): void {
+  const checkouts = join(runtimeConfigRoot(agentDir), 'typevault', 'checkouts')
+  if (!existsSync(checkouts)) return
+  for (const checkout of readdirSync(checkouts)) {
+    const path = join(checkouts, checkout, 'run', 'daemon.holder')
+    if (!existsSync(path)) continue
+    let claim: { host?: unknown; name?: unknown } | null
+    try {
+      claim = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      continue
+    }
+    if (claim?.host === TYPEVAULT_HOST_ID && claim.name === undefined) rmSync(path, { force: true })
+  }
+}
 
 // The environment every typevault call runs under. The agent's vault is opened
 // as typevault's "global" vault at an explicit TYPEVAULT_DIR, so nothing
