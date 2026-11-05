@@ -21,24 +21,24 @@ typevault ls                     # entries your grant reaches
 typevault whoami                 # your grant, its tiers and expiry
 ```
 
-Entries are named `tv://<service>[/<account>][#<field>]`, e.g. `tv://openai`, `tv://github/bot#password`.
+Entries are named `typevault://<service>[/<account>][#<field>]`, e.g. `typevault://openai`, `typevault://github/bot#password`.
 
 ## Use secrets
 
 ```sh
-typevault run --only tv://openai --reason "summarize the report" -- sh -c 'curl -H "Authorization: Bearer $OPENAI" https://api.openai.com/v1/models'
-typevault run --only tv://github/bot --reason "log in to GitHub" -- ./login.sh
-DATABASE_URL=tv://postgres/prod#url typevault run --reason "run migrations" -- bun run migrate
+typevault run --only typevault://openai --reason "summarize the report" -- sh -c 'curl -H "Authorization: Bearer $OPENAI" https://api.openai.com/v1/models'
+typevault run --only typevault://github/bot --reason "log in to GitHub" -- ./login.sh
+DATABASE_URL=typevault://postgres/prod#url typevault run --reason "run migrations" -- bun run migrate
 ```
 
-- Env names come from the entry name: `tv://github/bot#password` -> `GITHUB_BOT_PASSWORD`, `tv://openai` -> `OPENAI`. To choose the name, set a variable to a `tv://` reference as above.
+- Env names come from the entry name: `typevault://github/bot#password` -> `GITHUB_BOT_PASSWORD`, `typevault://openai` -> `OPENAI`. To choose the name, set a variable to a `typevault://` reference as above.
 - Quote `$VAR` references in single quotes so your shell does not expand them before `run` sets them.
 - `run` loads every entry of your own tier; entries from lower tiers load only when `--only` names them exactly.
 - TOTP fields hold the current code, never the seed.
 
 ## Fill a web form
 
-Call `browser_fill_secret` with a vault reference as `name` (e.g. `tv://github/bot#password`) after focusing the field. The value is typed into the page and never comes back to you.
+Call `browser_fill_secret` with a vault reference as `name` (e.g. `typevault://github/bot#password`) after focusing the field. The value is typed into the page and never comes back to you.
 
 ## Ask the user for a secret
 
@@ -49,7 +49,7 @@ If `vault_request` says the page has no public URL yet, its tunnel is still star
 ## Store secrets
 
 ```sh
-printf '%s' "$VALUE_FROM_ENV" | typevault set tv://service/account --preset api_key --stdin
+printf '%s' "$VALUE_FROM_ENV" | typevault set typevault://service/account --preset api_key --stdin
 ```
 
 A secret is stored in your role's tier, so roles below yours cannot read it. Never type a secret value into a command yourself, even piped.
