@@ -327,6 +327,9 @@ export type GithubCliConfig = z.infer<typeof githubCliSchema>
 const typevaultObjectSchema = z
   .object({
     enabled: z.boolean().default(false),
+    // Container port for the one-time secret page. The daemon binds it on the
+    // first request, so a clash with another listener only shows up then.
+    promptPort: z.number().int().min(1).max(65535).default(8976),
   })
   .strict()
 

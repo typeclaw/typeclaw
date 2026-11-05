@@ -8,7 +8,6 @@ import type { PermissionService } from '@/permissions'
 import { BUILTIN_ROLE_NAMES, CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin, type Hooks } from '@/plugin'
 import { isTypevaultMarkerFile } from '@/typevault/envelope-store'
-import { TYPEVAULT_PROMPT_PORT } from '@/typevault/prompt-tunnel'
 import { vaultSecretValues } from '@/typevault/redaction'
 import { ensureRoleTiers, isRoleTier, vaultAdmin } from '@/typevault/vault'
 
@@ -37,7 +36,7 @@ export default definePlugin({
       return {}
     }
 
-    const admin = vaultAdmin(ctx.agentDir, { promptPort: TYPEVAULT_PROMPT_PORT })
+    const admin = vaultAdmin(ctx.agentDir, { promptPort: config.typevault.promptPort })
     const grants = createSessionGrants({
       issue: ({ tier, label }) => admin.grant({ tiers: [tier], ttl: GRANT_TTL, label }),
       revoke: async (label) => {

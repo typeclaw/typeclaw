@@ -327,7 +327,7 @@ This is an ordinary operator config change, not a security request to push back 
 ## typevault (experimental)
 
 ```json
-"typevault": { "enabled": true }
+"typevault": { "enabled": true, "promptPort": 8976 }
 ```
 
 `enabled` (default `false`) keeps the agent's `secrets.json` (provider keys, channel tokens, MCP logins) in the agent's own TypeVault vault instead of a plaintext file. **Restart-required**: the move happens in `typeclaw start`. Setting it back to `false` and restarting restores `secrets.json` from the vault; anything else stored in the vault stays there for the next time it is enabled. `.env` is never touched. While enabled, `secrets.json` only holds a marker; never edit it or `.typevault/` by hand.
@@ -338,7 +338,7 @@ Follow **Editing `typeclaw.json` safely**: set `typevault.enabled` to `true`, co
 
 ### The `vault_request` secret page
 
-The one-time secret page is served on container port `8975`. With `typevault.enabled`, TypeClaw opens a free Cloudflare quick tunnel to it at boot and builds `cloudflared` into the image, so nothing needs configuring. An operator who wants a stable URL can add their own `manual` tunnel with `upstreamPort: 8975`, or a `cloudflare-named` one named `typevault` (its upstream is set in Cloudflare, so it has no `upstreamPort`); either replaces the implicit one.
+The one-time secret page is served on the container port in `typevault.promptPort` (default `8976`; **restart-required**), which must not match `channels.github.webhookPort` or any other listener. To move it, set the field, commit, and tell them to run `typeclaw restart`. With `typevault.enabled`, TypeClaw opens a free Cloudflare quick tunnel to it at boot and builds `cloudflared` into the image, so nothing needs configuring. An operator who wants a stable URL can add their own `manual` tunnel with `upstreamPort` set to that port, or a `cloudflare-named` one named `typevault` (its upstream is set in Cloudflare, so it has no `upstreamPort`); either replaces the implicit one. TypeClaw can't see or change a `cloudflare-named` tunnel's origin: whenever `typevault.promptPort` changes, the operator must also retarget the origin in Cloudflare, or the link opens but no page is served.
 
 ## Network and model HTTP internal destinations
 
