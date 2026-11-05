@@ -16,7 +16,7 @@ Nothing else. No global toolchain, no Node, no Python.
 git clone https://github.com/typeclaw/typeclaw
 cd typeclaw
 bun install
-bun run test
+bun run test --full
 ```
 
 `bun install` runs `postinstall`, which regenerates the four JSON schemas at the repo root (`typeclaw.schema.json`, `cron.schema.json`, `secrets.schema.json`, `auth.schema.json`) from the Zod sources. If you change a schema, re-run `bun install` (or `bun run generate:schema`) before committing — the generated files are tracked.
@@ -78,11 +78,15 @@ bun run lint
 bun run format
 ```
 
-CI runs the same three commands plus `bun test --parallel`. Run the tests locally too — they're fast (`--parallel` shards across CPUs) and most of them don't need Docker:
+CI runs the same three commands plus `bun test --parallel`. Run the tests locally too — most of them don't need Docker:
 
 ```sh
-bun run test
+bun run test                  # only the tests impacted by your changes
+bun run test --full           # everything
+bun run test src/init         # arguments go straight to `bun test`, unfiltered
 ```
+
+`bun run test` compares your working tree, including uncommitted and untracked files, with the merge-base of `origin/main`. It selects a test when a changed module reaches it through imports, or through a path the test names to spawn or read. A change to any other test input (config, lockfile, fixtures, skill Markdown), a deleted module, or a change that reaches the test preload runs everything. Changes under `docs/` and `.github/`, root Markdown, and the lint and format configs run nothing. CI always runs everything, so reach for `--full` before pushing if you suspect the selection missed something.
 
 A handful of tests in `src/init/` shell out to a real `bun install` and take 4-5s each; that's normal. CI uses `--timeout 30000` for the same reason — keep yours at the default unless you see false negatives.
 
