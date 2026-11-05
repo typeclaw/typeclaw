@@ -79,6 +79,7 @@ describe('buildChannelChecks', () => {
       'channel.github.credentials',
       'channel.github.webhook-delivery',
       'channel.github.event-allowlist',
+      'channel.github.webhook-port',
     ])
   })
 
@@ -483,6 +484,39 @@ describe('buildChannelChecks', () => {
 
       expect(result.status).toBe('ok')
       expect(result.message).toContain('admits pull_request.synchronize')
+    })
+  })
+
+  describe('github webhook port', () => {
+    function makeAgentWithVault(
+      github: Record<string, unknown>,
+      typevault: Record<string, unknown> = { enabled: true },
+    ): string {
+      const dir = mkdtempSync(join(tmpdir(), 'typeclaw-doctor-channels-'))
+      writeFileSync(join(dir, 'typeclaw.json'), JSON.stringify({ channels: { github }, typevault }), 'utf8')
+      return dir
+    }
+
+    test('the default ports do not collide', async () => {
+      const result = await runCheck('channel.github.webhook-port', ctxFor(makeAgentWithVault({})))
+
+      expect(result.status).toBe('ok')
+    })
+
+    test('warns when both are set to the same port', async () => {
+      const cwd = makeAgentWithVault({ webhookPort: 9100 }, { enabled: true, promptPort: 9100 })
+
+      const result = await runCheck('channel.github.webhook-port', ctxFor(cwd))
+
+      expect(result.status).toBe('warning')
+    })
+
+    test('stays quiet about that port when the vault is off', async () => {
+      const cwd = makeAgentWithVault({ webhookPort: 9100 }, { enabled: false, promptPort: 9100 })
+
+      const result = await runCheck('channel.github.webhook-port', ctxFor(cwd))
+
+      expect(result.status).toBe('skipped')
     })
   })
 })
