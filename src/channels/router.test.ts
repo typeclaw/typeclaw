@@ -11803,7 +11803,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
           for (let i = 0; i < 3; i++) {
             fake.emit({
               type: 'message_end',
-              message: { role: 'assistant', stopReason: 'error', errorMessage: `transient upstream blip ${i}` },
+              message: { role: 'assistant', stopReason: 'error', errorMessage: `billing failure ${i}` },
             })
           }
         }
@@ -11823,7 +11823,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     // when: one user turn that retries 3 times
     await router.route(inbound({ text: 'hi bot' }))
     await router.__testing!.flushDebounce(KEY)
-    const notice = softErrorNotice('transient upstream blip 0')
+    const notice = softErrorNotice('billing failure 0')
     const noticesAfterFirstTurn = sent.filter((t) => t.includes(notice)).length
 
     // when: a second, separate user turn that also fails
@@ -12102,6 +12102,38 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
 
       expect(reactions).toHaveLength(1)
       expect(sent).toEqual([])
+    })
+
+    test.each<[string, ReactionResult]>([
+      ['cannot render the reaction', { ok: false, error: 'unsupported emoji', code: 'unsupported' }],
+      ['refuses the reaction', { ok: false, error: 'reaction rejected' }],
+    ])('an unclassified failure posts nothing when the adapter %s', async (_name, reactionResult) => {
+      const { sent, reactions } = await failingTurnRouter('unexpected stream shape: missing delta', reactionResult)
+
+      expect(reactions).toHaveLength(1)
+      expect(sent).toEqual([])
+    })
+
+    test('an unclassified failure posts nothing when the message has no reactable target', async () => {
+      const { sent, reactions } = await failingTurnRouter(
+        'unexpected stream shape: missing delta',
+        { ok: true },
+        { reactionRef: undefined },
+      )
+
+      expect(reactions).toEqual([])
+      expect(sent).toEqual([])
+    })
+
+    test('a transient failure still posts its notice when the message has no reactable target', async () => {
+      const { sent, reactions } = await failingTurnRouter(
+        'transient server_is_overloaded',
+        { ok: true },
+        { reactionRef: undefined },
+      )
+
+      expect(reactions).toEqual([])
+      expect(sent).toEqual([softErrorNotice('transient server_is_overloaded')])
     })
 
     test('a rate limit keeps the text notice so the cause stays visible', async () => {
@@ -17916,6 +17948,32 @@ describe('ChannelRouter continue_after_reply:true empty-stop recovery (phrase-in
     expect(sent.filter((text) => PROVIDER_NOTICE.test(text))).toHaveLength(1)
     expect(sent[2]).toMatch(/connection to the upstream LLM provider dropped/i)
     expect(sent[2]).not.toContain('status-raw-detail')
+  })
+
+  test('surfaces the generic notice when an unclassified failure breaks a promised reply and no reaction can land', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (msg) => {
+      sent.push(msg.text ?? '')
+      return { ok: true }
+    })
+
+    await router.route(inbound({ text: '지난 기록 찾아줘', reactionRef: undefined }))
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: '찾아볼게.' })
+      await sessions[0]!.agent.afterToolCall!(continueReplyContext('찾아볼게.'))
+      sessions[0]!.emit({ type: 'tool_execution_start' })
+      sessions[0]!.agent.state.messages = [{ role: 'toolResult' }, { role: 'assistant', stopReason: 'error' }]
+      sessions[0]!.emit({
+        type: 'message_end',
+        message: { role: 'assistant', stopReason: 'error', errorMessage: 'unexpected stream shape: missing delta' },
+      })
+      sessions[0]!.setAssistantMidTurn('', 'error')
+    }
+    await router.__testing!.flushDebounce(KEY)
+
+    expect(sent).toEqual(['찾아볼게.', softErrorNotice('unexpected stream shape: missing delta')])
   })
 
   test('suppresses the warning when system recovery fulfills a promised reply', async () => {

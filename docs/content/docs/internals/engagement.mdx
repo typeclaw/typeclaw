@@ -242,13 +242,18 @@ write failure is logged without replaying the turn; the debt stays owed.
 A retry-and-see failure answers with a `warning` (⚠️) reaction on the turn's
 triggering message instead of a chat line. These are transport drops, observer
 stalls, network or 5xx blips, and provider overloads (`isTransientProviderFailure`
-in `src/agent/provider-error.ts`), plus the exhausted empty-turn fallback ("I got
-stuck…"). A landed reaction settles the same owned inbound refs the notice would.
-Auth, billing, quota, model-config, rate or usage limits, and unclassified
-failures keep the text notice, because someone has to act on them. Any adapter
-that can't render the reaction (GitHub's fixed set, reaction-less platforms) or
-whose reaction call fails also falls back to the text notice. The operator log
-line is unchanged. A turn that already ran tools and promised nothing further
+in `src/agent/provider-error.ts`), unclassified failures, plus the exhausted
+empty-turn fallback ("I got stuck…"). A landed reaction settles the same owned
+inbound refs the notice would. Auth, billing, quota, model-config, and rate or
+usage limits keep the text notice, because someone has to act on them.
+
+When the reaction can't land (GitHub's fixed set, reaction-less platforms, no
+reactable target, or a failed reaction call), transient failures and the
+empty-turn fallback fall back to the text notice. An unclassified failure posts
+nothing, because it names nothing the user can act on: the operator log carries
+it (`provider_error_notice_suppressed reason=unclassified_no_reaction`) and its
+coverage settles silently. A turn that promised more work still posts the notice,
+since silence would leave the user waiting. A turn that already ran tools and promised nothing further
 posts no provider-error notice at all, and the coverage it still holds then
 settles silently instead of becoming a live-turn-ended notice, so the same
 failure never resurfaces through the recovery path.
