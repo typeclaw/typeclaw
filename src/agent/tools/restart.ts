@@ -1,5 +1,5 @@
-import { Type } from '@earendil-works/pi-ai'
 import { defineTool } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import { requestContainerRestart } from '@/agent/restart'
 import type { RestartHandoffOrigin } from '@/agent/restart-handoff'

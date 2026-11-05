@@ -17,10 +17,10 @@ import {
   fauxText,
   fauxToolCall,
   normalizeContext,
-  Type,
   type AssistantMessage,
 } from '@earendil-works/pi-ai'
 import type { SessionEntry } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
 import { LiveSubagentRegistry } from '@/agent/live-subagents'
