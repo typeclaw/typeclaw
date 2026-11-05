@@ -236,7 +236,7 @@ describe.skipIf(process.platform === 'win32')('role tiers against a real vault',
     const direct = await createClient({ direct: true, global: true, dir: typevaultDir(dir), env: typevaultEnv(dir) })
     for (const tier of ['owner', 'member', 'guest']) {
       await direct.set({
-        name: parseEntryName(`tv://${tier}-only`),
+        name: parseEntryName(`typevault://${tier}-only`),
         tier,
         fields: { $default: { type: 'secret', value: `${tier}-secret-value` } },
       })
@@ -252,7 +252,7 @@ describe.skipIf(process.platform === 'win32')('role tiers against a real vault',
     const token = await grants.tokenFor('s1', 'member')
     const access = await grantAccess(dir, token)
     const names = (await access.list()).map((entry) => String(entry.name)).sort()
-    await access.get(parseEntryName('tv://member-only'), 'test')
+    await access.get(parseEntryName('typevault://member-only'), 'test')
     const event = {
       tool: 'bash',
       sessionId: 's1',
