@@ -30,7 +30,7 @@ export function createVaultRequestTool(tunnelUrl: typeof promptTunnelUrl = promp
       "The value is stored under `name` in your role's tier when they submit; nothing comes back to you. Check later with `typevault ls`.",
     ].join(' '),
     parameters: z.object({
-      name: z.string().describe('Entry name, e.g. tv://github/bot or tv://openai'),
+      name: z.string().describe('Entry name, e.g. typevault://github/bot or typevault://openai'),
       preset: z
         .enum(['password', 'api_key', 'oauth', 'ssh', 'totp', 'note'])
         .optional()

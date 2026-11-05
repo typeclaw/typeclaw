@@ -24,7 +24,7 @@ const MEMBER_NAME = 'typeclaw'
 // ever reaches this tier.
 export const RUNTIME_TIER = 'runtime'
 
-const SECRETS_ENTRY = parseEntryName('tv://typeclaw/secrets')
+const SECRETS_ENTRY = parseEntryName('typevault://typeclaw/secrets')
 const READ_REASON = 'typeclaw runtime credentials'
 
 export function typevaultDir(agentDir: string): string {
@@ -97,7 +97,7 @@ export async function requireSecretsEntry(agentDir: string): Promise<string> {
   const text = await readSecretsEntry(agentDir)
   if (text === undefined) {
     throw new Error(
-      'the TypeVault vault has no readable secrets entry (tv://typeclaw/secrets); restore .typevault/ from the agent repo history',
+      'the TypeVault vault has no readable secrets entry (typevault://typeclaw/secrets); restore .typevault/ from the agent repo history',
     )
   }
   return text

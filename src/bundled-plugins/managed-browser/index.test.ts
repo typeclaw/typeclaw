@@ -120,8 +120,8 @@ describe('browser_fill_secret permissions', () => {
     })
     const member = guard({ roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }) })
     const shopper = guard({ roles })
-    expect(await call(member, 'tv://github/bot#password', slack)).toBeUndefined()
-    expect(await call(shopper, 'tv://github/bot#password', slack)).toMatchObject({ block: true })
+    expect(await call(member, 'typevault://github/bot#password', slack)).toBeUndefined()
+    expect(await call(shopper, 'typevault://github/bot#password', slack)).toMatchObject({ block: true })
   })
 
   test('lets a member type ordinary variables but not the secret tier, which needs fs.see.secrets', async () => {

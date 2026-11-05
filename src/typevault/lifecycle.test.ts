@@ -118,7 +118,7 @@ describe('reconcileTypevault', () => {
     await reconcileTypevault(dir, true)
     const vault = await createClient({ direct: true, global: true, dir: typevaultDir(dir), env: typevaultEnv(dir) })
     await vault.set({
-      name: parseEntryName('tv://example/login'),
+      name: parseEntryName('typevault://example/login'),
       tier: 'runtime',
       fields: { $default: { type: 'secret', value: 'kept' } },
     })
@@ -129,7 +129,7 @@ describe('reconcileTypevault', () => {
     expect(await reconcileTypevault(dir, true)).toEqual({ action: 'resumed' })
 
     expect(await readSecretsEntry(dir)).toBe(edited)
-    expect((await vault.get(parseEntryName('tv://example/login'), 'test')).fields['$default']).toMatchObject({
+    expect((await vault.get(parseEntryName('typevault://example/login'), 'test')).fields['$default']).toMatchObject({
       value: 'kept',
     })
   })

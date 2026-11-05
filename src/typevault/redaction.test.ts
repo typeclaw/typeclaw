@@ -24,7 +24,7 @@ test('a secret stays redacted after its entry is overwritten or deleted, and run
   await reconcileTypevault(dir, true)
   await ensureRoleTiers(dir, ['owner', 'trusted', 'member', 'guest'])
   const vault = await createClient({ direct: true, global: true, dir: typevaultDir(dir), env: typevaultEnv(dir) })
-  const login = parseEntryName('tv://shop/login')
+  const login = parseEntryName('typevault://shop/login')
   const store = (password: string) =>
     vault.set({
       name: login,
