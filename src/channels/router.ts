@@ -10,6 +10,7 @@ import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
 import {
+  type DetectedProviderError,
   detectHardProviderError,
   isFailoverWorthy,
   isTransientProviderFailure,
@@ -273,7 +274,15 @@ export function disengageReactionEmojiFor(adapter: AdapterId): string {
   return DISENGAGE_REACTION_EMOJI_OVERRIDES[adapter] ?? DISENGAGE_REACTION_EMOJI
 }
 
-type PendingProviderError = { turnSeq: number; safeMessage: string; retryAndSee: boolean }
+type PendingProviderError = { turnSeq: number; safeMessage: string; retryAndSee: boolean; unclassified: boolean }
+
+// Transient overloads share the generic notice text, so the notice alone can't
+// identify a failure nothing is known about; the raw text has to rule them out.
+function providerFailureSurface(err: DetectedProviderError): { retryAndSee: boolean; unclassified: boolean } {
+  const transient = isTransientProviderFailure(err.message)
+  const unclassified = !transient && isUnclassifiedProviderNotice(err.safeMessage)
+  return { retryAndSee: transient || unclassified, unclassified }
+}
 
 type SilentAckReason = 'github_review_output' | 'awaiting_background_child'
 
@@ -1295,7 +1304,7 @@ type LiveSession = {
   // the turn already ran tools. The same failure must not resurface as a
   // live-turn-ended notice, so turn-end settles held coverage silently.
   // Cleared with the other logical-turn state.
-  providerErrorSilencedThisLogicalTurn: boolean
+  providerErrorSilencedThisLogicalTurn: 'tool-activity' | 'unclassified-failure' | null
   // Successful, non-communication, non-control tool output observed during
   // this logical turn. Unlike toolExecutionThisLogicalTurn, channel_reply and
   // todo/control calls cannot satisfy a later durable completion claim.
@@ -3301,7 +3310,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         githubReviewOutputTurn: null,
         toolExecutionThisLogicalTurn: false,
         backgroundWakeLogicalTurn: false,
-        providerErrorSilencedThisLogicalTurn: false,
+        providerErrorSilencedThisLogicalTurn: null,
         qualifyingWorkThisLogicalTurn: false,
         promisedWorkOutstandingThisLogicalTurn: false,
         statusOutputOutstandingThisLogicalTurn: false,
@@ -3336,7 +3345,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.pendingProviderError = {
           turnSeq: live.turnSeq,
           safeMessage: err.safeMessage,
-          retryAndSee: isTransientProviderFailure(err.message) || isUnclassifiedProviderNotice(err.safeMessage),
+          ...providerFailureSurface(err),
         }
       })
       live.unsubTodoOutcome = created.session.subscribe((event: unknown) => {
@@ -4901,7 +4910,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // record.
     if (live.toolExecutionThisLogicalTurn && !owesPromisedWork(live)) {
       live.pendingProviderError = null
-      live.providerErrorSilencedThisLogicalTurn = true
+      live.providerErrorSilencedThisLogicalTurn = 'tool-activity'
       logger.warn(
         `[channels] ${live.keyId}: provider_error_notice_suppressed reason=tool_activity_this_turn notice="${pending.safeMessage}"`,
       )
@@ -4952,6 +4961,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       return
     }
+    // The reaction couldn't land (a reaction-less adapter, no reactable target, or
+    // a refused call). An unclassified failure names nothing the user can act on,
+    // so it isn't worth looking broken in the chat: the operator log carries it.
+    // Promised work keeps the notice, since silence would leave the user waiting.
+    if (pending.unclassified && !owesPromisedWork(live)) {
+      live.providerErrorSilencedThisLogicalTurn = 'unclassified-failure'
+      logger.warn(
+        `[channels] ${live.keyId}: provider_error_notice_suppressed reason=unclassified_no_reaction notice="${pending.safeMessage}"`,
+      )
+      return
+    }
     const result = await send(
       {
         adapter: live.key.adapter,
@@ -4986,17 +5006,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // the journal rows stay owed meanwhile.
   // A logical turn that may not error out in the channel: one opened by background
   // work rather than a user, or one whose provider-error notice was already
-  // suppressed because it ran tools. Whatever such a turn leaves owed settles
-  // silently instead of becoming a live-turn-ended notice, wherever it ends.
+  // suppressed. Whatever such a turn leaves owed settles silently instead of
+  // becoming a live-turn-ended notice, wherever it ends.
   const silentTurnEnd = (live: LiveSession): { log: string; reason: string } | null =>
     live.backgroundWakeLogicalTurn
       ? { log: 'background_wake_turn_ended_silently', reason: 'background-wake-turn-ended' }
-      : live.providerErrorSilencedThisLogicalTurn
+      : live.providerErrorSilencedThisLogicalTurn === 'tool-activity'
         ? {
             log: 'turn_end_notice_suppressed reason=provider_error_after_tool_activity',
             reason: 'provider-error-after-tool-activity',
           }
-        : null
+        : live.providerErrorSilencedThisLogicalTurn === 'unclassified-failure'
+          ? {
+              log: 'turn_end_notice_suppressed reason=unclassified_provider_failure',
+              reason: 'unclassified-provider-failure',
+            }
+          : null
 
   // Settles a source turn's held rows by their exact generations, for when a fresh
   // batch abandons a silent turn: the rows may be owned by a predecessor session,
@@ -5095,7 +5120,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.githubReviewOutputTurn = null
     live.toolExecutionThisLogicalTurn = false
     live.backgroundWakeLogicalTurn = true
-    live.providerErrorSilencedThisLogicalTurn = false
+    live.providerErrorSilencedThisLogicalTurn = null
     live.qualifyingWorkThisLogicalTurn = false
   }
 
@@ -5551,7 +5576,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.githubReviewOutputTurn = null
           live.toolExecutionThisLogicalTurn = false
           live.backgroundWakeLogicalTurn = false
-          live.providerErrorSilencedThisLogicalTurn = false
+          live.providerErrorSilencedThisLogicalTurn = null
           live.qualifyingWorkThisLogicalTurn = false
           live.promisedWorkOutstandingThisLogicalTurn = false
           live.statusOutputOutstandingThisLogicalTurn = false
@@ -5757,9 +5782,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.pendingProviderError = {
               turnSeq: live.turnSeq,
               safeMessage: hardProviderError.safeMessage,
-              retryAndSee:
-                isTransientProviderFailure(hardProviderError.message) ||
-                isUnclassifiedProviderNotice(hardProviderError.safeMessage),
+              ...providerFailureSurface(hardProviderError),
             }
           }
           live.consecutiveSends.clear()
@@ -9587,7 +9610,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // Answers a failed turn with a reaction on its triggering message instead of
   // a chat line; in busy rooms the old text notices outnumbered real replies.
   // False when there is nothing reactable or the adapter refused, so the caller
-  // falls back to its text notice and the user is never left with silence.
+  // decides whether the failure still earns its text notice.
   const reactTurnFailed = async (live: LiveSession): Promise<boolean> => {
     const reactionRef = live.currentTurnReactionRef
     if (reactionRef === null) return false
@@ -9600,7 +9623,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       emoji: TURN_FAILED_REACTION_EMOJI,
     })
     if (!result.ok && result.code !== 'unsupported') {
-      logger.info(`[channels] ${live.keyId}: turn-failed reaction failed, posting notice: ${result.error}`)
+      logger.info(`[channels] ${live.keyId}: turn-failed reaction failed: ${result.error}`)
     }
     return result.ok
   }

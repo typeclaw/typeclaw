@@ -1858,6 +1858,26 @@ for (const ranTools of [true, false]) {
   })
 }
 
+test('an unclassified provider failure with no reaction settles the request silently', async () => {
+  const f = await debtFixture()
+  try {
+    const parent = f.sessions[0]!
+    parent.onPrompt = async () => parent.failProvider('unexpected stream shape: missing delta')
+    const request = await f.route('Review the PR again.')
+    await f.flush()
+
+    // No chat line, and the same failure must not resurface as a live-turn-ended notice.
+    expect(f.sent).toEqual([])
+    expect(f.inputRow(request)).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'intentionally-suppressed' },
+    })
+    expect(await f.outbox.list()).toEqual([])
+  } finally {
+    await f.cleanup()
+  }
+})
+
 test('a provider failure after tool work stays silent when a follow-up is queued behind it', async () => {
   const f = await debtFixture()
   try {
