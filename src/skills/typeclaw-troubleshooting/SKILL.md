@@ -1,6 +1,6 @@
 ---
 name: typeclaw-troubleshooting
-description: Use this skill when you are stuck in a fix-it loop — you've made roughly three attempts at the same failure and you're still cycling shell commands (kill the process, re-run, `sleep`, `capture-pane`, inspect, retry) without converging. Triggers include a hung or runaway process that won't die, a `C-c` that didn't stop the program, `<defunct>`/zombie processes piling up in `ps`, an interactive program that blocks `bash` waiting for input, a script that "ran" but produced no output and no file, repeated "not found"/timeout/same-error-again loops, and any moment you catch yourself thinking "let me wait a bit more and check again" for the third time. Also read it before you start a minutes-long or input-waiting program in your own session (dev server, REPL, watcher, `docker compose up`, interactive installer) — foreground `bash` blocks until exit, and this skill has the detached tmux start/observe/drive/stop pattern. Read it before you spawn `operator` to take over the debugging — it covers the operator hand-off prompt, the tmux session pattern, killing stuck/zombie processes properly, and the edge-triggered capture-pane polling loop that the inline retry-and-sleep approach gets wrong. Also read it when `gh` works but `git push`/`git fetch` to GitHub fails with 403, "Permission denied", or "Authentication failed", or when `gh` and git seem to act as different GitHub accounts.
+description: Use this skill when you are stuck in a fix-it loop — you've made roughly three attempts at the same failure and you're still cycling shell commands (kill the process, re-run, `sleep`, `capture-pane`, inspect, retry) without converging. Triggers include a hung or runaway process that won't die, a `C-c` that didn't stop the program, `<defunct>`/zombie processes piling up in `ps`, an interactive program that blocks `bash` waiting for input, a script that "ran" but produced no output and no file, repeated "not found"/timeout/same-error-again loops, and any moment you catch yourself thinking "let me wait a bit more and check again" for the third time. Also read it before you start a minutes-long or input-waiting program in your own session (dev server, REPL, watcher, `docker compose up`, interactive installer) — foreground `bash` blocks until exit, and this skill has the detached tmux start/observe/drive/stop pattern. Read it before you spawn `operator` to take over the debugging — it covers the operator hand-off prompt, the tmux session pattern, killing stuck/zombie processes properly, and the edge-triggered capture-pane polling loop that the inline retry-and-sleep approach gets wrong. Also read it when `gh` works but `git push`/`git fetch` to GitHub fails with 403, "Permission denied", or "Authentication failed", or when `gh` and git seem to act as different GitHub accounts. Also read it when `vault_request` fails with `internal daemon error`.
 ---
 
 # typeclaw-troubleshooting
@@ -126,3 +126,20 @@ TypeClaw has two GitHub credential sources, and you cannot see either one (`secr
 These can belong to different GitHub accounts. A green `gh auth status` or a working `gh api` call proves nothing about the account `git push` uses. When a brokered git command fails on auth, TypeClaw appends a note to the result naming the credential source it used and that account's login. Read it before retrying.
 
 Do not try to fix this from inside the session. Don't rewrite the remote URL, embed a token, run `gh auth login`, or edit git credential config: the broker owns these credentials, and you can't read or change them. Report the mismatch to the operator, naming both accounts and the target repo, and tell them how to recover: correct or remove the mismatched push credential (`channels.github` in `secrets.json`, or the declared `GH_TOKEN` in `.env`), then run `typeclaw restart`.
+
+## TypeVault: `vault_request` fails with `internal daemon error`
+
+The daemon returns this text for every unexpected failure and writes the real exception to its log. `.typeclaw/typevault/` is masked from your tools, so you can't read that log and shouldn't spawn `operator` to look for it. Tell the operator to run this on the host, in the agent folder:
+
+```sh
+tail -n 40 .typeclaw/typevault/config/typevault/checkouts/*/run/daemon.log
+```
+
+If the log says `Failed to start server. Is port <port> in use?` (`EADDRINUSE`), another process in the container holds the secret-page port (`typevault.promptPort`, default `8976`). The daemon binds that port on the first request, so `typevault whoami` still succeeds and nothing fails at boot.
+
+- **Check first:** `channels.github.webhookPort` may match it. `typeclaw doctor` warns about this as `channel.github.webhook-port`.
+- **Otherwise:** a service the agent or operator started is listening on that port.
+- **Fix:** set `typevault.promptPort` in `typeclaw.json` to a free port, and don't stop the other listener. See the `typeclaw-config` skill for the edit.
+- **Then restart:** after a failed bind the daemon keeps returning this error until it restarts, even once the port is free. The field is restart-required too. Tell the operator to run `typeclaw restart`, then retry `vault_request`.
+
+Never ask the user to paste the secret into chat while this is broken.

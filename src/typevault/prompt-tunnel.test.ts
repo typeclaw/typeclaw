@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test'
 
 import type { TunnelConfig } from '@/tunnels'
 
-import { runtimeTunnels, TYPEVAULT_PROMPT_PORT, typevaultPromptTunnel } from './prompt-tunnel'
+import { runtimeTunnels, typevaultPromptTunnel } from './prompt-tunnel'
+
+const PROMPT_PORT = 9100
 
 const webhook: TunnelConfig = {
   name: 'github-webhook',
@@ -12,11 +14,11 @@ const webhook: TunnelConfig = {
 
 describe('typevault prompt tunnel', () => {
   test('an enabled vault with no tunnel of its own gets a quick tunnel to the prompt port', () => {
-    const config = { typevault: { enabled: true }, tunnels: [webhook] }
+    const config = { typevault: { enabled: true, promptPort: PROMPT_PORT }, tunnels: [webhook] }
 
     expect(runtimeTunnels(config)).toEqual([
       webhook,
-      { name: 'typevault', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: TYPEVAULT_PROMPT_PORT },
+      { name: 'typevault', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: PROMPT_PORT },
     ])
   })
 
@@ -25,10 +27,10 @@ describe('typevault prompt tunnel', () => {
       name: 'vault',
       provider: 'external',
       for: { kind: 'manual' },
-      upstreamPort: TYPEVAULT_PROMPT_PORT,
+      upstreamPort: PROMPT_PORT,
       externalUrl: 'https://vault.example.com',
     }
-    const config = { typevault: { enabled: true }, tunnels: [own] }
+    const config = { typevault: { enabled: true, promptPort: PROMPT_PORT }, tunnels: [own] }
 
     expect(typevaultPromptTunnel(config)).toBe(own)
     expect(runtimeTunnels(config)).toEqual([own])
@@ -42,14 +44,26 @@ describe('typevault prompt tunnel', () => {
       hostname: 'https://vault.example.com',
       tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
     }
-    const config = { typevault: { enabled: true }, tunnels: [named] }
+    const config = { typevault: { enabled: true, promptPort: PROMPT_PORT }, tunnels: [named] }
 
     expect(typevaultPromptTunnel(config)).toBe(named)
     expect(runtimeTunnels(config)).toEqual([named])
   })
 
+  test("a tunnel on some other port is not taken for the secret page's", () => {
+    const other: TunnelConfig = {
+      name: 'vault',
+      provider: 'cloudflare-quick',
+      for: { kind: 'manual' },
+      upstreamPort: PROMPT_PORT + 1,
+    }
+    const config = { typevault: { enabled: true, promptPort: PROMPT_PORT }, tunnels: [other] }
+
+    expect(typevaultPromptTunnel(config)?.upstreamPort).toBe(PROMPT_PORT)
+  })
+
   test('a disabled vault adds no tunnel', () => {
-    const config = { typevault: { enabled: false }, tunnels: [webhook] }
+    const config = { typevault: { enabled: false, promptPort: PROMPT_PORT }, tunnels: [webhook] }
 
     expect(typevaultPromptTunnel(config)).toBeUndefined()
     expect(runtimeTunnels(config)).toEqual([webhook])
@@ -69,7 +83,7 @@ describe('typevault prompt tunnel', () => {
       upstreamPort: 4000,
     }
 
-    const tunnels = runtimeTunnels({ typevault: { enabled: true }, tunnels: [app, docs] })
+    const tunnels = runtimeTunnels({ typevault: { enabled: true, promptPort: PROMPT_PORT }, tunnels: [app, docs] })
 
     expect(tunnels.map((entry) => entry.name)).toEqual(['typevault', 'typevault-2', 'typevault-3'])
     expect(tunnels.slice(0, 2)).toEqual([app, docs])

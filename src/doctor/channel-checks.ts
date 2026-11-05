@@ -41,6 +41,7 @@ export function buildChannelChecks(): DoctorCheck[] {
     githubCredentials(),
     githubWebhookDelivery(),
     githubEventAllowlist(),
+    githubWebhookPort(),
   ]
 }
 
@@ -358,6 +359,38 @@ function githubWebhookDelivery(): DoctorCheck {
         ],
         fix: {
           description: 'Configure webhookUrl or a github tunnel; see `typeclaw tunnel add` for managed tunnels.',
+        },
+      }
+    },
+  }
+}
+
+function githubWebhookPort(): DoctorCheck {
+  return {
+    name: 'channel.github.webhook-port',
+    category: 'channels',
+    description: 'github webhookPort differs from typevault.promptPort',
+    applies: (ctx) => ctx.hasAgentFolder,
+    async run(ctx) {
+      const cfg = safeLoadConfig(ctx)
+      if (cfg === null) return configInvalidResult()
+      const github = cfg.channels.github
+      if (github === undefined || github.enabled === false) {
+        return { status: 'skipped', message: 'github not configured' }
+      }
+      if (!cfg.typevault.enabled) return { status: 'skipped', message: 'typevault not enabled' }
+      if (github.webhookPort !== cfg.typevault.promptPort) {
+        return {
+          status: 'ok',
+          message: `github webhook port ${github.webhookPort} differs from TypeVault port ${cfg.typevault.promptPort}`,
+        }
+      }
+      return {
+        status: 'warning',
+        message: `github webhookPort ${github.webhookPort} is the port TypeVault serves its secret page on`,
+        details: ['`vault_request` fails with `internal daemon error` while the webhook server holds the port.'],
+        fix: {
+          description: 'Change `typevault.promptPort` or `channels.github.webhookPort`, then run `typeclaw restart`.',
         },
       }
     },

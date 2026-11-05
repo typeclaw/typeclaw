@@ -1,11 +1,8 @@
 import type { TunnelConfig } from '@/tunnels'
 
-// Container-internal port the daemon serves one-time `request` pages on.
-export const TYPEVAULT_PROMPT_PORT = 8975
-
 const PROMPT_TUNNEL_NAME = 'typevault'
 
-type PromptTunnelConfig = { typevault: { enabled: boolean }; tunnels: readonly TunnelConfig[] }
+type PromptTunnelConfig = { typevault: { enabled: boolean; promptPort: number }; tunnels: readonly TunnelConfig[] }
 
 // The one-time secret page must be reachable from the user's phone. An
 // operator's own manual tunnel wins: one to the prompt port, or one named
@@ -17,7 +14,7 @@ export function typevaultPromptTunnel(config: PromptTunnelConfig): TunnelConfig 
   const configured = config.tunnels.find(
     (entry) =>
       entry.for.kind === 'manual' &&
-      (entry.upstreamPort === TYPEVAULT_PROMPT_PORT ||
+      (entry.upstreamPort === config.typevault.promptPort ||
         (entry.name === PROMPT_TUNNEL_NAME && entry.upstreamPort === undefined)),
   )
   if (configured !== undefined) return configured
@@ -27,7 +24,7 @@ export function typevaultPromptTunnel(config: PromptTunnelConfig): TunnelConfig 
   const taken = new Set(config.tunnels.map((entry) => entry.name))
   let name = PROMPT_TUNNEL_NAME
   for (let suffix = 2; taken.has(name); suffix++) name = `${PROMPT_TUNNEL_NAME}-${suffix}`
-  return { name, provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: TYPEVAULT_PROMPT_PORT }
+  return { name, provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: config.typevault.promptPort }
 }
 
 export function runtimeTunnels(config: PromptTunnelConfig): TunnelConfig[] {
