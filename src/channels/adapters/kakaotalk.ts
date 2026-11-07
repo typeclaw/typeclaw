@@ -52,6 +52,7 @@ import { createKakaoChannelResolver, type KakaoChannelResolver } from './kakaota
 import { classifyInbound, type InboundDropReason } from './kakaotalk-classify'
 import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
+import { createKakaoListCallback } from './kakaotalk-list'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { resolveKakaoMentions } from './kakaotalk-mention'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
@@ -68,7 +69,7 @@ export interface KakaoTalkClient {
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
     accountId?: string,
   ): Promise<this>
-  getChats(options?: { all?: boolean; search?: string }): Promise<KakaoChat[]>
+  getChats(options?: { all?: boolean; search?: string; resolveTitles?: boolean }): Promise<KakaoChat[]>
   getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]>
   sendMessage(
     chatId: string,
@@ -430,6 +431,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     authorResolver,
     selfUserIdRef: () => selfUserId,
   })
+  const listCallback = createKakaoListCallback({ client, logger })
 
   const outboundCallback = withOutboundAccount(
     createOutboundCallback({
@@ -727,6 +729,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       options.router.setTypingHeartbeatInterval('kakaotalk', KAKAO_TYPING_HEARTBEAT_MS)
       options.router.registerChannelNameResolver('kakaotalk', channelResolver.resolve)
       options.router.registerHistory('kakaotalk', historyCallback)
+      options.router.registerList('kakaotalk', listCallback)
       options.router.registerFetchAttachment('kakaotalk', fetchAttachmentCallback)
       options.router.registerMembership('kakaotalk', membershipResolver)
     },
@@ -741,6 +744,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       typing.reset()
       options.router.unregisterChannelNameResolver('kakaotalk', channelResolver.resolve)
       options.router.unregisterHistory('kakaotalk', historyCallback)
+      options.router.unregisterList('kakaotalk', listCallback)
       options.router.unregisterFetchAttachment('kakaotalk', fetchAttachmentCallback)
       options.router.unregisterMembership('kakaotalk', membershipResolver)
       if (inflightInbounds > 0) {

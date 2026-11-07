@@ -33,7 +33,7 @@ export const ADAPTER_READ_CAPABILITIES: Record<AdapterId, readonly ReadCapabilit
   github: ['history'],
   instagram: ['history'],
   line: ['history'],
-  kakaotalk: ['history'],
+  kakaotalk: ['history', 'list'],
   slack: ['history'],
   'slack-bot': ['history', 'message-get', 'list'],
   teams: ['history'],
