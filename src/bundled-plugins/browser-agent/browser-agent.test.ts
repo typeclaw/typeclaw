@@ -12,10 +12,10 @@ import {
 } from './browser-agent'
 
 describe('browser subagent', () => {
-  test('runs the deep profile at low thinking', () => {
+  test('runs the fast profile at medium thinking', () => {
     const subagent = createBrowserSubagent({ engines: ['agent-browser'], extensions: [] })
-    expect(subagent.profile).toBe('deep')
-    expect(subagent.thinkingLevel).toBe('low')
+    expect(subagent.profile).toBe('fast')
+    expect(subagent.thinkingLevel).toBe('medium')
   })
 
   test('drops a per-spawn profile override so the parent cannot move its tier', () => {

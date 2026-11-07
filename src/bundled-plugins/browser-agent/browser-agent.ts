@@ -102,11 +102,13 @@ export function createBrowserSubagent(
 ): Subagent<BrowserPayload> {
   return {
     systemPrompt: buildBrowserSystemPrompt(drivers, options),
-    // The deep model at low effort, like omo's deep-low browser lane: strong
-    // agentic UI handling without deliberating before every click. Without a
-    // configured `deep` profile this resolves to plain `default` (its own level).
-    profile: 'deep',
-    thinkingLevel: 'low',
+    // The fast model at medium effort, the tier dedicated browser agents ship
+    // by default: a browsing step is mostly reading a snapshot and picking an
+    // action, so per-step speed and cost matter more than depth. Medium, not
+    // `fast`'s own low, leaves room to recover from misclicks. Without a
+    // configured `fast` profile this resolves to plain `default` (its own level).
+    profile: 'fast',
+    thinkingLevel: 'medium',
     timeoutMs: BROWSER_TIMEOUT_MS,
     tools: [readTool, grepTool, findTool, lsTool, bashTool, writeTool],
     // Lets a login finish inside this subagent instead of bouncing the
@@ -115,7 +117,7 @@ export function createBrowserSubagent(
     payloadSchema: browserPayloadSchema,
     visibility: 'public',
     rosterDescription:
-      'ALL web browsing — navigate, click, fill forms, log in, screenshot, scrape JS-rendered pages; deep model at low thinking (default profile if no deep); never drive a browser yourself',
+      'ALL web browsing — navigate, click, fill forms, log in, screenshot, scrape JS-rendered pages; fast model at medium thinking (default profile if no fast); never drive a browser yourself',
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     toolResultBudget: {
       maxTotalBytes: 1_000_000,
