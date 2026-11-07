@@ -46,7 +46,7 @@ export const BSK_DAEMON_PORT = 52800
 
 export const OMOWRIGHT_MODULE = `${BROWSER_ROOT}/omowright/index.js`
 
-const OMOWRIGHT_COMMIT = '6827bf1cd84f1c83c0be30eba1ca45097e32c548'
+const OMOWRIGHT_COMMIT = '7d98044a9ade8c54a4b9fd5a14e2befee2d48144'
 const BROWSER_USE_VERSION = '0.13.11'
 const BSK_VERSION = '0.3.3'
 const BSK_RELEASES = 'https://github.com/Tencent/BrowserSkill/releases/download'
