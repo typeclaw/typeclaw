@@ -148,18 +148,28 @@ export function normalizeTeamsText(text: string): string {
 // ONLY thing standing between the agent and answering its own message. That
 // makes the comparison worth hardening: we fingerprint what we handed the SDK,
 // but Teams stores messages as HTML, so the text comes back escaped-then-decoded
-// and the two sides are not the same string. The decode is also lossy in one
-// direction — it expands `&amp;` before `&lt;`, so a literal `&lt;` we wrote
-// returns as `<` — which without this would miss its own reservation and route
-// the agent's message back in as inbound. Decoding both sides identically makes
-// the comparison survive the round trip; on text holding no entities it is a
-// no-op. Order mirrors the SDK's decoder, and must keep mirroring it.
+// and the two sides are not the same string. How many entity layers come back
+// depends on the SDK and the message shape: a tag-free channel body without a
+// `messagetype` returns still escaped, a typed body is decoded once, and older
+// SDKs decoded lossily (`&amp;lt;` -> `<`). Any mismatch would miss the
+// reservation and route the agent's message back in as inbound. Decoding both
+// sides until no entity layer remains gives the same key for every one of those
+// shapes; on text holding no entities it is a no-op.
 export function teamsEchoTextKey(text: string): string {
-  const decoded = text
+  let decoded = text
+  for (;;) {
+    const next = decodeTeamsEntities(decoded)
+    if (next === decoded) break
+    decoded = next
+  }
+  return normalizeTeamsText(decoded)
+}
+
+function decodeTeamsEntities(text: string): string {
+  return text
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-  return normalizeTeamsText(decoded)
 }
