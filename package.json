@@ -59,7 +59,7 @@
     "@huggingface/transformers": "4.2.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
-    "agent-messenger": "^2.37.2",
+    "agent-messenger": "^2.41.0",
     "cheerio": "^1.2.0",
     "citty": "^0.2.2",
     "cron-parser": "^5.5.0",
