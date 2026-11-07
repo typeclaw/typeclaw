@@ -5,7 +5,7 @@ description: Playwright-shaped browser automation library (OmOWright) for the sh
 
 # omowright
 
-OmOWright is a JavaScript library with the Playwright API shape (`page.goto`, `page.locator(ref).click()`, `page.mouse.wheel`, `page.keyboard.type`, `page.screenshot`). Write a short Bun script and run it with `bun`. Each script connects to the shared browser, so state survives between scripts.
+OmOWright is a JavaScript library with the Playwright API shape (`page.goto`, `page.locator(ref).click()`, `page.mouse.wheel`, `page.keyboard.type`, `page.screenshot`). Write a short Bun script and run it with `bun`. Each script connects to the shared browser, so tabs, logins, and cookies survive between scripts. Snapshot refs do not.
 
 `$OMOWRIGHT_CDP_URL` holds the connection URL. If the variable is unset, this session's role cannot use the shared browser (it needs the `browser.shared` permission) or the browser failed to start; the operator log (`typeclaw logs`) names which. Do not try to start Chrome yourself.
 
@@ -28,7 +28,11 @@ await page.locator('e1').click()
 process.exit(0) // leaves the tab and browser running
 ```
 
-A later script continues in the same tab with `const page = await browser.attachPage(targetId)`; take a fresh `page.snapshot()` before using refs. `browser.listTargets()` lists open tabs when the id is lost.
+A later script continues in the same tab with `const page = await browser.attachPage(targetId)`. `browser.listTargets()` lists open tabs when the id is lost.
+
+Refs like `e14` belong to the script that took the snapshot. A new script has none, so `page.locator('e14')` from an earlier run always throws `RefStaleError`. In every script that acts on refs, call `page.snapshot()` first and use the refs from that snapshot in the same script. A page change (a click that navigates, a modal opening) also invalidates refs: snapshot again in the same script before the next ref action. When a ref stays stale, use a semantic locator instead, such as `page.getByRole('link', { name: '로그인' })` or `page.locator('#userId')`.
+
+Reuse your tab across retries with `attachPage` instead of opening another `tabs.create` for the same site, and close tabs you no longer need (`await page.close()`). Duplicate tabs of one site make it unclear which tab later steps (and `browser_fill_secret`) act on.
 
 - Prefer `compactSnapshot(await page.snapshot())` over screenshots; re-snapshots come back as a diff.
 - Long lists: `createNetworkSnoop` + `collectWhileScrolling` read the page's JSON instead of scraping rows.
