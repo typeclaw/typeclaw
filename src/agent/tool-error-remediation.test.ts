@@ -68,6 +68,23 @@ describe('remediateToolErrorMessage', () => {
     expect(remediateToolErrorMessage('edit', message)).toBe(message)
   })
 
+  it('tells bash that a timeout after printed output means the command never exited', () => {
+    // given: the upstream bash timeout status after the command already printed its result
+    const message = '- textbox "아이디" [ref=e20]\n- button "로그인" [ref=e22]\n\nCommand timed out after 15 seconds'
+
+    const result = remediateToolErrorMessage('bash', message)
+
+    expect(result.startsWith(message)).toBe(true)
+    expect(result).toContain('did not exit')
+  })
+
+  it('leaves a bash timeout with no output undecorated', () => {
+    // nothing was printed, so there is no evidence the work finished
+    const message = 'Command timed out after 15 seconds'
+
+    expect(remediateToolErrorMessage('bash', message)).toBe(message)
+  })
+
   it('does not decorate bash sandbox / subagent-policy errors', () => {
     // given: bash-only internal control errors (bash is in no rule's tool set)
     const sandbox = 'model-driven bash has no permission service; refusing unsandboxed execution'
