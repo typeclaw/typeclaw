@@ -68,7 +68,7 @@ export interface KakaoTalkClient {
     credentials?: { oauthToken: string; userId: string; deviceUuid?: string; deviceType?: 'pc' | 'tablet' },
     accountId?: string,
   ): Promise<this>
-  getChats(options?: { all?: boolean; search?: string }): Promise<KakaoChat[]>
+  getChats(options?: { all?: boolean; search?: string; resolveTitles?: boolean }): Promise<KakaoChat[]>
   getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]>
   sendMessage(
     chatId: string,
