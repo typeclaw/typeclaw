@@ -51,6 +51,9 @@ export default definePlugin({
       skillsDirs: [SKILLS_ROOT],
       tools: { [VAULT_REQUEST_TOOL]: createVaultRequestTool() },
       hooks: {
+        'session.prompt': (event) => {
+          event.prompt += `\n\n${CREDENTIALS_PROMPT}`
+        },
         'tool.before': async (event, hookCtx) => {
           // Tool contexts carry no origin, so remember the role each session
           // last acted as for vault tools that run outside bash.
@@ -68,6 +71,13 @@ export default definePlugin({
     }
   },
 })
+
+const CREDENTIALS_PROMPT = `## Credentials
+
+This agent keeps usernames, passwords, API keys, and other credentials in its TypeVault vault (see the \`typevault\` skill).
+
+- Never ask the user to paste a credential into chat, and never put a credential value in a subagent prompt. When one is missing, call \`${VAULT_REQUEST_TOOL}\` and send the user its link and match code.
+- For a browser login, give \`browser\` the \`typevault://\` entry name, never the value. When \`browser\` reports a missing entry, request it with \`${VAULT_REQUEST_TOOL}\`, and spawn \`browser\` again once the user says it is stored.`
 
 export function vaultBashHook(
   agentDir: string,
