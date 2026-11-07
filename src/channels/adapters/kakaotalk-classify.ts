@@ -59,13 +59,11 @@ export function classifyInbound(
     return { kind: 'drop', reason: 'unknown_chat' }
   }
 
-  // KakaoTalk has no native @-mention syntax in the LOCO protocol that the
-  // SDK exposes (mention rendering happens client-side via display_name
-  // matching). Mention-equivalent engagement comes solely from alias
-  // matching, which the engagement layer treats as equivalent to a direct
-  // mention (see engagement.ts: alias is unconditional and ranks alongside
-  // explicit triggers). Without aliases configured, only `reply` and `dm`
-  // triggers can fire on KakaoTalk.
+  // A native @-tag carries the tagged user ids in `mentions`. Alias matching
+  // stays alongside it because people also address the bot by name without
+  // tagging, which the engagement layer treats as equivalent to a mention.
+  const mentionedUserIds = (event.mentions ?? []).map((m) => m.user_id)
+  const botTagged = mentionedUserIds.includes(context.selfUserId)
   const aliasMatched = matchesAnyAlias(rawText, context.selfAliases ?? [])
 
   return {
@@ -84,9 +82,9 @@ export function classifyInbound(
       authorId: String(event.author_id),
       authorName: event.author_name ?? String(event.author_id),
       authorIsBot: false,
-      isBotMention: aliasMatched,
+      isBotMention: botTagged || aliasMatched,
       replyToBotMessageId: replyContext?.target === 'bot' ? replyContext.logId : null,
-      mentionsOthers: false,
+      mentionsOthers: mentionedUserIds.length > 0 && !botTagged,
       replyToOtherMessageId: replyContext?.target === 'other' ? replyContext.logId : null,
       isDm: chatInfo.isDm,
       // SDK delivers `sent_at` in Unix seconds (LOCO `sendAt`); contract
