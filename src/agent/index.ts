@@ -97,6 +97,7 @@ import {
   renderRuntimeNondisclosureRule,
   stripRuntimeIdentityProse,
   USER_INTENT_RULE,
+  GOAL_OWNERSHIP_RULE,
 } from './system-prompt'
 import { attachToolNotFoundNudge } from './tool-not-found-nudge'
 import { createBudgetState, type ToolResultBudget, wrapToolDefinitionWithBudget } from './tool-result-budget'
@@ -1282,7 +1283,7 @@ export async function createOverrideResourceLoader(
   runtimeVersion?: string,
 ): Promise<DefaultResourceLoader> {
   const branding = getConfig().branding
-  const withRule = `${systemPrompt}\n\n${USER_INTENT_RULE}`
+  const withRule = `${systemPrompt}\n\n${USER_INTENT_RULE}\n\n${GOAL_OWNERSHIP_RULE}`
   const withRuntime = branding
     ? runtimeVersion !== undefined
       ? `${withRule}\n\n${renderRuntimeBlock(runtimeVersion)}`
