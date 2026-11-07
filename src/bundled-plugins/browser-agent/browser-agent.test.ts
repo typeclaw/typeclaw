@@ -18,9 +18,9 @@ describe('browser subagent', () => {
     expect(subagent.thinkingLevel).toBe('medium')
   })
 
-  test('drops a per-spawn profile override so the parent cannot move its tier', () => {
-    const parsed = browserPayloadSchema.parse({ prompt: 'open example.com', profile: 'deep' })
-    expect(parsed).toEqual({ prompt: 'open example.com' })
+  test('keeps a per-spawn profile override so the parent can rerun a declined task on another model', () => {
+    const parsed = browserPayloadSchema.parse({ prompt: 'open example.com', profile: 'default' })
+    expect(parsed).toEqual({ prompt: 'open example.com', profile: 'default' })
   })
 
   test('every engine and extension skill path points at a shipped SKILL.md', () => {

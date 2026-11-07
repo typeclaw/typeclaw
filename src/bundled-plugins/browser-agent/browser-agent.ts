@@ -79,8 +79,8 @@ TypeVault is enabled: this agent keeps logins and other credentials in its vault
 - Report entry names, never values. Never put a credential in a file, a command line, or a screenshot.
 `
 
-// `profile` is dropped, not passed through: the browsing tier is fixed (see
-// createBrowserSubagent), so a parent must not move it via a per-spawn `profile`.
+// A per-spawn `profile` passes through so the parent can rerun a task the
+// browsing model declined on another model profile (see the roster line).
 export const browserPayloadSchema = z
   .object({
     requestId: z.string().optional(),
@@ -88,7 +88,6 @@ export const browserPayloadSchema = z
     description: z.string().optional(),
   })
   .passthrough()
-  .transform(({ profile: _profile, ...rest }) => rest)
 
 export type BrowserPayload = z.infer<typeof browserPayloadSchema>
 
