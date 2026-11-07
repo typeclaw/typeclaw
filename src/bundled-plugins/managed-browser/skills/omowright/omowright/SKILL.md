@@ -17,7 +17,9 @@ const url = process.env.OMOWRIGHT_CDP_URL
 // The relay requires the token on every request; omowright drops the URL query
 // for HTTP discovery (listTargets), so pass it as an Authorization header too.
 const token = new URL(url).searchParams.get('token')
-const browser = await connect(url, {
+// `await using` closes this script's connection when the script ends, so the
+// script exits on its own; the tab and the browser keep running.
+await using browser = await connect(url, {
   client: { authorizer: { resolveAuthorization: async () => `Bearer ${token}` } },
 })
 const tabs = createAgentTabs(browser) // background tabs that never steal focus
@@ -25,10 +27,11 @@ const { targetId, page } = await tabs.create('https://example.com')
 console.log(targetId) // keep it: later scripts reattach with browser.attachPage(targetId)
 console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
-process.exit(0) // required: leaves the tab and browser running
 ```
 
-End every script with `process.exit(0)`. The browser connection keeps Bun running, so a script without it prints its output and then hangs until the bash timeout kills it. A "Command timed out" result after the script already printed what you asked for means the script never exited, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen. End every later script with `process.exit(0)`.
+Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for the next script; a popup tab the script attached (from `window.open`) closes with the connection, so do work that must continue later in an agent tab.
+
+A "Command timed out" result after the script printed output means the script did not exit, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen.
 
 A later script continues in the same tab with `const page = await browser.attachPage(targetId)`. `browser.listTargets()` lists open tabs when the id is lost.
 
