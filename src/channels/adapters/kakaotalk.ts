@@ -17,7 +17,12 @@ import {
   type KakaoTalkPushMessageEvent,
   type KakaoTypingResult,
 } from 'agent-messenger/kakaotalk'
-import type { KakaoAccountCredentials, KakaoConfig, PendingLoginState } from 'agent-messenger/kakaotalk'
+import type {
+  KakaoAccountCredentials,
+  KakaoConfig,
+  KakaoMentionInput,
+  PendingLoginState,
+} from 'agent-messenger/kakaotalk'
 
 import { prependQuoteAnchor, type ChannelRouter } from '@/channels/router'
 import type { ChannelAdapterConfig } from '@/channels/schema'
@@ -48,6 +53,7 @@ import { classifyInbound, type InboundDropReason } from './kakaotalk-classify'
 import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
+import { resolveKakaoMentions } from './kakaotalk-mention'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
 import { withOutboundAccount } from './outbound-account'
 
@@ -64,7 +70,11 @@ export interface KakaoTalkClient {
   ): Promise<this>
   getChats(options?: { all?: boolean; search?: string }): Promise<KakaoChat[]>
   getMessages(chatId: string, options?: { count?: number; from?: string }): Promise<KakaoMessage[]>
-  sendMessage(chatId: string, text: string, options?: { replyTo?: KakaoReplyTarget }): Promise<KakaoSendResult>
+  sendMessage(
+    chatId: string,
+    text: string,
+    options?: { replyTo?: KakaoReplyTarget; mentions?: KakaoMentionInput[] },
+  ): Promise<KakaoSendResult>
   sendAttachment(
     chatId: string,
     data: Uint8Array | Buffer,
@@ -188,7 +198,7 @@ async function readAttachmentBuffer(path: string): Promise<Buffer> {
 }
 
 export function createOutboundCallback(deps: {
-  client: Pick<KakaoTalkClient, 'sendMessage' | 'sendAttachment' | 'getMessages'>
+  client: Pick<KakaoTalkClient, 'sendMessage' | 'sendAttachment' | 'getMessages' | 'getMembers'>
   logger: KakaotalkAdapterLogger
   formatChannelTag: (workspace: string, chat: string) => Promise<string>
   readFile?: (path: string) => Promise<Buffer>
@@ -256,12 +266,12 @@ export function createOutboundCallback(deps: {
           outboundText = prependQuoteAnchor(text, msg.replyTo.source)
         }
       }
+      const mentions = await resolveOutboundMentions(client, msg.chat, outboundText, logger)
       try {
-        const result = await client.sendMessage(
-          msg.chat,
-          outboundText,
-          replyTarget !== undefined ? { replyTo: replyTarget } : undefined,
-        )
+        const result = await client.sendMessage(msg.chat, outboundText, {
+          ...(replyTarget !== undefined ? { replyTo: replyTarget } : {}),
+          ...(mentions.length > 0 ? { mentions } : {}),
+        })
         if (!result.success) {
           logger.error(`[kakaotalk] sendMessage status_code=${result.status_code} ${tag}`)
           return { ok: false, error: `kakaotalk send failed with status ${result.status_code}` }
@@ -280,6 +290,23 @@ export function createOutboundCallback(deps: {
     // anchor; attachment-only sends fall back to the attachment log_id.
     const anchor = logIds.length > 0 ? logIds[logIds.length - 1] : undefined
     return { ok: true, messageId: anchor, messageIds: logIds }
+  }
+}
+
+// A failed member lookup only costs the native tags: the text still carries
+// the `@name` the agent wrote, so the send goes out untagged.
+async function resolveOutboundMentions(
+  client: Pick<KakaoTalkClient, 'getMembers'>,
+  chatId: string,
+  text: string,
+  logger: KakaotalkAdapterLogger,
+): Promise<KakaoMentionInput[]> {
+  if (!text.includes('@')) return []
+  try {
+    return resolveKakaoMentions(text, await client.getMembers(chatId))
+  } catch (err) {
+    logger.warn(`[kakaotalk] mention member lookup failed chat=${chatId}: ${describeError(err)}`)
+    return []
   }
 }
 

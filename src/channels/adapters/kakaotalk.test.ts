@@ -8,6 +8,7 @@ import type {
   KakaoChat,
   KakaoMarkReadResult,
   KakaoMember,
+  KakaoMentionInput,
   KakaoMessage,
   KakaoProfile,
   KakaoReplyTarget,
@@ -75,7 +76,12 @@ function isAttachmentInputArray(
 
 class FakeClient implements KakaoTalkClient {
   loginCalls = 0
-  sendMessageCalls: Array<{ chatId: string; text: string; replyTo?: KakaoReplyTarget }> = []
+  sendMessageCalls: Array<{
+    chatId: string
+    text: string
+    replyTo?: KakaoReplyTarget
+    mentions?: KakaoMentionInput[]
+  }> = []
   getMessagesCalls: Array<{ chatId: string; opts?: { count?: number; from?: string } }> = []
   getMessagesResult: KakaoMessage[] = []
   getMessagesError: Error | null = null
@@ -113,11 +119,16 @@ class FakeClient implements KakaoTalkClient {
     return this.getMessagesResult
   }
 
-  async sendMessage(chatId: string, text: string, options?: { replyTo?: KakaoReplyTarget }): Promise<KakaoSendResult> {
+  async sendMessage(
+    chatId: string,
+    text: string,
+    options?: { replyTo?: KakaoReplyTarget; mentions?: KakaoMentionInput[] },
+  ): Promise<KakaoSendResult> {
     this.sendMessageCalls.push({
       chatId,
       text,
       ...(options?.replyTo !== undefined ? { replyTo: options.replyTo } : {}),
+      ...(options?.mentions !== undefined ? { mentions: options.mentions } : {}),
     })
     return this.sendResult
   }
@@ -533,6 +544,78 @@ describe('createKakaotalkAdapter — outbound', () => {
     })
     expect(result).toEqual({ ok: true, messageId: 'L1', messageIds: ['L1'] })
     expect(client.sendMessageCalls).toEqual([{ chatId: '111', text: 'hello' }])
+
+    await adapter.stop()
+    await router.stop()
+  })
+
+  test('tags `@nickname` of a chat member as a native mention', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+    client.membersByChat.set('111', [
+      {
+        user_id: '333',
+        nickname: '연규',
+        profile_image_url: null,
+        full_profile_image_url: null,
+        original_profile_image_url: null,
+        status_message: null,
+        country_iso: null,
+        user_type: 100,
+        open_token: null,
+        open_profile_link_id: null,
+        open_permission: null,
+      },
+    ])
+    await adapter.start()
+    listener.emit('connected', { userId: '999' })
+
+    const result = await router.send({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      text: '@연규님 계정이 잠깐 막혔대요',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(client.sendMessageCalls).toEqual([
+      { chatId: '111', text: '@연규님 계정이 잠깐 막혔대요', mentions: [{ user_id: '333', name: '연규' }] },
+    ])
+
+    await adapter.stop()
+    await router.stop()
+  })
+
+  test('still sends untagged text when the member lookup for mentions fails', async () => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+    client.getMembersError = new Error('GETMEM failed')
+    await adapter.start()
+    listener.emit('connected', { userId: '999' })
+
+    const result = await router.send({
+      adapter: 'kakaotalk',
+      workspace: '@kakao-group',
+      chat: '111',
+      text: '@Alice hi',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(client.sendMessageCalls).toEqual([{ chatId: '111', text: '@Alice hi' }])
 
     await adapter.stop()
     await router.stop()
