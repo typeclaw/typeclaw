@@ -750,7 +750,7 @@ describe('renderSessionOrigin', () => {
     expect(out).toContain('do not echo them back as outbound mentions')
   })
 
-  test('KakaoTalk channel origin names KakaoTalk and teaches alias/display-name mention (NOT angle-id)', () => {
+  test('KakaoTalk channel origin names KakaoTalk and teaches @display-name mention (NOT angle-id)', () => {
     const out = renderSessionOrigin({
       kind: 'channel',
       adapter: 'kakaotalk',
@@ -759,7 +759,7 @@ describe('renderSessionOrigin', () => {
       thread: null,
     })
     expect(out).toContain('KakaoTalk channel session')
-    expect(out).toContain('KakaoTalk has no in-band mention syntax')
+    expect(out).toContain('followed by their exact KakaoTalk display name')
     expect(out).not.toContain('Discord channel session')
     expect(out).not.toContain('Slack syntax')
     expect(out).not.toContain('Discord syntax')
@@ -836,7 +836,7 @@ describe('renderSessionOrigin', () => {
     expect(out).not.toContain('`<@authorId>` works for any author')
   })
 
-  test('KakaoTalk participants block renders `name (id)` addressing per line and trailing prose teaches display-name addressing', () => {
+  test('KakaoTalk participants block renders `name (id)` addressing per line and trailing prose teaches @display-name addressing', () => {
     const now = Date.now()
     const participants: ChannelParticipant[] = [
       { authorId: 'k_42', authorName: 'alice', firstMessageAt: now - 1000, lastMessageAt: now - 1000, messageCount: 5 },
@@ -847,7 +847,7 @@ describe('renderSessionOrigin', () => {
     )
     expect(out).toContain('- alice (k_42) —')
     expect(out).not.toContain('<@k_42>')
-    expect(out).toContain('display name as plain text')
+    expect(out).toContain('mention them as `@` + their display name')
     expect(out).toContain('must not be echoed back')
     expect(out).not.toContain('`<@authorId>` works for any author')
   })
@@ -895,7 +895,7 @@ describe('renderSessionOrigin', () => {
 
     // then: the model is told NOT to emit `<@999> hello` and is given KakaoTalk-specific guidance
     expect(kakao).not.toContain('<@999> hello')
-    expect(kakao).toContain('KakaoTalk has no in-band mention syntax')
+    expect(kakao).toContain('`@Momo hello`')
 
     // when: Telegram session with the same participant set
     const telegram = renderSessionOrigin(
@@ -966,7 +966,7 @@ describe('renderSessionOrigin channel self-identity', () => {
     expect(out).toMatch(/You are `@acme` on GitHub/)
   })
 
-  test('kakaotalk origin renders no self-mention line (no in-band mention syntax)', () => {
+  test('kakaotalk origin renders no self-mention line (tags are by display name, not id)', () => {
     const out = renderSessionOrigin({
       kind: 'channel',
       adapter: 'kakaotalk',

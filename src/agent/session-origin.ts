@@ -123,13 +123,16 @@ export const PARTICIPANTS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 //   - 'at-username'  — Telegram: `@username` plain text. The numeric
 //                      `authorId` is NOT what gets mentioned; usernames are
 //                      a separate field that not every user has.
-//   - 'alias'        — KakaoTalk: type the bot's alias as plain text. The
-//                      adapter's classifier (`kakaotalk-classify.ts`) does
-//                      a substring match against configured aliases; there
-//                      is no in-band syntax to copy.
+//   - 'at-name'      — KakaoTalk: `@DisplayName` plain text. The adapter
+//                      turns `@` + a chat member's exact nickname into a
+//                      native tag (`kakaotalk-mention.ts`); `authorId` is
+//                      never part of the syntax.
+//   - 'alias'        — Instagram/LINE/Teams: type the person's name as plain
+//                      text. The classifiers substring-match configured
+//                      aliases; there is no in-band syntax to copy.
 type PlatformInfo = {
   displayName: string
-  mentionMode: 'angle-id' | 'at-username' | 'alias'
+  mentionMode: 'angle-id' | 'at-username' | 'at-name' | 'alias'
   // This platform has no rich-text rendering, so markdown markers appear
   // literally to users.
   plainTextOnly: boolean
@@ -231,7 +234,7 @@ const PLATFORM_INFO: Record<AdapterId, PlatformInfo> = {
   },
   kakaotalk: {
     displayName: 'KakaoTalk',
-    mentionMode: 'alias',
+    mentionMode: 'at-name',
     plainTextOnly: true,
     supportsReactions: false,
     supportsAttachments: true,
@@ -778,6 +781,13 @@ function renderMentionGuidance(
         'If no `@username` is known, use display name; reply context carries it.',
         ...renderSelfMention(platformInfo, self),
       ]
+    case 'at-name':
+      return [
+        `To mention someone in your reply, write \`@\` followed by their exact ${platformInfo.displayName} display name,`,
+        `e.g. \`@${exampleName} hello\`; it becomes a native ${platformInfo.displayName} mention when that name belongs to a chat member.`,
+        'Display names are in the participants block. Any `<@id>` marker is inbound-only typeclaw convention;',
+        `do not echo them back as outbound mentions or ${platformInfo.displayName} renders them literally.`,
+      ]
     case 'alias':
       return [
         `${platformInfo.displayName} has no in-band mention syntax. To address someone, just type their display name as plain text;`,
@@ -792,9 +802,9 @@ function renderMentionGuidance(
 // id, so a message addressed to its own id reads as "addressed to someone
 // else" and it wrongly skips the turn (issue: skipped_by_tool "Message
 // addressed to @U…, not to <name>"). This line closes that gap by stating
-// the bot's own addressing token explicitly. Empty for the alias platform
-// (KakaoTalk has no in-band mention token to recognize) and when identity
-// has not resolved yet — both fall through to "omit the line".
+// the bot's own addressing token explicitly. Empty for the at-name and alias
+// platforms (no id-shaped token to recognize; KakaoTalk tags by display name)
+// and when identity has not resolved yet — all fall through to "omit the line".
 function renderSelfMention(platformInfo: PlatformInfo, self: ChannelSelfIdentity | undefined): string[] {
   if (self === undefined) return []
   switch (platformInfo.mentionMode) {
@@ -807,6 +817,7 @@ function renderSelfMention(platformInfo: PlatformInfo, self: ChannelSelfIdentity
         'contains your id, it is addressed to YOU — do not skip it as "addressed to another user".',
       ]
     }
+    case 'at-name':
     case 'at-username': {
       if (self.username === undefined || self.username === '') return []
       return [
@@ -896,6 +907,7 @@ function renderParticipantAddressing(p: ChannelParticipant, platformInfo: Platfo
     case 'angle-id':
       return `<@${p.authorId}> (${p.authorName})`
     case 'at-username':
+    case 'at-name':
     case 'alias':
       return `${p.authorName} (${p.authorId})`
   }
@@ -921,6 +933,12 @@ function renderParticipantsTrailing(platformInfo: PlatformInfo): string[] {
         "If a current sender isn't listed, address by `@username` when known.",
         `${platformInfo.displayName} usernames are a SEPARATE field from numeric \`authorId\`, and`,
         'not every user has one. The list is recent context, not a directory.',
+      ]
+    case 'at-name':
+      return [
+        "If a current sender isn't listed, mention them as `@` + their display name.",
+        '`authorId` is reference only and must not be echoed back.',
+        'The list is recent context, not a directory.',
       ]
     case 'alias':
       return [
