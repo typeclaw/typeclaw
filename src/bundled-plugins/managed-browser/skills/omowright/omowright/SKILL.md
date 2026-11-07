@@ -25,8 +25,10 @@ const { targetId, page } = await tabs.create('https://example.com')
 console.log(targetId) // keep it: later scripts reattach with browser.attachPage(targetId)
 console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
-process.exit(0) // leaves the tab and browser running
+process.exit(0) // required: leaves the tab and browser running
 ```
+
+End every script with `process.exit(0)`. The browser connection keeps Bun running, so a script without it prints its output and then hangs until the bash timeout kills it. A "Command timed out" result after the script already printed what you asked for means the script never exited, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen. End every later script with `process.exit(0)`.
 
 A later script continues in the same tab with `const page = await browser.attachPage(targetId)`. `browser.listTargets()` lists open tabs when the id is lost.
 
