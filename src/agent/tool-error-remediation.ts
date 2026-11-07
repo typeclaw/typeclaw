@@ -1,7 +1,9 @@
 // SECURITY/CORRECTNESS: rules are gated on BOTH the emitting tool name and a
 // verbatim upstream pi-coding-agent error substring. `bash` (the only tool that
-// raises sandbox/subagent-policy errors) is never in a rule's tool set, and
-// abort/cleanup/guard failures never match any pattern, so internal control
+// raises sandbox/subagent-policy errors) appears only in the timeout rule, whose
+// pattern is pi's own timeout status after printed output and so can never match
+// a sandbox or policy refusal. Abort/cleanup/guard failures never match any
+// pattern, so internal control
 // errors are never decorated with a nonsensical "read the file first" hint. A
 // wording drift upstream simply stops decorating (fails safe) rather than
 // mis-firing on the wrong error class.
@@ -19,8 +21,21 @@ type RemediationRule = {
 }
 
 // First matching rule wins; keep the most specific patterns first. Upstream
-// sources: node_modules/@earendil-works/pi-coding-agent/dist/core/tools/{edit,read,ls,grep}.js
+// sources: node_modules/@earendil-works/pi-coding-agent/dist/core/tools/{edit,read,ls,grep,bash}.js
 const RULES: readonly RemediationRule[] = [
+  {
+    // bash.js joins the captured output and the status with a blank line, and
+    // emits the bare status when nothing was printed. Only the printed-output
+    // form is decorated: there the command may have finished its work and then
+    // never exited (an open browser/CDP connection, a server, a watcher), which
+    // models otherwise misreport as the work itself timing out. Output alone
+    // does not prove completion (it may be progress), so the hint stays
+    // conditional.
+    tools: ['bash'],
+    upstream: '<output>\n\nCommand timed out after N seconds',
+    test: /\S\s*\n\nCommand timed out after \d+ seconds/,
+    hint: `${HINT_PREFIX} the command printed output and then did not exit before the timeout killed it. It may have finished its work and been kept alive by an open connection, server, or watcher, or it may still have been working; the output alone does not show which. Check the output and the resulting state (for a browser, reattach to the tab and snapshot it) before reporting success or failure, and do not blindly repeat steps with side effects (a click, a submit, a write) that may already have gone through. Make scripts exit when done, for example with \`process.exit(0)\`.`,
+  },
   {
     tools: ['edit'],
     upstream: 'Could not find edits[0] in <path>. / Could not find the exact text in <path>.',
