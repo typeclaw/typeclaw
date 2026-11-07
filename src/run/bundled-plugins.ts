@@ -1,4 +1,5 @@
 import agentBrowserPlugin from '@/bundled-plugins/agent-browser'
+import agentMessengerCliAuthPlugin from '@/bundled-plugins/agent-messenger-cli-auth'
 import backupPlugin from '@/bundled-plugins/backup'
 import browserAgentPlugin from '@/bundled-plugins/browser-agent'
 import bunHygienePlugin from '@/bundled-plugins/bun-hygiene'
@@ -49,6 +50,9 @@ import type { ResolvedPlugin } from '@/plugin'
 // ordering security first still matters so a blocked command never reaches the
 // mint path at all.
 //
+// `agent-messenger-cli-auth` follows the same rule: security inspects the
+// command before a channel bot token is minted into a CLI profile for it.
+//
 // `typevault` is registered right after `security` so its `tool.after`
 // redaction sees the full tool output: if `tool-result-cap` truncated first, a
 // secret cut at the cap boundary would no longer match and part of it could
@@ -66,6 +70,7 @@ export const BUNDLED_PLUGINS: ResolvedPlugin[] = [
   { name: 'guard', version: undefined, source: '<bundled>', defined: guardPlugin },
   { name: 'bun-hygiene', version: undefined, source: '<bundled>', defined: bunHygienePlugin },
   { name: 'github-cli-auth', version: undefined, source: '<bundled>', defined: githubCliAuthPlugin },
+  { name: 'agent-messenger-cli-auth', version: undefined, source: '<bundled>', defined: agentMessengerCliAuthPlugin },
   { name: 'memory', version: undefined, source: '<bundled>', defined: memoryPlugin },
   { name: 'backup', version: undefined, source: '<bundled>', defined: backupPlugin },
   { name: 'agent-browser', version: undefined, source: '<bundled>', defined: agentBrowserPlugin },
