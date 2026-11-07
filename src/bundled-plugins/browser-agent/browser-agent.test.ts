@@ -12,15 +12,15 @@ import {
 } from './browser-agent'
 
 describe('browser subagent', () => {
-  test('runs the deep profile at low thinking', () => {
+  test('runs the fast profile at medium thinking', () => {
     const subagent = createBrowserSubagent({ engines: ['agent-browser'], extensions: [] })
-    expect(subagent.profile).toBe('deep')
-    expect(subagent.thinkingLevel).toBe('low')
+    expect(subagent.profile).toBe('fast')
+    expect(subagent.thinkingLevel).toBe('medium')
   })
 
-  test('drops a per-spawn profile override so the parent cannot move its tier', () => {
-    const parsed = browserPayloadSchema.parse({ prompt: 'open example.com', profile: 'deep' })
-    expect(parsed).toEqual({ prompt: 'open example.com' })
+  test('keeps a per-spawn profile override so the parent can rerun a declined task on another model', () => {
+    const parsed = browserPayloadSchema.parse({ prompt: 'open example.com', profile: 'default' })
+    expect(parsed).toEqual({ prompt: 'open example.com', profile: 'default' })
   })
 
   test('every engine and extension skill path points at a shipped SKILL.md', () => {
