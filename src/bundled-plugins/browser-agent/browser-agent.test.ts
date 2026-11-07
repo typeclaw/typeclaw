@@ -3,7 +3,13 @@ import { existsSync } from 'node:fs'
 
 import { BROWSER_ENGINE_IDS, BROWSER_EXTENSION_IDS } from '@/browser/registry'
 
-import { browserPayloadSchema, buildBrowserSystemPrompt, createBrowserSubagent, driverSkillPath } from './browser-agent'
+import {
+  browserPayloadSchema,
+  buildBrowserSystemPrompt,
+  createBrowserSubagent,
+  driverSkillPath,
+  TYPEVAULT_SKILL_PATH,
+} from './browser-agent'
 
 describe('browser subagent', () => {
   test('runs the deep profile at low thinking', () => {
@@ -27,6 +33,13 @@ describe('browser subagent', () => {
     expect(prompt).toContain(driverSkillPath('omowright'))
     expect(prompt).not.toContain(driverSkillPath('agent-browser'))
     expect(prompt).not.toContain(driverSkillPath('browserskill'))
+  })
+
+  test('points the worker at the typevault skill only when the vault is live', () => {
+    const drivers = { engines: ['agent-browser'], extensions: [] } as const
+    expect(existsSync(TYPEVAULT_SKILL_PATH)).toBe(true)
+    expect(createBrowserSubagent(drivers, { typevault: true }).systemPrompt).toContain(TYPEVAULT_SKILL_PATH)
+    expect(createBrowserSubagent(drivers).systemPrompt).not.toContain(TYPEVAULT_SKILL_PATH)
   })
 
   test('a BrowserSkill-only config still hands the worker its driver skill', () => {
