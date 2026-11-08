@@ -7,9 +7,9 @@ import type { ChannelRouter } from '@/channels/router'
 // in the target, so an empty result is common. Without a next step here the
 // model reads it as "unreachable" and stops.
 const NO_TARGETS_TEXT =
-  'No eligible live sessions found. The conversation may still be reachable: if the owner asked, read it directly ' +
-  'with `channel_read` (`mode: "list"` finds chat ids) and post there with `channel_send`. For any other speaker, ' +
-  "don't read or post there; tell them no live session owns that conversation."
+  'No eligible live sessions found. The conversation may still be reachable: read it directly with `channel_read` ' +
+  '(`mode: "list"` finds chat ids) and, if that read is allowed, post there with `channel_send`. If `channel_read` ' +
+  "is denied, don't post there; tell the speaker no live session owns that conversation."
 
 export function createChannelSessionSearchTool(options: {
   router: Pick<ChannelRouter, 'searchSessions'>
