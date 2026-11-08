@@ -79,6 +79,7 @@ export function createChannelHistoryTool({
       }
 
       const result = await router.fetchHistory(origin.adapter, {
+        workspace: origin.workspace,
         chat: origin.chat,
         thread: scope === 'thread' ? origin.thread : null,
         limit,

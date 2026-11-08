@@ -75,7 +75,7 @@ describe('createChannelHistoryTool', () => {
 
     // then
     expect(seen).toHaveLength(1)
-    expect(seen[0]).toEqual({ chat: 'C0', thread: '1700000000.000100', limit: 20 })
+    expect(seen[0]).toEqual({ workspace: 'T0', chat: 'C0', thread: '1700000000.000100', limit: 20 })
   })
 
   test('defaults to channel scope when origin has no thread', async () => {
@@ -94,7 +94,7 @@ describe('createChannelHistoryTool', () => {
 
     // then
     expect(seen).toHaveLength(1)
-    expect(seen[0]).toEqual({ chat: 'C0', thread: null, limit: 20 })
+    expect(seen[0]).toEqual({ workspace: 'T0', chat: 'C0', thread: null, limit: 20 })
   })
 
   test('rejects scope:thread on a channel-root session without calling the adapter', async () => {
