@@ -66,8 +66,9 @@ export function createChannelSendTool({
       'or use `channel_reply`. A returned id starts a thread only where the adapter accepts a message ' +
       'id as `thread` (e.g. a new top-level Slack post); other adapters use different thread ids. ' +
       'Some adapters do not report ids. ' +
-      'For work belonging to another conversation, use channel_session_search and channel_handoff so the owning ' +
-      'session answers with current context. Use this tool for an explicit direct post, not to take over that work.',
+      'For work belonging to another conversation, prefer channel_session_search and channel_handoff so its live ' +
+      'owning session answers with current context. Post there directly only when the owner asks and no live session ' +
+      'owns it; for other speakers, use the handoff path even when the search finds nothing.',
     parameters: Type.Object({
       adapter: Type.Union(
         ADAPTER_IDS.map((a) => Type.Literal(a)),
