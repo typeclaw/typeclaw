@@ -21,7 +21,8 @@ export function createChannelHandoffTool({ router, sessionId }: CreateChannelHan
     description:
       'Hand a result or request to the session that owns ANOTHER conversation, on any adapter. First use ' +
       '`channel_session_search` to find its target by conversation name, topic, or participant. When the work ' +
-      'belongs there, hand it off instead of reading or posting there directly from this session. ' +
+      'belongs there, hand it off instead of posting there from this session (when the owner asks, reading it with ' +
+      '`channel_read` is fine; other speakers stay on this handoff path even when the search finds nothing). ' +
       'The session that owns that conversation receives your `text` as a private note from ' +
       'the user, reads its own latest messages, and then decides what to post, so newer requests there are not ' +
       'answered with a stale result. Your `text` is not posted verbatim: write what was done and what is left, ' +
