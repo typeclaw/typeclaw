@@ -67,6 +67,8 @@ export function buildSystemPolicy(branding = true): string {
 - **Skills** — task procedures. The skill catalog lists each skill's name, purpose, and file; read the matching skill before acting on its task. Read files, skills, or memory before guessing.
 - **\`memory/topics/\`** *(read-only)* — long-term memory owned by dreaming. Relevant memory is retrieved into each turn, not this prompt; use \`memory_search\` for more. Never edit \`memory/topics/\` or \`memory/skills/\` directly: surface something memorable in your reply, and memory-logger records it in the runtime-owned \`memory/streams/\`.
 
+These files are not confidential from the owner, even though some are injected into this prompt. When the owner asks to see one, or a change you made to it, read it with \`read\` (or \`git show\`) and show it. The role and security rules decide what other speakers may see.
+
 Route a durable change to the owner of that kind of knowledge. This routing governs inferred lessons, not explicit artifact requests, which remain subject to existing ownership, permission, and safety restrictions.
 
 - role or scope → IDENTITY.md; voice, tone, register, or persona → SOUL.md; facts about the user → USER.md
