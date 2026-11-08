@@ -22,7 +22,7 @@ import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
 import { findPermissionGaps } from './event-permissions'
 import { createGithubFetchAttachmentCallback } from './fetch-attachment'
-import { createGithubHistoryCallback } from './history'
+import { createChatWorkspaceIndex, createGithubHistoryCallback } from './history'
 import { createGithubWebhookHandler, processVerifiedGithubDelivery, type GithubWebhookHandlerOptions } from './inbound'
 import { readGithubLastAlive, writeGithubLastAlive } from './last-alive'
 import { applyManagedPath, buildManagedPath, resolveAgentId } from './managed-path'
@@ -166,7 +166,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let stopObservingDismissals: (() => void) | null = null
   let lifecycleGeneration = 0
   let unregisterTokenBridge: (() => void) | null = null
-  const workspaceByChat = new Map<string, string>()
+  const workspaceByChat = createChatWorkspaceIndex()
   const pendingAdmissions = pendingAdmissionsByRouter.get(options.router) ?? new Set<string>()
   pendingAdmissionsByRouter.set(options.router, pendingAdmissions)
   const setIntervalFn =
@@ -177,7 +177,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     })
 
   const rememberWorkspace = (workspace: string, chat: string): void => {
-    workspaceByChat.set(chat, workspace)
+    workspaceByChat.remember(workspace, chat)
   }
 
   // Repo/owner-aware token resolver. A single GitHub App can span multiple
@@ -236,7 +236,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const history = createGithubHistoryCallback({
     token: authToken,
     fetchImpl,
-    workspaceForChat: (chat) => workspaceByChat.get(chat) ?? null,
+    workspaceForChat: workspaceByChat.resolve,
   })
   const membership = createGithubMembershipResolver({ token: authToken, fetchImpl })
   const reviewThreadResolver = createGithubReviewThreadResolver({

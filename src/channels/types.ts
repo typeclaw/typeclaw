@@ -515,6 +515,9 @@ export type ChannelHistoryMessage = {
 }
 
 export type FetchHistoryArgs = {
+  // Adapters whose chat ids repeat across workspaces (GitHub `pr:12` in every
+  // repo) need it to address the right conversation. Callers that know it pass it.
+  workspace?: string
   chat: string
   thread: string | null
   limit: number

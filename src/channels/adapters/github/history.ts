@@ -5,14 +5,35 @@ import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { parseChat, parseRepo } from './outbound'
 
+// Repos that have delivered an inbound, per chat id. A chat id like `pr:12`
+// exists in every repo, so a read names its repo explicitly; without one it
+// resolves only when a single repo is known for that chat, never by recency,
+// so one conversation's read can't land in another repo's thread.
+export function createChatWorkspaceIndex() {
+  const workspacesByChat = new Map<string, Set<string>>()
+  return {
+    remember(workspace: string, chat: string): void {
+      const known = workspacesByChat.get(chat)
+      if (known === undefined) workspacesByChat.set(chat, new Set([workspace]))
+      else known.add(workspace)
+    },
+    resolve(chat: string, workspace?: string): string | null {
+      const known = workspacesByChat.get(chat)
+      if (known === undefined) return null
+      if (workspace !== undefined) return known.has(workspace) ? workspace : null
+      return known.size === 1 ? [...known][0]! : null
+    },
+  }
+}
+
 export function createGithubHistoryCallback(options: {
   token: (context?: GithubAuthContext) => Promise<string>
-  workspaceForChat: (chat: string) => string | null
+  workspaceForChat: (chat: string, workspace?: string) => string | null
   fetchImpl?: typeof fetch
 }): HistoryCallback {
   const fetchImpl = options.fetchImpl ?? fetch
   return async (args: FetchHistoryArgs): Promise<FetchHistoryResult> => {
-    const workspace = options.workspaceForChat(args.chat)
+    const workspace = options.workspaceForChat(args.chat, args.workspace)
     if (workspace === null)
       return { ok: false, error: 'github history unavailable until this chat receives an inbound' }
     const repo = parseRepo(workspace)
