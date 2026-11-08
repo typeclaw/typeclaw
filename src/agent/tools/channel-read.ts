@@ -191,6 +191,7 @@ async function readHistory(args: {
     return fail('mode "history" requires `chat`.')
   }
   const result = await router.fetchHistory(adapter, {
+    workspace: params.workspace,
     chat: params.chat,
     thread: params.thread ?? null,
     limit,
