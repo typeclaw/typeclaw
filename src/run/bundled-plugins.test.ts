@@ -22,6 +22,7 @@ describe('BUNDLED_PLUGINS', () => {
       'guard',
       'bun-hygiene',
       'github-cli-auth',
+      'agent-messenger-cli-auth',
       'memory',
       'backup',
       'agent-browser',
@@ -41,5 +42,10 @@ describe('BUNDLED_PLUGINS', () => {
   test('security precedes github-cli-auth so gh/git token minting never runs on a blocked command', () => {
     const names = BUNDLED_PLUGINS.map((p) => p.name)
     expect(names.indexOf('security')).toBeLessThan(names.indexOf('github-cli-auth'))
+  })
+
+  test('security precedes agent-messenger-cli-auth so a blocked command never gets a minted profile', () => {
+    const names = BUNDLED_PLUGINS.map((p) => p.name)
+    expect(names.indexOf('security')).toBeLessThan(names.indexOf('agent-messenger-cli-auth'))
   })
 })

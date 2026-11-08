@@ -1,5 +1,6 @@
 import type { SecuritySeverity } from '../permissions'
 import type { SecurityBlock } from '../policy'
+import { outboundTexts } from './outbound-text'
 
 export const GUARD_SYSTEM_PROMPT_LEAK = 'systemPromptLeak'
 // Classified `high` (audience-leak axis): bypass posts TypeClaw runtime
@@ -64,13 +65,7 @@ export function checkSystemPromptLeakGuard(options: {
   args: Record<string, unknown>
 }): SecurityBlock | undefined {
   const { tool, args } = options
-  if (tool !== 'channel_send' && tool !== 'channel_reply') return undefined
-  const candidates: string[] = []
-  for (const key of ['text', 'message', 'content', 'body']) {
-    const v = args[key]
-    if (typeof v === 'string' && v.length > 0) candidates.push(v)
-  }
-  for (const text of candidates) {
+  for (const text of outboundTexts(tool, args)) {
     const hits = findSystemPromptLeak(text)
     if (hits.length === 0) continue
     const summary = hits.map((h) => h.label).join('; ')
