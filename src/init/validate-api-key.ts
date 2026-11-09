@@ -34,6 +34,8 @@ const PROVIDER_PROBE: Partial<Record<KnownProviderId, Probe>> = {
   opengateway: { url: 'https://apis.opengateway.ai/v1/me', authHeader: 'bearer', successShape: 'json-object' },
   // inception has no probe: its /v1/models is public and returns 200 for any
   // key, so probing it would vouch for garbage.
+  // exaone has no probe: the platform documents only /v1/chat/completions, and an
+  // undocumented /v1/models could reject a valid key.
 }
 
 // When a base-URL override (ANTHROPIC_BASE_URL / OPENAI_BASE_URL) points at a
@@ -197,6 +199,9 @@ export const API_KEY_DASHBOARD_URL: Partial<Record<KnownProviderId, string>> = {
   'moonshot-coding': 'https://www.kimi.com/code/console',
   opengateway: 'https://opengateway.ai/docs/reference/guides/authentication',
   inception: 'https://platform.inceptionlabs.ai',
+  // The overview page hosts the "Get an API Key" entry point; there is no
+  // separate console host.
+  exaone: 'https://docs.exaone.ai/en/docs/overview',
 }
 
 // MiniMax sells the same `minimax` provider under two billing surfaces that

@@ -1465,6 +1465,66 @@ export const KNOWN_PROVIDERS = {
       },
     },
   },
+  // LG AI Research EXAONE API Platform (docs.exaone.ai). OpenAI-compatible
+  // /v1/chat/completions with Bearer auth, so it goes through pi-ai's
+  // `openai-completions` adapter with a custom baseUrl. api-key only.
+  //
+  // Only K-EXAONE 2.5 is listed: EXAONE Tabular is a structured-data predictor,
+  // not a chat model. Per docs.exaone.ai/en/docs/k-exaone-2.5 (2026-11-09) it is
+  // text-only with a 524,288-token context, and input + max_tokens must stay
+  // within that limit or the API returns 400. max_tokens counts reasoning too, so
+  // maxTokens mirrors the context window; typeclaw's default output allowance
+  // caps the actual request well below it.
+  //
+  // The model always reasons (enable_thinking is forced on) and reasoning_effort
+  // defaults to `max` when omitted. `off` therefore maps to `low`, the cheapest
+  // effort, instead of null: omitting the field would silently run every
+  // non-reasoning turn at max effort. The endpoint accepts only low/high/max, so
+  // medium rounds up to `high` and xhigh maps to `max`. Reasoning streams back
+  // in `reasoning_content`, which pi-ai already replays on assistant history.
+  //
+  // The endpoint documents system/user/assistant roles and `max_tokens`, but not
+  // `store`, the `developer` role, or `strict` on tool definitions, and pi-ai
+  // doesn't auto-detect compat for this baseUrl, so those are turned off.
+  //
+  // No per-token price is published yet, so cost is 0.
+  exaone: {
+    id: 'exaone',
+    name: 'LG EXAONE',
+    baseUrl: 'https://api.exaone.ai/v1',
+    auth: ['api-key'],
+    apiKeyEnv: 'EXAONE_API_KEY',
+    oauthProviderId: null,
+    models: {
+      'k-exaone_v2.5': {
+        id: 'k-exaone_v2.5',
+        name: 'K-EXAONE 2.5',
+        api: 'openai-completions',
+        provider: 'exaone',
+        baseUrl: 'https://api.exaone.ai/v1',
+        reasoning: true,
+        thinkingLevelMap: {
+          off: 'low',
+          minimal: 'low',
+          low: 'low',
+          medium: 'high',
+          high: 'high',
+          xhigh: 'max',
+        },
+        input: ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 524288,
+        maxTokens: 524288,
+        compat: {
+          supportsStore: false,
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: true,
+          supportsStrictMode: false,
+          maxTokensField: 'max_tokens',
+        },
+      },
+    },
+  },
 } as const satisfies Record<string, KnownProvider>
 
 export type KnownProviderId = keyof typeof KNOWN_PROVIDERS
@@ -1556,6 +1616,11 @@ export const KNOWN_PROVIDER_VENDORS = {
     id: 'inception',
     name: 'Inception (Mercury)',
     providers: ['inception'],
+  },
+  exaone: {
+    id: 'exaone',
+    name: 'LG EXAONE',
+    providers: ['exaone'],
   },
   // Listed last because it is a reseller, not a lab: a user who knows they want
   // Anthropic should land on the Anthropic row, not the gateway that proxies it.
