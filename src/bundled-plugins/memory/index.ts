@@ -213,6 +213,12 @@ async function renderVectorTurnMemory(
   logger?: { info: (msg: string) => void },
 ): Promise<string> {
   if (isInternalInfraTurn(event.origin)) return ''
+  // A runtime wakeup (subagent completion, review-state reminder) has no inbound
+  // text. There is nothing to retrieve for: an empty query embeds to a vector that
+  // scores every topic alike, so the slug tie-break injected the same first-N
+  // headings on every wakeup. The human turn that started the work already
+  // carried its own memory, and `memory_search` stays available.
+  if (event.userPrompt.trim() === '') return ''
   const plan = await loadMemoryInjectionPlan(event.agentDir, { injectionBudgetBytes })
   const isChannel = event.origin?.kind === 'channel'
   if (plan.mode === 'direct' && isChannel) {

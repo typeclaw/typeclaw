@@ -41,6 +41,32 @@ afterEach(async () => {
 })
 
 describe('vector session.turn.start hook', () => {
+  // A runtime wakeup (subagent completion, review-state reminder) carries no
+  // inbound text, so the turn prompt is blank. Embedding an empty string scores
+  // every topic alike and the slug tie-break injected the same first-N headings
+  // on every such turn.
+  test.each([
+    ['a non-channel turn', undefined],
+    [
+      'a channel turn',
+      { kind: 'channel' as const, adapter: 'slack-bot' as const, workspace: 'w1', chat: 'c1', thread: null },
+    ],
+  ])('a blank prompt on %s injects no memory and skips search', async (_label, origin) => {
+    hybridSearchMock.mockClear()
+    await writeTopic(agentDir, 'first-topic', 'First Topic', 'first body')
+    await writeTopic(agentDir, 'second-topic', 'Second Topic', 'second body')
+    const exports = await bootVectorPlugin(16384)
+    const retrievalContext = { results: '' }
+
+    await exports.hooks!['session.turn.start']!(
+      { sessionId: 'ses_wakeup', agentDir, userPrompt: '  \n ', origin, retrievalContext },
+      { agentDir, pluginName: 'memory', logger: createPluginLogger('memory') },
+    )
+
+    expect(retrievalContext.results).toBe('')
+    expect(hybridSearchMock).not.toHaveBeenCalled()
+  })
+
   test('an undefined origin receives automatic retrieval without a permission gate', async () => {
     hybridSearchMock.mockClear()
     await writeTopic(agentDir, 'private-topic', 'Private Topic', 'private body')
