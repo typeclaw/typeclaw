@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { AfterToolCallContext, AfterToolCallResult, StreamFn } from '@earendil-works/pi-agent-core'
-import { normalizeContext, Type, type AssistantMessage } from '@earendil-works/pi-ai'
+import { normalizeContext, type AssistantMessage } from '@earendil-works/pi-ai'
 import { SessionManager, type ExtensionToolContext, type SessionEntry } from '@earendil-works/pi-coding-agent'
+import { Type } from 'typebox'
 
 import { createSessionWithDispose, type AgentSession } from '../agent'
 import { createChannelSendTool, type ChannelSendOrigin } from '../agent/tools/channel-send'
