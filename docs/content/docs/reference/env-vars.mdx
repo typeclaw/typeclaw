@@ -65,6 +65,7 @@ These env vars override a stored API-key credential in `secrets.json` (env-wins)
 | `MOONSHOT_CODING_API_KEY` | `moonshot-coding` | Kimi Code subscription — separate billing surface from `moonshot`.                                       |
 | `OPENGATEWAY_API_KEY`     | `opengateway`     | OpenGateway multi-vendor gateway. One key reaches every upstream it fronts.                              |
 | `INCEPTION_API_KEY`       | `inception`       | Inception (Mercury) pay-as-you-go.                                                                       |
+| `EXAONE_API_KEY`          | `exaone`          | LG EXAONE API Platform.                                                                                  |
 | (others)                  |                   | Each known provider has a canonical env var; see [/reference/secrets-json](/docs/reference/secrets-json) |
 
 Custom env-var names are supported via the `Secret`'s `env` field — `{ "key": { "env": "MY_OPENAI" } }`. See [/concepts/secrets-policy](/docs/concepts/secrets-policy) for resolution order.

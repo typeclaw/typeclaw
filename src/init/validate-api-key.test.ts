@@ -339,7 +339,8 @@ describe('drift guard', () => {
     const probes = new Set(providersWithApiKeyProbe())
     // Inception serves /v1/models publicly and has no authenticated GET, so a
     // probe would accept any string.
-    const noAuthenticatedProbe = new Set<KnownProviderId>(['inception'])
+    // EXAONE documents no models endpoint to probe.
+    const noAuthenticatedProbe = new Set<KnownProviderId>(['inception', 'exaone'])
     const apiKeyProviders = (Object.keys(KNOWN_PROVIDERS) as KnownProviderId[]).filter(
       (id) => supportsApiKey(KNOWN_PROVIDERS[id]) && !noAuthenticatedProbe.has(id),
     )

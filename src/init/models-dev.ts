@@ -56,6 +56,8 @@ const PROVIDER_TO_MODELS_DEV: Record<KnownProviderId, string | null> = {
   // are retired for new users or don't serve chat. Surface the curated
   // Mercury 3 record alone.
   inception: null,
+  // models.dev has no EXAONE catalog. Surface the curated K-EXAONE 2.5 record.
+  exaone: null,
 }
 
 function upstreamProviderFor(
