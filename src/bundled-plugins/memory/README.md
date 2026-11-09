@@ -67,6 +67,10 @@ Each stripped topic is injected with its `slug:` line so the agent can re-fetch 
 
 The system prompt never contains long-term memory, so a session cannot double-carry memory in both the system prompt and the user turn.
 
+### Blank-prompt turns skip retrieval
+
+A runtime wakeup (a subagent completion or review-state reminder in a channel) has no inbound text, so its `userPrompt` is blank. An empty query embeds to a vector that scores every topic alike, and the slug tie-break used to inject the same first ten headings on every such turn. A blank prompt now injects nothing; the human turn that started the work already carried its own memory, and `memory_search` stays available.
+
 ### Internal-infrastructure turns skip retrieval
 
 The `session.turn.start` per-turn injection runs for user-delegated subagents (researcher, reviewer) but is skipped entirely for **TypeClaw-owned infrastructure turns**. Their `userPrompt` is a fixed instruction block (`buildInitialPrompt`), not a user message — feeding it into `hybridSearch` keyword-mines the subagent's own framing prose ("Read the transcript past the watermark…"), retrieves nothing useful, and embeds a ~560-token query that trips the 512-token bound warning on every spawn. None of these subagents consume injected long-term memory the way a conversational turn does, so retrieval there is pure waste.
