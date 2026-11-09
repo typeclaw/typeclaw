@@ -27,9 +27,10 @@ typeclaw provider add moonshot --key sk-...     # Moonshot (Kimi) Open Platform 
 typeclaw provider add moonshot-coding --key ... # Moonshot Kimi Code subscription
 typeclaw provider add opengateway --key ...     # OpenGateway — one key, many vendors
 typeclaw provider add inception --key ...       # Inception (Mercury 3) pay-as-you-go
+typeclaw provider add exaone --key ...          # LG EXAONE (K-EXAONE 2.5)
 ```
 
-The supported providers are `openai`, `openai-codex`, `anthropic`, `fireworks`, `zai`, `zai-coding`, `xai`, `minimax`, `deepseek`, `upstage`, `moonshot`, `moonshot-coding`, `opengateway`, and `inception`. The key (or browser login) is stored in `secrets.json`, git-ignored like the rest of your credentials.
+The supported providers are `openai`, `openai-codex`, `anthropic`, `fireworks`, `zai`, `zai-coding`, `xai`, `minimax`, `deepseek`, `upstage`, `moonshot`, `moonshot-coding`, `opengateway`, `inception`, and `exaone`. The key (or browser login) is stored in `secrets.json`, git-ignored like the rest of your credentials.
 
 <Callout type="info" title="OpenGateway: one key, many vendors">
   `opengateway` is a **gateway**, not a lab: a single OpenAI-compatible endpoint that routes to OpenAI, Anthropic,
