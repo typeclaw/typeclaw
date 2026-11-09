@@ -116,3 +116,15 @@ describe('checkSystemPromptLeakGuard', () => {
     expect(GUARD_SYSTEM_PROMPT_LEAK).toBe('systemPromptLeak')
   })
 })
+
+describe('system-prompt-leak on bot CLI sends', () => {
+  test('blocks system-prompt fingerprints in a bot CLI send', () => {
+    const command = "agent-webexbot message send room 'You are a general-purpose AI agent running inside TypeClaw.'"
+    expect(checkSystemPromptLeakGuard({ tool: 'bash', args: { command } })?.reason).toContain(GUARD_SYSTEM_PROMPT_LEAK)
+  })
+
+  test('does not scan bash that is not a bot CLI send', () => {
+    const command = "grep 'You are a general-purpose AI agent running inside TypeClaw.' notes.md"
+    expect(checkSystemPromptLeakGuard({ tool: 'bash', args: { command } })).toBeUndefined()
+  })
+})

@@ -27,13 +27,8 @@ export async function fillSecretIntoFocusedField(options: FillSecretOptions): Pr
   try {
     const target = await pickTarget(cdp, options.url)
     if ('reason' in target) return { status: 'refused', reason: target.reason }
-    const { sessionId } = (await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true })) as {
-      sessionId: string
-    }
-    // Background tabs (omowright opens them) report no focus; emulate it so
-    // keyboard input reaches the focused element without stealing the window.
-    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId)
-    const focused = await inspectFocus(cdp, sessionId)
+    const sessionId = target.sessionId ?? (await attachWithFocus(cdp, target.targetId))
+    const focused = target.focus ?? (await inspectFocus(cdp, sessionId))
     if (focused.kind === 'none') {
       return {
         status: 'refused',
@@ -99,18 +94,43 @@ export async function fillSecretIntoFocusedField(options: FillSecretOptions): Pr
 
 type TargetInfo = { targetId: string; type: string; url: string }
 
-async function pickTarget(
-  cdp: CdpConnection,
-  url: string | undefined,
-): Promise<{ targetId: string; url: string } | { reason: string }> {
+type PickedTarget = { targetId: string; url: string; sessionId?: string; focus?: FocusInfo & { kind: 'editable' } }
+
+async function pickTarget(cdp: CdpConnection, url: string | undefined): Promise<PickedTarget | { reason: string }> {
   const { targetInfos } = (await cdp.send('Target.getTargets')) as { targetInfos: TargetInfo[] }
   const pages = targetInfos.filter((t) => t.type === 'page' && !/^(devtools|chrome|chrome-extension):/.test(t.url))
-  const matches = url === undefined ? pages : pages.filter((t) => t.url === url || t.url.startsWith(url))
+  const prefixed = url === undefined ? pages : pages.filter((t) => t.url === url || t.url.startsWith(url))
+  // An exact URL names one tab even when it is also a prefix of its siblings'
+  // URLs (`/` vs `/login`).
+  const exact = url === undefined ? [] : prefixed.filter((t) => t.url === url)
+  const matches = exact.length > 0 ? exact : prefixed
   if (matches.length === 1) return matches[0]!
   if (matches.length === 0) {
     return { reason: url === undefined ? 'the shared browser has no open tab' : `no open tab matches ${url}` }
   }
-  return { reason: `several tabs match; pass \`url\` to pick one of: ${matches.map((t) => t.url).join(', ')}` }
+  // Duplicate tabs of one site are common after a retry opens a fresh tab, and
+  // no URL can tell them apart. The secret goes into the focused field, so the
+  // one tab whose focus sits in an editable field is the one just clicked.
+  const focused: PickedTarget[] = []
+  for (const t of matches) {
+    const sessionId = await attachWithFocus(cdp, t.targetId)
+    const focus = await inspectFocus(cdp, sessionId)
+    if (focus.kind === 'editable') focused.push({ targetId: t.targetId, url: t.url, sessionId, focus })
+  }
+  if (focused.length === 1) return focused[0]!
+  return {
+    reason: `several tabs match and ${focused.length === 0 ? 'none has' : 'more than one has'} a focused editable field; click the field first, or close the duplicate tabs, or pass the exact \`url\` of one of: ${matches.map((t) => t.url).join(', ')}`,
+  }
+}
+
+async function attachWithFocus(cdp: CdpConnection, targetId: string): Promise<string> {
+  const { sessionId } = (await cdp.send('Target.attachToTarget', { targetId, flatten: true })) as {
+    sessionId: string
+  }
+  // Background tabs (omowright opens them) report no focus; emulate it so
+  // keyboard input reaches the focused element without stealing the window.
+  await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId)
+  return sessionId
 }
 
 type FocusInfo = { kind: 'editable'; field: string; objectId?: string } | { kind: 'none'; field?: string }

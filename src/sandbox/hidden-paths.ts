@@ -63,7 +63,7 @@ export function canWriteAgentRootInSandbox(permissions: PermissionService, origi
   return canSeePrivateSurface(permissions, origin) && seesSecrets
 }
 
-function canSeePrivateSurface(permissions: PermissionService, origin: SessionOrigin | undefined): boolean {
+export function canSeePrivateSurface(permissions: PermissionService, origin: SessionOrigin | undefined): boolean {
   return (
     permissions.has(origin, CORE_PERMISSIONS.fsSeePrivate) ||
     permissions.has(origin, 'security.bypass.low') ||

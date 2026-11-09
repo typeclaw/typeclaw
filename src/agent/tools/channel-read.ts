@@ -8,11 +8,23 @@ import type { ChannelKey, ChannelListEntry } from '@/channels/types'
 import { renderHistoryMessage, renderHistoryMessages } from './channel-history-render'
 import { type ChannelToolLogger, consoleChannelLogger, formatChannelToolFailure } from './channel-log'
 
+// `chat` is absent for mode "list", which enumerates the whole workspace and
+// so never counts as the speaker's own conversation.
+export type ChannelReadTarget = { adapter: AdapterId; workspace: string; chat?: string; thread?: string }
+
 export type CreateChannelReadToolOptions = {
   router: ChannelRouter
   logger?: ChannelToolLogger
   sessionId?: string
+  // Decides per call whether the current speaker may read `target`. Absent
+  // means no gate (composition tests without a permission service).
+  canRead?: (target: ChannelReadTarget) => boolean
 }
+
+const READ_DENIED =
+  "reading a conversation other than the current one requires the `fs.see.private` permission, which the current speaker's role does not have. " +
+  'Hand the request to its owning session with channel_session_search and channel_handoff instead. ' +
+  'An operator can grant the permission through `roles` in typeclaw.json.'
 
 const DEFAULT_LIMIT = 20
 
@@ -27,6 +39,7 @@ export function createChannelReadTool({
   router,
   logger = consoleChannelLogger,
   sessionId,
+  canRead,
 }: CreateChannelReadToolOptions) {
   return defineTool({
     name: 'channel_read',
@@ -38,9 +51,11 @@ export function createChannelReadTool({
       '- "message": fetch ONE message from `chat` by `message_id`. Use for "what do you think of <message id>".\n' +
       '- "list": discover channels/chats in `workspace` (no `chat` needed). Use when you do not yet know a chat id.\n' +
       'For Discord guild channels, `workspace` is the guild id; for Slack team channels, `workspace` is the team id (e.g. "T0ACME"); for DMs, "@dm". ' +
+      'For KakaoTalk, `workspace` is "@kakao-dm", "@kakao-group", or "@kakao-open" (open chats). ' +
       'On failure returns { ok: false, error }. Not every adapter supports every mode — an unsupported mode returns a not-supported error rather than throwing. ' +
-      'This is read-only. When work belongs to another conversation, use channel_session_search and channel_handoff ' +
-      'instead of reading or posting there directly. An access error may include an authorized handoff target.',
+      'This is read-only. Reading a conversation other than the current one (including mode "list") requires the ' +
+      'speaker to hold `fs.see.private`; when it is denied, use channel_session_search and channel_handoff instead. ' +
+      'An access error may include an authorized handoff target.',
     parameters: Type.Object({
       mode: Type.Union([Type.Literal('history'), Type.Literal('message'), Type.Literal('list')], {
         description:
@@ -87,6 +102,23 @@ export function createChannelReadTool({
     async execute(_toolCallId, params) {
       const adapter = params.adapter
       const limit = params.limit ?? DEFAULT_LIMIT
+      if (
+        canRead !== undefined &&
+        !canRead({
+          adapter,
+          workspace: params.workspace,
+          ...(params.mode !== 'list' && params.chat !== undefined ? { chat: params.chat } : {}),
+          ...(params.mode !== 'list' && params.thread !== undefined ? { thread: params.thread } : {}),
+        })
+      ) {
+        logger.warn(
+          formatChannelToolFailure(
+            'channel_read',
+            `${adapter}:${params.workspace}/${params.chat ?? '*'}: denied, speaker lacks fs.see.private`,
+          ),
+        )
+        return fail(READ_DENIED)
+      }
 
       let result: { content: { type: 'text'; text: string }[]; details: Details }
       switch (params.mode) {
@@ -159,6 +191,7 @@ async function readHistory(args: {
     return fail('mode "history" requires `chat`.')
   }
   const result = await router.fetchHistory(adapter, {
+    workspace: params.workspace,
     chat: params.chat,
     thread: params.thread ?? null,
     limit,

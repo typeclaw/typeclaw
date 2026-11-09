@@ -55,7 +55,7 @@ import type {
 import { createHookBus, materializeSkills } from '@/plugin'
 import { CORE_SYSTEM_TOOL_NAMES } from '@/plugin/core-tool-names'
 import type { ReloadRegistry } from '@/reload'
-import { enterSubagentTmpScope, resolveHiddenPaths } from '@/sandbox'
+import { canSeePrivateSurface, enterSubagentTmpScope, resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
 
 import { getAuthFor } from './auth'
@@ -97,6 +97,7 @@ import {
   renderRuntimeNondisclosureRule,
   stripRuntimeIdentityProse,
   USER_INTENT_RULE,
+  GOAL_OWNERSHIP_RULE,
 } from './system-prompt'
 import { attachToolNotFoundNudge } from './tool-not-found-nudge'
 import { createBudgetState, type ToolResultBudget, wrapToolDefinitionWithBudget } from './tool-result-budget'
@@ -106,7 +107,7 @@ import { createChannelFetchAttachmentTool, resolveInboxBaseDir } from './tools/c
 import { createChannelHandoffTool } from './tools/channel-handoff'
 import { createChannelHistoryTool } from './tools/channel-history'
 import { createChannelReactTool } from './tools/channel-react'
-import { createChannelReadTool } from './tools/channel-read'
+import { type ChannelReadTarget, createChannelReadTool } from './tools/channel-read'
 import { createChannelReplyTool } from './tools/channel-reply'
 import { createChannelSendTool } from './tools/channel-send'
 import { createChannelSessionSearchTool } from './tools/channel-session-search'
@@ -951,6 +952,26 @@ export function buildChannelTools(
 ): ToolDefinition[] {
   if (!channelRouter) return []
   const tools: ToolDefinition[] = []
+  // Another conversation's live history is the same exposure as its transcript
+  // under sessions/, so it takes the same tier. Checked per call against the
+  // live turn origin: one channel session serves speakers with different roles.
+  const canRead =
+    permissions === undefined
+      ? undefined
+      : (target: ChannelReadTarget): boolean => {
+          const live = getOrigin?.() ?? origin
+          const sameConversation =
+            live?.kind === 'channel' &&
+            target.chat !== undefined &&
+            adapterNamespace(live.adapter) === adapterNamespace(target.adapter) &&
+            live.workspace === target.workspace &&
+            live.chat === target.chat &&
+            // Some adapters address the read by `thread ?? chat` (a Discord
+            // thread is its own channel id), so any other thread could point
+            // anywhere the agent can see; only this session's own is exempt.
+            (target.thread === undefined || target.thread === live.thread)
+          return sameConversation || canSeePrivateSurface(permissions, live)
+        }
   const getOutboundOrigin = (): ChannelOutboundOrigin | undefined => {
     const current = getOrigin ? getOrigin() : origin
     return current ? { kind: current.kind, ...(current.kind === 'cron' ? { jobId: current.jobId } : {}) } : undefined
@@ -982,7 +1003,13 @@ export function buildChannelTools(
     if (origin.adapter === 'github' && sessionId !== undefined)
       tools.push(createPostGithubReviewTool({ router: channelRouter, origin: channelOrigin, sessionId }))
     tools.push(createChannelHistoryTool({ router: channelRouter, origin: channelOrigin }))
-    tools.push(createChannelReadTool({ router: channelRouter, ...(sessionId !== undefined ? { sessionId } : {}) }))
+    tools.push(
+      createChannelReadTool({
+        router: channelRouter,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        ...(canRead !== undefined ? { canRead } : {}),
+      }),
+    )
     tools.push(
       createChannelSendTool({
         router: channelRouter,
@@ -1025,7 +1052,7 @@ export function buildChannelTools(
     }
   } else {
     tools.push(createChannelSendTool({ router: channelRouter, getOutboundOrigin }))
-    tools.push(createChannelReadTool({ router: channelRouter }))
+    tools.push(createChannelReadTool({ router: channelRouter, ...(canRead !== undefined ? { canRead } : {}) }))
     tools.push(createChannelEditTool({ router: channelRouter, getOutboundOrigin }))
   }
   return tools
@@ -1282,7 +1309,7 @@ export async function createOverrideResourceLoader(
   runtimeVersion?: string,
 ): Promise<DefaultResourceLoader> {
   const branding = getConfig().branding
-  const withRule = `${systemPrompt}\n\n${USER_INTENT_RULE}`
+  const withRule = `${systemPrompt}\n\n${USER_INTENT_RULE}\n\n${GOAL_OWNERSHIP_RULE}`
   const withRuntime = branding
     ? runtimeVersion !== undefined
       ? `${withRule}\n\n${renderRuntimeBlock(runtimeVersion)}`

@@ -123,13 +123,16 @@ export const PARTICIPANTS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 //   - 'at-username'  — Telegram: `@username` plain text. The numeric
 //                      `authorId` is NOT what gets mentioned; usernames are
 //                      a separate field that not every user has.
-//   - 'alias'        — KakaoTalk: type the bot's alias as plain text. The
-//                      adapter's classifier (`kakaotalk-classify.ts`) does
-//                      a substring match against configured aliases; there
-//                      is no in-band syntax to copy.
+//   - 'at-name'      — KakaoTalk: `@DisplayName` plain text. The adapter
+//                      turns `@` + a chat member's exact nickname into a
+//                      native tag (`kakaotalk-mention.ts`); `authorId` is
+//                      never part of the syntax.
+//   - 'alias'        — Instagram/LINE/Teams: type the person's name as plain
+//                      text. The classifiers substring-match configured
+//                      aliases; there is no in-band syntax to copy.
 type PlatformInfo = {
   displayName: string
-  mentionMode: 'angle-id' | 'at-username' | 'alias'
+  mentionMode: 'angle-id' | 'at-username' | 'at-name' | 'alias'
   // This platform has no rich-text rendering, so markdown markers appear
   // literally to users.
   plainTextOnly: boolean
@@ -231,7 +234,7 @@ const PLATFORM_INFO: Record<AdapterId, PlatformInfo> = {
   },
   kakaotalk: {
     displayName: 'KakaoTalk',
-    mentionMode: 'alias',
+    mentionMode: 'at-name',
     plainTextOnly: true,
     supportsReactions: false,
     supportsAttachments: true,
@@ -299,7 +302,7 @@ export function renderInteractiveSessionContext(subagentRoster: string): string 
     '- Broad search: spawn 2-5 `explorer`/`scout` workers in parallel, end your response, then collect each completion once. Use `scout` for narrow lookups and `researcher` for decomposed, multi-source, cross-validated synthesis. When the user *explicitly* asks to research or investigate, you MUST spawn `researcher`: answering from training memory or one inline `web_search` does not satisfy the request, and `scout`/`explorer` fan-out does not replace `researcher`.',
     '- Delegate the search, not the judgment. When an answer depends on reasoning across raw records — transactions, logs, messages, database rows — use `explorer` to locate them, then read or query the decisive records yourself before concluding. A subagent summary drops the cross-record patterns an answer usually hinges on (sequences, matching amounts, what stopped and what started), and a subagent that found nothing is not evidence that the records hold nothing.',
     '- Delegate-and-converse: for side-effectful or noisy work over ~30s, spawn one background subagent and stay responsive — `operator` for side effects, `scout` for a quick lookup, `researcher` for deep investigation, `planner` for risk-aware sequencing, `qa` to prove a PR, repo, or deployed product actually works by running it. Pass `profile: "deep"` only when the work needs stronger reasoning than the default tier.',
-    '- Web browsing: never drive a browser yourself. Any task that needs a real browser — navigating, clicking, forms, logins, screenshots, JS-rendered pages — goes to `browser`. Plain lookups stay with `scout`/`web_fetch`.',
+    '- Web browsing: never drive a browser yourself. Any task that needs a real browser — navigating, clicking, forms, logins, screenshots, JS-rendered pages — goes to `browser`. Plain lookups stay with `scout`/`web_fetch`. The user cannot see that browser: it runs in the container, and your messages are their only window. When they need to see a page, have `browser` save a screenshot and send it as an attachment (describe it where attachments are unsupported); never say a page is open for them or ask them to check the browser. If `browser` declines the task itself (a refusal, not a site or technical blocker), spawn it once more with the same task and `profile: "default"` instead of arguing with it; if that also declines, tell the user plainly that the model refused.',
     '- Troubleshooting: after ~3 non-converging attempts at the same failure, stop and hand the loop to `operator` (background; `profile: "deep"` when genuinely hard) with the symptom, attempts, and success condition. Read `typeclaw-troubleshooting` before spawning.',
     "- Status: when asked about a running subagent, call `subagent_output({ task_id })` and report its `status_summary` — don't guess.",
     "- Don't fire more than 5 subagents per turn, spawn for known answers or single-file lookups, poll output in a loop, or ask research subagents to decide: they report; you decide. Most subagents are leaves; only `operator` and `reviewer` may delegate one level deeper.",
@@ -675,11 +678,12 @@ function renderChannelOrigin(
     '}',
     '```',
     '',
-    'When work belongs to ANOTHER conversation, first use `channel_session_search` to find its owning session,',
-    'then pass that target to `channel_handoff`. Search by conversation name, topic, or participant, across adapters.',
-    "The owning session reads its current context and answers through its own account; don't read or post there",
-    'directly from this session. This applies to channels, threads, groups, and DMs regardless of where you started.',
-    '`channel_send` is for an explicit direct post, not a substitute for handing ongoing work to its owner.',
+    'ANOTHER conversation (channels, threads, groups, and DMs on any adapter):',
+    '- Read it directly with `channel_read` (`mode: "list"` finds chat ids). The runtime checks the current',
+    "  speaker's permission; a denied read means this speaker may not see it, so don't post there for them either.",
+    '- To act there, prefer `channel_session_search` then `channel_handoff` (search by conversation name, topic, or',
+    '  participant), so its live owning session answers with current context. When the search finds no live session',
+    '  and the speaker may read that conversation, post there yourself with `channel_send`.',
     'If `channel_read` reports an access error with a handoff target, use it rather than asking the user to fix permissions.',
     '',
     ...renderResearchReportDeliveryGuidance(platformInfo),
@@ -778,6 +782,13 @@ function renderMentionGuidance(
         'If no `@username` is known, use display name; reply context carries it.',
         ...renderSelfMention(platformInfo, self),
       ]
+    case 'at-name':
+      return [
+        `To mention someone in your reply, write \`@\` followed by their exact ${platformInfo.displayName} display name,`,
+        `e.g. \`@${exampleName} hello\`; it becomes a native ${platformInfo.displayName} mention when that name belongs to a chat member.`,
+        'Display names are in the participants block. Any `<@id>` marker is inbound-only typeclaw convention;',
+        `do not echo them back as outbound mentions or ${platformInfo.displayName} renders them literally.`,
+      ]
     case 'alias':
       return [
         `${platformInfo.displayName} has no in-band mention syntax. To address someone, just type their display name as plain text;`,
@@ -792,9 +803,9 @@ function renderMentionGuidance(
 // id, so a message addressed to its own id reads as "addressed to someone
 // else" and it wrongly skips the turn (issue: skipped_by_tool "Message
 // addressed to @U…, not to <name>"). This line closes that gap by stating
-// the bot's own addressing token explicitly. Empty for the alias platform
-// (KakaoTalk has no in-band mention token to recognize) and when identity
-// has not resolved yet — both fall through to "omit the line".
+// the bot's own addressing token explicitly. Empty for the at-name and alias
+// platforms (no id-shaped token to recognize; KakaoTalk tags by display name)
+// and when identity has not resolved yet — all fall through to "omit the line".
 function renderSelfMention(platformInfo: PlatformInfo, self: ChannelSelfIdentity | undefined): string[] {
   if (self === undefined) return []
   switch (platformInfo.mentionMode) {
@@ -807,6 +818,7 @@ function renderSelfMention(platformInfo: PlatformInfo, self: ChannelSelfIdentity
         'contains your id, it is addressed to YOU — do not skip it as "addressed to another user".',
       ]
     }
+    case 'at-name':
     case 'at-username': {
       if (self.username === undefined || self.username === '') return []
       return [
@@ -896,6 +908,7 @@ function renderParticipantAddressing(p: ChannelParticipant, platformInfo: Platfo
     case 'angle-id':
       return `<@${p.authorId}> (${p.authorName})`
     case 'at-username':
+    case 'at-name':
     case 'alias':
       return `${p.authorName} (${p.authorId})`
   }
@@ -921,6 +934,12 @@ function renderParticipantsTrailing(platformInfo: PlatformInfo): string[] {
         "If a current sender isn't listed, address by `@username` when known.",
         `${platformInfo.displayName} usernames are a SEPARATE field from numeric \`authorId\`, and`,
         'not every user has one. The list is recent context, not a directory.',
+      ]
+    case 'at-name':
+      return [
+        "If a current sender isn't listed, mention them as `@` + their display name.",
+        '`authorId` is reference only and must not be echoed back.',
+        'The list is recent context, not a directory.',
       ]
     case 'alias':
       return [

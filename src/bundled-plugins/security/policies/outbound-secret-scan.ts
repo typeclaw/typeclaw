@@ -1,5 +1,6 @@
 import type { SecuritySeverity } from '../permissions'
 import type { SecurityBlock } from '../policy'
+import { outboundTexts } from './outbound-text'
 
 export const GUARD_OUTBOUND_SECRET = 'outboundSecret'
 // Classified `high` (audience-leak axis): bypass posts credential-shaped
@@ -60,6 +61,7 @@ const PROCESS_ENV_TARGETS: ReadonlyArray<string> = [
   'MOONSHOT_API_KEY',
   'MOONSHOT_CODING_API_KEY',
   'INCEPTION_API_KEY',
+  'EXAONE_API_KEY',
   'GOOGLE_API_KEY',
   'GEMINI_API_KEY',
   'AWS_ACCESS_KEY_ID',
@@ -94,8 +96,6 @@ const ENV_KEY_RECON_THRESHOLD = 3
 const ENV_KEY_RECON_MATCHERS: ReadonlyArray<readonly [name: string, pattern: RegExp]> = ENV_KEY_RECON_TARGETS.map(
   (name) => [name, new RegExp(`\\b${name}\\b`)] as const,
 )
-
-const TEXT_KEYS = ['text', 'message', 'content', 'body']
 
 export type OutboundSecretMatch = {
   kind: string
@@ -156,11 +156,8 @@ export function checkOutboundSecretGuard(options: {
   env?: NodeJS.ProcessEnv
 }): SecurityBlock | undefined {
   const { tool, args } = options
-  if (tool !== 'channel_send' && tool !== 'channel_reply') return undefined
   const env = options.env ?? process.env
-  for (const key of TEXT_KEYS) {
-    const value = args[key]
-    if (typeof value !== 'string' || value.length === 0) continue
+  for (const value of outboundTexts(tool, args)) {
     const matches = findOutboundSecrets(value, env)
     if (matches.length === 0) continue
 

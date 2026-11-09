@@ -148,6 +148,48 @@ describe('classifyInbound', () => {
     expect(verdict.payload.isBotMention).toBe(true)
   })
 
+  test('a native @-tag of the bot sets isBotMention without any alias configured', () => {
+    const verdict = classifyInbound(
+      event({ message: '@타입이 오늘 일정 알려줘', mentions: [{ user_id: '999', at: [1], len: 3 }] }),
+      groupConfig(),
+      { selfUserId: '999', lookupChat: groupLookup },
+    )
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') return
+    expect(verdict.payload.isBotMention).toBe(true)
+    expect(verdict.payload.mentionsOthers).toBe(false)
+  })
+
+  test('a native @-tag of someone else marks mentionsOthers and not isBotMention', () => {
+    const verdict = classifyInbound(
+      event({ message: '@Alice can you check?', mentions: [{ user_id: '333', at: [1], len: 5 }] }),
+      groupConfig(),
+      { selfUserId: '999', lookupChat: groupLookup },
+    )
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') return
+    expect(verdict.payload.isBotMention).toBe(false)
+    expect(verdict.payload.mentionsOthers).toBe(true)
+  })
+
+  test('tagging the bot together with someone else is a bot mention, not mentionsOthers', () => {
+    const verdict = classifyInbound(
+      event({
+        message: '@Alice @타입이 둘 다 봐줘',
+        mentions: [
+          { user_id: '333', at: [1], len: 5 },
+          { user_id: '999', at: [2], len: 3 },
+        ],
+      }),
+      groupConfig(),
+      { selfUserId: '999', lookupChat: groupLookup },
+    )
+    expect(verdict.kind).toBe('route')
+    if (verdict.kind !== 'route') return
+    expect(verdict.payload.isBotMention).toBe(true)
+    expect(verdict.payload.mentionsOthers).toBe(false)
+  })
+
   test('threads structured attachments from context into the routed payload', () => {
     const attachments = [{ id: 1, kind: 'photo' as const, ref: 'https://example.com/p.jpg', mimetype: 'image/jpeg' }]
     const verdict = classifyInbound(event({ message: '[KakaoTalk attachment #1: photo image/jpeg]' }), dmConfig(), {

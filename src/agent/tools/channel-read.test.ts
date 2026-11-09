@@ -58,7 +58,7 @@ describe('createChannelReadTool — mode: history', () => {
     await runTool(tool, { mode: 'history', adapter: 'slack-bot', workspace: 'T0', chat: 'C9', thread: 'th1', limit: 5 })
 
     // then
-    expect(seen).toEqual([{ chat: 'C9', thread: 'th1', limit: 5 }])
+    expect(seen).toEqual([{ workspace: 'T0', chat: 'C9', thread: 'th1', limit: 5 }])
   })
 
   test('renders messages oldest-first with a BOT marker for the agent own replies', async () => {

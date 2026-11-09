@@ -13941,7 +13941,7 @@ describe('ChannelRouter cold-start prefetch', () => {
     await router.route(inbound({ thread: 't-A', externalMessageId: 'engage', text: 'hi' }))
     await router.__testing!.flushDebounce(THREAD_KEY)
 
-    expect(captured).toEqual([{ chat: 'c1', thread: 't-A', limit: 8, prefetch: true }])
+    expect(captured).toEqual([{ workspace: 'g1', chat: 'c1', thread: 't-A', limit: 8, prefetch: true }])
   })
 })
 

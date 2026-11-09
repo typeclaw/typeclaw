@@ -5,7 +5,7 @@ description: Playwright-shaped browser automation library (OmOWright) for the sh
 
 # omowright
 
-OmOWright is a JavaScript library with the Playwright API shape (`page.goto`, `page.locator(ref).click()`, `page.mouse.wheel`, `page.keyboard.type`, `page.screenshot`). Write a short Bun script and run it with `bun`. Each script connects to the shared browser, so state survives between scripts.
+OmOWright is a JavaScript library with the Playwright API shape (`page.goto`, `page.locator(ref).click()`, `page.mouse.wheel`, `page.keyboard.type`, `page.screenshot`). Write a short Bun script and run it with `bun`. Each script connects to the shared browser, so tabs, logins, and cookies survive between scripts. Snapshot refs do not.
 
 `$OMOWRIGHT_CDP_URL` holds the connection URL. If the variable is unset, this session's role cannot use the shared browser (it needs the `browser.shared` permission) or the browser failed to start; the operator log (`typeclaw logs`) names which. Do not try to start Chrome yourself.
 
@@ -17,7 +17,9 @@ const url = process.env.OMOWRIGHT_CDP_URL
 // The relay requires the token on every request; omowright drops the URL query
 // for HTTP discovery (listTargets), so pass it as an Authorization header too.
 const token = new URL(url).searchParams.get('token')
-const browser = await connect(url, {
+// `await using` closes this script's connection when the script ends, so the
+// script exits on its own; the tab and the browser keep running.
+await using browser = await connect(url, {
   client: { authorizer: { resolveAuthorization: async () => `Bearer ${token}` } },
 })
 const tabs = createAgentTabs(browser) // background tabs that never steal focus
@@ -25,10 +27,17 @@ const { targetId, page } = await tabs.create('https://example.com')
 console.log(targetId) // keep it: later scripts reattach with browser.attachPage(targetId)
 console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
-process.exit(0) // leaves the tab and browser running
 ```
 
-A later script continues in the same tab with `const page = await browser.attachPage(targetId)`; take a fresh `page.snapshot()` before using refs. `browser.listTargets()` lists open tabs when the id is lost.
+Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for the next script; a popup tab the script attached (from `window.open`) closes with the connection, so do work that must continue later in an agent tab.
+
+A "Command timed out" result after the script printed output means the script did not exit, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen.
+
+A later script continues in the same tab with `const page = await browser.attachPage(targetId)`. `browser.listTargets()` lists open tabs when the id is lost.
+
+Refs like `e14` belong to the script that took the snapshot. A new script has none, so `page.locator('e14')` from an earlier run always throws `RefStaleError`. In every script that acts on refs, call `page.snapshot()` first and use the refs from that snapshot in the same script. A page change (a click that navigates, a modal opening) also invalidates refs: snapshot again in the same script before the next ref action. When a ref stays stale, use a semantic locator instead, such as `page.getByRole('link', { name: '로그인' })` or `page.locator('#userId')`.
+
+Reuse your tab across retries with `attachPage` instead of opening another `tabs.create` for the same site, and close tabs you no longer need (`await page.close()`). Duplicate tabs of one site make it unclear which tab later steps (and `browser_fill_secret`) act on.
 
 - Prefer `compactSnapshot(await page.snapshot())` over screenshots; re-snapshots come back as a diff.
 - Long lists: `createNetworkSnoop` + `collectWhileScrolling` read the page's JSON instead of scraping rows.

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -44,9 +44,58 @@ describe.skipIf(process.platform === 'win32')('daemon claims across container re
   function leaveClaim(dir: string, host: string): string {
     const holder = join(dirname(agentSocketPath(dir, runtimeConfigRoot(dir))), 'daemon.holder')
     mkdirSync(dirname(holder), { recursive: true })
+    writeFileSync(
+      holder,
+      JSON.stringify({ host, name: 'gone-host', pid: 2_147_483_646, token: 'stale', at: new Date(0).toISOString() }),
+    )
+    return holder
+  }
+
+  function leaveLegacyClaim(dir: string, host: string): string {
+    const holder = leaveClaim(dir, host)
     writeFileSync(holder, JSON.stringify({ host, pid: 2_147_483_646, token: 'stale', at: new Date(0).toISOString() }))
     return holder
   }
+
+  test('a 0.3 claim left by a stopped container does not lock the upgraded agent out', async () => {
+    // given: the 0.3 daemon of a stopped container left a claim with no name
+    const dir = await enabledVault()
+    leaveLegacyClaim(dir, TYPEVAULT_HOST_ID)
+
+    // when: the upgraded CLI starts the agent
+    const result = await reconcileTypevault(dir, true)
+
+    // then: the credentials are still readable
+    expect(result).toEqual({ action: 'unchanged' })
+    expect(await readSecretsEntry(dir)).toBe(SECRETS)
+  }, 30_000)
+
+  test('a 0.3 claim under the container checkout is cleared from the host path', async () => {
+    // given: the stopped container's claim, keyed by /agent/.typevault rather than the host path
+    const dir = await enabledVault()
+    const holder = join(dirname(agentSocketPath('/agent', runtimeConfigRoot(dir))), 'daemon.holder')
+    mkdirSync(dirname(holder), { recursive: true })
+    writeFileSync(
+      holder,
+      JSON.stringify({ host: TYPEVAULT_HOST_ID, pid: 2_147_483_646, token: 'stale', at: new Date(0).toISOString() }),
+    )
+
+    // when: the host-stage CLI reconciles through the host path
+    await reconcileTypevault(dir, true)
+
+    // then: the claim that would refuse the upgraded container is gone
+    expect(existsSync(holder)).toBe(false)
+  }, 30_000)
+
+  test('a 0.3 claim from another machine is kept and still refuses the vault', async () => {
+    const dir = await enabledVault()
+    const holder = leaveLegacyClaim(dir, 'another-machine')
+
+    const result = await reconcileTypevault(dir, true)
+
+    expect(result.action).toBe('skipped')
+    expect(existsSync(holder)).toBe(true)
+  }, 30_000)
 
   test('a claim left by a previous container of this agent does not lock the next one out', async () => {
     // given: the daemon of a container that is gone left its claim behind

@@ -24,6 +24,7 @@ export {
   _resetRealProcProbeCacheForTests,
 } from './availability'
 export {
+  canSeePrivateSurface,
   canWriteAgentRootInSandbox,
   ensureHiddenMaskTargets,
   resolveHiddenPaths,

@@ -69,16 +69,18 @@ CLI: `typeclaw channel add kakaotalk` (interactive). **Do not use `channel set`*
 
 ## Capabilities
 
-| Feature                 | Supported | Notes                                                                                     |
-| ----------------------- | --------- | ----------------------------------------------------------------------------------------- |
-| Outbound messages       | yes       |                                                                                           |
-| Reactions               | no        |                                                                                           |
-| Typing indicator        | DM/group  | Animated "…" composing dots via the sub-device LOCO session; **not** OpenChat (see below) |
-| Channel-name resolution | yes       |                                                                                           |
-| Self identity           | no        |                                                                                           |
-| History                 | yes       | Limit 200 messages                                                                        |
-| Attachments             | yes       | Files sent before text; no combined text+file send in one call                            |
-| Membership              | no        |                                                                                           |
+| Feature                 | Supported | Notes                                                                                                  |
+| ----------------------- | --------- | ------------------------------------------------------------------------------------------------------ |
+| Outbound messages       | yes       |                                                                                                        |
+| Reactions               | no        |                                                                                                        |
+| Mentions                | yes       | A native `@` tag of the agent engages it; outbound `@DisplayName` tags a chat member by exact nickname |
+| Typing indicator        | DM/group  | Animated "…" composing dots via the sub-device LOCO session; **not** OpenChat (see below)              |
+| Channel-name resolution | yes       |                                                                                                        |
+| Self identity           | no        |                                                                                                        |
+| History                 | yes       | Limit 200 messages                                                                                     |
+| Chat list               | yes       | `channel_read` `list` mode, one workspace (`@kakao-dm`, `@kakao-group`, `@kakao-open`) at a time       |
+| Attachments             | yes       | Files sent before text; no combined text+file send in one call                                         |
+| Membership              | no        |                                                                                                        |
 
 ## Token renewal
 

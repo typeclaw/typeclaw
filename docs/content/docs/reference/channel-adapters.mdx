@@ -152,11 +152,11 @@ Not every adapter backs every mode. When an adapter hasn't registered a capabili
 | `github`       |    yes    |    no     |   no   |
 | `instagram`    |    yes    |    no     |   no   |
 | `line`         |    yes    |    no     |   no   |
-| `kakaotalk`    |    yes    |    no     |   no   |
+| `kakaotalk`    |    yes    |    no     |  yes   |
 | `teams`        |    yes    |    no     |   no   |
 | `telegram-bot` |  **no**   |    no     |   no   |
 
-Only the two first-class bot adapters (`slack-bot`, `discord-bot`) back the `message` and `list` modes. `telegram-bot` backs none — the Bot API has no server-side history read, so even `history` is unavailable there and the agent relies on its live context buffer instead.
+Only the two first-class bot adapters (`slack-bot`, `discord-bot`) back the `message` mode. `kakaotalk` also backs `list`, scoped to one of its three workspaces (`@kakao-dm`, `@kakao-group`, `@kakao-open`) so every returned chat id is addressable under the workspace it was listed in. `telegram-bot` backs none — the Bot API has no server-side history read, so even `history` is unavailable there and the agent relies on its live context buffer instead.
 
 ## Outbound delivery receipts
 

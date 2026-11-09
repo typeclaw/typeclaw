@@ -3494,6 +3494,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // emitting a misleading elision marker for a zero-length gap.
     const requested = head + tail + 1
     const result = await fetchHistory(live.key.adapter, {
+      workspace: live.key.workspace,
       chat: live.key.chat,
       thread: live.key.thread,
       ...(live.githubReviewRound !== null ? { githubReviewRound: live.githubReviewRound } : {}),
@@ -3533,6 +3534,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       if (tail === 0) return
       head = 0
       const channelResult = await fetchHistory(live.key.adapter, {
+        workspace: live.key.workspace,
         chat: live.key.chat,
         thread: null,
         limit: tail + 1,

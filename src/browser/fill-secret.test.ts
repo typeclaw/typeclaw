@@ -6,7 +6,8 @@ import { CLEAR_FIELD_FUNCTION, fillSecretIntoFocusedField } from './fill-secret'
 
 type Focus = { kind: string; field?: string }
 type FakeOptions = {
-  targets: { url: string }[]
+  // A target's own `focus` overrides the default for that tab.
+  targets: { url: string; focus?: Focus }[]
   focus: Focus
   // What makes the page navigate: a real Enter keystroke (script-driven logins
   // that cancel a direct form submit), only a direct form submit, or nothing.
@@ -54,9 +55,10 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[]; subm
         }
         const navigate = (): void => {
           handleAlive = false
-          ws.send(JSON.stringify({ method: 'Page.frameStartedLoading', sessionId: 'S', params: { frameId: 'main' } }))
-          ws.send(JSON.stringify({ method: 'Page.frameNavigated', sessionId: 'S', params: { frame: { id: 'main' } } }))
+          ws.send(JSON.stringify({ method: 'Page.frameStartedLoading', sessionId, params: { frameId: 'main' } }))
+          ws.send(JSON.stringify({ method: 'Page.frameNavigated', sessionId, params: { frame: { id: 'main' } } }))
         }
+        const focusOf = (): Focus => options.targets[Number(sessionId?.slice('S:t'.length))]?.focus ?? options.focus
         if (method === 'Page.enable' && options.failOn === 'Page.enable') return fail()
         switch (method) {
           case 'Target.getTargets':
@@ -64,7 +66,7 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[]; subm
               targetInfos: options.targets.map((t, i) => ({ targetId: `t${i}`, type: 'page', url: t.url })),
             })
           case 'Target.attachToTarget':
-            return reply({ sessionId: 'S' })
+            return reply({ sessionId: `S:${String(params['targetId'])}` })
           case 'Page.getFrameTree':
             return reply({ frameTree: { frame: { id: 'main' } } })
           case 'Input.dispatchKeyEvent':
@@ -76,9 +78,7 @@ function fakeChrome(options: FakeOptions): { cdpUrl: string; calls: Call[]; subm
             }
             return
           case 'Runtime.evaluate':
-            return reply(
-              params['returnByValue'] ? { result: { value: options.focus } } : { result: { objectId: 'el-1' } },
-            )
+            return reply(params['returnByValue'] ? { result: { value: focusOf() } } : { result: { objectId: 'el-1' } })
           case 'Runtime.callFunctionOn': {
             const fn = String(params['functionDeclaration'])
             if (!handleAlive) {
@@ -241,6 +241,59 @@ describe('fillSecretIntoFocusedField', () => {
     })
     expect(outcome).toMatchObject({ status: 'filled', url: 'https://a.example/login' })
     expect(picked.calls.find((c) => c.method === 'Target.attachToTarget')?.params['targetId']).toBe('t0')
+  })
+
+  test('prefers the tab whose url equals the one passed over tabs it is only a prefix of', async () => {
+    const { cdpUrl, calls } = fakeChrome({
+      targets: [{ url: 'https://shop.example/' }, { url: 'https://shop.example/login' }],
+      focus: password,
+      navigatesOn: 'never',
+    })
+
+    const outcome = await fillSecretIntoFocusedField({
+      cdpUrl,
+      value: 'x',
+      submit: false,
+      url: 'https://shop.example/',
+    })
+
+    expect(outcome).toMatchObject({ status: 'filled', url: 'https://shop.example/' })
+    expect(calls.find((c) => c.method === 'Input.insertText')?.sessionId).toBe('S:t0')
+  })
+
+  test('fills the one duplicate tab whose focus is in an editable field', async () => {
+    const none: Focus = { kind: 'none', field: 'body' }
+    const { cdpUrl, calls } = fakeChrome({
+      targets: [
+        { url: 'https://shop.example/login', focus: none },
+        { url: 'https://shop.example/login', focus: password },
+      ],
+      focus: none,
+      navigatesOn: 'never',
+    })
+
+    const outcome = await fillSecretIntoFocusedField({
+      cdpUrl,
+      value: 'x',
+      submit: false,
+      url: 'https://shop.example/login',
+    })
+
+    expect(outcome).toMatchObject({ status: 'filled', field: 'input[type=password]' })
+    expect(calls.filter((c) => c.method === 'Input.insertText').map((c) => c.sessionId)).toEqual(['S:t1'])
+  })
+
+  test('refuses without typing when several duplicate tabs all have a focused field', async () => {
+    const { cdpUrl, calls } = fakeChrome({
+      targets: [{ url: 'https://shop.example/login' }, { url: 'https://shop.example/login' }],
+      focus: password,
+      navigatesOn: 'never',
+    })
+
+    const outcome = await fillSecretIntoFocusedField({ cdpUrl, value: 'x', submit: false })
+
+    expect(outcome).toMatchObject({ status: 'refused' })
+    expect(insertedText(calls)).toEqual([])
   })
 
   test.each(['Page.enable', 'submit'] as const)(
