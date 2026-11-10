@@ -1,6 +1,7 @@
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import type { StreamEvent } from './stream-events'
 import { readEvents } from './stream-io'
 
 // Daily stream files are named `YYYY-MM-DD.jsonl` (see `formatLocalDate` in
@@ -11,13 +12,8 @@ const DAILY_STREAM_NAME = /^\d{4}-\d{2}-\d{2}\.jsonl$/
 export async function readWatermarkFromFile(streamFilePath: string, parentSessionId: string): Promise<string | null> {
   const events = await readEvents(streamFilePath)
 
-  let lastEntryId: string | null = null
-  for (const event of events) {
-    if ((event.type === 'fragment' || event.type === 'watermark') && event.source === parentSessionId) {
-      lastEntryId = event.entry
-    }
-  }
-  return lastEntryId
+  const progress = findProgress(events, parentSessionId)
+  return progress.checkpoint ?? progress.legacy
 }
 
 // Returns the latest watermark entry id for `parentSessionId` across all
@@ -47,9 +43,21 @@ export async function readLatestWatermark(memoryDir: string, parentSessionId: st
   const dailyStreams = entries
     .filter((name) => DAILY_STREAM_NAME.test(name))
     .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+  let legacy: string | null = null
   for (const name of dailyStreams) {
-    const watermark = await readWatermarkFromFile(join(memoryDir, name), parentSessionId)
-    if (watermark !== null) return watermark
+    const progress = findProgress(await readEvents(join(memoryDir, name)), parentSessionId)
+    if (progress.checkpoint !== null) return progress.checkpoint
+    legacy ??= progress.legacy
   }
-  return null
+  return legacy
+}
+
+function findProgress(events: StreamEvent[], source: string): { checkpoint: string | null; legacy: string | null } {
+  let checkpoint: string | null = null
+  let legacy: string | null = null
+  for (const event of events) {
+    if (event.type === 'watermark' && event.source === source) checkpoint = event.entry
+    if (event.type === 'fragment' && event.source === source) legacy = event.entry
+  }
+  return { checkpoint, legacy }
 }
