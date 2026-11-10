@@ -8,7 +8,9 @@ import {
   type KakaoChat,
   type KakaoMarkReadResult,
   type KakaoMember,
+  type KakaoMemberSnapshot,
   type KakaoMessage,
+  type KakaoPartialMemberSnapshot,
   type KakaoProfile,
   type KakaoReplyTarget,
   type KakaoSendResult,
@@ -86,7 +88,14 @@ export interface KakaoTalkClient {
   markRead(chatId: string, logId: string, opts?: { linkId?: string }): Promise<KakaoMarkReadResult>
   sendTyping(chatId: string, opts?: { linkId?: string }): Promise<KakaoTypingResult>
   getProfile(): Promise<KakaoProfile>
+  // Always called with `allowPartial: true`: the strict default throws on every
+  // read in open chats whose GETMEM roster is capped below the active member
+  // count, which would leave those rooms with no roster at all.
   getMembers(chatId: string): Promise<KakaoMember[]>
+  getMemberSnapshot(
+    chatId: string,
+    options: { allowPartial: true },
+  ): Promise<KakaoMemberSnapshot | KakaoPartialMemberSnapshot>
   lookupAuthorName(chatId: string, authorId: number): string | null
   close(): void
 }
@@ -199,7 +208,7 @@ async function readAttachmentBuffer(path: string): Promise<Buffer> {
 }
 
 export function createOutboundCallback(deps: {
-  client: Pick<KakaoTalkClient, 'sendMessage' | 'sendAttachment' | 'getMessages' | 'getMembers'>
+  client: Pick<KakaoTalkClient, 'sendMessage' | 'sendAttachment' | 'getMessages' | 'getMemberSnapshot'>
   logger: KakaotalkAdapterLogger
   formatChannelTag: (workspace: string, chat: string) => Promise<string>
   readFile?: (path: string) => Promise<Buffer>
@@ -297,14 +306,21 @@ export function createOutboundCallback(deps: {
 // A failed member lookup only costs the native tags: the text still carries
 // the `@name` the agent wrote, so the send goes out untagged.
 async function resolveOutboundMentions(
-  client: Pick<KakaoTalkClient, 'getMembers'>,
+  client: Pick<KakaoTalkClient, 'getMemberSnapshot'>,
   chatId: string,
   text: string,
   logger: KakaotalkAdapterLogger,
 ): Promise<KakaoMentionInput[]> {
   if (!text.includes('@')) return []
   try {
-    return resolveKakaoMentions(text, await client.getMembers(chatId))
+    const snapshot = await client.getMemberSnapshot(chatId, { allowPartial: true })
+    // Nickname matching is only safe against the whole roster: an omitted
+    // duplicate or longer nickname would tag the wrong member. Send untagged.
+    if (!snapshot.complete) {
+      logger.info(`[kakaotalk] mention roster incomplete chat=${chatId}; sending untagged`)
+      return []
+    }
+    return resolveKakaoMentions(text, snapshot.members)
   } catch (err) {
     logger.warn(`[kakaotalk] mention member lookup failed chat=${chatId}: ${describeError(err)}`)
     return []
