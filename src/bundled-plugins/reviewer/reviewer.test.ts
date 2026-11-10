@@ -122,7 +122,7 @@ describe('reviewer subagent declaration', () => {
     }
 
     const k1 = sub.inFlightKey?.({ requestId: 'bg_a', reviewIdentity })
-    const k2 = sub.inFlightKey?.({ requestId: 'bg_b', reviewIdentity })
+    const k2 = sub.inFlightKey?.({ requestId: 'bg_b', reviewIdentity, skill: 'code-review' })
 
     expect(k1).toBe(`acme/widgets#42#${'a'.repeat(40)}#${'b'.repeat(40)}#review`)
     expect(k2).toBe(k1)

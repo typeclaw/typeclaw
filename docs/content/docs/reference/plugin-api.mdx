@@ -136,6 +136,14 @@ A subagent inherits its system prompt, payload schema, and optional `inFlightKey
 
 An optional subagent `handler(ctx, runSession)` can call `runSession({ userPrompt, onFinalMessage })`. The callback fires after a completed session turn with the terminal assistant message's text (trimmed), or `null` when the terminal message is empty or the provider failed. It receives raw assistant text, not the `<review>`/`<report>` block projection used by subagent orchestration. The handler may persist the returned text with trusted plugin code rather than granting the model a file-write tool. `runSession` itself still resolves to `void`; `ctx.spawnSubagent` does not return the text.
 
+`runSession` also accepts an optional `systemPrompt: string`, supplied by trusted plugin handler code for that fresh session. Omission retains the declared prompt. The runtime resolves this override only in `invokeSubagent`'s handler callback; it never forwards a payload's raw `systemPrompt` field. Session construction still appends runtime and role context and keeps the declared tools, permissions, profile, bash policy, budgets, and result capture.
+
+The bundled `reviewer` accepts an optional payload field `skill`: one of `code-review`, `doc-review`, `plan-review`, `security-audit`, `writing-review`, `data-review`, or `general`. Unknown values are rejected before creating a session. Explicit selection places only that trusted curated skill's complete body in the system prefix, before task-specific user content, so repeated reviews using the same skill share stable prefix bytes. Each review still starts an independent session and captures its own required `<review>` verdict; no previous verdict is reused. This is a context-layout improvement, not a token-count or cache-hit-rate guarantee.
+
+The model-facing `spawn_subagent` tool exposes the same selection as `review_skill` when `subagent_type` is `reviewer`. It maps to `payload.skill` and rejects invalid selections before starting a session. Trusted plugin calls use `ctx.spawnSubagent('reviewer', { skill: 'code-review', ... })` directly.
+
+Omit `skill` when the domain is unspecified or spans domains without one clear choice. The reviewer then retains its existing dynamic `load_skill` selection path. The tool remains available for an additional domain even with an explicit selection. Selection is never inferred from task keywords.
+
 ### Cron
 
 `cronJobs` is a `Record<string, PluginCronJob>`; the runtime prefixes each key with `__plugin_<plugin-name>_` to form the global cron id (no collision with `cron.json` user jobs or across plugins). `PluginCronJob` is a discriminated union on `kind`:
