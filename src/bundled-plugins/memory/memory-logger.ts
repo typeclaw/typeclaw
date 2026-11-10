@@ -7,7 +7,12 @@ import { getConfig, resolveModel } from '@/config'
 import { type Subagent, readTool } from '@/plugin'
 import { formatLocalDate } from '@/shared'
 
-import { advanceWatermarkTool, createAppendTool, type FragmentsAppendedHook } from './append-tool'
+import {
+  advanceWatermarkTool,
+  createAdvanceWatermarkTool,
+  createAppendTool,
+  type FragmentsAppendedHook,
+} from './append-tool'
 import { findEntryTool } from './find-entry-tool'
 import { formatMemorySnapshot } from './memory-snapshot'
 import { streamFilePath, streamsDir } from './paths'
@@ -86,7 +91,7 @@ Tools: \`read\`, \`find_entry\`, \`append\`, \`store_reference\`, and the waterm
 
 # Read loop, watermark, and stopping
 
-The runtime usually preloads the transcript past the watermark into your first message. Evaluate that slice directly: do not call \`find_entry\` or \`read\` for lines it already contains. If it says more lines remain, continue with \`read\` from the offset it gives and follow the loop below from there. A preloaded line ending in a \`truncated\` marker was too large to show whole; judge it from the part shown. Without a preload, use the loop below from the start.
+The runtime usually preloads a bounded transcript page into your first message. Evaluate that page directly. An \`entry-part\` contains an exact text segment of one large projected source record; its \`id\` is the original evidence anchor. Never treat a partial record as fully consumed. When a page supplies a \`memory-page-checkpoint\`, finish all fragment/reference writes first, then call the watermark-advance tool exactly once with that checkpoint as \`latestEntryId\` and exit. An append does not complete the page. The runtime supplies later pages in fresh sessions; do not use \`read\` or \`find_entry\` to bypass paging. Without a preload, use the read loop below.
 
 Session transcripts are JSONL; each line has an \`id\`. They can be large, and \`read\` truncates output to 50 KB or 2000 lines, returning the line range and next offset. Do not scroll from line 1 through a prefix already covered by the watermark.
 
@@ -280,7 +285,8 @@ function renderPreload(preload: TranscriptPreload): string {
     `Preloaded transcript lines ${preload.startLine}-${preload.endLine} of totalLines=${preload.totalLines}${preload.watermarkFound ? ' (starting right after the watermark)' : ''}.`,
     preload.nextOffset === null
       ? 'This reaches the end of the transcript; do not call read on it.'
-      : `More lines remain: after evaluating these, continue with read(path=<transcript>, offset=${preload.nextOffset}).`,
+      : 'More lines remain: the runtime will supply the next page after this page is committed.',
+    `After all fragment writes, complete this page with latestEntryId from <memory-page-checkpoint>${preload.checkpoint}</memory-page-checkpoint>.`,
   ]
   return [...header, '<transcript>', preload.text, '</transcript>'].join('\n')
 }
@@ -355,14 +361,72 @@ export function createMemoryLoggerSubagent(
   // single mutable cell safely carries this spawn's origin to the append tool.
   let currentOrigin: SessionOrigin | undefined
   let currentTranscriptPath: string | undefined
+  let page:
+    | {
+        source: string
+        checkpoint: string | null
+        entries: Set<string>
+        committed: boolean
+        closed: boolean
+        pending: number
+      }
+    | undefined
+  const validateCheckpoint = (source: string, checkpoint: string, entry?: string): void => {
+    if (
+      page !== undefined &&
+      (page.closed ||
+        page.checkpoint === null ||
+        source !== page.source ||
+        checkpoint !== page.checkpoint ||
+        (entry === undefined && page.pending > 0) ||
+        (entry !== undefined && !page.entries.has(entry)))
+    ) {
+      throw new Error('Memory checkpoint must match the active page; unseen or incomplete evidence cannot be skipped.')
+    }
+    // Reserve completion before its first I/O await so a parallel tool call
+    // cannot start writing evidence behind the durable checkpoint.
+    if (page !== undefined && entry === undefined) page.closed = true
+  }
+  const beginWrite = (): (() => void) | undefined => {
+    const active = page
+    if (active === undefined) return undefined
+    if (active.closed) throw new Error('Memory page is closed; stale writes cannot continue.')
+    active.pending++
+    return () => {
+      active.pending--
+    }
+  }
   const appendTool = createAppendTool({
     onFragmentsAppended: options.onFragmentsAppended,
     originProvider: () => currentOrigin,
     referenceSlugResolver: (agentDir) => listReferenceSlugs(agentDir),
     transcriptPathProvider: () => currentTranscriptPath,
+    validateCheckpoint,
+    deferWatermark: () => page !== undefined,
+    beginWrite,
   })
-  const storeReferenceTool = createStoreReferenceTool(options.onReferenceStored)
-  const customTools = [findEntryTool, appendTool, storeReferenceTool, advanceWatermarkTool]
+  const referenceTool = createStoreReferenceTool(options.onReferenceStored)
+  const storeReferenceTool = {
+    ...referenceTool,
+    execute: async (...args: Parameters<typeof referenceTool.execute>) => {
+      const finishWrite = beginWrite()
+      try {
+        return await referenceTool.execute(...args)
+      } finally {
+        finishWrite?.()
+      }
+    },
+  }
+  const pageWatermarkTool = createAdvanceWatermarkTool({
+    validateCheckpoint,
+    onAdvanced: () => {
+      if (page !== undefined) {
+        page.committed = true
+        page.closed = true
+      }
+    },
+  })
+  const customTools = [findEntryTool, appendTool, storeReferenceTool, pageWatermarkTool]
   return {
     systemPrompt: MEMORY_LOGGER_SYSTEM_PROMPT,
     // Logging is "read transcript past the watermark, decide 0-N fragments,
@@ -395,6 +459,7 @@ export function createMemoryLoggerSubagent(
         path: string,
         mark: string | null,
         basePrompt: string,
+        untilLine?: number,
       ): Promise<TranscriptPreload | null> => {
         let models: PreloadModelLimits[]
         try {
@@ -409,24 +474,68 @@ export function createMemoryLoggerSubagent(
           Buffer.byteLength(MEMORY_LOGGER_SYSTEM_PROMPT, 'utf8') +
           Buffer.byteLength(basePrompt, 'utf8') +
           PRELOAD_FRAME_BYTES
-        const maxBytes = preloadBudgetBytes(models, promptBytes)
-        return maxBytes === null ? null : buildTranscriptPreload(path, mark, { maxBytes })
+        let maxBytes = preloadBudgetBytes(models, promptBytes)
+        let endLine = untilLine
+        while (maxBytes !== null) {
+          const preload = await buildTranscriptPreload(path, mark, { maxBytes, untilLine: endLine })
+          if (preload === null) return null
+          const frameBytes = Buffer.byteLength(renderPreload(preload), 'utf8') - Buffer.byteLength(preload.text, 'utf8')
+          const fitted = preloadBudgetBytes(models, promptBytes - PRELOAD_FRAME_BYTES + frameBytes)
+          if (fitted === null) return null
+          if (Buffer.byteLength(preload.text, 'utf8') <= fitted) return preload
+          maxBytes = fitted
+          endLine ??= preload.totalLines
+        }
+        return null
       }
       currentOrigin = ctx.payload.origin
       currentTranscriptPath = ctx.payload.parentTranscriptPath
       const today = formatLocalDate()
       const memoryDir = streamsDir(ctx.payload.agentDir)
       const streamFile = streamFilePath(ctx.payload.agentDir, today)
-      const watermark = await readLatestWatermark(memoryDir, ctx.payload.parentSessionId)
+      let watermark = await readLatestWatermark(memoryDir, ctx.payload.parentSessionId)
       const fragmentsBefore = await countFragments(streamFile)
       const start = Date.now()
       logger.info(
         `[memory-logger] ${ctx.payload.parentSessionId} start stream=${today}.jsonl watermark=${watermark ?? 'none'}`,
       )
       try {
-        const basePrompt = buildInitialPrompt(ctx.payload, streamFile, watermark, null)
-        const preload = await preloadFor(ctx.payload.parentTranscriptPath, watermark, basePrompt)
-        await runSession({ userPrompt: buildInitialPrompt(ctx.payload, streamFile, watermark, preload) })
+        let untilLine: number | undefined
+        while (true) {
+          const basePrompt = buildInitialPrompt(ctx.payload, streamFile, watermark, null)
+          const preload = await preloadFor(ctx.payload.parentTranscriptPath, watermark, basePrompt, untilLine)
+          untilLine ??= preload?.totalLines
+          if (preload !== null) {
+            if (preload.startCheckpoint !== null) {
+              await advanceWatermarkTool.execute(
+                { source: ctx.payload.parentSessionId, latestEntryId: preload.startCheckpoint },
+                { agentDir: ctx.agentDir, sessionId: ctx.payload.parentSessionId, signal: undefined, logger },
+              )
+            }
+            page = {
+              source: ctx.payload.parentSessionId,
+              checkpoint: preload.entryIds.length === 0 ? null : preload.checkpoint,
+              entries: new Set(preload.entryIds),
+              committed: false,
+              closed: false,
+              pending: 0,
+            }
+          } else {
+            page = undefined
+          }
+          try {
+            await runSession({ userPrompt: buildInitialPrompt(ctx.payload, streamFile, watermark, preload) })
+          } finally {
+            if (page !== undefined) page.closed = true
+          }
+          if (!page?.committed || preload?.nextOffset === null) {
+            if (page && page.entries.size > 0 && !page.committed) {
+              logger.warn(`[memory-logger] ${ctx.payload.parentSessionId} page not committed; evidence remains pending`)
+            }
+            break
+          }
+          watermark = page.checkpoint
+        }
         const fragmentsWritten = (await countFragments(streamFile)) - fragmentsBefore
         logger.info(
           `[memory-logger] ${ctx.payload.parentSessionId} done fragments_written=${fragmentsWritten} elapsed_ms=${Date.now() - start} ${formatMemorySnapshot()}`,
@@ -437,6 +546,8 @@ export function createMemoryLoggerSubagent(
           `[memory-logger] ${ctx.payload.parentSessionId}: run threw: ${message} elapsed_ms=${Date.now() - start}`,
         )
         throw err
+      } finally {
+        if (page !== undefined) page.closed = true
       }
     },
   }
