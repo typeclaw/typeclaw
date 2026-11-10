@@ -9,6 +9,7 @@ import { formatLocalDate } from '@/shared'
 
 import { advanceWatermarkTool, appendTool, createAppendTool, provenanceFromOrigin } from './append-tool'
 import { readEvents } from './stream-io'
+import { encodeTranscriptCursor } from './transcript-cursor'
 
 type AppendInput = Parameters<typeof appendTool.execute>[0]
 
@@ -51,6 +52,27 @@ async function callExpectingThrow(root: string, input: Partial<AppendInput>): Pr
 }
 
 describe('appendTool', () => {
+  test('keeps the operational-incident fence when a page checkpoint is inside the anchor entry', async () => {
+    const root = tmpRoot()
+    const transcript = join(root, 'source.jsonl')
+    const record = JSON.stringify({
+      type: 'message',
+      id: 'incident',
+      message: {
+        role: 'toolResult',
+        content: `${'x'.repeat(20_000)} TYPECLAW_OPERATIONAL_INCIDENT {"fingerprint":"test"}`,
+      },
+    })
+    writeFileSync(transcript, `${record}\n`)
+    const fenced = createAppendTool({ transcriptPathProvider: () => transcript })
+    const cursor = encodeTranscriptCursor(transcript, 'incident', record, 1000)
+
+    await expect(fenced.execute({ ...baseInput, entry: 'incident', latestEntryId: cursor }, ctx(root))).rejects.toThrow(
+      'operational incident',
+    )
+    expect(existsSync(streamPath(root))).toBe(false)
+  })
+
   test('mechanically rejects every evaluated interval that belongs to an operational incident', async () => {
     const root = tmpRoot()
     const transcript = join(root, 'sessions', 'session.jsonl')
