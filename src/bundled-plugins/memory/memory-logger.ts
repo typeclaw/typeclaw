@@ -19,6 +19,7 @@ import { streamFilePath, streamsDir } from './paths'
 import { listReferenceSlugs } from './references/load-references'
 import { createStoreReferenceTool, type ReferenceStoredHook } from './references/store-reference-tool'
 import { readEvents } from './stream-io'
+import { decodeTranscriptCursor } from './transcript-cursor'
 import {
   buildTranscriptPreload,
   PRELOAD_FRAME_BYTES,
@@ -504,6 +505,12 @@ export function createMemoryLoggerSubagent(
         while (true) {
           const basePrompt = buildInitialPrompt(ctx.payload, streamFile, watermark, null)
           const preload = await preloadFor(ctx.payload.parentTranscriptPath, watermark, basePrompt, untilLine)
+          if (preload === null && decodeTranscriptCursor(watermark) !== null) {
+            logger.warn(
+              `[memory-logger] ${ctx.payload.parentSessionId} partial transcript cursor remains pending: paging is unavailable`,
+            )
+            break
+          }
           untilLine ??= preload?.totalLines
           if (preload !== null) {
             if (preload.startCheckpoint !== null) {

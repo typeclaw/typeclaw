@@ -8,6 +8,7 @@ import { formatLocalDate } from '@/shared'
 import { createMemoryLoggerSubagent } from './memory-logger'
 import { streamsDir, streamFilePath } from './paths'
 import { readEvents } from './stream-io'
+import { decodeTranscriptCursor } from './transcript-cursor'
 import { readLatestWatermark } from './watermark'
 
 const roots: string[] = []
@@ -57,6 +58,52 @@ function toolContext(root: string) {
 }
 
 describe('memory logger page completion', () => {
+  test.each(['unavailable', 'insufficient'])(
+    'keeps a partial cursor pending when preload limits are %s',
+    async (limits) => {
+      const f = await fixture()
+      const interrupted = subagent()
+      let pages = 0
+      await expect(
+        interrupted.handler!(f.ctx, async (override) => {
+          if (pages++ > 0) throw new Error('interrupted on a later page')
+          await interrupted.customTools![3]!.execute(
+            { source: 'parent-1', latestEntryId: page(override!.userPrompt!).checkpoint },
+            toolContext(f.root),
+          )
+        }),
+      ).rejects.toThrow('interrupted on a later page')
+      const checkpoint = await readLatestWatermark(streamsDir(f.root), 'parent-1')
+      expect(decodeTranscriptCursor(checkpoint)!.offset).toBeGreaterThan(0)
+      const warnings: string[] = []
+      const resumed = createMemoryLoggerSubagent({
+        logger: { ...logger, warn: (message) => warnings.push(message) },
+        fastModelLimits: () => (limits === 'unavailable' ? [] : [{ contextWindow: 1000, outputTokens: 1000 }]),
+      })
+      let fallbackCalls = 0
+
+      await resumed.handler!(f.ctx, async () => {
+        fallbackCalls++
+        await resumed.customTools![3]!.execute(
+          { source: 'parent-1', latestEntryId: 'large-entry' },
+          toolContext(f.root),
+        )
+      })
+
+      expect(fallbackCalls).toBe(0)
+      expect(await readLatestWatermark(streamsDir(f.root), 'parent-1')).toBe(checkpoint)
+      expect(warnings.some((message) => message.includes('partial transcript cursor remains pending'))).toBe(true)
+      const recovered = subagent()
+      await recovered.handler!(f.ctx, async (override) => {
+        await recovered.customTools![3]!.execute(
+          { source: 'parent-1', latestEntryId: page(override!.userPrompt!).checkpoint },
+          toolContext(f.root),
+        )
+      })
+      expect(await readLatestWatermark(streamsDir(f.root), 'parent-1')).toBe('large-entry')
+    },
+  )
+
   test('rejects fragment writes once page completion has started', async () => {
     const f = await fixture()
     const worker = subagent()
