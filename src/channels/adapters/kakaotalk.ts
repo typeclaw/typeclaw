@@ -7,7 +7,6 @@ import {
   type AttachmentInput,
   type KakaoChat,
   type KakaoMarkReadResult,
-  type KakaoMember,
   type KakaoMemberSnapshot,
   type KakaoMessage,
   type KakaoPartialMemberSnapshot,
@@ -91,7 +90,6 @@ export interface KakaoTalkClient {
   // Always called with `allowPartial: true`: the strict default throws on every
   // read in open chats whose GETMEM roster is capped below the active member
   // count, which would leave those rooms with no roster at all.
-  getMembers(chatId: string): Promise<KakaoMember[]>
   getMemberSnapshot(
     chatId: string,
     options: { allowPartial: true },

@@ -193,10 +193,6 @@ class FakeClient implements KakaoTalkClient {
     return this.profileResult
   }
 
-  async getMembers(chatId: string): Promise<KakaoMember[]> {
-    return (await this.getMemberSnapshot(chatId)).members
-  }
-
   async getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot | KakaoPartialMemberSnapshot> {
     this.getMembersCalls.push(chatId)
     if (this.getMembersError !== null) throw this.getMembersError
