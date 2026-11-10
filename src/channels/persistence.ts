@@ -29,6 +29,10 @@ export type ChannelSessionRecord = {
   sessionFile?: string
   lastInboundAt?: number
   participants: ChannelParticipant[]
+  // Set once the bot has delivered a message into this conversation. The live
+  // send counter resets on restart and rollover, so this is what keeps a
+  // thread the bot already joined from looking like an un-addressed intrusion.
+  botParticipated?: true
   githubReviewRound?: GithubReviewFollowupRound & {
     status: 'pending' | 'completed'
     createdAt: number
@@ -247,6 +251,7 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.sessionFile === undefined || typeof r.sessionFile === 'string') &&
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
     Array.isArray(r.participants) &&
+    (r.botParticipated === undefined || r.botParticipated === true) &&
     (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r)) &&
     (r.githubReviewThreadCloseout === undefined || isValidGithubReviewThreadCloseout(r.githubReviewThreadCloseout, r))
   )
