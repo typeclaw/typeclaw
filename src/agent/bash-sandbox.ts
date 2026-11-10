@@ -35,6 +35,7 @@ import { typevaultBashCliPath } from '@/typevault/cli-path'
 import {
   buildRoleScopedConfigEnv,
   buildSandboxEnvPolicy,
+  resolveAgentGitIdentityEnv,
   resolveExposableBashEnvNames,
   spreadSandboxEnv,
 } from './bash-sandbox-env'
@@ -135,9 +136,11 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
   try {
     preparation = await deferredPreparation?.()
     const command = preparation?.command ?? originalCommand
-    const preparedEnvOverlay = preparation?.env === undefined ? envOverlay : { ...envOverlay, ...preparation.env }
-    const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
     const envNames = resolveExposableBashEnvNames(agentDir)
+    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.exposable)
+    const mergedEnvOverlay = { ...gitIdentityEnv, ...envOverlay, ...preparation?.env }
+    const preparedEnvOverlay = Object.keys(mergedEnvOverlay).length > 0 ? mergedEnvOverlay : undefined
+    const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
     const sandboxEnvOverlay = buildRoleScopedConfigEnv(agentDir, dirs, preparedEnvOverlay)
     const effectiveEnvWithhold = (envWithhold ?? []).filter((name) => !Object.hasOwn(sandboxEnvOverlay ?? {}, name))
     const maskTargets = await ensureHiddenMaskTargets({ dirs, files })
