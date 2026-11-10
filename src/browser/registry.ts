@@ -46,7 +46,7 @@ export const BSK_DAEMON_PORT = 52800
 
 export const OMOWRIGHT_MODULE = `${BROWSER_ROOT}/omowright/index.js`
 
-const OMOWRIGHT_COMMIT = '7d98044a9ade8c54a4b9fd5a14e2befee2d48144'
+const OMOWRIGHT_VERSION = '0.3.0'
 const BROWSER_USE_VERSION = '0.13.11'
 const BSK_VERSION = '0.3.3'
 const BSK_RELEASES = 'https://github.com/Tencent/BrowserSkill/releases/download'
@@ -59,7 +59,7 @@ export const BROWSER_ENGINES: Record<BrowserEngineId, BrowserEngineSpec> = {
   },
   omowright: {
     id: 'omowright',
-    install: { kind: 'bun-global', spec: `github:code-yeongyu/omowright#${OMOWRIGHT_COMMIT}` },
+    install: { kind: 'bun-global', spec: `omowright@${OMOWRIGHT_VERSION}` },
     env: (cdpUrl) => ({ OMOWRIGHT_CDP_URL: cdpUrl }),
   },
   'browser-use': {
