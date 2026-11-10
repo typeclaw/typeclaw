@@ -8,7 +8,7 @@ export type KakaoAuthorResolver = {
 }
 
 export type KakaoAuthorResolverOptions = {
-  client: Pick<KakaoTalkClient, 'getMembers'>
+  client: Pick<KakaoTalkClient, 'getMemberSnapshot'>
   now?: () => number
   ttlMs?: number
   logger?: { warn: (msg: string) => void }
@@ -40,10 +40,12 @@ export function createKakaoAuthorResolver(options: KakaoAuthorResolverOptions): 
     const existing = inflight.get(chatId)
     if (existing !== undefined) return existing
     const promise = options.client
-      .getMembers(chatId)
-      .then((members): ChatCacheEntry => {
+      .getMemberSnapshot(chatId, { allowPartial: true })
+      .then((snapshot): ChatCacheEntry => {
+        // A partial roster still names most authors; misses fall back to the
+        // raw user_id exactly as a failed read does.
         const map = new Map<string, string>()
-        for (const m of members) map.set(m.user_id, m.nickname)
+        for (const m of snapshot.members) map.set(m.user_id, m.nickname)
         const entry: ChatCacheEntry = { members: map, expiresAt: now() + ttlMs }
         cache.set(chatId, entry)
         return entry
@@ -51,7 +53,7 @@ export function createKakaoAuthorResolver(options: KakaoAuthorResolverOptions): 
       .catch((err: unknown): null => {
         // Author resolution is best-effort. Failing here makes the message
         // render with the raw user_id, which is uglier but still routes.
-        logger?.warn(`[kakaotalk] getMembers(${chatId}) failed: ${describeError(err)}`)
+        logger?.warn(`[kakaotalk] getMemberSnapshot(${chatId}) failed: ${describeError(err)}`)
         return null
       })
       .finally(() => {
