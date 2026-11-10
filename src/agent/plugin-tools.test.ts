@@ -4302,6 +4302,41 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     }
   })
 
+  test('passes resolved GitHub self into the bash identity environment', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-github-identity-'))
+    let identityEnv: Record<string, string> | undefined
+    const wrapped = wrapBuiltinToolDefinition(fakeBash({}), {
+      agentDir,
+      sessionId: 'github-identity',
+      hooks: createHookBus(),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      getGithubSelf: () => ({ login: 'my-app[bot]', id: 12345 }),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand(command, options) {
+          identityEnv = options?.env?.set
+          return { ...buildSandboxedCommand(command, options), commandString: command }
+        },
+      },
+    })
+
+    try {
+      await wrapped.execute('c', { command: 'git status' }, undefined, undefined, {} as never)
+
+      expect(identityEnv).toMatchObject({
+        GIT_AUTHOR_NAME: 'my-app[bot]',
+        GIT_AUTHOR_EMAIL: '12345+my-app[bot]@users.noreply.github.com',
+        GIT_COMMITTER_NAME: 'my-app[bot]',
+        GIT_COMMITTER_EMAIL: '12345+my-app[bot]@users.noreply.github.com',
+      })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('prepends the per-session dependency bin directory to PATH at the bash sandbox boundary', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-path-'))
     const workspaceRoot = path.join(agentDir, 'packages', 'workspace-cli')

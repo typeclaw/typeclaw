@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 
-import { resolveGitIdentity } from '@/git/resolve-identity'
+import type { GithubSelfUser } from '@/channels/adapters/github/auth'
+import { isFallbackGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { readEnvFile } from '@/init/env-file'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 type BashEnvOverlay = Record<string, string>
@@ -94,6 +95,7 @@ export function resolveExposableBashEnvNames(agentDir: string): { exposable: str
 export async function resolveAgentGitIdentityEnv(
   agentDir: string,
   exposableEnvNames: readonly string[],
+  githubSelf: GithubSelfUser | null = null,
 ): Promise<BashEnvOverlay> {
   const exposable = new Set(exposableEnvNames)
   const names = {
@@ -104,7 +106,11 @@ export async function resolveAgentGitIdentityEnv(
   } as const
   const missing = Object.entries(names).filter(([name]) => !exposable.has(name))
   if (missing.length === 0) return {}
-  const identity = await resolveGitIdentity(agentDir)
+  const repoIdentity = await resolveGitIdentity(agentDir)
+  const identity =
+    githubSelf !== null && (repoIdentity === null || (await isFallbackGitIdentity(agentDir, repoIdentity)))
+      ? { name: githubSelf.login, email: `${githubSelf.id}+${githubSelf.login}@users.noreply.github.com` }
+      : repoIdentity
   if (identity === null) return {}
   return Object.fromEntries(missing.map(([name, field]) => [name, identity[field]]))
 }

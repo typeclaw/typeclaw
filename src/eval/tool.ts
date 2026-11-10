@@ -42,6 +42,7 @@ export function registerEvalTool(options: {
     })
   if (!eligible()) return undefined
   const kernel = createSandboxedEvalKernel({
+    getGithubSelf: options.wrappers.getGithubSelf,
     agentDir: options.wrappers.agentDir,
     sessionId: options.wrappers.sessionId,
     permissions: options.wrappers.permissions ?? noopPermissionService,

@@ -498,6 +498,7 @@ async function startAgentRuntime(
     tunnelUrlForChannel: (name) => resolveTunnelUrlForChannel(name, tunnelManager),
     tunnelConfiguredForChannel: (name) => isTunnelConfiguredForChannel(name),
     createSessionForChannel: buildChannelSessionFactory({
+      getGithubSelf: githubTokenBridge.getSelf,
       cwd,
       sessionFactory,
       stream,
@@ -586,6 +587,7 @@ async function startAgentRuntime(
       const allowBackgroundFromSubagent =
         entry.pluginSubagent.canBackgroundSpawnSubagents === true && entry.pluginSubagent.canSpawnSubagents === true
       const created = await createSessionWithDispose({
+        getGithubSelf: githubTokenBridge.getSelf,
         systemPromptOverride: subagentOptions?.systemPromptOverride ?? entry.pluginSubagent.systemPrompt,
         sessionManager,
         channelRouter: channelManager.router,
@@ -666,6 +668,7 @@ async function startAgentRuntime(
     // attribution stay per-session).
     const sessionManager = SessionManager.create(cwd, sessionFactory.sessionDir())
     return defaultCreateSessionForSubagent(subagent, {
+      getGithubSelf: githubTokenBridge.getSelf,
       ...subagentOptions,
       plugins: {
         registry: snap.registry,
@@ -743,6 +746,7 @@ async function startAgentRuntime(
         origin,
         prompt: (text: string) =>
           runPromptForCommand({
+            getGithubSelf: githubTokenBridge.getSelf,
             text,
             origin,
             runtime: pluginRuntime,
@@ -787,6 +791,7 @@ async function startAgentRuntime(
         console.error(`[cron] ${job.id}: clear todos failed: ${err instanceof Error ? err.message : String(err)}`),
       )
       const session = await createSession({
+        getGithubSelf: githubTokenBridge.getSelf,
         reloadRegistry,
         sessionManager,
         stream,
@@ -1058,6 +1063,7 @@ async function startAgentRuntime(
 
   const commandRunnerFactory = (outbound: import('@/server/command-runner').CommandOutbound): CommandRunner =>
     createCommandRunner({
+      getGithubSelf: githubTokenBridge.getSelf,
       pluginRuntime,
       permissions: pluginsLoaded.permissions,
       spawnSubagent: dispatchSpawnSubagent,
@@ -1071,6 +1077,7 @@ async function startAgentRuntime(
     })
 
   const serverFactory = createServer({
+    getGithubSelf: githubTokenBridge.getSelf,
     port,
     reloadAll: reloadAllNonDestructive,
     reloadRegistry,

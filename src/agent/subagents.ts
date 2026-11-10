@@ -1,6 +1,7 @@
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { z } from 'zod'
 
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import { getConfig, resolveModel, type ThinkingLevel } from '@/config'
 import { effectiveModels } from '@/config/model-overrides'
 import type { PermissionService } from '@/permissions'
@@ -200,6 +201,7 @@ export type CreateSessionForSubagentOptions = {
   // task-spawned subagent's `git push`/`gh` gets a minted token instead of
   // failing with "could not read Username".
   plugins?: PluginSessionWiring
+  readonly getGithubSelf?: GetGithubSelf
   // The role/permission service that drives builtin-bash sandboxing. It MUST be
   // forwarded alongside `plugins`: buildBuiltinPiToolOverrides only applies
   // applyBashSandbox / applyTmpPathRedirect when `permissions` is present, so
@@ -222,6 +224,7 @@ export type CreateSessionForSubagent = (
 
 export const defaultCreateSessionForSubagent: CreateSessionForSubagent = (subagent, options) =>
   createSession({
+    getGithubSelf: options?.getGithubSelf,
     systemPromptOverride: options?.systemPromptOverride ?? subagent.systemPrompt,
     origin: {
       kind: 'subagent',

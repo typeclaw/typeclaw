@@ -20,15 +20,16 @@ async function agentRepo(): Promise<string> {
   return dir
 }
 
-async function git(cwd: string, args: string[]): Promise<void> {
+async function git(cwd: string, args: string[], env: Record<string, string> = {}): Promise<string> {
   const proc = Bun.spawn({
     cmd: ['git', ...args],
     cwd,
-    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    env: { ...process.env, ...env, GIT_MASTER: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
     stdout: 'pipe',
     stderr: 'pipe',
   })
   expect(await proc.exited).toBe(0)
+  return new Response(proc.stdout).text()
 }
 
 describe('resolveAgentGitIdentityEnv', () => {
@@ -58,7 +59,7 @@ describe('resolveAgentGitIdentityEnv', () => {
     await git(agentDir, ['config', '--local', 'user.email', 'agent@example.com'])
 
     // when
-    const env = await resolveAgentGitIdentityEnv(agentDir, [])
+    const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'octocat', id: 12345 })
 
     // then
     expect(env['GIT_AUTHOR_EMAIL']).toBe('agent@example.com')
@@ -71,15 +72,55 @@ describe('resolveAgentGitIdentityEnv', () => {
     await ensureGitIdentity(agentDir)
 
     // when
-    const env = await resolveAgentGitIdentityEnv(agentDir, ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL'])
+    const env = await resolveAgentGitIdentityEnv(agentDir, ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL'], {
+      login: 'octocat',
+      id: 12345,
+    })
 
     // then
-    expect(Object.keys(env).sort()).toEqual(['GIT_COMMITTER_EMAIL', 'GIT_COMMITTER_NAME'])
+    expect(env).toEqual({
+      GIT_COMMITTER_NAME: 'octocat',
+      GIT_COMMITTER_EMAIL: '12345+octocat@users.noreply.github.com',
+    })
   })
 
   test('adds nothing when the agent repo has no identity', async () => {
     const agentDir = await agentRepo()
 
     await expect(resolveAgentGitIdentityEnv(agentDir, [])).resolves.toEqual({})
+  })
+
+  test.each(['fallback', 'missing'] as const)('uses GitHub self when the repo identity is %s', async (kind) => {
+    // given
+    const agentDir = await agentRepo()
+    if (kind === 'fallback') await ensureGitIdentity(agentDir)
+
+    // when
+    const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'my-app[bot]', id: 12345 })
+
+    await git(
+      agentDir,
+      ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'test'],
+      env,
+    )
+
+    // then
+    const committedIdentity = await git(agentDir, ['log', '-1', '--format=%an|%ae|%cn|%ce'])
+    expect(committedIdentity.trim()).toBe(
+      'my-app[bot]|12345+my-app[bot]@users.noreply.github.com|my-app[bot]|12345+my-app[bot]@users.noreply.github.com',
+    )
+  })
+
+  test('adds nothing when all identity names are exposed', async () => {
+    const agentDir = await agentRepo()
+    await ensureGitIdentity(agentDir)
+
+    const env = await resolveAgentGitIdentityEnv(
+      agentDir,
+      ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'],
+      { login: 'octocat', id: 12345 },
+    )
+
+    expect(env).toEqual({})
   })
 })

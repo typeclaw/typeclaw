@@ -74,6 +74,7 @@ export type ServerLogger = {
 }
 
 export type ServerOptions = {
+  readonly getGithubSelf?: CreateSessionOptions['getGithubSelf']
   port: number
   reloadAll?: ReloadAllFn
   reloadRegistry?: ReloadRegistry
@@ -286,6 +287,7 @@ function encodeBase64(bytes: Uint8Array): string {
 }
 
 export function createServer({
+  getGithubSelf,
   port,
   reloadAll,
   reloadRegistry,
@@ -548,6 +550,7 @@ export function createServer({
             // either side at exactly its current tool surface.
             const subagentRegistry = runtimeSnapshot?.subagents
             const result = await createSession({
+              getGithubSelf,
               reloadRegistry,
               sessionManager,
               origin,
