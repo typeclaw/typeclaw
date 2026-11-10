@@ -96,7 +96,13 @@ describe('buildTranscriptPreload', () => {
       expect(Buffer.byteLength(preload!.text)).toBeLessThanOrEqual(1024)
       for (const line of preload!.text.split('\n')) {
         const record = JSON.parse(line)
-        if (record.id === 'big') parts.push(record.type === 'entry-part' ? record.text : line)
+        if (record.id === 'big') {
+          if (record.offset > 0) {
+            expect(record.precedingText.length).toBeGreaterThan(0)
+            expect(raw.slice(0, record.offset).endsWith(record.precedingText)).toBe(true)
+          }
+          parts.push(record.type === 'entry-part' ? record.text : line)
+        }
         if (record.id === 'next') sawNext = true
       }
       checkpoint = preload!.checkpoint

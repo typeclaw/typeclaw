@@ -92,6 +92,8 @@ Tools: \`read\`, \`find_entry\`, \`append\`, \`store_reference\`, and the waterm
 
 # Read loop, watermark, and stopping
 
+An \`entry-part\` may include \`precedingText\`: read-only source overlap immediately before its new \`text\`. Interpret them together to recover instructions crossing a boundary. Capture complete facts supported by the new segment; do not emit a fragment for overlap alone. Only the issued page checkpoint advances progress; overlap never does.
+
 The runtime usually preloads a bounded transcript page into your first message. Evaluate that page directly. An \`entry-part\` contains an exact text segment of one large projected source record; its \`id\` is the original evidence anchor. Never treat a partial record as fully consumed. When a page supplies a \`memory-page-checkpoint\`, finish all fragment/reference writes first, then call the watermark-advance tool exactly once with that checkpoint as \`latestEntryId\` and exit. An append does not complete the page. The runtime supplies later pages in fresh sessions; do not use \`read\` or \`find_entry\` to bypass paging. Without a preload, use the read loop below.
 
 Session transcripts are JSONL; each line has an \`id\`. They can be large, and \`read\` truncates output to 50 KB or 2000 lines, returning the line range and next offset. Do not scroll from line 1 through a prefix already covered by the watermark.

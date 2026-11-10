@@ -58,6 +58,65 @@ function toolContext(root: string) {
 }
 
 describe('memory logger page completion', () => {
+  test('extracts a complete instruction crossing the boundary between fresh page sessions', async () => {
+    const f = await fixture()
+    let raw = JSON.stringify({
+      ...JSON.parse(f.entry),
+      message: { role: 'user', content: 'x'.repeat(200_000) },
+    })
+    await writeFile(f.path, `${raw}\n`)
+    const probe = async () => {
+      const worker = subagent()
+      let cut = 0
+      await expect(
+        worker.handler!(f.ctx, async (override) => {
+          cut = page(override!.userPrompt!).records[0].text.length
+          throw new Error('probe boundary')
+        }),
+      ).rejects.toThrow('probe boundary')
+      return cut
+    }
+    // The first attempt persists the start cursor. Measure with that same
+    // prompt frame so rewriting equal-length evidence preserves the boundary.
+    await probe()
+    const cut = await probe()
+    const prefix = 'Always obtain approval before'
+    const instruction = `${prefix} deploying any production changes.`
+    const start = cut - prefix.length
+    raw = raw.slice(0, start) + instruction + raw.slice(start + instruction.length)
+    await writeFile(f.path, `${raw}\n`)
+    const worker = subagent()
+    let sessions = 0
+
+    await worker.handler!(f.ctx, async (override) => {
+      const current = page(override!.userPrompt!)
+      const record = current.records[0]
+      if (sessions++ === 0) expect(record.text.endsWith(prefix)).toBe(true)
+      const visibleEvidence = (record.precedingText ?? '') + record.text
+      if (visibleEvidence.includes(instruction)) {
+        await worker.customTools![1]!.execute(
+          {
+            topic: 'Deployment approval',
+            body: instruction,
+            source: 'parent-1',
+            entry: record.id,
+            latestEntryId: current.checkpoint,
+          },
+          toolContext(f.root),
+        )
+      }
+      await worker.customTools![3]!.execute(
+        { source: 'parent-1', latestEntryId: current.checkpoint },
+        toolContext(f.root),
+      )
+    })
+
+    const events = await readEvents(streamFilePath(f.root, formatLocalDate()))
+    expect(events.filter((event) => event.type === 'fragment').map((event) => event.body)).toEqual([instruction])
+    expect(sessions).toBeGreaterThan(1)
+    expect(await readFile(f.path, 'utf8')).toBe(`${raw}\n`)
+  })
+
   test.each(['unavailable', 'insufficient'])(
     'keeps a partial cursor pending when preload limits are %s',
     async (limits) => {

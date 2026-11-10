@@ -116,17 +116,29 @@ export async function buildTranscriptPreload(
     if (out.length > 0) break
 
     const context = entryContext(text)
+    // Read-only overlap lets a fresh session interpret facts split at the
+    // boundary. Reserve most of even a small page for new progress.
+    let overlapStart = Math.max(0, offset - Math.min(2048, Math.floor(maxBytes / 16)))
+    if (isInsideSurrogatePair(text, overlapStart)) overlapStart++
+    const precedingText = offset > 0 ? text.slice(overlapStart, offset) : undefined
     let low = offset
     let high = text.length
     while (low < high) {
       const middle = Math.ceil((low + high) / 2)
-      const part = JSON.stringify({ type: 'entry-part', id, context, offset, text: text.slice(offset, middle) })
+      const part = JSON.stringify({
+        type: 'entry-part',
+        id,
+        context,
+        offset,
+        precedingText,
+        text: text.slice(offset, middle),
+      })
       if (Buffer.byteLength(part, 'utf8') <= maxBytes) low = middle
       else high = middle - 1
     }
     const end = isInsideSurrogatePair(text, low) ? low - 1 : low
     if (end <= offset) throw new Error('Memory transcript page budget cannot hold the next character.')
-    out.push(JSON.stringify({ type: 'entry-part', id, context, offset, text: text.slice(offset, end) }))
+    out.push(JSON.stringify({ type: 'entry-part', id, context, offset, precedingText, text: text.slice(offset, end) }))
     entryIds.push(id)
     checkpoint = end === text.length ? id : encodeTranscriptCursor(path, id, text, end)
     partial = end < text.length
