@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import { config, getSandboxWritablePathSpecs } from '@/config/config'
 import type { PermissionService } from '@/permissions/permissions'
 import {
@@ -94,6 +95,7 @@ export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) 
 export type BashSandboxReveal = NonNullable<SandboxPolicy['reveal']>
 
 export type BashSandboxRequest = {
+  readonly getGithubSelf?: GetGithubSelf
   readonly command: string
   readonly permissions: PermissionService
   readonly origin: SessionOrigin | undefined
@@ -137,7 +139,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     preparation = await deferredPreparation?.()
     const command = preparation?.command ?? originalCommand
     const envNames = resolveExposableBashEnvNames(agentDir)
-    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.exposable)
+    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.exposable, options.getGithubSelf?.())
     const mergedEnvOverlay = { ...gitIdentityEnv, ...envOverlay, ...preparation?.env }
     const preparedEnvOverlay = Object.keys(mergedEnvOverlay).length > 0 ? mergedEnvOverlay : undefined
     const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)

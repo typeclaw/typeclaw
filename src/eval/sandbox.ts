@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 import { prepareBashSandbox } from '@/agent/bash-sandbox'
 import type { SessionOrigin } from '@/agent/session-origin'
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import type { PermissionService } from '@/permissions/permissions'
 import { shellQuote } from '@/sandbox/quote'
 
@@ -39,6 +40,7 @@ export function authorityOrigin(origin: SessionOrigin | undefined): unknown {
 }
 
 export function createSandboxedEvalKernel(options: {
+  readonly getGithubSelf?: GetGithubSelf
   readonly agentDir: string
   readonly sessionId: string
   readonly permissions: PermissionService
@@ -48,6 +50,7 @@ export function createSandboxedEvalKernel(options: {
     const origin = options.getOrigin()
     const entry = fileURLToPath(new URL('./entry.ts', import.meta.url))
     const prepared = await prepareBashSandbox({
+      getGithubSelf: options.getGithubSelf,
       command: `exec ${shellQuote(process.execPath)} --no-install ${shellQuote(entry)}`,
       agentDir: options.agentDir,
       sessionId: options.sessionId,

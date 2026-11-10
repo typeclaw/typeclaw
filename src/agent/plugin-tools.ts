@@ -19,6 +19,7 @@ import { Type } from 'typebox'
 import { z } from 'zod'
 
 import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/keys'
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import { readOomEvents, toolOomNote } from '@/container/oom-events'
 import { withToolOomPriorityCommand } from '@/container/tool-oom-priority'
 import {
@@ -296,6 +297,7 @@ export type WrapToolOptions = {
 }
 
 export type WrapSystemToolOptions = {
+  readonly getGithubSelf?: GetGithubSelf
   agentDir: string
   sessionId: string
   hooks: HookBus
@@ -655,6 +657,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             }
             if (typeof attemptArgs.command !== 'string') throw new SandboxPolicyError('bash command must be a string')
             preparedSandboxRuntime = await prepareBashSandbox({
+              getGithubSelf: opts.getGithubSelf,
               command: attemptArgs.command,
               permissions: opts.permissions,
               origin: liveOrigin,

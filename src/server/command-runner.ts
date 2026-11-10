@@ -37,6 +37,7 @@ export type CommandOutbound = {
 }
 
 export type CommandRunnerOptions = {
+  readonly getGithubSelf?: CreateSessionOptions['getGithubSelf']
   pluginRuntime: PluginRuntime
   permissions: PermissionService
   spawnSubagent: CommandSpawnSubagent
@@ -190,6 +191,7 @@ export function createCommandRunner(opts: CommandRunnerOptions): CommandRunner {
           origin,
           prompt: (text) =>
             runPromptForCommand({
+              getGithubSelf: opts.getGithubSelf,
               text,
               origin,
               runtime: opts.pluginRuntime,
@@ -413,6 +415,7 @@ function drainWrites(stream: WritableStream<Uint8Array>): Promise<void> {
 export type CreateSessionForCommand = (options: CreateSessionOptions) => Promise<CreateSessionResult>
 
 export async function runPromptForCommand(args: {
+  readonly getGithubSelf?: CreateSessionOptions['getGithubSelf']
   text: string
   origin: SessionOrigin
   runtime: PluginRuntime
@@ -446,6 +449,7 @@ export async function runPromptForCommand(args: {
   const sessionId = resolveSessionIdForOrigin(args.origin)
   const create = args._createSession ?? createSessionWithDispose
   const { session, dispose } = await create({
+    getGithubSelf: args.getGithubSelf,
     origin: args.origin,
     permissions: args.permissions,
     sessionManager: args.sessionFactory.createPersisted(),

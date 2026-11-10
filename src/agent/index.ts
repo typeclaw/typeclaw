@@ -11,6 +11,7 @@ import {
 import type { AgentSession, ToolDefinition } from '@earendil-works/pi-coding-agent'
 
 import { adapterNamespace } from '@/channels/adapter-namespace'
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import type { ChannelRouter } from '@/channels/router'
 import type { ReactionRef } from '@/channels/types'
 import { createCodingAgentTool } from '@/coding-agent/tool'
@@ -163,6 +164,7 @@ export type PluginSubagentSelection = {
 export type SessionOriginRef = { current: SessionOrigin | undefined }
 
 export type CreateSessionOptions = {
+  readonly getGithubSelf?: GetGithubSelf
   reloadRegistry?: ReloadRegistry
   sessionManager?: SessionManager
   stream?: Stream
@@ -530,6 +532,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // unwrapped bash path. `wrapBuiltinToolDefinition` no-ops the optional
   // stages (plugin hooks, permissions, bashPolicy) when they are absent.
   const builtinPiToolOverrides = buildBuiltinPiToolOverrides({
+    getGithubSelf: options.getGithubSelf,
     agentDir: options.plugins?.agentDir ?? process.cwd(),
     sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
     hooks: options.plugins?.hooks ?? createHookBus(),
@@ -576,6 +579,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     activeNames: intendedActiveToolNames,
     getActiveNames: () => activeSession?.getActiveToolNames() ?? intendedActiveToolNames,
     wrappers: {
+      getGithubSelf: options.getGithubSelf,
       agentDir: options.plugins?.agentDir ?? process.cwd(),
       sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
       hooks: options.plugins?.hooks ?? createHookBus(),

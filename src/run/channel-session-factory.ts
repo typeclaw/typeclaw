@@ -10,6 +10,7 @@ import type { CreateSessionForSubagent, SubagentCoalescer, SubagentRegistry } fr
 import { capJsonlFileInPlace } from '@/bundled-plugins/tool-result-cap/cap-jsonl'
 import type { CapOptions } from '@/bundled-plugins/tool-result-cap/cap-result'
 import type { CreateSessionForChannel, ChannelRouter } from '@/channels'
+import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import type { McpManager } from '@/mcp'
 import type { PermissionService, RolesConfig } from '@/permissions'
 import type { ReloadRegistry } from '@/reload'
@@ -29,6 +30,7 @@ const consoleLogger: FactoryLogger = {
 }
 
 export type BuildChannelSessionFactoryDeps = {
+  readonly getGithubSelf?: GetGithubSelf
   cwd: string
   sessionFactory: SessionFactory
   stream: Stream
@@ -130,6 +132,7 @@ export function buildChannelSessionFactory(deps: BuildChannelSessionFactoryDeps)
 
     const snap = deps.pluginRuntime.get()
     const session = await createSession({
+      getGithubSelf: deps.getGithubSelf,
       reloadRegistry: deps.reloadRegistry,
       sessionManager,
       stream: deps.stream,
