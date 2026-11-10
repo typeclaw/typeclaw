@@ -164,9 +164,8 @@ describe('vaultBashHook', () => {
     expect(issued).toEqual([{ tier: 'member', label: 'session:s1:1' }])
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({
       GH_REPO: 'acme/widgets',
-      TYPEVAULT_GRANT: 'tvl1.1',
-      TYPEVAULT_DIR: join('/agent', '.typevault'),
-      TYPEVAULT_GLOBAL: '1',
+      TYPECLAW_VAULT_GRANT: 'tvl1.1',
+      TYPECLAW_VAULT_DIR: join('/agent', '.typevault'),
     })
     const reveal = event.args[TYPECLAW_INTERNAL_BASH_REVEAL] as { type: string; source: string; dest: string }[]
     const runtimeRoot = join('/agent', '.typeclaw', 'typevault', 'config')

@@ -6126,11 +6126,15 @@ describe('buildSandboxEnvPolicy exposable .env names', () => {
 
   test('a TypeVault grant travels by inheritance and never appears in the bwrap argv', () => {
     const grant = 'tvl1.grant-token-value'
-    const policy = buildSandboxEnvPolicy({ TYPEVAULT_GRANT: grant, TYPEVAULT_GLOBAL: '1' }, undefined, [])
+    const policy = buildSandboxEnvPolicy(
+      { TYPECLAW_VAULT_GRANT: grant, TYPECLAW_VAULT_DIR: '/agent/.typevault' },
+      undefined,
+      [],
+    )
     const built = buildSandboxedCommand('true', { env: policy })
 
-    expect(policy.inherit).toEqual(['TYPEVAULT_GRANT'])
-    expect(policy.set).toEqual({ TYPEVAULT_GLOBAL: '1' })
+    expect(policy.inherit).toEqual(['TYPECLAW_VAULT_GRANT'])
+    expect(policy.set).toEqual({ TYPECLAW_VAULT_DIR: '/agent/.typevault' })
     expect(built.commandString).not.toContain(grant)
   })
 

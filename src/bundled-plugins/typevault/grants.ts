@@ -83,14 +83,17 @@ export function sessionLabel(sessionId: string): string {
 // What model bash needs to reach the vault through a grant: the token, the
 // ciphertext-only vault re-exposed read-only over its mask, and the daemon's
 // agent socket bound where a client with the sandbox HOME looks for it. The
-// admin sockets beside it and the agent's own key stay masked.
+// admin sockets beside it and the agent's own key stay masked. The token and
+// vault go under TypeClaw's names, read only by the `typevault` command
+// (src/typevault/bash-cli.ts): a TYPEVAULT_* variable would steer every
+// typevault CLI, a project's own included, to the agent's vault.
 export function bashVaultAccess(
   agentDir: string,
   token: string,
 ): { env: Record<string, string>; reveal: BashSandboxReveal } {
   const sandboxConfigRoot = join(DEFAULT_SANDBOX_ENV.HOME ?? '/tmp', '.config')
   return {
-    env: { TYPEVAULT_GRANT: token, TYPEVAULT_DIR: typevaultDir(agentDir), TYPEVAULT_GLOBAL: '1' },
+    env: { TYPECLAW_VAULT_GRANT: token, TYPECLAW_VAULT_DIR: typevaultDir(agentDir) },
     reveal: [
       { type: 'ro-bind', source: typevaultDir(agentDir), dest: typevaultDir(agentDir) },
       {
