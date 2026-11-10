@@ -77,11 +77,11 @@ describe('readWatermarkFromFile', () => {
     await expect(readWatermarkFromFile(path, 'ses_abc')).resolves.toBe('quietday')
   })
 
-  test('the latest marker wins regardless of whether it is a fragment or a bare watermark', async () => {
+  test('an explicit checkpoint is not overtaken by a fragment from an unfinished page', async () => {
     const path = await tmpFile(
       [fragment('ses_abc', '11111111'), watermark('ses_abc', '22222222'), fragment('ses_abc', '33333333')].join(''),
     )
-    await expect(readWatermarkFromFile(path, 'ses_abc')).resolves.toBe('33333333')
+    await expect(readWatermarkFromFile(path, 'ses_abc')).resolves.toBe('22222222')
   })
 
   test('fragment markers with a trailing certainty attribute still match', async () => {
@@ -91,6 +91,15 @@ describe('readWatermarkFromFile', () => {
 })
 
 describe('readLatestWatermark', () => {
+  test('retains an explicit checkpoint when an interrupted page wrote fragments after midnight', async () => {
+    const memoryDir = await tmpMemoryDir({
+      '2026-05-15.jsonl': watermark('ses_abc', 'unfinished-page-start'),
+      '2026-05-16.jsonl': fragment('ses_abc', 'unfinished-entry'),
+    })
+
+    await expect(readLatestWatermark(memoryDir, 'ses_abc')).resolves.toBe('unfinished-page-start')
+  })
+
   test('returns null when the memory dir does not exist', async () => {
     await expect(readLatestWatermark(join(dir, 'no-such-memory-dir-xyz'), 'ses_abc')).resolves.toBeNull()
   })

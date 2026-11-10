@@ -4,6 +4,16 @@ The bundled memory plugin. Owns `memory/topics/` (sharded long-term memory) and 
 
 Auto-loaded by every TypeClaw agent. No `plugins[]` entry to add and no opt-out. Configure via the `memory` block in `typeclaw.json`.
 
+## Extractor pages
+
+`memory-logger` receives a projected, bounded transcript view rather than provider bookkeeping and opaque replay signatures. Message content, timestamps, attribution, source IDs, parent/tool-call links, errors, and unknown evidence fields remain available; canonical transcripts stay unchanged.
+
+Large projected records are supplied as lossless `entry-part` segments. The runtime persists a starting checkpoint before each page, defers progress while fragments are being written, and accepts page completion only for the issued checkpoint and source. An interruption replays the unfinished page. Explicit checkpoints remain authoritative across daily streams; fragments alone cannot advance an unfinished page.
+
+Each continuation includes bounded read-only `precedingText` from the same record, charged to the page budget, so split instructions can be interpreted with their preceding context. Only new `text` contributes to checkpoint progress. If a partial cursor cannot be preloaded because limits are unavailable or insufficient, it remains pending with an operator warning; the legacy reader never receives it.
+
+Partial-entry checkpoints use versioned `memory-page:` cursors. Changed source records restart at their beginning, and legacy complete-entry watermarks remain supported. Drain pending pages before downgrading to a version without cursor support. No scheduling, idle-delta, or buffer-ceiling settings change.
+
 ## Config
 
 ```json

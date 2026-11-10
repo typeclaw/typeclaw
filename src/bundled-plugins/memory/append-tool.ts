@@ -14,6 +14,7 @@ import { detectSecrets } from './secret-detector'
 import { newEventId, timestampFromId } from './stream-events'
 import type { FragmentEvent, FragmentProvenance, WatermarkEvent } from './stream-events'
 import { appendEvents, readEvents, type FragmentsAppendedContext } from './stream-io'
+import { transcriptEntryId } from './transcript-cursor'
 
 export type FragmentsAppendedHook = (fragments: FragmentEvent[], context: FragmentsAppendedContext) => Promise<void>
 
@@ -35,6 +36,9 @@ export type CreateAppendToolOptions = {
   originProvider?: OriginProvider
   referenceSlugResolver?: ReferenceSlugResolver
   transcriptPathProvider?: TranscriptPathProvider
+  validateCheckpoint?: (source: string, checkpoint: string, entry?: string) => void
+  deferWatermark?: () => boolean
+  beginWrite?: () => (() => void) | undefined
 }
 
 // Stamped fields are the stable channel coordinates only. Author identity is
@@ -87,81 +91,93 @@ export function createAppendTool(options: CreateAppendToolOptions = {}) {
       nonFile: ['topic', 'body', 'source', 'entry', 'latestEntryId', 'references', 'who'],
     },
     async execute({ topic, body, source, entry, latestEntryId, references, who }, ctx) {
-      const streamPath = dailyStreamPath(ctx.agentDir)
-      const where = provenanceFromOrigin(originProvider?.())
-      const transcriptPath = transcriptPathProvider?.()
-      if (
-        transcriptPath !== undefined &&
-        (await anchorBelongsToOperationalIncident(transcriptPath, entry, latestEntryId))
-      ) {
-        throw new Error(
-          'Refusing to append: the transcript anchor belongs to a deterministic operational incident sequence. ' +
-            'Operational defects are owned by the incident ledger, not semantic memory.',
+      options.validateCheckpoint?.(source, latestEntryId, entry)
+      const finishWrite = options.beginWrite?.()
+      try {
+        const streamPath = dailyStreamPath(ctx.agentDir)
+        const where = provenanceFromOrigin(originProvider?.())
+        const transcriptPath = transcriptPathProvider?.()
+        if (
+          transcriptPath !== undefined &&
+          (await anchorBelongsToOperationalIncident(transcriptPath, entry, latestEntryId))
+        ) {
+          throw new Error(
+            'Refusing to append: the transcript anchor belongs to a deterministic operational incident sequence. ' +
+              'Operational defects are owned by the incident ledger, not semantic memory.',
+          )
+        }
+        // `who` is LLM-supplied and force-committed to memory, so it clears the
+        // same secret guard as topic/body — a token-shaped display name is refused
+        // with the same retryable error. (`where` names are origin-derived and the
+        // agent can't rewrite them, so they are self-redacted in provenanceFromOrigin
+        // instead of throwing here.)
+        assertNoSecrets([topic, body, who])
+
+        const hash = fragmentContentHash({ topic, body })
+        const events = await readEvents(streamPath)
+        const duplicate = events
+          .filter((event) => event.type === 'fragment')
+          .find((event) => fragmentContentHash(event) === hash)
+        if (duplicate !== undefined) {
+          throw new Error(
+            `Refusing to append: fragment "${duplicate.topic}" already exists in ${streamPath} with byte-equivalent content. ` +
+              `The dreaming subagent will see the existing fragment; do not write it again. If the new occurrence ` +
+              `is genuinely informative, write a fragment that says so explicitly rather than restating the original.`,
+          )
+        }
+
+        const fragmentId = newEventId()
+        const watermarkId = newEventId()
+        const fragment: FragmentEvent = {
+          type: 'fragment',
+          id: fragmentId,
+          ts: timestampFromId(fragmentId),
+          source,
+          entry,
+          topic,
+          body,
+        }
+        const validReferences = await resolveValidReferences(references, referenceSlugResolver, ctx)
+        if (validReferences.length > 0) {
+          fragment.references = validReferences
+        }
+        const safeWho = sanitizeProvenanceName(who)
+        if (safeWho !== undefined) fragment.who = safeWho
+        if (where !== undefined) fragment.where = where
+        const watermark: WatermarkEvent = {
+          type: 'watermark',
+          id: watermarkId,
+          ts: timestampFromId(watermarkId),
+          source,
+          entry: latestEntryId,
+        }
+
+        await mkdir(dirname(streamPath), { recursive: true })
+        const deferred = options.deferWatermark?.() ?? false
+        await appendEvents(
+          streamPath,
+          deferred ? [fragment] : [fragment, watermark],
+          onFragmentsAppended,
+          onFragmentsAppended
+            ? (err) => {
+                ctx.logger?.warn(
+                  `[memory] post-append vector hook failed: ${err instanceof Error ? err.message : String(err)}`,
+                )
+              }
+            : undefined,
         )
-      }
-      // `who` is LLM-supplied and force-committed to memory, so it clears the
-      // same secret guard as topic/body — a token-shaped display name is refused
-      // with the same retryable error. (`where` names are origin-derived and the
-      // agent can't rewrite them, so they are self-redacted in provenanceFromOrigin
-      // instead of throwing here.)
-      assertNoSecrets([topic, body, who])
 
-      const hash = fragmentContentHash({ topic, body })
-      const events = await readEvents(streamPath)
-      const duplicate = events
-        .filter((event) => event.type === 'fragment')
-        .find((event) => fragmentContentHash(event) === hash)
-      if (duplicate !== undefined) {
-        throw new Error(
-          `Refusing to append: fragment "${duplicate.topic}" already exists in ${streamPath} with byte-equivalent content. ` +
-            `The dreaming subagent will see the existing fragment; do not write it again. If the new occurrence ` +
-            `is genuinely informative, write a fragment that says so explicitly rather than restating the original.`,
-        )
-      }
-
-      const fragmentId = newEventId()
-      const watermarkId = newEventId()
-      const fragment: FragmentEvent = {
-        type: 'fragment',
-        id: fragmentId,
-        ts: timestampFromId(fragmentId),
-        source,
-        entry,
-        topic,
-        body,
-      }
-      const validReferences = await resolveValidReferences(references, referenceSlugResolver, ctx)
-      if (validReferences.length > 0) {
-        fragment.references = validReferences
-      }
-      const safeWho = sanitizeProvenanceName(who)
-      if (safeWho !== undefined) fragment.who = safeWho
-      if (where !== undefined) fragment.where = where
-      const watermark: WatermarkEvent = {
-        type: 'watermark',
-        id: watermarkId,
-        ts: timestampFromId(watermarkId),
-        source,
-        entry: latestEntryId,
-      }
-
-      await mkdir(dirname(streamPath), { recursive: true })
-      await appendEvents(
-        streamPath,
-        [fragment, watermark],
-        onFragmentsAppended,
-        onFragmentsAppended
-          ? (err) => {
-              ctx.logger?.warn(
-                `[memory] post-append vector hook failed: ${err instanceof Error ? err.message : String(err)}`,
-              )
-            }
-          : undefined,
-      )
-
-      return {
-        content: [{ type: 'text' as const, text: `Appended memory fragment and watermark to ${streamPath}` }],
-        details: { path: streamPath, fragmentId: fragment.id, watermarkId: watermark.id },
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Appended memory fragment${deferred ? '; complete the page after all fragments' : ' and watermark'} to ${streamPath}`,
+            },
+          ],
+          details: { path: streamPath, fragmentId: fragment.id, ...(deferred ? {} : { watermarkId: watermark.id }) },
+        }
+      } finally {
+        finishWrite?.()
       }
     },
   })
@@ -191,7 +207,7 @@ export async function anchorBelongsToOperationalIncident(
       }
     })
   const anchorIndex = entries.findIndex((entry) => entryIdOf(entry) === entryId)
-  const latestIndex = entries.findIndex((entry) => entryIdOf(entry) === latestEntryId)
+  const latestIndex = entries.findIndex((entry) => entryIdOf(entry) === transcriptEntryId(latestEntryId))
   if (anchorIndex < 0 || latestIndex < anchorIndex) return false
 
   for (let i = anchorIndex; i <= latestIndex; i++) {
@@ -230,33 +246,44 @@ function containsIncidentMarker(entry: unknown): boolean {
 
 export const appendTool = createAppendTool()
 
-export const advanceWatermarkTool = defineTool({
-  description:
-    'Advance the daily-stream watermark without writing a fragment. Use this when you evaluated transcript entries this run but decided none warranted a fragment — still call this once so the next run does not re-read the same prefix. The runtime writes the watermark line and chooses the filename.',
-  parameters: z.object({
-    source: z.string().min(1),
-    latestEntryId: z.string().min(1),
-  }),
-  async execute({ source, latestEntryId }, ctx) {
-    const streamPath = dailyStreamPath(ctx.agentDir)
-    const watermarkId = newEventId()
-    const watermark: WatermarkEvent = {
-      type: 'watermark',
-      id: watermarkId,
-      ts: timestampFromId(watermarkId),
-      source,
-      entry: latestEntryId,
-    }
+export function createAdvanceWatermarkTool(
+  options: {
+    validateCheckpoint?: (source: string, checkpoint: string) => void
+    onAdvanced?: () => void
+  } = {},
+) {
+  return defineTool({
+    description:
+      'Advance the daily-stream watermark without writing a fragment. Use this when you evaluated transcript entries this run but decided none warranted a fragment — still call this once so the next run does not re-read the same prefix. The runtime writes the watermark line and chooses the filename.',
+    parameters: z.object({
+      source: z.string().min(1),
+      latestEntryId: z.string().min(1),
+    }),
+    async execute({ source, latestEntryId }, ctx) {
+      options.validateCheckpoint?.(source, latestEntryId)
+      const streamPath = dailyStreamPath(ctx.agentDir)
+      const watermarkId = newEventId()
+      const watermark: WatermarkEvent = {
+        type: 'watermark',
+        id: watermarkId,
+        ts: timestampFromId(watermarkId),
+        source,
+        entry: latestEntryId,
+      }
 
-    await mkdir(dirname(streamPath), { recursive: true })
-    await appendEvents(streamPath, [watermark])
+      await mkdir(dirname(streamPath), { recursive: true })
+      await appendEvents(streamPath, [watermark])
+      options.onAdvanced?.()
 
-    return {
-      content: [{ type: 'text' as const, text: `Advanced memory watermark in ${streamPath}` }],
-      details: { path: streamPath, watermarkId: watermark.id },
-    }
-  },
-})
+      return {
+        content: [{ type: 'text' as const, text: `Advanced memory watermark in ${streamPath}` }],
+        details: { path: streamPath, watermarkId: watermark.id },
+      }
+    },
+  })
+}
+
+export const advanceWatermarkTool = createAdvanceWatermarkTool()
 
 function dailyStreamPath(agentDir: string): string {
   return streamFilePath(agentDir, formatLocalDate())

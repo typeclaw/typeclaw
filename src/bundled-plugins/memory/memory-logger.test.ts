@@ -530,8 +530,9 @@ describe('memoryLoggerSubagent', () => {
 
   test('the wired append tool drops a hallucinated reference slug while keeping the real one', async () => {
     const agentDir = makeAgentDir()
-    const wiredStore = silentSubagent.customTools!.find((t) => t.description.startsWith('store_reference:'))!
-    const wiredAppend = silentSubagent.customTools!.find((t) => t.description.startsWith('Append a memory fragment'))!
+    const subagent = createMemoryLoggerSubagent({ logger: silentLogger })
+    const wiredStore = subagent.customTools!.find((t) => t.description.startsWith('store_reference:'))!
+    const wiredAppend = subagent.customTools!.find((t) => t.description.startsWith('Append a memory fragment'))!
 
     const stored = await wiredStore.execute(
       { title: 'Lookup query', body: 'SELECT 1', origin: 'episode', tags: [] },
