@@ -32,6 +32,8 @@ The runtime fixes the transcript boundary for each drain and supplies each bound
 
 Before a page runs, trusted code persists its starting checkpoint. Scoped `append` writes fragments without advancing progress; after all fragment/reference writes, the watermark-advance tool commits only the exact runtime-issued page checkpoint. Foreign sources, unseen anchors, and stale page completions are rejected. Interrupted pages replay after restart, even if fragments were already written. Explicit watermark events take precedence over fragment-derived legacy progress across daily streams, so a fragment written after midnight cannot skip an unfinished entry. Fragment anchors retain the original source ID, and operational-incident checks still inspect the canonical source record, including unseen tails.
 
+Continuation segments include bounded `precedingText` from the same source record so a fresh session can interpret instructions crossing the boundary. This read-only overlap counts toward the page budget but never advances progress. If paging cannot fit or model limits are unavailable while a partial cursor exists, extraction keeps that cursor pending and logs the cause instead of entering the legacy entry-ID reader.
+
 ## Boundary with operational incidents
 
 Memory is not a repair system. A deterministic environment defect that TypeClaw can classify mechanically is owned by the [operational incident subsystem](/docs/internals/operational-incidents), never solely by a remembered workaround. This boundary is enforced before consolidation:
