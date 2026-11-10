@@ -804,7 +804,7 @@ describe('session.end byte-equality skip', () => {
     expect(spawned).toHaveLength(1)
   })
 
-  test('retries unchanged bytes on session.end when the previous logger did not complete its page', async () => {
+  test.each([null, 'a'])('retries unchanged bytes on session.end with unfinished checkpoint %s', async (checkpoint) => {
     const transcript = join(agentDir, 'transcript.jsonl')
     await writeFile(transcript, `${JSON.stringify({ id: 'a', message: { text: 'a'.repeat(15_000) } })}\n`)
     const { exports, spawned } = await bootMemoryPlugin(agentDir, {
@@ -818,6 +818,12 @@ describe('session.end byte-equality skip', () => {
     await appendFile(transcript, `${JSON.stringify({ id: 'b', message: { text: 'b'.repeat(11_000) } })}\n`)
     await exports.hooks!['session.idle']!(event, ctx)
     expect(spawned).toHaveLength(1)
+    if (checkpoint !== null) {
+      await advanceWatermarkTool.execute(
+        { source: 'ses_a', latestEntryId: checkpoint },
+        { agentDir, sessionId: 'test', signal: undefined, logger: createPluginLogger('m') },
+      )
+    }
 
     await exports.hooks!['session.end']!({ sessionId: 'ses_a' } as SessionEndEvent, ctx)
 
