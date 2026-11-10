@@ -195,6 +195,12 @@ export const reviewerPayloadSchema = z
     requestId: z.string().optional(),
     prompt: z.string().optional(),
     description: z.string().optional(),
+    skill: z
+      .enum(REVIEWER_SKILLS.map((skill) => skill.name))
+      .optional()
+      .describe(
+        'One curated review skill to preload. Omit for ambiguous or unspecified domains; load_skill remains available.',
+      ),
     reviewIdentity: reviewerReviewIdentitySchema.optional(),
   })
   .passthrough()
@@ -230,6 +236,20 @@ If none of the listed skills fit the target, load \`general\`. Keep the skill-se
       ...(options === undefined ? [] : [createReviewerCheckoutTool(options.resolveTokenForRepo)]),
     ],
     payloadSchema: reviewerPayloadSchema,
+    handler: async ({ payload }, runSession) => {
+      const skill = REVIEWER_SKILLS.find((candidate) => candidate.name === payload.skill)
+      await runSession(
+        skill === undefined
+          ? undefined
+          : {
+              systemPrompt:
+                `${REVIEWER_SYSTEM_PROMPT}\n\n## Preloaded review skill: ${skill.name}\n\n` +
+                'The following curated skill is already loaded. Apply it directly; skip the initial load_skill call. ' +
+                'Keep load_skill for an additional domain only when the target requires it.\n\n' +
+                skill.content,
+            },
+      )
+    },
     visibility: 'public',
     rosterDescription:
       'deep read-only code/PR/plan review in a fresh context, returns a structured verdict; it does NOT post — you act on its findings',
