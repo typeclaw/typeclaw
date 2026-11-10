@@ -29,6 +29,7 @@ import { hybridSearch, type EmbedFn } from './vector/hybrid'
 import { makeAppendHook } from './vector/index-on-write'
 import { makeReferenceStoredHook } from './vector/reference-index-on-write'
 import { type OpenVectorStore, VectorStore } from './vector/store'
+import { readLatestWatermark } from './watermark'
 
 const DEFAULT_IDLE_MS = 60_000
 const DEFAULT_BUFFER_BYTES = 500_000
@@ -361,8 +362,8 @@ export function createMemoryPlugin(deps: MemoryPluginDeps = defaultDeps) {
             const currentSize = await readSize(parentTranscriptPath)
             const currentLines = await readLineCount(parentTranscriptPath)
             bytesAtLastRun.set(sessionId, currentSize)
-            // Real drained watermark — set only here, inside an actual spawn, so
-            // session.end's byte-equality skip never trusts a buffer-only seed.
+            // Record only an actual spawn baseline, not a buffer-only seed.
+            // session.end also confirms the durable final-entry checkpoint.
             bytesAtLastSpawn.set(sessionId, currentSize)
             // Monotonic: never regress below a baseline the idle gate already
             // reserved. readLineCount returns 0 on a read error or a
@@ -578,10 +579,25 @@ export function createMemoryPlugin(deps: MemoryPluginDeps = defaultDeps) {
                 if (baseline !== undefined && baseline > 0) {
                   const currentSize = await readSize(last.parentTranscriptPath)
                   if (currentSize === baseline) {
-                    ctx.logger.info(
-                      `memory-logger session-end skip ${sessionId} (no new bytes since last spawn at ${baseline})`,
-                    )
-                    skip = true
+                    try {
+                      const checkpoint = await readLatestWatermark(streamsDir(ctx.agentDir), sessionId)
+                      const raw = await readFile(last.parentTranscriptPath, 'utf8')
+                      const tail: unknown = JSON.parse(raw.trimEnd().split('\n').at(-1) ?? 'null')
+                      if (
+                        checkpoint !== null &&
+                        typeof tail === 'object' &&
+                        tail !== null &&
+                        'id' in tail &&
+                        tail.id === checkpoint
+                      ) {
+                        ctx.logger.info(
+                          `memory-logger session-end skip ${sessionId} (no new bytes since last spawn at ${baseline})`,
+                        )
+                        skip = true
+                      }
+                    } catch {
+                      ctx.logger.warn(`memory-logger ${sessionId} final checkpoint unconfirmed; keeping final sweep`)
+                    }
                   }
                 }
               }

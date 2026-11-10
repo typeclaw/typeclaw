@@ -191,7 +191,7 @@ The `session.idle` hook fires after every prompt completion. A chatty channel se
 
 ### Byte-equality skip (session.end)
 
-When `session.end` arrives and an earlier idle/buffer-trip spawn already drained the transcript to its current size, the session-end spawn is skipped. The skip is logged as `memory-logger session-end skip ses_X (no new bytes since last spawn at N)`. The skip only applies when a real baseline was recorded (`bytesAtLastRun > 0`); sessions that ended before any spawn ran still fire on close.
+When `session.end` arrives, the final sweep is skipped only when an earlier spawn recorded the same byte size **and** its durable watermark matches the transcript's complete final entry. Returning from a logger spawn does not itself prove the evidence was drained. Missing checkpoints, partial-entry cursors, malformed tails, and failed coverage checks retain the final sweep. The skip is logged as `memory-logger session-end skip ses_X (no new bytes since last spawn at N)`. Sessions that ended before any spawn ran still fire on close.
 
 ### Daily-stream cursor (memory-logger payload)
 

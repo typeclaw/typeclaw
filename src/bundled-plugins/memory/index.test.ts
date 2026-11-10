@@ -14,6 +14,7 @@ import { createPluginContext, createPluginLogger } from '@/plugin/context'
 import { formatLocalDate } from '@/shared'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
+import { advanceWatermarkTool } from './append-tool'
 import memoryPlugin, { createMemoryPluginForTests, type MemoryPluginDeps } from './index'
 import { streamFilePath } from './paths'
 import { VectorStore } from './vector/store'
@@ -771,9 +772,9 @@ describe('session.end byte-equality skip', () => {
   beforeEach(installFakeClock)
   afterEach(uninstallFakeClock)
 
-  test('skips spawn when session.end arrives with no new bytes since the last logger run', async () => {
+  test('skips spawn when unchanged transcript bytes have a completed final-entry checkpoint', async () => {
     const transcript = join(agentDir, 'transcript.jsonl')
-    await writeFile(transcript, 'a'.repeat(15_000))
+    await writeFile(transcript, `${JSON.stringify({ id: 'a', message: { text: 'a'.repeat(15_000) } })}\n`)
 
     const { exports, spawned } = await bootMemoryPlugin(agentDir, {
       idleMs: 60_000,
@@ -786,10 +787,14 @@ describe('session.end byte-equality skip', () => {
     // given: first idle initializes baseline at 15_000 bytes (no spawn)
     await exports.hooks!['session.idle']!(event, ctx)
     // when: transcript crosses bufferBytes and idle fires → buffer-trip spawn (baseline now 25_000)
-    await appendFile(transcript, 'b'.repeat(10_000))
+    await appendFile(transcript, `${JSON.stringify({ id: 'b', message: { text: 'b'.repeat(10_000) } })}\n`)
     await exports.hooks!['session.idle']!(event, ctx)
     await waitFor(() => spawned.length >= 1, 'buffer-trip spawn')
     expect(spawned).toHaveLength(1)
+    await advanceWatermarkTool.execute(
+      { source: 'ses_a', latestEntryId: 'b' },
+      { agentDir, sessionId: 'test', signal: undefined, logger: createPluginLogger('m') },
+    )
 
     // when: session.end arrives with no new bytes
     await exports.hooks!['session.end']!({ sessionId: 'ses_a' } as SessionEndEvent, ctx)
@@ -797,6 +802,27 @@ describe('session.end byte-equality skip', () => {
     await tickMs(50)
     // then: no second spawn — the buffer-trip already drained this transcript
     expect(spawned).toHaveLength(1)
+  })
+
+  test('retries unchanged bytes on session.end when the previous logger did not complete its page', async () => {
+    const transcript = join(agentDir, 'transcript.jsonl')
+    await writeFile(transcript, `${JSON.stringify({ id: 'a', message: { text: 'a'.repeat(15_000) } })}\n`)
+    const { exports, spawned } = await bootMemoryPlugin(agentDir, {
+      idleMs: 60_000,
+      bufferBytes: 10_000,
+      minIdleDeltaLines: 0,
+    })
+    const ctx = { agentDir, pluginName: 'memory', logger: createPluginLogger('m') }
+    const event: SessionIdleEvent = { sessionId: 'ses_a', parentTranscriptPath: transcript, idleMs: 0 }
+    await exports.hooks!['session.idle']!(event, ctx)
+    await appendFile(transcript, `${JSON.stringify({ id: 'b', message: { text: 'b'.repeat(11_000) } })}\n`)
+    await exports.hooks!['session.idle']!(event, ctx)
+    expect(spawned).toHaveLength(1)
+
+    await exports.hooks!['session.end']!({ sessionId: 'ses_a' } as SessionEndEvent, ctx)
+
+    await waitFor(() => spawned.length === 2, 'unfinished page retried at session end')
+    expect(spawned).toHaveLength(2)
   })
 
   test('still spawns on session.end when transcript grew since the last logger run', async () => {
