@@ -13360,6 +13360,59 @@ describe('ChannelRouter cold-start prefetch', () => {
     expect(sessions[0]!.prompts).toHaveLength(1)
   })
 
+  test.each([
+    { shape: 'thread-keyed (Slack-style)', chat: 'c1', thread: 't-A', otherChat: 'c1', otherThread: 't-B' },
+    { shape: 'thread-channel (Discord-style)', chat: 'thread1', thread: null, otherChat: 'thread2', otherThread: null },
+  ])(
+    '$shape: a thread the bot replied in keeps engaging un-addressed follow-ups after a restart',
+    async ({ chat, thread, otherChat, otherThread }) => {
+      // given: the bot was mentioned in the thread and replied, then the process restarted
+      const dir = await tempDir()
+      const room = thread === null ? { kind: 'thread' as const, parentChat: 'c1' } : undefined
+      const key = { adapter: 'discord-bot' as const, workspace: 'g1', chat, thread }
+      const firstRun = makeRouter(dir)
+      firstRun.router.registerOutbound('discord-bot', async () => ({ ok: true }))
+      await firstRun.router.route(inbound({ chat, thread, ...(room ? { room } : {}), text: 'bot, take a look' }))
+      await firstRun.router.__testing!.flushDebounce(key)
+      const sent = await firstRun.router.send({ adapter: 'discord-bot', workspace: 'g1', chat, thread, text: 'on it' })
+      expect(sent.ok).toBe(true)
+      await firstRun.router.stop()
+
+      // when: after the restart, the same human follows up without mentioning the bot,
+      // and another human posts un-addressed in a thread the bot never joined
+      const secondRun = makeRouter(dir)
+      await secondRun.router.route(
+        inbound({
+          chat,
+          thread,
+          ...(room ? { room } : {}),
+          externalMessageId: 'after-restart',
+          isBotMention: false,
+          text: '이것도 확인해줘',
+        }),
+      )
+      await secondRun.router.__testing!.flushDebounce(key)
+      await secondRun.router.route(
+        inbound({
+          chat: otherChat,
+          thread: otherThread,
+          ...(room ? { room } : {}),
+          externalMessageId: 'unjoined-thread',
+          authorId: 'bob',
+          authorName: 'bob',
+          isBotMention: false,
+          text: 'just chatting here',
+        }),
+      )
+      await secondRun.router.__testing!.flushDebounce({ ...key, chat: otherChat, thread: otherThread })
+
+      // then: the joined thread engages; the never-joined thread stays observed
+      expect(secondRun.sessions[0]!.prompts).toHaveLength(1)
+      expect(secondRun.sessions[0]!.prompts[0]).toContain('이것도 확인해줘')
+      expect(secondRun.sessions[1]!.prompts).toHaveLength(0)
+    },
+  )
+
   test('a cold-started bot-joined thread with two historical humans observes an un-addressed message', async () => {
     // given: thread history already holds Alice, Bob, and our earlier reply
     const dir = await tempDir()

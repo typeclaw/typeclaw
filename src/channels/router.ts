@@ -1093,6 +1093,9 @@ type LiveSession = {
   // future hard cap without picking a threshold out of thin air.
   sendTimestamps: Map<string, number[]>
   successfulChannelSends: number
+  // Durable twin of `successfulChannelSends > 0`, restored from the persisted
+  // mapping so `botInThread` survives restarts and rollovers.
+  botParticipated: boolean
   // Monotonic per-LiveSession turn counter incremented just before each
   // `live.session.prompt(...)` call in `drain()`. Used as a turn identity
   // so `skip_response` can record "I skipped turn N" without leaking
@@ -2982,6 +2985,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               chat: prev.chat,
               thread: prev.thread,
               participants: prev.participants,
+              ...(prev.botParticipated === true ? { botParticipated: true as const } : {}),
               lastInboundAt: 0,
               ...(prev.githubReviewThreadCloseout !== undefined && prev.githubReviewRound !== undefined
                 ? { githubReviewRound: prev.githubReviewRound }
@@ -3032,6 +3036,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           chat: record.chat,
           thread: record.thread,
           participants: record.participants,
+          ...(record.botParticipated === true ? { botParticipated: true as const } : {}),
           lastInboundAt: 0,
           ...(record.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
           ...(record.githubReviewThreadCloseout !== undefined
@@ -3064,6 +3069,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           sessionId: resumeTarget.sessionId,
           sessionFile: resumeTarget.sessionFile,
           participants: (record?.participants ?? []) as ChannelParticipant[],
+          ...(record?.botParticipated === true ? { botParticipated: true as const } : {}),
           lastInboundAt: now(),
           ...(record?.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
           ...(record?.githubReviewThreadCloseout !== undefined
@@ -3169,6 +3175,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         ...(transcriptPath ? { sessionFile: basename(transcriptPath) } : {}),
         lastInboundAt: now(),
         participants,
+        ...(resolvedRecord?.botParticipated === true ? { botParticipated: true as const } : {}),
         ...(restoredRound !== null && restoredRoundStatus !== null
           ? (() => {
               const state = githubReviewRoundPersistence(restoredRound, now)
@@ -3285,6 +3292,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastSendLeafId: null,
         sendTimestamps: new Map(),
         successfulChannelSends: 0,
+        botParticipated: resolvedRecord?.botParticipated === true,
         turnSeq: 0,
         logicalTurnStartedAt: now(),
         coverageDeferredSince: null,
@@ -3610,6 +3618,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (idx < 0) return
     const next = mappings.slice()
     next[idx] = { ...next[idx]!, participants: live.participants }
+    mappings = next
+    await persist()
+  }
+
+  const persistBotParticipation = async (live: LiveSession): Promise<void> => {
+    if (mappings === null) return
+    const idx = mappings.findIndex(
+      (s) =>
+        s.adapter === live.key.adapter &&
+        s.workspace === live.key.workspace &&
+        s.chat === live.key.chat &&
+        (s.thread ?? null) === (live.key.thread ?? null),
+    )
+    if (idx < 0) return
+    const next = mappings.slice()
+    next[idx] = { ...next[idx]!, botParticipated: true }
     mappings = next
     await persist()
   }
@@ -6495,7 +6519,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   }
 
   const hasBotParticipated = (live: LiveSession): boolean => {
-    if (live.successfulChannelSends > 0) return true
+    if (live.botParticipated || live.successfulChannelSends > 0) return true
     // Only OUR own prefetched history counts as participation — matching any
     // bot here let a PEER bot's buffered message flip botInThread=true,
     // neutralizing the replyToOtherMessageId suppressor and engaging us in a
@@ -7597,6 +7621,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
+      if (!live.botParticipated) {
+        live.botParticipated = true
+        void persistBotParticipation(live).catch((err) => {
+          logger.warn(`[channels] ${live.keyId}: persisting bot participation failed: ${describeError(err)}`)
+        })
+      }
       // Promise fulfillment follows OUTPUT KIND, never source:
       //   (a) ordinary substantive tool output clears;
       //   (b) multilingual continuation-willingness/status output preserves, and
