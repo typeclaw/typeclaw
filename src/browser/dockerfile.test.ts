@@ -16,7 +16,7 @@ test('enabled engines and extensions install pinned, checksum-verified layers in
       browser: { engines: ['agent-browser', 'omowright', 'browser-use'], extensions: ['browserskill'] },
     })
 
-    expect(dockerfile).toContain('bun add github:code-yeongyu/omowright#')
+    expect(dockerfile).toMatch(/bun add omowright@\d+\.\d+\.\d+/)
     expect(dockerfile).toMatch(/uv tool install --python 3\.12 browser-use==\d+\.\d+\.\d+/)
     expect(dockerfile).toContain('sha256sum -c -')
     expect(dockerfile).toContain('/usr/local/lib/typeclaw-browser/extensions/browserskill')

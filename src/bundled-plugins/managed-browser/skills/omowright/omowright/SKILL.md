@@ -42,7 +42,7 @@ Reuse your tab across retries with `attachPage` instead of opening another `tabs
 - Prefer `compactSnapshot(await page.snapshot())` over screenshots; re-snapshots come back as a diff.
 - Long lists: `createNetworkSnoop` + `collectWhileScrolling` read the page's JSON instead of scraping rows.
 - Canvas or custom widgets: `createCua(page)` gives coordinate-level clicks and scrolls.
-- `connectPipe()` and `connectBrowserSkill()` launch or find other browsers; do not use them here.
+- `connectBrowser()`, `connectPipe()`, and `connectBrowserSkill()` launch or find other browsers; do not use them here.
 
 ## Sites with anti-macro checks
 

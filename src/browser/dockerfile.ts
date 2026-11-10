@@ -35,7 +35,7 @@ RUN mkdir -p ${root} \\
  && cd ${root} \\
  && printf '{}' > package.json \\
  && BUN_INSTALL_CACHE_DIR=/tmp/typeclaw-browser-bun-cache bun add ${spec} \\
- && printf '%s\\n' 'export * from "${root}/node_modules/${id}/src/index.js"' > ${module} \\
+ && printf '%s\\n' 'export * from "${id}"' > ${module} \\
  && rm -rf /tmp/typeclaw-browser-bun-cache \\
  && chmod -R a+rX ${root} \\
  && bun -e 'await import("${module}")'`
