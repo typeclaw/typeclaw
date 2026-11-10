@@ -166,6 +166,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   let stopObservingDismissals: (() => void) | null = null
   let lifecycleGeneration = 0
   let unregisterTokenBridge: (() => void) | null = null
+  let unregisterSelfBridge: (() => void) | null = null
   const workspaceByChat = createChatWorkspaceIndex()
   const pendingAdmissions = pendingAdmissionsByRouter.get(options.router) ?? new Set<string>()
   pendingAdmissionsByRouter.set(options.router, pendingAdmissions)
@@ -486,6 +487,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
           () => selfLogin,
         )
       }
+      unregisterSelfBridge = options.githubTokenBridge?.registerSelf(self) ?? null
       logger.info(`[github] webhook listening on port ${options.configRef().webhookPort} as @${self.login}`)
       // Attach before any webhook can start a review, and close checks a
       // previous process left in progress.
@@ -727,6 +729,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         unregisterTokenBridge()
         unregisterTokenBridge = null
       }
+      unregisterSelfBridge?.()
+      unregisterSelfBridge = null
       await auth.dispose()
       if (options.secrets.auth.type === 'pat') delete process.env.GH_TOKEN
       server = null

@@ -1271,10 +1271,12 @@ describe('createGithubAdapter lifecycle', () => {
       })
 
       await adapter.start()
+      expect(bridge.getSelf()).toEqual({ login: 'mybot[bot]', id: 1 })
       const result = await bridge.resolveTokenForRepo('acme/widgets')
       await adapter.stop()
 
       expect(result).toEqual({ kind: 'token', token: 'ghs_minted', accountIdentity: 'github:1' })
+      expect(bridge.getSelf()).toBeNull()
     })
 
     test('refuses to mint for a repo not in repos[] (blocks cross-repo token minting)', async () => {
@@ -1333,6 +1335,7 @@ describe('createGithubAdapter lifecycle', () => {
       try {
         // when / then
         await adapter.start()
+        expect(bridge.getSelf()).toEqual({ login: 'agent-user', id: 7 })
         expect(bridge.hasAppTokenResolver()).toBe(false)
         await expect(bridge.resolvePatForRepo('ACME/Widgets')).resolves.toEqual({ kind: 'token', token: 'ghp_test' })
         const refused = await bridge.resolvePatForRepo('victim/private')
@@ -1344,6 +1347,7 @@ describe('createGithubAdapter lifecycle', () => {
 
         repos = ['acme/widgets']
         await adapter.stop()
+        expect(bridge.getSelf()).toBeNull()
         expect((await bridge.resolvePatForRepo('acme/widgets')).kind).toBe('unavailable')
       } finally {
         await adapter.stop()

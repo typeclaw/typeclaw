@@ -1,3 +1,4 @@
+import type { GithubSelfUser } from './adapters/github/auth'
 import { describeError } from './describe-error'
 // Decoupled from ChannelRouter on purpose: minting a token for an arbitrary
 // bash `gh` command is adjacent to channels but is not routing, and a global
@@ -10,8 +11,11 @@ export type GithubTokenResolveResult =
   | { kind: 'unavailable'; reason: string }
 
 export type ResolveGithubTokenForRepo = (repoSlug: string) => Promise<GithubTokenResolveResult>
+export type GetGithubSelf = () => GithubSelfUser | null
 
 export type GithubTokenBridge = {
+  getSelf: GetGithubSelf
+  registerSelf: (self: GithubSelfUser) => () => void
   resolveTokenForRepo: ResolveGithubTokenForRepo
   // True when a per-repo App-token minter is registered (only the GitHub App
   // adapter registers one). This is the non-secret "App auth with per-repo
@@ -38,11 +42,20 @@ const NO_PAT_RESOLVER_REASON =
   'No GitHub channel PAT is available; the GitHub channel is not configured with PAT auth, or its adapter is not running.'
 
 export function createGithubTokenBridge(): GithubTokenBridge {
+  let currentSelf: { readonly user: GithubSelfUser } | null = null
   let current: ((repoSlug: string) => Promise<GithubTokenCredential>) | null = null
   let currentSelfLogin: (() => string | null) | null = null
   let currentPat: ((repoSlug: string) => Promise<GithubTokenCredential>) | null = null
 
   return {
+    getSelf: () => currentSelf?.user ?? null,
+    registerSelf: (self) => {
+      const registration = { user: self }
+      currentSelf = registration
+      return () => {
+        if (currentSelf === registration) currentSelf = null
+      }
+    },
     resolvePatForRepo: async (repoSlug) => {
       const resolver = currentPat
       if (resolver === null) return { kind: 'unavailable', reason: NO_PAT_RESOLVER_REASON }

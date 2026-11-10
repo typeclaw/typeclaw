@@ -3,6 +3,32 @@ import { describe, expect, it } from 'bun:test'
 import { createGithubTokenBridge } from './github-token-bridge'
 
 describe('createGithubTokenBridge', () => {
+  it('has no self until an adapter publishes it', () => {
+    const bridge = createGithubTokenBridge()
+
+    expect(bridge.getSelf()).toBeNull()
+  })
+
+  it('clears self when the publishing adapter stops', () => {
+    const bridge = createGithubTokenBridge()
+    const unregister = bridge.registerSelf({ login: 'my-app[bot]', id: 12345 })
+    expect(bridge.getSelf()).toEqual({ login: 'my-app[bot]', id: 12345 })
+
+    unregister()
+
+    expect(bridge.getSelf()).toBeNull()
+  })
+
+  it('keeps a replacement account when an old adapter unregisters', () => {
+    const bridge = createGithubTokenBridge()
+    const unregister = bridge.registerSelf({ login: 'my-app[bot]', id: 12345 })
+    bridge.registerSelf({ login: 'octocat', id: 67890 })
+
+    unregister()
+
+    expect(bridge.getSelf()).toEqual({ login: 'octocat', id: 67890 })
+  })
+
   it('in-flight resolver rotation preserves the credential actor pair', async () => {
     const bridge = createGithubTokenBridge()
     const release = Promise.withResolvers<void>()
