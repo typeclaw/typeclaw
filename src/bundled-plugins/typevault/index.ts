@@ -9,7 +9,7 @@ import { BUILTIN_ROLE_NAMES, CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin, type Hooks } from '@/plugin'
 import { isTypevaultMarkerFile } from '@/typevault/envelope-store'
 import { vaultSecretValues } from '@/typevault/redaction'
-import { ensureRoleTiers, isRoleTier, vaultAdmin } from '@/typevault/vault'
+import { ensureProjectIdentity, ensureRoleTiers, isRoleTier, projectMemberName, vaultAdmin } from '@/typevault/vault'
 
 import { bashVaultAccess, createSessionGrants, GRANT_TTL } from './grants'
 import { createVaultRequestTool, VAULT_REQUEST_TOOL } from './request'
@@ -36,6 +36,14 @@ export default definePlugin({
       return {}
     }
 
+    let projectIdentity = true
+    try {
+      await ensureProjectIdentity(ctx.agentDir, projectMemberName(process.env.TYPECLAW_CONTAINER_NAME))
+    } catch (error) {
+      projectIdentity = false
+      ctx.logger.warn(`typevault: could not create the identity for joining project vaults: ${String(error)}`)
+    }
+
     const admin = vaultAdmin(ctx.agentDir, { promptPort: config.typevault.promptPort })
     const grants = createSessionGrants({
       issue: ({ tier, label }) => admin.grant({ tiers: [tier], ttl: GRANT_TTL, label }),
@@ -45,7 +53,7 @@ export default definePlugin({
     })
     const roles = new Map<string, string>()
     activateVaultRuntime({ agentDir: ctx.agentDir, grants, roles })
-    const bashHook = vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger)
+    const bashHook = vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger, { projectIdentity })
 
     return {
       skillsDirs: [SKILLS_ROOT],
@@ -84,6 +92,7 @@ export function vaultBashHook(
   permissions: PermissionService,
   grants: SessionGrants,
   logger: { warn: (msg: string) => void },
+  options: { projectIdentity?: boolean } = {},
 ): NonNullable<Hooks['tool.before']> {
   return async (event) => {
     if (event.tool !== 'bash' || !permissions.has(event.origin, CORE_PERMISSIONS.vaultUse)) return
@@ -98,7 +107,7 @@ export function vaultBashHook(
       logger.warn(`typevault: could not issue a grant for tier ${tier}: ${String(error)}`)
       return
     }
-    const access = bashVaultAccess(agentDir, token)
+    const access = bashVaultAccess(agentDir, token, options)
     const existingEnv = event.args[TYPECLAW_INTERNAL_BASH_ENV]
     event.args[TYPECLAW_INTERNAL_BASH_ENV] = {
       ...(existingEnv !== null && typeof existingEnv === 'object' ? (existingEnv as Record<string, string>) : {}),

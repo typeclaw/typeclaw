@@ -14,7 +14,14 @@ import type { ToolAfterEvent, ToolBeforeEvent } from '@/plugin'
 import { typevaultCliPath } from '@/typevault/cli-path'
 import { reconcileTypevault } from '@/typevault/lifecycle'
 import { vaultSecretValues } from '@/typevault/redaction'
-import { ensureRoleTiers, grantAccess, typevaultDir, typevaultEnv, vaultAdmin } from '@/typevault/vault'
+import {
+  ensureRoleTiers,
+  grantAccess,
+  projectIdentityPath,
+  typevaultDir,
+  typevaultEnv,
+  vaultAdmin,
+} from '@/typevault/vault'
 
 import { createSessionGrants, type GrantIssuer } from './grants'
 import { REDACTION_UNAVAILABLE, vaultBashHook, vaultRedactHook } from './index'
@@ -178,6 +185,22 @@ describe('vaultBashHook', () => {
     expect(reveal[1]?.source).toStartWith(join(runtimeRoot, 'typevault', 'checkouts'))
     expect(reveal[1]?.dest).toStartWith(join(sandboxRoot, 'typevault', 'checkouts'))
     expect(reveal[1]?.dest.slice(sandboxRoot.length)).toBe(reveal[1]?.source.slice(runtimeRoot.length))
+  })
+
+  test('the project member identity lands where a typevault CLI under the sandbox HOME looks for it', async () => {
+    const { issuer } = fakeIssuer()
+    const hook = vaultBashHook('/agent', createPermissionService(), createSessionGrants(issuer), silent, {
+      projectIdentity: true,
+    })
+    const event = bashEvent(spawnedBy('member'))
+
+    await hook(event, {} as never)
+
+    expect(event.args[TYPECLAW_INTERNAL_BASH_REVEAL]).toContainEqual({
+      type: 'ro-bind',
+      source: projectIdentityPath('/agent'),
+      dest: join('/tmp', '.config', 'typevault', 'identity.json'),
+    })
   })
 
   test('a custom role named runtime never receives a grant for the runtime tier', async () => {
