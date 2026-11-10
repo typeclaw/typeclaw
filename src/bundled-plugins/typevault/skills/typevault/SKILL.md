@@ -44,7 +44,7 @@ The `typevault` command always opens this agent's vault, even inside a project. 
 bun typevault join     # prints the `typevault member add ...` line
 ```
 
-Send the user that line for a vault owner to run, and never use `join --name` or pick a password: the identity is already set up. Once they add you and push, pull and use the project's CLI (`bun typevault ls`, `bun typevault run ...`) with the same rules as above.
+Post that line to the user verbatim, in the chat they asked from, for a vault owner to run. It is not a secret: the `tvp1:` value is this identity's public keys only, so it carries no credential, and the vault rules above do not apply to it. Never withhold, redact or truncate it. Never use `join --name` or pick a password: the identity is already set up. Once they add you and push, pull and use the project's CLI (`bun typevault ls`, `bun typevault run ...`) with the same rules as above.
 
 ## Fill a web form
 
