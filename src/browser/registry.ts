@@ -48,7 +48,7 @@ export const OMOWRIGHT_MODULE = `${BROWSER_ROOT}/omowright/index.js`
 
 const OMOWRIGHT_VERSION = '0.3.0'
 const BROWSER_USE_VERSION = '0.13.11'
-const BSK_VERSION = '0.3.3'
+const BSK_VERSION = '0.4.2'
 const BSK_RELEASES = 'https://github.com/Tencent/BrowserSkill/releases/download'
 
 export const BROWSER_ENGINES: Record<BrowserEngineId, BrowserEngineSpec> = {
@@ -75,18 +75,18 @@ export const BROWSER_EXTENSIONS: Record<BrowserExtensionId, BrowserExtensionSpec
     version: BSK_VERSION,
     zip: {
       url: `${BSK_RELEASES}/ext-v${BSK_VERSION}/browser-skill-extension-v${BSK_VERSION}-chrome.zip`,
-      sha256: '10ef76e68f352893fa22dd4cce2f1b96cb90ed957b815d656e13180d07d3c6ea',
+      sha256: '5360ef01ec8fcd3550215e12c417d8b98814bff0e54d478e6b867d693c1d4d76',
     },
     cli: {
       name: 'bsk',
       urlByArch: {
         amd64: {
           url: `${BSK_RELEASES}/cli-v${BSK_VERSION}/bsk-v${BSK_VERSION}-x86_64-unknown-linux-musl.tar.gz`,
-          sha256: '141b73489bec99d768cf18042919f0e054c9f614e6ecdfd754028d2b606e9106',
+          sha256: '5286ccdc104e52200c47b4a492c6e043069e5bf1e638db8fdbde62a9d4939979',
         },
         arm64: {
           url: `${BSK_RELEASES}/cli-v${BSK_VERSION}/bsk-v${BSK_VERSION}-aarch64-unknown-linux-musl.tar.gz`,
-          sha256: '747e4c416da46650c7d8127a47dd8f08e813e0f69366c4db1af226d0b63a575d',
+          sha256: 'f965474d8ad61cfb819b5123f4355135ee2afa9c4f742bbbe9e4f463dc7d5fa3',
         },
       },
     },
