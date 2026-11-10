@@ -1424,6 +1424,7 @@ exit 0
       .replaceAll('/tmp/.X11-unix/X99', socketPath)
       .replace('[ -S ' + socketPath + ' ]', '[ -e ' + socketPath + ' ]')
     const shimPath = join(runWorkdir, 'shim-runtime-xvfb.sh')
+    const stderrPath = join(runWorkdir, 'stderr.log')
     await writeShellScript(shimPath, shim)
 
     const fakeHome = join(runWorkdir, 'home')
@@ -1436,11 +1437,14 @@ exit 0
         TYPECLAW_HOST_UID: String(process.getuid?.() ?? 1000),
         TYPECLAW_HOST_GID: String(process.getgid?.() ?? 1000),
       },
-      stdout: 'pipe',
-      stderr: 'pipe',
+      stdout: 'ignore',
+      // A file, not a pipe: the shim's Xvfb monitor subshell outlives the shim
+      // and holds stderr open until the fake Xvfb exits, so reading a pipe to
+      // EOF would block for the fake's full lifetime.
+      stderr: Bun.file(stderrPath),
     })
     const exitCode = await proc.exited
-    const stderr = await new Response(proc.stderr).text()
+    const stderr = readFileSync(stderrPath, 'utf8')
 
     expect(stderr).not.toContain('Xvfb exited immediately')
     expect(exitCode).toBe(0)
