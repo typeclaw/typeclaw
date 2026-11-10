@@ -122,6 +122,63 @@ function fixedSpawn(opts: {
 }
 
 describe('createSpawnSubagentTool — visibility gate', () => {
+  test('an explicit review skill reaches the trusted fresh-session prefix through the public spawn tool', async () => {
+    const { tools: _tools, customTools: _customTools, ...reviewer } = createReviewerSubagent()
+    const created = Promise.withResolvers<CreateSessionForSubagentOptions | undefined>()
+    const session = emittingSession(() => ({
+      type: 'message_end',
+      message: { role: 'assistant', content: '<review><summary>Checked</summary><verdict>approve</verdict></review>' },
+    }))
+    const { tool } = fixedSpawn({
+      registry: { reviewer },
+      createSession: async (_subagent, options) => {
+        created.resolve(options)
+        return session
+      },
+    })
+
+    await tool.execute(
+      'call_skill',
+      { subagent_type: 'reviewer', prompt: '변경 사항을 검토해 주세요.', review_skill: 'code-review' },
+      undefined,
+      undefined,
+      ctx,
+    )
+    const options = await created.promise
+
+    expect(options?.systemPromptOverride).toContain('## Preloaded review skill: code-review')
+    expect(options?.name).toBe('reviewer')
+  })
+
+  test.each([
+    { subagent_type: 'explorer', review_skill: 'code-review' },
+    { subagent_type: 'reviewer', review_skill: 'unknown-review-skill' },
+  ])(
+    'rejects invalid explicit skill selection before session creation: $subagent_type/$review_skill',
+    async (selection) => {
+      let creations = 0
+      const { reviewer } = reviewerRegistry()
+      const { tool } = fixedSpawn({
+        registry: { ...makeRegistry(), reviewer },
+        createSession: async () => {
+          creations++
+          return stubSession()
+        },
+      })
+
+      const result = await tool.execute(
+        'call_invalid_skill',
+        { ...selection, prompt: 'Review this task.' },
+        undefined,
+        undefined,
+        ctx,
+      )
+
+      expect(result.details).toMatchObject({ ok: false })
+      expect(creations).toBe(0)
+    },
+  )
+
   test('public subagent (explorer) spawns successfully', async () => {
     const session = stubSession()
     const { tool } = fixedSpawn({ createSession: async () => session })

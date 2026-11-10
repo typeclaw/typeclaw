@@ -122,6 +122,13 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
             'Model profile to run this spawn on, overriding the subagent\'s default tier for this one task. Use "deep" for hard work that needs stronger reasoning (gnarly bugs, non-obvious refactors, failures that resisted a quick fix); omit (or "default") for routine work. Resolves against the configured model profiles; an unknown name falls back to default. Most useful on `operator` — leave it off unless the task clearly warrants a heavier model.',
         }),
       ),
+      review_skill: Type.Optional(
+        Type.String({
+          description:
+            'Explicit curated skill for reviewer: code-review, doc-review, plan-review, security-audit, writing-review, data-review, or general. ' +
+            'Valid only for reviewer. Choose only when the review domain is explicit; omit for ambiguous tasks so the reviewer selects dynamically.',
+        }),
+      ),
       review_identity: Type.Optional(
         Type.Object(
           {
@@ -186,6 +193,10 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       const payload: Record<string, unknown> = { requestId: taskId, prompt: params.prompt }
       if (params.description !== undefined) payload.description = params.description
       if (params.profile !== undefined) payload.profile = params.profile
+      if (params.review_skill !== undefined) {
+        if (subagentName !== 'reviewer') return errorResult('review_skill is only valid for reviewer subagents')
+        payload.skill = params.review_skill
+      }
       if (params.review_identity !== undefined) {
         if (subagentName !== 'reviewer') {
           return errorResult('review_identity is only valid for reviewer subagents')
@@ -197,6 +208,9 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           baseSha: params.review_identity.base_sha,
           reviewKind: params.review_identity.review_kind,
         }
+      }
+      if (params.review_skill !== undefined && !subagent.payloadSchema?.safeParse(payload).success) {
+        return errorResult('review_skill is not accepted by this reviewer')
       }
       const workKey =
         params.review_identity === undefined
