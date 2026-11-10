@@ -1,6 +1,6 @@
 ---
 name: typevault
-description: Use secrets from this agent's TypeVault vault without putting them in the transcript. Use when a task needs an API key, password, token, OAuth credential, SSH key or TOTP code that lives in the vault, or when the user mentions TypeVault, the vault, or storing a secret.
+description: Use secrets from this agent's TypeVault vault without putting them in the transcript. Use when a task needs an API key, password, token, OAuth credential, SSH key or TOTP code that lives in the vault or in a project's `.typevault/`, when asked to join a project's vault, or when the user mentions TypeVault, the vault, or storing a secret.
 ---
 
 # TypeVault
@@ -35,6 +35,16 @@ DATABASE_URL=typevault://postgres/prod#url typevault run --reason "run migration
 - Quote `$VAR` references in single quotes so your shell does not expand them before `run` sets them.
 - `run` loads every entry of your own tier; entries from lower tiers load only when `--only` names them exactly.
 - TOTP fields hold the current code, never the seed.
+
+## A project's own vault
+
+The `typevault` command always opens this agent's vault, even inside a project. For a project that keeps its own `.typevault/`, run the project's CLI from its checkout instead, e.g. `bun typevault ...` when the project depends on `typevault`. Your bash already holds this agent's machine identity for project vaults, so nothing asks for a password.
+
+```sh
+bun typevault join     # prints the `typevault member add ...` line
+```
+
+Send the user that line for a vault owner to run, and never use `join --name` or pick a password: the identity is already set up. Once they add you and push, pull and use the project's CLI (`bun typevault ls`, `bun typevault run ...`) with the same rules as above.
 
 ## Fill a web form
 
