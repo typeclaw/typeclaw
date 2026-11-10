@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { KakaoChat, KakaoMember } from 'agent-messenger/kakaotalk'
+import type { KakaoChat, KakaoMember, KakaoMemberSnapshot } from 'agent-messenger/kakaotalk'
 
 import type { KakaoTalkClient } from './kakaotalk'
 import { createKakaoChannelResolver, kakaoWorkspaceForType, provenKindFromMembers } from './kakaotalk-channel-resolver'
@@ -46,11 +46,19 @@ const member = (id: string, overrides: Partial<KakaoMember> = {}): KakaoMember =
   ...overrides,
 })
 
-type FakeClient = Pick<KakaoTalkClient, 'getChats' | 'getMembers'>
+const snapshot = (members: KakaoMember[]): KakaoMemberSnapshot => ({
+  chat_id: 'chat',
+  active_members: members.length,
+  members,
+  complete: true,
+  consistency_basis: 'stable_double_read_chatinfo_getmem',
+})
+
+type FakeClient = Pick<KakaoTalkClient, 'getChats' | 'getMemberSnapshot'>
 
 const fakeClient = (chats: KakaoChat[], members: KakaoMember[] = []): FakeClient => ({
   getChats: async () => chats,
-  getMembers: async () => members,
+  getMemberSnapshot: async () => snapshot(members),
 })
 
 describe('createKakaoChannelResolver', () => {
@@ -88,7 +96,7 @@ describe('createKakaoChannelResolver', () => {
     let now = 1000
     let chats: KakaoChat[] = [dmChat('111', 'Alice')]
     const resolver = createKakaoChannelResolver({
-      client: { getChats: async () => chats, getMembers: async () => [] },
+      client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
       now: () => now,
       ttlMs: 100,
     })
@@ -109,7 +117,7 @@ describe('createKakaoChannelResolver', () => {
         await new Promise((r) => setTimeout(r, 20))
         return [dmChat('111', 'Alice')]
       },
-      getMembers: async () => [],
+      getMemberSnapshot: async () => snapshot([]),
     }
     const resolver = createKakaoChannelResolver({ client: slowClient })
     await Promise.all([resolver.refresh(), resolver.refresh(), resolver.refresh()])
@@ -120,7 +128,7 @@ describe('createKakaoChannelResolver', () => {
     let now = 1000
     let chats: KakaoChat[] = [dmChat('111', 'Alice')]
     const resolver = createKakaoChannelResolver({
-      client: { getChats: async () => chats, getMembers: async () => [] },
+      client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
       now: () => now,
       ttlMs: 100,
     })
@@ -167,7 +175,7 @@ describe('createKakaoChannelResolver — ingestProvisional', () => {
   test('subsequent refresh upgrades a provisional entry to its real kind', async () => {
     let chats: KakaoChat[] = []
     const resolver = createKakaoChannelResolver({
-      client: { getChats: async () => chats, getMembers: async () => [] },
+      client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
     })
 
     // Simulates the production failure mode: getChats({all:true}) initially
@@ -283,7 +291,7 @@ describe('createKakaoChannelResolver — provisional classification via members'
     const resolver = createKakaoChannelResolver({
       client: {
         getChats: async () => [],
-        getMembers: async () => {
+        getMemberSnapshot: async () => {
           throw new Error('GETMEM timeout')
         },
       },
@@ -311,9 +319,9 @@ describe('createKakaoChannelResolver — provisional classification via members'
     const resolver = createKakaoChannelResolver({
       client: {
         getChats: async () => [dmChat('468625891988320', 'Counterpart')],
-        getMembers: async () => {
+        getMemberSnapshot: async () => {
           await membersPending
-          return [member(SELF), member('200'), member('300')]
+          return snapshot([member(SELF), member('200'), member('300')])
         },
       },
       selfUserId: () => SELF,

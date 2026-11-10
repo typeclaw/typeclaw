@@ -1,14 +1,9 @@
-import {
-  classifyKakaoChat,
-  type KakaoChat,
-  type KakaoChatKind,
-  type KakaoMember,
-  type KakaoTalkClient,
-} from 'agent-messenger/kakaotalk'
+import { classifyKakaoChat, type KakaoChat, type KakaoChatKind, type KakaoMember } from 'agent-messenger/kakaotalk'
 
 import type { ChannelKey, ChannelNameResolver, ResolvedChannelNames } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import type { KakaoTalkClient } from './kakaotalk'
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000
 
@@ -35,10 +30,9 @@ export type KakaoChatLookupValue = {
 
 // What a member roster PROVES about a chat — never what it merely suggests.
 //
-// A roster read is only ever a SUBSET of the true membership: `getMembers`
-// merges GETMEM with a CHATONROOM fallback whose failure it swallows, and that
-// fallback can itself yield just `displayMembers`. So only conclusions that
-// survive adding unseen members are sound:
+// A roster read is only ever a SUBSET of the true membership: it is read with
+// `allowPartial`, and GETMEM can return fewer records than the room has active
+// members. So only conclusions that survive adding unseen members are sound:
 //
 //   - an open marker present proves OpenChat — a subset cannot invent one
 //     (`open_token` / `open_profile_link_id` / `open_permission` are
@@ -84,7 +78,7 @@ export type KakaoChannelResolver = {
 }
 
 export type KakaoChannelResolverOptions = {
-  client: Pick<KakaoTalkClient, 'getChats' | 'getMembers'>
+  client: Pick<KakaoTalkClient, 'getChats' | 'getMemberSnapshot'>
   now?: () => number
   ttlMs?: number
   logger?: { warn: (msg: string) => void }
@@ -167,8 +161,8 @@ export function createKakaoChannelResolver(options: KakaoChannelResolverOptions)
 
   const provenKindFor = async (chatId: string): Promise<'open' | 'group' | null> => {
     try {
-      const members = await options.client.getMembers(chatId)
-      return provenKindFromMembers(members, options.selfUserId?.() ?? null)
+      const snapshot = await options.client.getMemberSnapshot(chatId, { allowPartial: true })
+      return provenKindFromMembers(snapshot.members, options.selfUserId?.() ?? null)
     } catch (err) {
       options.logger?.warn(`[kakaotalk] provisional member lookup failed chat=${chatId}: ${describeError(err)}`)
       return null

@@ -8,8 +8,10 @@ import type {
   KakaoChat,
   KakaoMarkReadResult,
   KakaoMember,
+  KakaoMemberSnapshot,
   KakaoMentionInput,
   KakaoMessage,
+  KakaoPartialMemberSnapshot,
   KakaoProfile,
   KakaoReplyTarget,
   KakaoSendResult,
@@ -97,6 +99,8 @@ class FakeClient implements KakaoTalkClient {
   }
   chats: KakaoChat[] = []
   membersByChat: Map<string, KakaoMember[]> = new Map()
+  // Chats whose roster read returns a partial snapshot (GETMEM below the active count).
+  partialRosterChats: Set<string> = new Set()
   inlineNamesByChat: Map<string, Map<number, string>> = new Map()
   getMembersError: Error | null = null
   sendResult: KakaoSendResult = { success: true, status_code: 0, chat_id: '111', log_id: 'L1', sent_at: 0 }
@@ -189,10 +193,27 @@ class FakeClient implements KakaoTalkClient {
     return this.profileResult
   }
 
-  async getMembers(chatId: string): Promise<KakaoMember[]> {
+  async getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot | KakaoPartialMemberSnapshot> {
     this.getMembersCalls.push(chatId)
     if (this.getMembersError !== null) throw this.getMembersError
-    return this.membersByChat.get(chatId) ?? []
+    const members = this.membersByChat.get(chatId) ?? []
+    if (this.partialRosterChats.has(chatId)) {
+      return {
+        chat_id: chatId,
+        active_members: members.length + 1000,
+        members,
+        complete: false,
+        consistency_basis: 'stable_double_read_chatinfo_getmem',
+        incomplete_reason: 'member_count_mismatch',
+      }
+    }
+    return {
+      chat_id: chatId,
+      active_members: members.length,
+      members,
+      complete: true,
+      consistency_basis: 'stable_double_read_chatinfo_getmem',
+    }
   }
 
   lookupAuthorName(chatId: string, authorId: number): string | null {
@@ -588,6 +609,51 @@ describe('createKakaotalkAdapter — outbound', () => {
     expect(client.sendMessageCalls).toEqual([
       { chatId: '111', text: '@연규님 계정이 잠깐 막혔대요', mentions: [{ user_id: '333', name: '연규' }] },
     ])
+
+    await adapter.stop()
+    await router.stop()
+  })
+
+  test.each([
+    { case: 'an omitted duplicate nickname', nickname: 'Alex', text: '@Alex hi' },
+    { case: 'an omitted longer Korean nickname', nickname: '김', text: '@김철수 안녕하세요' },
+  ])('sends untagged text when the mention roster is partial ($case)', async ({ nickname, text }) => {
+    const client = new FakeClient()
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+    })
+    // given: the partial roster holds a member who would match, while the
+    // real target (a second Alex, or 김철수) was not returned
+    client.membersByChat.set('111', [
+      {
+        user_id: '333',
+        nickname,
+        profile_image_url: null,
+        full_profile_image_url: null,
+        original_profile_image_url: null,
+        status_message: null,
+        country_iso: null,
+        user_type: 100,
+        open_token: null,
+        open_profile_link_id: null,
+        open_permission: null,
+      },
+    ])
+    client.partialRosterChats.add('111')
+    await adapter.start()
+    listener.emit('connected', { userId: '999' })
+
+    // when
+    const result = await router.send({ adapter: 'kakaotalk', workspace: '@kakao-group', chat: '111', text })
+
+    // then
+    expect(result.ok).toBe(true)
+    expect(client.sendMessageCalls).toEqual([{ chatId: '111', text }])
 
     await adapter.stop()
     await router.stop()

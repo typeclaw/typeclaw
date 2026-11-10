@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { KakaoMember } from 'agent-messenger/kakaotalk'
+import type { KakaoMember, KakaoMemberSnapshot } from 'agent-messenger/kakaotalk'
 
 import type { KakaoTalkClient } from './kakaotalk'
 import { createKakaoAuthorResolver } from './kakaotalk-author-resolver'
@@ -20,7 +20,15 @@ const member = (overrides: Partial<KakaoMember>): KakaoMember => ({
   ...overrides,
 })
 
-type FakeMembersClient = Pick<KakaoTalkClient, 'getMembers'> & {
+const snapshot = (members: KakaoMember[]): KakaoMemberSnapshot => ({
+  chat_id: 'chat',
+  active_members: members.length,
+  members,
+  complete: true,
+  consistency_basis: 'stable_double_read_chatinfo_getmem',
+})
+
+type FakeMembersClient = Pick<KakaoTalkClient, 'getMemberSnapshot'> & {
   calls: string[]
   failWith?: Error
 }
@@ -30,10 +38,10 @@ const fakeClient = (membersByChat: Record<string, KakaoMember[]> = {}): FakeMemb
   const calls: string[] = []
   return {
     calls,
-    getMembers(chatId: string): Promise<KakaoMember[]> {
+    getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot> {
       calls.push(chatId)
       if (this.failWith !== undefined) return Promise.reject(this.failWith)
-      return Promise.resolve(map.get(chatId) ?? [])
+      return Promise.resolve(snapshot(map.get(chatId) ?? []))
     },
   }
 }
@@ -115,10 +123,10 @@ describe('createKakaoAuthorResolver', () => {
   })
 
   test('coalesces concurrent resolve() calls on the same chat into one GETMEM', async () => {
-    let resolveBatch: ((value: KakaoMember[]) => void) | null = null
-    const client: Pick<KakaoTalkClient, 'getMembers'> & { calls: string[] } = {
+    let resolveBatch: ((value: KakaoMemberSnapshot) => void) | null = null
+    const client: Pick<KakaoTalkClient, 'getMemberSnapshot'> & { calls: string[] } = {
       calls: [],
-      getMembers(chatId: string): Promise<KakaoMember[]> {
+      getMemberSnapshot(chatId: string): Promise<KakaoMemberSnapshot> {
         this.calls.push(chatId)
         return new Promise((res) => {
           resolveBatch = res
@@ -137,7 +145,9 @@ describe('createKakaoAuthorResolver', () => {
     await new Promise((r) => setTimeout(r, 0))
     expect(client.calls).toEqual(['111'])
 
-    resolveBatch!([member({ user_id: '222', nickname: 'Alice' }), member({ user_id: '333', nickname: 'Bob' })])
+    resolveBatch!(
+      snapshot([member({ user_id: '222', nickname: 'Alice' }), member({ user_id: '333', nickname: 'Bob' })]),
+    )
 
     const results = await inflight
     expect(results).toEqual(['Alice', 'Bob', null])
