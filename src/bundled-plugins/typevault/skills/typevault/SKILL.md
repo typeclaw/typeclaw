@@ -1,11 +1,11 @@
 ---
 name: typevault
-description: Use secrets from this agent's TypeVault vault without putting them in the transcript. Use when a task needs an API key, password, token, OAuth credential, SSH key or TOTP code that lives in the vault, when `TYPEVAULT_GRANT` is set in bash, or when the user mentions TypeVault, the vault, or storing a secret.
+description: Use secrets from this agent's TypeVault vault without putting them in the transcript. Use when a task needs an API key, password, token, OAuth credential, SSH key or TOTP code that lives in the vault, or when the user mentions TypeVault, the vault, or storing a secret.
 ---
 
 # TypeVault
 
-This agent keeps secrets in its own TypeVault vault. Your bash already holds a live grant (`TYPEVAULT_GRANT`) for your role's tier and every tier below it (`owner` > `trusted` > `member` > `guest`), so you can use what your role may use without asking for a key. Every read is audited with your session.
+This agent keeps secrets in its own TypeVault vault. The `typevault` command in your bash already holds a live grant for your role's tier and every tier below it (`owner` > `trusted` > `member` > `guest`), so you can use what your role may use without asking for a key. Every read is audited with your session.
 
 ## Rules
 
