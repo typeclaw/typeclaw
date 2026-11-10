@@ -199,6 +199,35 @@ export function runtimeConfigRoot(agentDir: string): string {
   return join(agentDir, TYPEVAULT_STATE_RELATIVE_DIR, 'config')
 }
 
+// The agent's member identity for other projects' vaults, apart from the key
+// that owns its own vault: model bash gets this one, so it must never open
+// the agent's vault. An owner adds it with the line `typevault join` prints.
+export function projectIdentityPath(agentDir: string): string {
+  return join(projectConfigRoot(agentDir), 'typevault', 'identity.json')
+}
+
+export async function ensureProjectIdentity(agentDir: string, name: string): Promise<void> {
+  if (existsSync(projectIdentityPath(agentDir))) return
+  // `join` is typevault's only way to mint a machine identity. It needs some
+  // vault to name; the agent's own is opened public-only and left unchanged.
+  await runTypevaultCli(agentDir, ['join', '--machine', '--name', name], {
+    XDG_CONFIG_HOME: projectConfigRoot(agentDir),
+  })
+}
+
+// A typevault member name ([a-z0-9-]) for this agent, from its container name.
+export function projectMemberName(containerName: string | undefined): string {
+  const name = (containerName ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return name === '' ? MEMBER_NAME : name
+}
+
+function projectConfigRoot(agentDir: string): string {
+  return join(agentDir, TYPEVAULT_STATE_RELATIVE_DIR, 'project-member')
+}
+
 async function listTiers(agentDir: string): Promise<Map<string, Set<string>>> {
   const tiers = new Map<string, Set<string>>()
   const lines = (await runTypevaultCli(agentDir, ['tier', 'ls'])).split('\n').slice(1)
@@ -230,10 +259,14 @@ async function ensureTier(agentDir: string, tier: string): Promise<void> {
   }
 }
 
-async function runTypevaultCli(agentDir: string, args: string[]): Promise<string> {
+async function runTypevaultCli(
+  agentDir: string,
+  args: string[],
+  envOverride: Record<string, string> = {},
+): Promise<string> {
   const child = Bun.spawn([process.execPath, typevaultCliPath(), ...args], {
     cwd: agentDir,
-    env: typevaultEnv(agentDir),
+    env: { ...typevaultEnv(agentDir), ...envOverride },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',

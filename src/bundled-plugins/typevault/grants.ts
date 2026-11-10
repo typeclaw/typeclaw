@@ -2,7 +2,7 @@ import { join } from 'node:path'
 
 import type { BashSandboxReveal } from '@/agent/bash-sandbox'
 import { DEFAULT_SANDBOX_ENV } from '@/sandbox/policy'
-import { agentSocketPath, runtimeConfigRoot, typevaultDir } from '@/typevault/vault'
+import { agentSocketPath, projectIdentityPath, runtimeConfigRoot, typevaultDir } from '@/typevault/vault'
 
 export const GRANT_TTL = '12h'
 const GRANT_TTL_MS = 12 * 60 * 60 * 1000
@@ -83,14 +83,21 @@ export function sessionLabel(sessionId: string): string {
 // What model bash needs to reach the vault through a grant: the token, the
 // ciphertext-only vault re-exposed read-only over its mask, and the daemon's
 // agent socket bound where a client with the sandbox HOME looks for it. The
-// admin sockets beside it and the agent's own key stay masked.
+// admin sockets beside it and the agent's own key stay masked. The token and
+// vault go under TypeClaw's names, read only by the `typevault` command
+// (src/typevault/bash-cli.ts): a TYPEVAULT_* variable would steer every
+// typevault CLI, a project's own included, to the agent's vault. The agent's
+// project member identity, when provisioned, sits where any typevault CLI
+// looks for this device's identity, so joining and opening a project's vault
+// needs no password.
 export function bashVaultAccess(
   agentDir: string,
   token: string,
+  options: { projectIdentity?: boolean } = {},
 ): { env: Record<string, string>; reveal: BashSandboxReveal } {
   const sandboxConfigRoot = join(DEFAULT_SANDBOX_ENV.HOME ?? '/tmp', '.config')
   return {
-    env: { TYPEVAULT_GRANT: token, TYPEVAULT_DIR: typevaultDir(agentDir), TYPEVAULT_GLOBAL: '1' },
+    env: { TYPECLAW_VAULT_GRANT: token, TYPECLAW_VAULT_DIR: typevaultDir(agentDir) },
     reveal: [
       { type: 'ro-bind', source: typevaultDir(agentDir), dest: typevaultDir(agentDir) },
       {
@@ -98,6 +105,15 @@ export function bashVaultAccess(
         source: agentSocketPath(agentDir, runtimeConfigRoot(agentDir)),
         dest: agentSocketPath(agentDir, sandboxConfigRoot),
       },
+      ...(options.projectIdentity === true
+        ? [
+            {
+              type: 'ro-bind' as const,
+              source: projectIdentityPath(agentDir),
+              dest: join(sandboxConfigRoot, 'typevault', 'identity.json'),
+            },
+          ]
+        : []),
     ],
   }
 }

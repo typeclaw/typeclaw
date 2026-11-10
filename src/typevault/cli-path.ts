@@ -5,3 +5,7 @@ import { dirname, join } from 'node:path'
 export function typevaultCliPath(): string {
   return join(dirname(Bun.resolveSync('typevault', import.meta.dir)), 'cli', 'index.ts')
 }
+
+export function typevaultBashCliPath(): string {
+  return join(import.meta.dir, 'bash-cli.ts')
+}
