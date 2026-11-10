@@ -250,6 +250,34 @@ describe('invokeSubagent', () => {
     expect(calls.disposed).toBe(1)
   })
 
+  test('trusted handler system prompt reaches the factory without changing declaration identity or spawn metadata', async () => {
+    const { session } = fakeSession()
+    const declaration: Subagent = {
+      systemPrompt: 'declared prompt',
+      handler: async (_ctx, runSession) => {
+        await runSession({ systemPrompt: 'trusted selected prompt' })
+      },
+    }
+    await invokeSubagent('worker', {
+      registry: { worker: declaration },
+      agentDir: '/agent',
+      userPrompt: 'task',
+      parentSessionId: 'parent',
+      spawnedByRole: 'member',
+      createSessionForSubagent: async (subagent, options) => {
+        expect(subagent).toBe(declaration)
+        expect(options).toEqual({
+          name: 'worker',
+          parentSessionId: 'parent',
+          spawnedByRole: 'member',
+          systemPromptOverride: 'trusted selected prompt',
+        })
+        return session
+      },
+    })
+    expect(declaration.systemPrompt).toBe('declared prompt')
+  })
+
   test('passes the completed assistant response to the handler before disposal', async () => {
     const listeners = new Set<(event: unknown) => void>()
     let captured = null as string | null

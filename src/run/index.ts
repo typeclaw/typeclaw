@@ -586,7 +586,7 @@ async function startAgentRuntime(
       const allowBackgroundFromSubagent =
         entry.pluginSubagent.canBackgroundSpawnSubagents === true && entry.pluginSubagent.canSpawnSubagents === true
       const created = await createSessionWithDispose({
-        systemPromptOverride: entry.pluginSubagent.systemPrompt,
+        systemPromptOverride: subagentOptions?.systemPromptOverride ?? entry.pluginSubagent.systemPrompt,
         sessionManager,
         channelRouter: channelManager.router,
         origin,

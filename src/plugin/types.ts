@@ -56,6 +56,9 @@ export type SubagentContext<P = unknown> = {
 
 export type RunSession = (override?: {
   userPrompt?: string
+  // Trusted plugin handler override for this fresh session's system prompt.
+  // Payload fields are never forwarded here by the runtime.
+  systemPrompt?: string
   // Called after a completed run with the terminal assistant text, or null
   // after an empty terminal response or provider failure. No block projection.
   onFinalMessage?: (message: string | null) => void

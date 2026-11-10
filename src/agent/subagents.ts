@@ -38,6 +38,8 @@ export type SubagentContext<P = unknown> = {
 // Unlike orchestration output, it never projects <review>/<report> blocks.
 export type RunSession = (override?: {
   userPrompt?: string
+  // Trusted handler only. Never resolved from model-authored payload fields.
+  systemPrompt?: string
   onFinalMessage?: (message: string | null) => void
 }) => Promise<void>
 
@@ -210,6 +212,8 @@ export type CreateSessionForSubagentOptions = {
   // (e.g. operator on `deep`) without a second subagent. Unknown profile names
   // fall back to `default` via resolveProfile, the same as a declared profile.
   profileOverride?: string
+  // Resolved only by invokeSubagent's trusted runSession closure.
+  systemPromptOverride?: string
 }
 export type CreateSessionForSubagent = (
   subagent: Subagent<any>,
@@ -218,7 +222,7 @@ export type CreateSessionForSubagent = (
 
 export const defaultCreateSessionForSubagent: CreateSessionForSubagent = (subagent, options) =>
   createSession({
-    systemPromptOverride: subagent.systemPrompt,
+    systemPromptOverride: options?.systemPromptOverride ?? subagent.systemPrompt,
     origin: {
       kind: 'subagent',
       subagent: options?.name ?? '<unknown>',
@@ -319,7 +323,14 @@ export async function invokeSubagent(name: string, options: InvokeSubagentOption
 
   const runSession: RunSession = async (override) => {
     const { session, dispose, hooks, sessionId, agentDir, origin, getTranscriptPath, backgroundDrain } =
-      normalizeSubagentSession(await createSessionForSubagent(subagent, sessionOptions))
+      normalizeSubagentSession(
+        await createSessionForSubagent(
+          subagent,
+          override?.systemPrompt === undefined
+            ? sessionOptions
+            : { ...sessionOptions, systemPromptOverride: override.systemPrompt },
+        ),
+      )
     let aborted = false
     let activeModelRef = resolveFallbackChain(
       effectiveModels(getConfig(), sessionOptions.spawnedByOrigin),
