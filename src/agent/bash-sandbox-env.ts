@@ -1,5 +1,6 @@
 import { join } from 'node:path'
 
+import { resolveGitIdentity } from '@/git/resolve-identity'
 import { readEnvFile } from '@/init/env-file'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 type BashEnvOverlay = Record<string, string>
@@ -83,6 +84,29 @@ export function resolveExposableBashEnvNames(agentDir: string): { exposable: str
     .filter(([name, value]) => value.length > 0 && !exposableSet.has(name))
     .map(([name]) => name)
   return { exposable, withheld }
+}
+
+// `typeclaw start` withholds a synthesized fallback identity from the container
+// env so a later `git config` in the agent repo still takes effect. Without this,
+// commits in any other repository (workspace clones, /tmp worktrees) fail with
+// "Author identity unknown" and the model invents an identity, which can credit a
+// stranger's GitHub account. Reading the agent repo per command keeps it live.
+export async function resolveAgentGitIdentityEnv(
+  agentDir: string,
+  exposableEnvNames: readonly string[],
+): Promise<BashEnvOverlay> {
+  const exposable = new Set(exposableEnvNames)
+  const names = {
+    GIT_AUTHOR_NAME: 'name',
+    GIT_AUTHOR_EMAIL: 'email',
+    GIT_COMMITTER_NAME: 'name',
+    GIT_COMMITTER_EMAIL: 'email',
+  } as const
+  const missing = Object.entries(names).filter(([name]) => !exposable.has(name))
+  if (missing.length === 0) return {}
+  const identity = await resolveGitIdentity(agentDir)
+  if (identity === null) return {}
+  return Object.fromEntries(missing.map(([name, field]) => [name, identity[field]]))
 }
 
 export function buildRoleScopedConfigEnv(
