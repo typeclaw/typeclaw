@@ -9381,7 +9381,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const round = publisher?.githubReviewRound ?? persistedPublisher?.githubReviewRound
     if (round === null || round === undefined) {
       const resetRound = resetGithubReviewRoundCompletionForPr(args.workspace, args.prNumber, now)
-      if (resetRound !== null) persistMatchingGithubReviewRound(resetRound)
+      // A first review never carries a round, so its verdict lands here every
+      // time. Only a pending round the publisher failed to hold is worth a warning.
+      if (resetRound === null) return { kind: 'no-round' }
+      persistMatchingGithubReviewRound(resetRound)
       logger.warn(
         `[channels] github review round completion rejected pr=${args.workspace}#${args.prNumber} verdict=${args.verdict}: no publisher session with round state session=${args.sessionId}`,
       )
