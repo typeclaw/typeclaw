@@ -94,7 +94,21 @@ tries two extraction routes against that same body, in a fixed order.
    length, and a selector-list-component-by-element work budget before any computed-style traversal.
    The limits protect against known
    synchronous DOM complexity hazards; they are not a claim that every parser
-   denial-of-service shape is impossible. `applyReadabilityDetailed` preserves the existing
+   denial-of-service shape is impossible, so the parse itself is contained:
+   `strategies/readability-process.ts` runs JSDOM, Readability, and Turndown in a
+   disposable `bun --smol` child with an empty environment. jsdom can allocate
+   tens of gigabytes inside one synchronous `getComputedStyle()` call, and memory
+   it frees is never returned to the OS, so an in-process parse could neither be
+   interrupted nor stop ratcheting the runtime's RSS. The child exits after every
+   page, returning all of it. The parent kills it on tool abort, and a watchdog
+   kills it once it holds at least 256 MiB while available memory (the tighter of
+   cgroup headroom, counting inactive page cache as free, and `MemAvailable`)
+   falls under 512 MiB, i.e. only where the parse would otherwise have taken the
+   agent down. The child also raises its own `oom_score_adj` to 1000 so the kernel
+   chooses it first if the watchdog is late. Either way the tool returns a fixed
+   error suggesting browser retrieval, and the operator log records a
+   `[webfetch] readability parser stopped near memory exhaustion` line. Hidden-content
+   pruning is never skipped to make a page fit. `applyReadabilityDetailed` preserves the existing
    `applyReadability()` string API while reporting structural evidence: whether
    Readability parsed an article, whether conversion fell back to the whole
    body, semantic/prose containers, and script count. Concise pages remain
