@@ -1,5 +1,6 @@
 import { walkHtmlLexically } from './html-lexical'
-import { applyReadabilityDetailed, type ReadabilityDetailedResult } from './strategies/readability'
+import type { ReadabilityDetailedResult } from './strategies/readability'
+import { applyReadabilityIsolated } from './strategies/readability-process'
 import type { HtmlExtractionAttempt } from './types'
 
 export type AdaptiveHtmlResult =
@@ -7,7 +8,7 @@ export type AdaptiveHtmlResult =
   | { kind: 'error'; message: string; attempts: HtmlExtractionAttempt[] }
 
 type AdaptiveHtmlDependencies = {
-  applyReadabilityDetailed: typeof applyReadabilityDetailed
+  applyReadabilityDetailed: (html: string, url: string, signal?: AbortSignal) => Promise<ReadabilityDetailedResult>
 }
 
 export const MAX_ADAPTIVE_HTML_SCAN_BYTES = 5 * 1024 * 1024
@@ -31,7 +32,8 @@ const ENCODER = new TextEncoder()
 export async function extractAdaptiveHtml(
   html: string,
   url: string,
-  dependencies: AdaptiveHtmlDependencies = { applyReadabilityDetailed },
+  dependencies: AdaptiveHtmlDependencies = { applyReadabilityDetailed: applyReadabilityIsolated },
+  signal?: AbortSignal,
 ): Promise<AdaptiveHtmlResult> {
   const attempts: HtmlExtractionAttempt[] = []
 
@@ -40,7 +42,7 @@ export async function extractAdaptiveHtml(
     attempts.push({ route: 'readability', outcome: 'error', reason: complexity.reason })
   } else {
     try {
-      const readability = await dependencies.applyReadabilityDetailed(html, url)
+      const readability = await dependencies.applyReadabilityDetailed(html, url, signal)
       const verdict = classifyReadability(readability)
       if (verdict.useful) {
         attempts.push({ route: 'readability', outcome: 'success', reason: verdict.reason })
