@@ -154,6 +154,22 @@ export async function processVerifiedGithubDelivery(
       ))
     }
   }
+  let staleRecoveredRemoval = false
+  // A recovered removal can arrive after a newer re-request was admitted. Applying it
+  // would cancel that request's check run and erase its pending replay entry.
+  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'review_request_removed') {
+    const repository = readRepository(payload)
+    const prNumber = readNumber(readRecord(payload.pull_request), 'number')
+    if (repository !== null && prNumber !== null) {
+      staleRecoveredRemoval = await recoveredReviewerIsRequestedAgain(
+        options,
+        repository,
+        prNumber,
+        payload,
+        `${repository.owner}/${repository.name}`,
+      )
+    }
+  }
   const isSynchronize = event === 'pull_request' && action === 'synchronize'
   if (!isSynchronize && delivery !== '') {
     if (options.dedup.has(delivery)) {
@@ -172,7 +188,7 @@ export async function processVerifiedGithubDelivery(
     options.dedup.add(delivery)
   }
 
-  if (!eventAllowed || staleRecoveredDraft) return
+  if (!eventAllowed || staleRecoveredDraft || staleRecoveredRemoval) return
 
   // This control event must run before the self-author drop: a maintainer can
   // draft the bot's PR, and the bot can draft its own PR. Either action must
@@ -230,6 +246,9 @@ export async function processVerifiedGithubDelivery(
   if (event === 'pull_request' && action === 'review_request_removed') {
     const prNumber = readNumber(readRecord(payload.pull_request), 'number')
     if (prNumber !== null) {
+      // Withdrawn work must not survive in the pending log, or the next boot's
+      // pending replay reviews a PR nobody asked for anymore.
+      await options.clearPendingReview?.(classified.workspace, prNumber)
       void githubReviewChecks.cancelPullRequest(classified.workspace, prNumber, 'the review request was removed')
     }
   }
@@ -383,6 +402,46 @@ async function recoveredPullRequestIsStillDraft(
     return draft
   } catch (err) {
     throw new Error(`recovered draft freshness check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
+  }
+}
+
+async function recoveredReviewerIsRequestedAgain(
+  options: GithubWebhookHandlerOptions,
+  repository: { owner: string; name: string },
+  prNumber: number,
+  payload: Record<string, unknown>,
+  workspace: string,
+): Promise<boolean> {
+  const removedLogin = readUser(payload.requested_reviewer)?.login ?? null
+  const removedTeam = readReviewerTeam(payload.requested_team)?.slug ?? null
+  if (removedLogin === null && removedTeam === null) return false
+  if (options.authToken === undefined) {
+    throw new Error(`recovered review request removal check unavailable for ${workspace}#${prNumber}: auth unavailable`)
+  }
+  try {
+    const token = await options.authToken({ repoSlug: workspace })
+    const response = await (options.fetchImpl ?? fetch)(
+      `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}/requested_reviewers`,
+      { headers: githubJsonHeaders(token) },
+    )
+    if (!response.ok) {
+      throw new Error(`requested reviewers fetch returned ${response.status}`)
+    }
+    const current = readRecord(await response.json().catch(() => null))
+    if (!Array.isArray(current?.users) || !Array.isArray(current?.teams)) {
+      throw new Error('requested reviewers response missing users or teams')
+    }
+    const requestedAgain =
+      (removedLogin !== null && current.users.some((user) => readUser(user)?.login === removedLogin)) ||
+      (removedTeam !== null && current.teams.some((team) => readReviewerTeam(team)?.slug === removedTeam))
+    if (requestedAgain) {
+      options.logger.info(
+        `[github] recovered review request removal skipped for ${workspace}#${prNumber}: reviewer was requested again`,
+      )
+    }
+    return requestedAgain
+  } catch (err) {
+    throw new Error(`recovered review request removal check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
   }
 }
 
