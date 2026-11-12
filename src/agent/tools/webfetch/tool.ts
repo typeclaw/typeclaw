@@ -6,7 +6,7 @@ import { fetchWithLimits, normalizeUrl, parseMimeType, WebFetchError } from './f
 import { applyGrep, GrepError } from './strategies/grep'
 import { applyJq, JqError } from './strategies/jq'
 import { applyRaw } from './strategies/raw'
-import { applyReadability } from './strategies/readability'
+import { applyReadabilityIsolated } from './strategies/readability-process'
 import { applySelector, SelectorError } from './strategies/selector'
 import { applySnapshot } from './strategies/snapshot'
 import {
@@ -135,7 +135,7 @@ export const webFetchTool = defineTool({
     let extractionAttempts: HtmlExtractionAttempt[] | undefined
     try {
       if (strategy === 'readability' && autoDetected) {
-        const extracted = await extractAdaptiveHtml(response.body, response.finalUrl)
+        const extracted = await extractAdaptiveHtml(response.body, response.finalUrl, undefined, signal)
         extractionAttempts = extracted.attempts
         if (extracted.kind === 'error') {
           return errorResult(normalizedUrl, extracted.message, {
@@ -165,7 +165,7 @@ export const webFetchTool = defineTool({
             })
           }
         }
-        output = await runStrategy(strategy, response.body, response.finalUrl, params)
+        output = await runStrategy(strategy, response.body, response.finalUrl, params, signal)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -262,12 +262,13 @@ async function runStrategy(
   body: string,
   url: string,
   params: WebFetchParams,
+  signal: AbortSignal | undefined,
 ): Promise<string> {
   switch (strategy) {
     case 'raw':
       return applyRaw(body)
     case 'readability':
-      return await applyReadability(body, url)
+      return (await applyReadabilityIsolated(body, url, signal)).output
     case 'jq':
       try {
         return await applyJq(body, params.query ?? '')
