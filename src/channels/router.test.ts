@@ -19564,6 +19564,26 @@ describe('GitHub review follow-up round composition', () => {
     await router.stop()
   })
 
+  test('a verdict on a PR with no follow-up round is not logged as a rejection', async () => {
+    __resetReviewVerdictGuardForTest()
+    const dir = await tempDir()
+    const logs: string[] = []
+    const { router } = makeRouter(dir, { logs, nowRef: { value: Date.now() } })
+
+    expect(
+      await router.completeGithubReviewRound?.({
+        workspace: 'acme/widgets',
+        prNumber: 7,
+        verdict: 'APPROVE',
+        sessionId: 'first-review-session',
+      }),
+    ).toEqual({ kind: 'no-round' })
+    expect(logs.some((log) => log.includes('round completion rejected'))).toBe(false)
+
+    __resetReviewVerdictGuardForTest()
+    await router.stop()
+  })
+
   test('releases a dismissal latch when the verified publisher is no longer live', async () => {
     __resetReviewVerdictGuardForTest()
     const dir = await tempDir()
