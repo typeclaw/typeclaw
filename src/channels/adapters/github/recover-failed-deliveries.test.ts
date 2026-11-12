@@ -217,6 +217,72 @@ describe('recoverFailedGithubDeliveries', () => {
     expect(aborts).toEqual([])
   })
 
+  test.each([{ requestedAgain: true }, { requestedAgain: false }])(
+    'recovered review request removal clears pending work only if the bot was not requested again ($requestedAgain)',
+    async ({ requestedAgain }) => {
+      // given: the removal delivery failed, and the bot may have been re-requested since
+      const routed: Routed[] = []
+      const clears: string[] = []
+      const requestedReviewers = {
+        users: requestedAgain ? [{ login: 'typeclaw-bot', id: 99, type: 'User' }] : [],
+        teams: [],
+      }
+      const handlerOptions: GithubWebhookHandlerOptions = {
+        webhookSecret: 'unused-by-recovery',
+        dedup: createDeliveryDedup(),
+        allowlist: () => ['pull_request.review_request_removed'],
+        selfId: () => '99',
+        selfLogin: () => 'typeclaw-bot',
+        authToken: async () => 'tok',
+        fetchImpl: Object.assign(
+          async (info: RequestInfo | URL) => {
+            if (!String(info).endsWith('/pulls/17/requested_reviewers'))
+              return new Response('unexpected', { status: 500 })
+            return Response.json(requestedReviewers)
+          },
+          { preconnect: () => {} },
+        ) as typeof fetch,
+        clearPendingReview: async (workspace, prNumber) => {
+          clears.push(`${workspace}#${prNumber}`)
+        },
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+        route: async () => ({ kind: 'observed' }),
+      }
+      const { fetch: fetchImpl } = fakeDeliveriesApi({
+        byHook: {
+          1: [
+            {
+              id: 14,
+              guid: 'g-removed',
+              event: 'pull_request',
+              statusCode: 502,
+              payload: {
+                action: 'review_request_removed',
+                repository: { name: 'widgets', owner: { login: 'acme' } },
+                pull_request: { number: 17, id: 1700 },
+                requested_reviewer: { login: 'typeclaw-bot', id: 99, type: 'User' },
+                sender: { login: 'alice', id: 10, type: 'User' },
+              },
+            },
+          ],
+        },
+      })
+
+      // when: recovery replays the old removal
+      const result = await recoverFailedGithubDeliveries(
+        baseOptions({
+          routed,
+          fetchImpl,
+          process: (input) => processVerifiedGithubDelivery(handlerOptions, input),
+        }),
+      )
+
+      // then: a newer request keeps its pending entry
+      expect(result.recovered).toBe(1)
+      expect(clears).toEqual(requestedAgain ? [] : ['acme/widgets#17'])
+    },
+  )
+
   test('retries recovered draft freshness after an indeterminate pull request lookup', async () => {
     const routed: Routed[] = []
     const tasks: Array<() => Promise<void>> = []

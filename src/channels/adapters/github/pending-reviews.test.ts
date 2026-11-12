@@ -442,6 +442,26 @@ test.each(['closed', 'converted_to_draft'])('clears pending work on %s, even wit
   expect(await f.store.list()).toEqual([])
 })
 
+test('clears pending work when the review request for the bot is removed', async () => {
+  const f = await fixture()
+  await f.adapter.start()
+  await f.store.record(pending)
+  await f.deliver('review_request_removed', 'pull_request', {
+    requested_reviewer: { login: 'bot', id: 1, type: 'User' },
+  })
+  expect(await f.store.list()).toEqual([])
+})
+
+test('keeps pending work when another reviewer is removed', async () => {
+  const f = await fixture()
+  await f.adapter.start()
+  await f.store.record(pending)
+  await f.deliver('review_request_removed', 'pull_request', {
+    requested_reviewer: { login: 'other-reviewer', id: 2, type: 'User' },
+  })
+  expect(await f.store.list()).toEqual([pending])
+})
+
 test('clears pending work through the registered review submitter before it returns', async () => {
   const f = await fixture()
   await f.adapter.start()
