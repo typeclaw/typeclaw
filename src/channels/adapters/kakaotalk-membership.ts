@@ -6,6 +6,7 @@ import type {
   MembershipResolverResult,
 } from '../membership'
 import type { KakaoTalkClient } from './kakaotalk'
+import type { KakaoMemberSnapshotCache } from './kakaotalk-member-cache'
 
 export type KakaoMembershipResolverOptions = {
   client: Pick<KakaoTalkClient, 'getMemberSnapshot'>
@@ -17,6 +18,9 @@ export type KakaoMembershipResolverOptions = {
   selfUserIdRef: () => string | null
   logger: { warn: (msg: string) => void }
   now?: () => number
+  // Cached roster reads carry the time the server answered, which becomes
+  // `fetchedAt`. Without it, a direct client read is stamped `now()`.
+  roster?: Pick<KakaoMemberSnapshotCache, 'readMemberSnapshot'>
 }
 
 // Without a registered resolver the router's `resolveEffectiveHumans` falls
@@ -46,7 +50,10 @@ export function createKakaoMembershipResolver(options: KakaoMembershipResolverOp
       return { kind: 'transient' } satisfies MembershipResolverFailure
     }
     try {
-      const snapshot = await options.client.getMemberSnapshot(key.chat, { allowPartial: true })
+      const { snapshot, fetchedAt } =
+        options.roster !== undefined
+          ? await options.roster.readMemberSnapshot(key.chat)
+          : { snapshot: await options.client.getMemberSnapshot(key.chat, { allowPartial: true }), fetchedAt: now() }
       // Dedupe by user_id defensively; a roster should not repeat a member.
       const memberIds = new Set<string>()
       for (const m of snapshot.members) memberIds.add(m.user_id)
@@ -57,12 +64,12 @@ export function createKakaoMembershipResolver(options: KakaoMembershipResolverOp
         // server's active count (which includes the agent) keeps the
         // approximate total from collapsing to the solo-human fallback.
         const humans = Math.max(humanMemberIds.length, snapshot.active_members - 1)
-        return { humans, bots: 1, fetchedAt: now(), truncated: true } satisfies MembershipCount
+        return { humans, bots: 1, fetchedAt, truncated: true } satisfies MembershipCount
       }
       return {
         humans: humanMemberIds.length,
         bots: 1,
-        fetchedAt: now(),
+        fetchedAt,
         truncated: false,
         humanMemberIds,
       } satisfies MembershipCount
