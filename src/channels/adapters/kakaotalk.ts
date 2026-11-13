@@ -41,6 +41,7 @@ import type {
   InboundAttachment,
 } from '@/channels/types'
 
+import { ChannelAdapterHaltedError } from '../adapter-halt'
 import { describeError } from '../describe-error'
 import {
   emoticonEventToMessageEvent,
@@ -186,6 +187,9 @@ export type KakaotalkAdapter = {
   start: () => Promise<void>
   stop: () => Promise<void>
   isConnected: () => boolean
+  // Non-null once the adapter gave up on its session for a reason a retry with
+  // the same credentials cannot fix. The manager stops supervising restarts.
+  haltReason?: () => string | null
 }
 
 export const KAKAO_HISTORY_LIMIT_MAX = 200
@@ -397,7 +401,13 @@ function clampLimit(requested: number, max: number): number {
 
 export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): KakaotalkAdapter {
   const logger = options.logger ?? consoleLogger
-  const client = options.client ?? new KakaoTalkClient()
+  // The SDK reconnects lazily: any call on a dropped session (a typing pulse,
+  // a send, a history read) runs a fresh LOGINLIST, and its callers only log
+  // failures. Every call goes through this guard so the first rejected login
+  // halts the adapter, wherever it surfaces.
+  const client = guardLoginRejections(options.client ?? new KakaoTalkClient(), (err) => {
+    haltOnLoginRejection(err)
+  })
   const now = options.now ?? Date.now
   const scheduleRecovery =
     options.scheduleRecovery ??
@@ -419,9 +429,40 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     pendingStabilityCheck: boolean
   }
   let recoveryEpisode: RecoveryEpisode | null = null
+  let haltReason: string | null = null
 
   const resetRecoveryEpisode = (): void => {
     recoveryEpisode = null
+  }
+
+  // Every SDK call on a dead session opens a new LOCO login, so a halt closes
+  // the client at once instead of waiting for the manager's next supervision
+  // tick: typing heartbeats and inbound bookkeeping would otherwise keep
+  // logging in against an account the server already refused.
+  const halt = (reason: string): void => {
+    if (haltReason !== null) return
+    haltReason = reason
+    connected = false
+    resetRecoveryEpisode()
+    logger.error(`[kakaotalk] halted: ${reason}`)
+    listener?.stop()
+    listener = null
+    try {
+      client.close()
+    } catch {
+      // The session is unusable either way; nothing to recover here.
+    }
+  }
+
+  const haltOnLoginRejection = (err: unknown): boolean => {
+    const status = kakaoLoginRejectionStatus(err)
+    if (status === null) return false
+    halt(
+      `KakaoTalk rejected the login (LOGINLIST status ${status}). Retrying with the same session only sends more ` +
+        'rejected logins, which KakaoTalk can treat as abuse. Check the account in the KakaoTalk app, then run ' +
+        '`typeclaw channel reauth kakaotalk` or `typeclaw restart`.',
+    )
+    return true
   }
 
   const channelResolver = createKakaoChannelResolver({ client, logger, selfUserId: () => selfUserId })
@@ -565,6 +606,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       if (started) return
       started = true
       lastConnectedAt = null
+      haltReason = null
       resetRecoveryEpisode()
       try {
         const credentialStore =
@@ -610,7 +652,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
             'either because the agent was just initialized without stored credentials, or because the encryption key ' +
             'is missing/wrong. Run `typeclaw channel reauth kakaotalk` to mint fresh tokens, then `typeclaw reload`.'
           logger.error(`[kakaotalk] ${message}`)
-          throw new Error(message)
+          throw new ChannelAdapterHaltedError(message)
         }
         logger.error(`[kakaotalk] getProfile failed: ${describeError(err)}`)
         throw err
@@ -620,6 +662,10 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
         await channelResolver.refresh()
       } catch (err) {
         logger.warn(`[kakaotalk] initial chat list fetch failed: ${describeError(err)}`)
+      }
+      if (haltReason !== null) {
+        started = false
+        throw new ChannelAdapterHaltedError(haltReason)
       }
 
       listener = options.listenerFactory ? options.listenerFactory(client) : new KakaoTalkListener(client)
@@ -652,6 +698,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       })
       listener.on('error', (err) => {
         logger.error(`[kakaotalk] listener error: ${describeError(err)}`)
+        if (haltReason !== null || haltOnLoginRejection(err)) return
         if (!isKickoutError(err)) return
         // KICKOUT closes the SDK session and skips scheduleReconnect, so
         // without intervention the adapter goes silent. We must either
@@ -678,7 +725,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
               'If the conflict persists, run `typeclaw channel reauth kakaotalk` to mint a fresh sub-device session ' +
               '(the existing device_uuid is preserved by default so the new login skips phone-passcode confirmation).',
           )
-          resetRecoveryEpisode()
+          halt(`session is DEAD after KICKOUT — ${reason}`)
           return
         }
         episode.attemptCount = nextAttemptIndex + 1
@@ -783,6 +830,10 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     isConnected(): boolean {
       return connected && selfUserId !== null
     },
+
+    haltReason(): string | null {
+      return haltReason
+    },
   }
 }
 
@@ -829,6 +880,33 @@ function dropHint(reason: InboundDropReason): string {
     case 'self_author':
       return ''
   }
+}
+
+function guardLoginRejections(client: KakaoTalkClient, onError: (err: unknown) => void): KakaoTalkClient {
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      const value: unknown = Reflect.get(target, prop, receiver)
+      if (typeof value !== 'function') return value
+      return (...args: unknown[]): unknown => {
+        const result: unknown = value.apply(target, args)
+        if (!(result instanceof Promise)) return result
+        return result.catch((err: unknown) => {
+          onError(err)
+          throw err
+        })
+      }
+    },
+  })
+}
+
+// The SDK maps every non-zero LOGINLIST status to KakaoTalkError code
+// `login_rejected`, or `invalid_access_token` for -950. Transport failures
+// carry other codes and stay retryable.
+function kakaoLoginRejectionStatus(err: unknown): number | null {
+  if (!(err instanceof Error)) return null
+  const { code, serverStatus } = err as { code?: unknown; serverStatus?: unknown }
+  if (code !== 'login_rejected' && code !== 'invalid_access_token') return null
+  return typeof serverStatus === 'number' ? serverStatus : 0
 }
 
 function isKickoutError(err: unknown): boolean {
