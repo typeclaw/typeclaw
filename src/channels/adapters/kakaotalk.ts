@@ -54,6 +54,7 @@ import { classifyInbound, type InboundDropReason } from './kakaotalk-classify'
 import { createFetchAttachmentCallback } from './kakaotalk-fetch-attachment'
 import { toKakaoPlainText } from './kakaotalk-format'
 import { createKakaoListCallback } from './kakaotalk-list'
+import { createKakaoMemberSnapshotCache } from './kakaotalk-member-cache'
 import { createKakaoMembershipResolver } from './kakaotalk-membership'
 import { resolveKakaoMentions } from './kakaotalk-mention'
 import { createKakaoTypingCallback, kakaoTypingClassFromLookup, KAKAO_TYPING_HEARTBEAT_MS } from './kakaotalk-typing'
@@ -210,8 +211,10 @@ export function createOutboundCallback(deps: {
   logger: KakaotalkAdapterLogger
   formatChannelTag: (workspace: string, chat: string) => Promise<string>
   readFile?: (path: string) => Promise<Buffer>
+  roster?: Pick<KakaoTalkClient, 'getMemberSnapshot'>
 }): OutboundCallback {
   const { client, logger, formatChannelTag } = deps
+  const roster = deps.roster ?? client
   const readFile = deps.readFile ?? readAttachmentBuffer
   return async (msg: OutboundMessage): Promise<SendResult> => {
     if (msg.adapter !== 'kakaotalk') {
@@ -274,7 +277,7 @@ export function createOutboundCallback(deps: {
           outboundText = prependQuoteAnchor(text, msg.replyTo.source)
         }
       }
-      const mentions = await resolveOutboundMentions(client, msg.chat, outboundText, logger)
+      const mentions = await resolveOutboundMentions(roster, msg.chat, outboundText, logger)
       try {
         const result = await client.sendMessage(msg.chat, outboundText, {
           ...(replyTarget !== undefined ? { replyTo: replyTarget } : {}),
@@ -424,10 +427,16 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
     recoveryEpisode = null
   }
 
-  const channelResolver = createKakaoChannelResolver({ client, logger, selfUserId: () => selfUserId })
-  const authorResolver = createKakaoAuthorResolver({ client, logger })
+  const roster = createKakaoMemberSnapshotCache({ client })
+  const channelResolver = createKakaoChannelResolver({
+    client: { getChats: (opts) => client.getChats(opts), getMemberSnapshot: roster.getMemberSnapshot },
+    logger,
+    selfUserId: () => selfUserId,
+  })
+  const authorResolver = createKakaoAuthorResolver({ client: roster, logger })
   const membershipResolver = createKakaoMembershipResolver({
-    client,
+    client: roster,
+    roster,
     selfUserIdRef: () => selfUserId,
     logger,
   })
@@ -452,6 +461,7 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       client,
       logger,
       formatChannelTag,
+      roster,
     }),
     (workspace) => fallbackChannelAccountIdentity('kakaotalk', workspace, selfUserId),
   )
@@ -701,10 +711,12 @@ export function createKakaotalkAdapter(options: KakaotalkAdapterOptions): Kakaot
       listener.on('emoticon', (event) => {
         void handleEmoticonEvent(event)
       })
-      listener.on('member_joined', () => {
+      listener.on('member_joined', (event) => {
+        roster.invalidate(event.chat_id)
         void channelResolver.refresh()
       })
-      listener.on('member_left', () => {
+      listener.on('member_left', (event) => {
+        roster.invalidate(event.chat_id)
         void channelResolver.refresh()
       })
 
