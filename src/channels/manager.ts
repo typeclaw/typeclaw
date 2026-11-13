@@ -14,6 +14,7 @@ import { SecretsTeamsCredentialStore } from '@/secrets/teams-store'
 import { SecretsWebexCredentialStore } from '@/secrets/webex-store'
 import type { Stream } from '@/stream'
 
+import { isChannelAdapterHaltedError } from './adapter-halt'
 import { createDiscordAdapter, type DiscordAdapter } from './adapters/discord'
 import { createDiscordBotAdapter, type DiscordBotAdapter } from './adapters/discord-bot'
 import { createGithubAdapter, type GithubAdapter } from './adapters/github'
@@ -211,7 +212,7 @@ type AdapterEntry = {
 }
 
 type FailedAdapter = {
-  kind: 'start-failed' | 'missing-credentials'
+  kind: 'start-failed' | 'missing-credentials' | 'halted'
   attempts: number
   failedSinceMs: number
   nextAttemptAtMs: number
@@ -543,10 +544,11 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     } catch (err) {
       await cleanupPartialStart(adapter)
       if (!canCommit()) return { status: 'aborted' }
+      const halted = isChannelAdapterHaltedError(err)
       return {
         status: 'failed',
-        kind: 'start-failed',
-        detail: `failed to start: ${describeError(err)}`,
+        kind: halted ? 'halted' : 'start-failed',
+        detail: halted ? `halted: ${err.message}` : `failed to start: ${describeError(err)}`,
         inputSignature: buildFailedInputSignature(name, cfg, credentials),
       }
     }
@@ -625,6 +627,17 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     entry.attempts = attempts
     entry.nextAttemptAtMs = now + delayMs
     entry.retryQueued = false
+
+    if (failure.kind === 'halted') {
+      entry.nextAttemptAtMs = Number.POSITIVE_INFINITY
+      logger.error(
+        `[channels] adapter "${name}" ${failure.detail}; not retrying automatically. ` +
+          'It starts again when its credentials or config change, on `typeclaw restart`, or on an explicit adapter restart.',
+      )
+      failed.set(name, entry)
+      failedInputSignatures.set(entry, failure.inputSignature)
+      return entry
+    }
 
     const reachedCap = nominalDelayMs === retryCapMs
     const justReachedCap = reachedCap && previousNominalDelayMs < retryCapMs
@@ -741,10 +754,43 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
     return applyStartResult(name, currentCfg, result, previousFailure) ? 'restarted' : 'recovery-pending'
   }
 
+  // A live adapter that halted itself must leave `live`: the disconnected-restart
+  // path below would otherwise log in again every backoff interval forever.
+  const retireHaltedAdapter = (name: AdapterId, entry: AdapterEntry, haltReason: string): void => {
+    entry.recoveryRestartQueued = true
+    const queuedEpoch = lifecycleEpoch
+    void runSerially(name, async () => {
+      try {
+        if (!running || queuedEpoch !== lifecycleEpoch || live.get(name) !== entry) return
+        if (!(await stopAdapter(name))) return
+        const cfg = options.channelsConfigRef()[name]
+        if (cfg === undefined || cfg.enabled === false) return
+        // Record the credentials the halted session actually ran with. Re-reading
+        // them here would adopt a rotation that landed during stop() as already
+        // tried, and the reload carrying it would skip the restart it owes.
+        recordFailure(name, cfg, {
+          status: 'failed',
+          kind: 'halted',
+          detail: `halted: ${haltReason}`,
+          inputSignature: buildFailedInputSignature(name, cfg, { signature: entry.credentialSignature, missing: [] }),
+        })
+      } finally {
+        if (live.get(name) === entry) entry.recoveryRestartQueued = false
+      }
+    }).catch((err) => {
+      logger.error(`[channels] adapter "${name}" halt supervision failed: ${describeError(err)}`)
+    })
+  }
+
   const superviseAdapters = (): void => {
     if (!running) return
     const now = recoveryNow()
     for (const [name, entry] of live) {
+      const haltReason = 'haltReason' in entry.adapter ? (entry.adapter.haltReason?.() ?? null) : null
+      if (haltReason !== null) {
+        if (!entry.recoveryRestartQueued) retireHaltedAdapter(name, entry, haltReason)
+        continue
+      }
       if (entry.adapter.isConnected()) {
         void router
           .recoverWaitingReactions(name)
@@ -1013,6 +1059,9 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
             const changed =
               failedInputSignatures.get(previousFailure) !== buildFailedInputSignature(name, latest, credentials)
             if (changed) failed.delete(name)
+            // A halted adapter only restarts on changed inputs; an unrelated
+            // reload must not send another login to a platform that refused it.
+            else if (previousFailure.kind === 'halted') return named ? 'skipped' : null
             // A queued retry will read the new credential when it fires, so the
             // rotation is on its way even though nothing happened right here.
             else if (previousFailure.retryQueued) return named ? 'recovery-pending' : null

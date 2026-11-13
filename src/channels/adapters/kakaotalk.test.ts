@@ -24,6 +24,7 @@ import { createChannelRouter as createRealChannelRouter, type ChannelRouter } fr
 import { defaultHistoryConfig, type ChannelAdapterConfig } from '@/channels/schema'
 import type { TypingCallback } from '@/channels/types'
 
+import { ChannelAdapterHaltedError } from '../adapter-halt'
 import {
   createKakaotalkAdapter,
   createOutboundCallback,
@@ -70,6 +71,13 @@ class FakeListener implements KakaoTalkListener {
   }
 }
 
+function loginRejected(status: number): Error {
+  return Object.assign(new Error(`KakaoTalk LOGINLIST rejected (status ${status})`), {
+    code: 'login_rejected',
+    serverStatus: status,
+  })
+}
+
 function isAttachmentInputArray(
   x: Uint8Array | Buffer | ReadonlyArray<AttachmentInput>,
 ): x is ReadonlyArray<AttachmentInput> {
@@ -113,7 +121,9 @@ class FakeClient implements KakaoTalkClient {
     return this
   }
 
+  getChatsError: Error | null = null
   async getChats(): Promise<KakaoChat[]> {
+    if (this.getChatsError !== null) throw this.getChatsError
     return this.chats
   }
 
@@ -347,6 +357,7 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
 
     await expect(adapter.start()).rejects.toThrow(/sub-device session is stale/)
     await expect(adapter.start()).rejects.toThrow(/typeclaw channel reauth kakaotalk/)
+    await expect(adapter.start()).rejects.toBeInstanceOf(ChannelAdapterHaltedError)
 
     await router.stop()
   })
@@ -365,7 +376,49 @@ describe('createKakaotalkAdapter — start/stop lifecycle', () => {
 
     await expect(adapter.start()).rejects.toThrow(/Profile request failed: 503/)
     await expect(adapter.start()).rejects.not.toThrow(/sub-device session is stale/)
+    await expect(adapter.start()).rejects.not.toBeInstanceOf(ChannelAdapterHaltedError)
 
+    await router.stop()
+  })
+
+  test('halts at start without opening the listener when LOGINLIST rejects the session', async () => {
+    const client = new FakeClient()
+    client.getChatsError = loginRejected(-997)
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await expect(adapter.start()).rejects.toBeInstanceOf(ChannelAdapterHaltedError)
+    expect(listener.startCalls).toBe(0)
+    expect(client.closed).toBe(true)
+
+    await router.stop()
+  })
+
+  test('starts normally when the initial chat list fetch fails for a transport reason', async () => {
+    const client = new FakeClient()
+    client.getChatsError = new Error('LOCO packet timeout: LCHATLIST (15000ms)')
+    const listener = new FakeListener()
+    const router = createChannelRouter({ agentDir, configForAdapter: () => adapterCfg() })
+    const adapter = createKakaotalkAdapter({
+      router,
+      configRef: () => adapterCfg(),
+      client,
+      listenerFactory: () => listener,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+
+    await adapter.start()
+    expect(listener.startCalls).toBe(1)
+    expect(adapter.haltReason?.()).toBeNull()
+
+    await adapter.stop()
     await router.stop()
   })
 
@@ -920,25 +973,20 @@ describe('createOutboundCallback — native reply', () => {
   })
 })
 
-describe('createKakaotalkAdapter — KICKOUT recovery', () => {
-  type ScheduledTask = { fn: () => void; delay: number }
-  type RecoveryHarness = {
+describe('createKakaotalkAdapter — KICKOUT handling', () => {
+  type Harness = {
+    client: FakeClient
     listener: FakeListener
     adapter: ReturnType<typeof createKakaotalkAdapter>
     router: ReturnType<typeof createChannelRouter>
     logs: Array<{ level: string; msg: string }>
-    tasks: ScheduledTask[]
-    advance: (ms: number) => void
-    nowMs: () => number
   }
 
-  const buildHarness = (agentDirArg: string): RecoveryHarness => {
+  const buildHarness = (agentDirArg: string): Harness => {
     const client = new FakeClient()
     const listener = new FakeListener()
     const router = createChannelRouter({ agentDir: agentDirArg, configForAdapter: () => adapterCfg() })
     const logs: Array<{ level: string; msg: string }> = []
-    const tasks: ScheduledTask[] = []
-    let nowMs = 1_000_000
     const adapter = createKakaotalkAdapter({
       router,
       configRef: () => adapterCfg(),
@@ -949,180 +997,82 @@ describe('createKakaotalkAdapter — KICKOUT recovery', () => {
         warn: (msg) => logs.push({ level: 'warn', msg }),
         error: (msg) => logs.push({ level: 'error', msg }),
       },
-      now: () => nowMs,
-      scheduleRecovery: (fn, delay) => {
-        tasks.push({ fn, delay })
-      },
     })
-    return {
-      listener,
-      adapter,
-      router,
-      logs,
-      tasks,
-      advance: (ms) => {
-        nowMs += ms
-      },
-      nowMs: () => nowMs,
-    }
+    return { client, listener, adapter, router, logs }
   }
 
-  test('starts a recovery episode on a KICKOUT inside the post-init window and reconnects with the first delay', async () => {
+  const kick = (h: Harness): void => h.listener.emit('error', new Error('Session kicked — another device logged in'))
+
+  test('halts on a KICKOUT without logging in again', async () => {
     const h = buildHarness(agentDir)
     await h.adapter.start()
-    expect(h.listener.startCalls).toBe(1)
-
     h.listener.emit('connected', { userId: '999' })
     expect(h.adapter.isConnected()).toBe(true)
 
-    h.advance(5_000)
-    h.listener.emit('error', new Error('Session kicked — another device logged in'))
+    kick(h)
 
     expect(h.adapter.isConnected()).toBe(false)
-    const reconnect = h.tasks.find((t) => t.delay === 2_000)
-    expect(reconnect).toBeDefined()
-    expect(h.logs.some((l) => l.level === 'warn' && l.msg.includes('attempt 1/3'))).toBe(true)
-
-    reconnect?.fn()
-    expect(h.listener.startCalls).toBe(2)
+    expect(h.adapter.haltReason?.()).toContain('KICKOUT')
+    expect(h.listener.startCalls).toBe(1)
+    expect(h.listener.stopCalls).toBe(1)
+    expect(h.client.closed).toBe(true)
+    expect(h.client.loginCalls).toBe(1)
+    expect(h.logs.some((l) => l.level === 'error' && l.msg.includes('halted:'))).toBe(true)
 
     await h.adapter.stop()
     await h.router.stop()
   })
 
-  test('survives ghost-session ping-pong by retrying with growing delays before giving up', async () => {
+  test('halts with the server status when the listener login is rejected', async () => {
     const h = buildHarness(agentDir)
     await h.adapter.start()
-    h.listener.emit('connected', { userId: '999' })
 
-    const kick = (): void => h.listener.emit('error', new Error('Session kicked — another device logged in'))
+    h.listener.emit('error', loginRejected(-997))
 
-    const expectedDelays = [2_000, 10_000, 60_000] as const
-    for (const [i, delay] of expectedDelays.entries()) {
-      h.advance(1_000)
-      kick()
-      const reconnect = h.tasks.at(-1)
-      expect(reconnect?.delay).toBe(delay)
-      h.advance(delay)
-      reconnect?.fn()
-      expect(h.listener.startCalls).toBe(i + 2)
-      h.listener.emit('connected', { userId: '999' })
+    expect(h.adapter.haltReason?.()).toContain('status -997')
+    expect(h.client.closed).toBe(true)
+
+    kick(h)
+    expect(h.adapter.haltReason?.()).toContain('status -997')
+
+    await h.adapter.stop()
+    await h.router.stop()
+  })
+
+  test('halts on the first rejected login from a lazy reconnect, such as a typing pulse', async () => {
+    const h = buildHarness(agentDir)
+    h.client.chats = [
+      {
+        chat_id: '111',
+        type: 10,
+        display_name: 'Team',
+        title: null,
+        active_members: 4,
+        unread_count: 0,
+        last_message: null,
+      },
+    ]
+    let typing: TypingCallback | null = null
+    const realRegisterTyping = h.router.registerTyping.bind(h.router)
+    h.router.registerTyping = (adapter, cb) => {
+      if (adapter === 'kakaotalk') typing = cb
+      return realRegisterTyping(adapter, cb)
     }
-
-    h.advance(1_000)
-    kick()
-    expect(h.listener.startCalls).toBe(expectedDelays.length + 1)
-    expect(
-      h.logs.some(
-        (l) =>
-          l.level === 'error' &&
-          l.msg.includes('DEAD after KICKOUT') &&
-          (l.msg.includes('attempt(s) exhausted') || l.msg.includes('budget exhausted')),
-      ),
-    ).toBe(true)
-
-    await h.adapter.stop()
-    await h.router.stop()
-  })
-
-  test('gives up with budget-exhausted reason when stalled retries push past the wall-clock cap', async () => {
-    const h = buildHarness(agentDir)
     await h.adapter.start()
     h.listener.emit('connected', { userId: '999' })
+    h.listener.emit('disconnected')
 
-    const kick = (): void => h.listener.emit('error', new Error('Session kicked — another device logged in'))
+    h.client.sendTypingError = loginRejected(-997)
+    await typing!({ adapter: 'kakaotalk', workspace: '@kakao-group', chat: '111', thread: null, phase: 'tick' })
 
-    // Two quick KICKOUTs consume attempts 1 and 2 (delays 2_000 and
-    // 10_000), then we sit at the recovered listener for ~4.5 minutes
-    // before a third KICKOUT arrives. The third attempt's 60_000 delay
-    // would push elapsed-in-episode past the 300_000 cap, so we should
-    // give up via the budget branch rather than scheduling attempt 3.
-    h.advance(1_000)
-    kick()
-    const reconnect1 = h.tasks.at(-1)
-    h.advance(2_000)
-    reconnect1?.fn()
-    h.listener.emit('connected', { userId: '999' })
-
-    h.advance(1_000)
-    kick()
-    const reconnect2 = h.tasks.at(-1)
-    h.advance(10_000)
-    reconnect2?.fn()
-    h.listener.emit('connected', { userId: '999' })
-
-    const tasksBeforeStallKick = h.tasks.length
-    h.advance(4 * 60 * 1000 + 30_000)
-    kick()
-
-    expect(h.tasks.length).toBe(tasksBeforeStallKick)
-    expect(h.logs.some((l) => l.level === 'error' && l.msg.includes('budget exhausted'))).toBe(true)
+    expect(h.adapter.haltReason?.()).toContain('status -997')
+    expect(h.client.closed).toBe(true)
 
     await h.adapter.stop()
     await h.router.stop()
   })
 
-  test('a stable recovered connection ends the episode and re-arms recovery for a much-later KICKOUT', async () => {
-    const h = buildHarness(agentDir)
-    await h.adapter.start()
-    h.listener.emit('connected', { userId: '999' })
-
-    h.advance(5_000)
-    h.listener.emit('error', new Error('Session kicked — another device logged in'))
-    const reconnect = h.tasks.at(-1)
-    expect(reconnect?.delay).toBe(2_000)
-    h.advance(2_000)
-    reconnect?.fn()
-    expect(h.listener.startCalls).toBe(2)
-
-    h.listener.emit('connected', { userId: '999' })
-    const stabilityCheck = h.tasks.at(-1)
-    expect(stabilityCheck?.delay).toBe(60_000)
-    h.advance(60_000)
-    stabilityCheck?.fn()
-
-    expect(h.logs.some((l) => l.level === 'info' && l.msg.includes('recovery episode succeeded'))).toBe(true)
-
-    const tasksBeforeFreshKick = h.tasks.length
-    h.advance(10 * 60 * 1000)
-    h.listener.emit('error', new Error('Session kicked — another device logged in'))
-    const freshReconnect = h.tasks.at(-1)
-    expect(h.tasks.length).toBe(tasksBeforeFreshKick + 1)
-    expect(freshReconnect?.delay).toBe(2_000)
-    const attemptOneLogs = h.logs.filter((l) => l.level === 'warn' && l.msg.includes('attempt 1/3'))
-    expect(attemptOneLogs.length).toBe(2)
-
-    await h.adapter.stop()
-    await h.router.stop()
-  })
-
-  test('a brief reconnect that gets kicked again does NOT count as episode success', async () => {
-    const h = buildHarness(agentDir)
-    await h.adapter.start()
-    h.listener.emit('connected', { userId: '999' })
-
-    h.advance(5_000)
-    h.listener.emit('error', new Error('Session kicked — another device logged in'))
-    const reconnect = h.tasks.at(-1)
-    expect(reconnect?.delay).toBe(2_000)
-    h.advance(2_000)
-    reconnect?.fn()
-    h.listener.emit('connected', { userId: '999' })
-    const stabilityCheck = h.tasks.at(-1)
-    expect(stabilityCheck?.delay).toBe(60_000)
-
-    h.advance(1_000)
-    h.listener.emit('error', new Error('Session kicked — another device logged in'))
-
-    h.advance(60_000)
-    stabilityCheck?.fn()
-    expect(h.logs.some((l) => l.msg.includes('recovery episode succeeded'))).toBe(false)
-
-    await h.adapter.stop()
-    await h.router.stop()
-  })
-
-  test('non-KICKOUT errors do not start a recovery episode or flip connected', async () => {
+  test('non-KICKOUT errors do not halt or flip connected', async () => {
     const h = buildHarness(agentDir)
     await h.adapter.start()
     h.listener.emit('connected', { userId: '999' })
@@ -1130,8 +1080,9 @@ describe('createKakaotalkAdapter — KICKOUT recovery', () => {
 
     h.listener.emit('error', new Error('socket closed unexpectedly'))
 
-    expect(h.tasks).toHaveLength(0)
     expect(h.adapter.isConnected()).toBe(true)
+    expect(h.adapter.haltReason?.()).toBeNull()
+    expect(h.client.closed).toBe(false)
 
     await h.adapter.stop()
     await h.router.stop()
