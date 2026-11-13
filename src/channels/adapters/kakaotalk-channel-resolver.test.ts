@@ -99,6 +99,7 @@ describe('createKakaoChannelResolver', () => {
       client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
       now: () => now,
       ttlMs: 100,
+      minRefreshIntervalMs: 100,
     })
     await resolver.refresh()
 
@@ -124,6 +125,60 @@ describe('createKakaoChannelResolver', () => {
     expect(calls).toBe(1)
   })
 
+  test('a DM first seen inside the refresh floor is classified by the trailing refresh', async () => {
+    let now = 1000
+    let chats: KakaoChat[] = [groupChat('222', 'Team')]
+    const scheduled: Array<{ fn: () => void; delayMs: number }> = []
+    const resolver = createKakaoChannelResolver({
+      client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
+      now: () => now,
+      minRefreshIntervalMs: 60_000,
+      scheduleRefresh: (fn, delayMs) => scheduled.push({ fn, delayMs }),
+    })
+    await resolver.refresh()
+
+    now += 10_000
+    chats = [groupChat('222', 'Team'), dmChat('111', 'Alice')]
+    await resolver.refresh()
+    await resolver.refresh()
+    await resolver.ingestProvisional('111')
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-group', isDm: false, provisional: true })
+    expect(scheduled).toHaveLength(1)
+    expect(scheduled[0]?.delayMs).toBe(50_000)
+
+    now += 50_000
+    scheduled[0]?.fn()
+    await resolver.refresh()
+    expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })
+  })
+
+  test('does not walk the chat list again inside the refresh floor', async () => {
+    let now = 1000
+    let calls = 0
+    const resolver = createKakaoChannelResolver({
+      scheduleRefresh: () => {},
+      client: {
+        getChats: async () => {
+          calls++
+          throw new Error('LOCO packet timeout: LCHATLIST (15000ms)')
+        },
+        getMemberSnapshot: async () => snapshot([]),
+      },
+      now: () => now,
+      minRefreshIntervalMs: 60_000,
+    })
+
+    await resolver.refresh()
+    now += 59_000
+    await resolver.refresh()
+    await resolver.resolve({ adapter: 'kakaotalk', workspace: '@kakao-dm', chat: '111', thread: null })
+    expect(calls).toBe(1)
+
+    now += 1_000
+    await resolver.refresh()
+    expect(calls).toBe(2)
+  })
+
   test('reflects chat-type changes after a fresh refresh', async () => {
     let now = 1000
     let chats: KakaoChat[] = [dmChat('111', 'Alice')]
@@ -131,6 +186,7 @@ describe('createKakaoChannelResolver', () => {
       client: { getChats: async () => chats, getMemberSnapshot: async () => snapshot([]) },
       now: () => now,
       ttlMs: 100,
+      minRefreshIntervalMs: 100,
     })
     await resolver.refresh()
     expect(resolver.lookupChat('111')).toEqual({ workspace: '@kakao-dm', isDm: true, provisional: false })

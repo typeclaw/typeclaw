@@ -5,7 +5,12 @@ import type { ChannelKey, ChannelNameResolver, ResolvedChannelNames } from '@/ch
 import { describeError } from '../describe-error'
 import type { KakaoTalkClient } from './kakaotalk'
 
-const DEFAULT_TTL_MS = 5 * 60 * 1000
+// Chat names and kinds rarely change, and membership pushes trigger a refresh
+// anyway, so a long TTL costs little. Every refresh is a full LCHATLIST walk,
+// and the floor stops failed or unknown-chat lookups from re-walking the chat
+// list on every message.
+const DEFAULT_TTL_MS = 30 * 60 * 1000
+const DEFAULT_MIN_REFRESH_INTERVAL_MS = 60 * 1000
 
 export type KakaoWorkspace = '@kakao-dm' | '@kakao-group' | '@kakao-open'
 
@@ -81,6 +86,8 @@ export type KakaoChannelResolverOptions = {
   client: Pick<KakaoTalkClient, 'getChats' | 'getMemberSnapshot'>
   now?: () => number
   ttlMs?: number
+  minRefreshIntervalMs?: number
+  scheduleRefresh?: (fn: () => void, delayMs: number) => void
   logger?: { warn: (msg: string) => void }
   selfUserId?: () => string | null
 }
@@ -96,14 +103,43 @@ type Entry = {
 export function createKakaoChannelResolver(options: KakaoChannelResolverOptions): KakaoChannelResolver {
   const now = options.now ?? Date.now
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
+  const minRefreshIntervalMs = options.minRefreshIntervalMs ?? DEFAULT_MIN_REFRESH_INTERVAL_MS
   const cache = new Map<string, Entry>()
   let inflight: Promise<void> | null = null
+  let lastRefreshAt: number | null = null
+  let trailingScheduled = false
+  const scheduleRefresh =
+    options.scheduleRefresh ??
+    ((fn: () => void, delayMs: number): void => {
+      setTimeout(fn, delayMs).unref?.()
+    })
+
+  // A suppressed refresh still owes one: a chat first seen inside the floor
+  // (a new DM) is filed provisionally under the strict group bucket, and only a
+  // real chat-list walk can upgrade it. Coalesce every suppressed request into
+  // one trailing refresh when the floor expires.
+  const scheduleTrailingRefresh = (waitMs: number): void => {
+    if (trailingScheduled) return
+    trailingScheduled = true
+    scheduleRefresh(() => {
+      trailingScheduled = false
+      void refresh()
+    }, waitMs)
+  }
 
   const refresh = async (): Promise<void> => {
     if (inflight !== null) {
       await inflight
       return
     }
+    if (lastRefreshAt !== null) {
+      const waitMs = lastRefreshAt + minRefreshIntervalMs - now()
+      if (waitMs > 0) {
+        scheduleTrailingRefresh(waitMs)
+        return
+      }
+    }
+    lastRefreshAt = now()
     const promise = loadAll().finally(() => {
       inflight = null
     })
