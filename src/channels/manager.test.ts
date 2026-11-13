@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import type { AgentSession } from '@/agent'
 import { createFileSecretsProvider } from '@/secrets/secrets-provider'
 
+import { ChannelAdapterHaltedError } from './adapter-halt'
 import {
   type ChannelManager,
   type ChannelManagerOptions,
@@ -1919,6 +1920,162 @@ describe('channel manager — kakaotalk credential preflight', () => {
     // Reported rather than silent: a named adapter that reports nothing reads as
     // "could not apply" and sends the caller to a container restart.
     expect(result.credentialApply).toEqual({ adapter: 'kakaotalk', outcome: 'already-current' })
+
+    await mgr.stop()
+  })
+
+  test('does not retry an adapter that halted at start until its credentials change', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const clock = fakeRecoveryClock({ checkIntervalMs: 10, retryBaseMs: 200 })
+    const logger = recordingLogger()
+    let constructions = 0
+    let halted = true
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      logger,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => {
+        constructions++
+        const fake = makeFakeAdapter()
+        fake.start = async () => {
+          fake.startCalls++
+          if (halted) throw new ChannelAdapterHaltedError('KakaoTalk rejected the login (LOGINLIST status -997)')
+        }
+        return fake
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    expect(constructions).toBe(1)
+    expect(logger.messages.some((m) => m.startsWith('error:') && m.includes('not retrying automatically'))).toBe(true)
+
+    for (let i = 0; i < 20; i++) {
+      clock.advanceBy(60 * 60 * 1_000)
+      await flushManagerWork()
+    }
+    await mgr.reload()
+    expect(constructions).toBe(1)
+
+    halted = false
+    await writeKakaoSecrets(agentDir, 'reauthed')
+    const result = await mgr.reload()
+    expect(constructions).toBe(2)
+    expect(result.started).toContain('kakaotalk')
+
+    await mgr.stop()
+  })
+
+  test('retires a live adapter that reports a halt instead of restarting it', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const clock = fakeRecoveryClock({ checkIntervalMs: 10, disconnectedGraceMs: 100, retryBaseMs: 200 })
+    let haltReason: string | null = null
+    const fake = Object.assign(makeFakeAdapter(), { haltReason: () => haltReason })
+    let constructions = 0
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => {
+        constructions++
+        return fake
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    fake.connected = false
+    haltReason = 'session is DEAD after KICKOUT'
+    clock.advanceBy(10)
+    await flushManagerWork()
+    expect(fake.stopCalls).toBe(1)
+
+    for (let i = 0; i < 20; i++) {
+      clock.advanceBy(60 * 60 * 1_000)
+      await flushManagerWork()
+    }
+    expect(constructions).toBe(1)
+
+    await mgr.stop()
+  })
+
+  test('a credential rotation that lands while a halted adapter is retiring still restarts it', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const clock = fakeRecoveryClock({ checkIntervalMs: 10, disconnectedGraceMs: 100, retryBaseMs: 200 })
+    const stopGate = deferred()
+    const stopEntered = deferred()
+    const halted = Object.assign(makeFakeAdapter(), { haltReason: () => 'KICKOUT' as string | null })
+    halted.stop = async () => {
+      halted.stopCalls++
+      stopEntered.resolve()
+      await stopGate.promise
+    }
+    const replacement = makeFakeAdapter()
+    const adapters = [halted, replacement]
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => adapters.shift()!,
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(10)
+    await stopEntered.promise
+
+    await writeKakaoSecrets(agentDir, 'rotated')
+    const reload = mgr.reload({ applyCredentialRotation: 'kakaotalk' })
+    stopGate.resolve()
+    const result = await reload
+
+    expect(replacement.startCalls).toBe(1)
+    expect(result.started).toContain('kakaotalk')
+
+    await mgr.stop()
+  })
+
+  test('keeps restarting a disconnected adapter that has not halted', async () => {
+    cfg.kakaotalk = enabledAdapterCfg()
+    await writeKakaoSecrets(agentDir)
+    const clock = fakeRecoveryClock({ checkIntervalMs: 10, disconnectedGraceMs: 100, retryBaseMs: 200 })
+    let constructions = 0
+    const replacementStarted = Promise.withResolvers<void>()
+    const mgr = createChannelManager({
+      agentDir,
+      channelsConfigRef: () => cfg,
+      env: kakaoEnv,
+      secretsProvider: createFileSecretsProvider(join(agentDir, 'secrets.json')),
+      createKakaotalkAdapter: () => {
+        constructions++
+        const fake = Object.assign(makeFakeAdapter(), { haltReason: () => null })
+        fake.start = async () => {
+          fake.startCalls++
+          fake.connected = false
+        }
+        if (constructions === 2) replacementStarted.resolve()
+        return fake
+      },
+      connectionRecovery: clock.connectionRecovery,
+    })
+
+    await mgr.start()
+    clock.advanceBy(10)
+    clock.advanceBy(101)
+    await Promise.race([
+      replacementStarted.promise,
+      Bun.sleep(2_000).then(() => {
+        throw new Error('disconnected adapter was not restarted')
+      }),
+    ])
+    expect(constructions).toBe(2)
 
     await mgr.stop()
   })
