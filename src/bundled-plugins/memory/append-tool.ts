@@ -7,16 +7,15 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { defineTool } from '@/plugin'
 import { formatLocalDate } from '@/shared'
 
-import { fragmentContentHash } from './fragment-parser'
+import { appendFragment, type FragmentsAppendedHook, type ReferenceSlugResolver } from './append-fragment'
 import { streamFilePath } from './paths'
 import { sanitizeProvenanceName } from './provenance-sanitize'
-import { detectSecrets } from './secret-detector'
 import { newEventId, timestampFromId } from './stream-events'
-import type { FragmentEvent, FragmentProvenance, WatermarkEvent } from './stream-events'
-import { appendEvents, readEvents, type FragmentsAppendedContext } from './stream-io'
+import type { FragmentProvenance, WatermarkEvent } from './stream-events'
+import { appendEvents } from './stream-io'
 import { transcriptEntryId } from './transcript-cursor'
 
-export type FragmentsAppendedHook = (fragments: FragmentEvent[], context: FragmentsAppendedContext) => Promise<void>
+export type { FragmentsAppendedHook, ReferenceSlugResolver } from './append-fragment'
 
 // Lets the memory-logger thread its spawn-time `payload.origin` into the append
 // tool so `where` is stamped server-side. A provider closure (not a static
@@ -28,7 +27,6 @@ export type OriginProvider = () => SessionOrigin | undefined
 // writes the file synchronously before returning the slug, so a same-run store
 // is already on disk by append time). Lets the append tool strip hallucinated
 // slugs the model invents without ever calling `store_reference`.
-export type ReferenceSlugResolver = (agentDir: string) => Promise<Iterable<string>>
 export type TranscriptPathProvider = () => string | undefined
 
 export type CreateAppendToolOptions = {
@@ -106,66 +104,14 @@ export function createAppendTool(options: CreateAppendToolOptions = {}) {
               'Operational defects are owned by the incident ledger, not semantic memory.',
           )
         }
-        // `who` is LLM-supplied and force-committed to memory, so it clears the
-        // same secret guard as topic/body — a token-shaped display name is refused
-        // with the same retryable error. (`where` names are origin-derived and the
-        // agent can't rewrite them, so they are self-redacted in provenanceFromOrigin
-        // instead of throwing here.)
-        assertNoSecrets([topic, body, who])
-
-        const hash = fragmentContentHash({ topic, body })
-        const events = await readEvents(streamPath)
-        const duplicate = events
-          .filter((event) => event.type === 'fragment')
-          .find((event) => fragmentContentHash(event) === hash)
-        if (duplicate !== undefined) {
-          throw new Error(
-            `Refusing to append: fragment "${duplicate.topic}" already exists in ${streamPath} with byte-equivalent content. ` +
-              `The dreaming subagent will see the existing fragment; do not write it again. If the new occurrence ` +
-              `is genuinely informative, write a fragment that says so explicitly rather than restating the original.`,
-          )
-        }
-
-        const fragmentId = newEventId()
-        const watermarkId = newEventId()
-        const fragment: FragmentEvent = {
-          type: 'fragment',
-          id: fragmentId,
-          ts: timestampFromId(fragmentId),
-          source,
-          entry,
-          topic,
-          body,
-        }
-        const validReferences = await resolveValidReferences(references, referenceSlugResolver, ctx)
-        if (validReferences.length > 0) {
-          fragment.references = validReferences
-        }
-        const safeWho = sanitizeProvenanceName(who)
-        if (safeWho !== undefined) fragment.who = safeWho
-        if (where !== undefined) fragment.where = where
-        const watermark: WatermarkEvent = {
-          type: 'watermark',
-          id: watermarkId,
-          ts: timestampFromId(watermarkId),
-          source,
-          entry: latestEntryId,
-        }
-
-        await mkdir(dirname(streamPath), { recursive: true })
         const deferred = options.deferWatermark?.() ?? false
-        await appendEvents(
-          streamPath,
-          deferred ? [fragment] : [fragment, watermark],
+        const { fragment, watermark } = await appendFragment({ topic, body, source, entry, references, who }, ctx, {
+          path: streamPath,
+          where,
+          watermarkEntry: deferred ? undefined : latestEntryId,
           onFragmentsAppended,
-          onFragmentsAppended
-            ? (err) => {
-                ctx.logger?.warn(
-                  `[memory] post-append vector hook failed: ${err instanceof Error ? err.message : String(err)}`,
-                )
-              }
-            : undefined,
-        )
+          referenceSlugResolver,
+        })
 
         return {
           content: [
@@ -287,46 +233,4 @@ export const advanceWatermarkTool = createAdvanceWatermarkTool()
 
 function dailyStreamPath(agentDir: string): string {
   return streamFilePath(agentDir, formatLocalDate())
-}
-
-// The model treats `references[]` as a free-text related-id field, citing empty
-// strings, stream paths, and slugs for references it never stored. Every path
-// first normalizes: trim, drop blank/whitespace-only entries, and de-duplicate
-// — an empty or repeated citation is never meaningful regardless of wiring.
-// With a resolver, only slugs backed by a real reference file then survive; the
-// rest are dropped and logged so dangling citations never reach the stream.
-// Without one (the standalone `appendTool` export, no reference subsystem
-// wired) the normalized slugs pass through.
-async function resolveValidReferences(
-  references: string[] | undefined,
-  resolver: ReferenceSlugResolver | undefined,
-  ctx: { agentDir: string; logger?: { warn(message: string): void } },
-): Promise<string[]> {
-  if (references === undefined || references.length === 0) return []
-  const requested = [...new Set(references.map((slug) => slug.trim()).filter((slug) => slug.length > 0))]
-  if (resolver === undefined) return requested
-
-  const known = new Set(await resolver(ctx.agentDir))
-  const valid = requested.filter((slug) => known.has(slug))
-  const dropped = requested.filter((slug) => !known.has(slug))
-  if (dropped.length > 0) {
-    ctx.logger?.warn(
-      `[memory] dropped ${dropped.length} unknown reference slug(s) from fragment: ${dropped.join(', ')}. ` +
-        `references[] may only cite slugs returned by store_reference.`,
-    )
-  }
-  return valid
-}
-
-function assertNoSecrets(parts: ReadonlyArray<string | undefined>): void {
-  const content = parts.filter((part): part is string => part !== undefined).join('\n')
-  const secrets = detectSecrets(content)
-  if (secrets.length === 0) return
-
-  const ruleNames = [...new Set(secrets.map((s) => s.rule))].join(', ')
-  throw new Error(
-    `Refusing to append: content contains a recognized credential pattern (${ruleNames}). ` +
-      `Memory fragments must never quote secret values verbatim. Record the env var name and how it ` +
-      `was discovered, not the value itself.`,
-  )
 }

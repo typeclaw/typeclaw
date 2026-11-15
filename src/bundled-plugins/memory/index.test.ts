@@ -164,10 +164,11 @@ afterEach(async () => {
 })
 
 describe('memory plugin shape', () => {
-  test('exposes memory subagents and memory_search tool', async () => {
+  test('exposes memory subagents and public memory tools', async () => {
     const { exports } = await bootMemoryPlugin(agentDir, {})
     expect(Object.keys(exports.subagents ?? {})).toEqual(expect.arrayContaining(['memory-logger', 'dreaming']))
     expect(exports.tools?.memory_search).toBeDefined()
+    expect(exports.tools?.memory_remember).toBeDefined()
   })
 
   test('registers a dreaming cron job with the configured schedule', async () => {

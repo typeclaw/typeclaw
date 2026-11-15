@@ -23,6 +23,15 @@ Nine plugins ship with TypeClaw and load automatically. You don't list them in `
 
 ## `memory`
 
+The plugin provides two tools to every role in TUI, channel, cron, and standard subagent sessions:
+
+| Tool              | Parameters                                                                                                                          | Behavior                                                                                                                                |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory_search`   | `query` or exact `topic`, with optional search/scoping options                                                                      | Recall topic shards, recent stream fragments, and references.                                                                           |
+| `memory_remember` | Required `topic` (short label), `body` (self-contained durable knowledge); optional `who` (attributed person), `verbatim` (boolean) | Immediately save one explicit fragment to today's daily stream. With `verbatim: true`, also store the exact body as a linked reference. |
+
+Use `memory_remember` for an explicit request to remember, a correction, or an established durable decision/preference. The runtime stamps session/transcript/channel provenance and indexes the fragment and optional reference immediately. The tool does not advance the logger watermark or write topic shards; dreaming consolidates explicit fragments normally. See [memory internals](/docs/internals/memory#deliberate-capture).
+
 ```json
 {
   "memory": {

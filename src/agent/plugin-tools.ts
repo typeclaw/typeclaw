@@ -354,7 +354,7 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
     label: opts.toolName,
     description: tool.description,
     parameters,
-    async execute(toolCallId, params, signal) {
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
       const envelope = extractGuardAcknowledgements(params, opts.toolName, opts.guards ?? [])
       if (!envelope.ok) return errorResult(`invalid arguments: ${envelope.error}`)
 
@@ -365,6 +365,8 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
 
       const mutableArgs = validated.data as Record<string, unknown>
       const liveOrigin = opts.getOrigin?.()
+      // Plain Agent/direct invocations may have no extension context.
+      const entryId = ctx?.sessionManager?.getLeafId() ?? undefined
       const before: ToolBeforeEvent = {
         tool: opts.toolName,
         sessionId: opts.sessionId,
@@ -397,6 +399,8 @@ export function wrapPluginTool(tool: Tool<any>, opts: WrapToolOptions): ToolDefi
         sessionId: opts.sessionId,
         agentDir: opts.agentDir,
         logger: opts.logger,
+        ...(liveOrigin === undefined ? {} : { origin: liveOrigin }),
+        ...(entryId === undefined ? {} : { entryId }),
       }
 
       let result: ToolResult | undefined

@@ -21,6 +21,9 @@ export type ToolLogger = {
 export type ToolContext = {
   signal: AbortSignal | undefined
   sessionId: string
+  readonly origin?: SessionOrigin
+  // Current transcript leaf at invocation; absent for tools called outside a session.
+  readonly entryId?: string
   agentDir: string
   logger: ToolLogger
 }

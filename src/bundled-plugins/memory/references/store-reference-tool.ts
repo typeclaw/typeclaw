@@ -6,7 +6,7 @@ import { defineTool } from '@/plugin'
 
 import { referenceFilePath, referencesDir } from '../paths'
 import { headingToSlug } from '../slug'
-import { renderReference } from './frontmatter'
+import { renderReference, type ReferenceOrigin } from './frontmatter'
 import { listReferenceSlugs } from './load-references'
 
 export type ReferenceStoredHook = (context: { slug: string; body: string }) => Promise<void>
@@ -27,37 +27,61 @@ export function createStoreReferenceTool(onReferenceStored?: ReferenceStoredHook
     // path; none is a caller-supplied file path. Declared so a title like
     // "README.md" or a body carrying "/" is not misread as a file operand.
     fileOperands: { nonFile: ['title', 'body', 'tags'] },
-    async execute({ title, body, origin, tags }, ctx) {
-      const existingSlugs = new Set(await listReferenceSlugs(ctx.agentDir))
-      const slug = headingToSlug(title, existingSlugs)
-      const created = new Date().toISOString()
-      const path = referenceFilePath(ctx.agentDir, slug)
-
-      await mkdir(referencesDir(ctx.agentDir), { recursive: true })
-      await writeFile(
-        path,
-        renderReference(
-          {
-            title,
-            origin,
-            created,
-            lastAccessed: created,
-            accessCount: 0,
-            pinned: false,
-            demoted: false,
-            tags: tags ?? [],
-          },
-          body,
-        ),
-        'utf8',
-      )
-
-      if (onReferenceStored !== undefined) await onReferenceStored({ slug, body })
-
-      return {
-        content: [{ type: 'text' as const, text: `Stored reference as ${slug}` }],
-        details: { path, slug },
-      }
+    async execute(input, ctx) {
+      return storeReference(input, ctx.agentDir, onReferenceStored)
     },
   })
+}
+
+export async function storeReference(
+  input: {
+    readonly title: string
+    readonly body: string
+    readonly origin: ReferenceOrigin
+    readonly tags?: string[] | undefined
+  },
+  agentDir: string,
+  onReferenceStored?: ReferenceStoredHook,
+) {
+  const { title, body, origin, tags } = input
+  const existingSlugs = new Set(await listReferenceSlugs(agentDir))
+  const created = new Date().toISOString()
+  const content = renderReference(
+    {
+      title,
+      origin,
+      created,
+      lastAccessed: created,
+      accessCount: 0,
+      pinned: false,
+      demoted: false,
+      tags: tags ?? [],
+    },
+    body,
+  )
+
+  await mkdir(referencesDir(agentDir), { recursive: true })
+  // Concurrent writers (memory-logger and every main-agent session) can pick
+  // the same slug from the same listing, so the file is reserved with an
+  // exclusive create and a taken slug moves to the next deduplicated suffix.
+  let slug = headingToSlug(title, existingSlugs)
+  let path = referenceFilePath(agentDir, slug)
+  for (;;) {
+    try {
+      await writeFile(path, content, { encoding: 'utf8', flag: 'wx' })
+      break
+    } catch (err) {
+      if (!(err instanceof Error && 'code' in err && err.code === 'EEXIST')) throw err
+      existingSlugs.add(slug)
+      slug = headingToSlug(title, existingSlugs)
+      path = referenceFilePath(agentDir, slug)
+    }
+  }
+
+  if (onReferenceStored !== undefined) await onReferenceStored({ slug, body })
+
+  return {
+    content: [{ type: 'text' as const, text: `Stored reference as ${slug}` }],
+    details: { path, slug },
+  }
 }

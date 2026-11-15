@@ -56,6 +56,8 @@ export const fragmentEventSchema = z
     entry: z.string(),
     topic: z.string(),
     body: z.string(),
+    // Deliberate main-agent capture; absent on legacy/logger fragments.
+    kind: z.literal('explicit').optional(),
     references: z.array(z.string()).optional(),
     // WHO the evidence is attributable to (display name/handle of the speaker).
     // LLM-supplied by the memory-logger, set ONLY when one transcript speaker

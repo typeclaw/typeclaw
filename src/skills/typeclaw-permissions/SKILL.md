@@ -58,7 +58,7 @@ For each user turn, the current speaker's effective role is delivered in the tur
 
 **The permission list (cron/subagent block) is exhaustive at session-creation time** for the resolved role. If a permission you expect isn't listed there, the role doesn't carry it — adding it requires editing `roles.<role>.permissions[]` and restarting.
 
-Memory recall is globally visible by default across all roles and origins. Provenance is additive searchable metadata, not an authorization boundary. The optional `workspace`, `chat`, and `thread` parameters on `memory_search` narrow results when a focused subset is needed; no memory-specific permission grant is required.
+Memory recall is globally visible by default across all roles and origins. Provenance is additive searchable metadata, not an authorization boundary. The optional `workspace`, `chat`, and `thread` parameters on `memory_search` narrow results when a focused subset is needed; no memory-specific permission grant is required. `memory_remember` is likewise available to every role; it appends a runtime-stamped fragment to the daily stream for dreaming to consolidate.
 
 ## The match-rule DSL
 

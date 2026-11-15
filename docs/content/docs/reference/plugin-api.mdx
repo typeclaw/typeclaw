@@ -99,6 +99,8 @@ type Tool<P = unknown> = {
 type ToolContext = {
   signal: AbortSignal | undefined // fires when the agent cancels the call
   sessionId: string
+  readonly origin?: SessionOrigin // live origin at invocation
+  readonly entryId?: string // transcript leaf at invocation, when available
   agentDir: string
   logger: ToolLogger
 }
