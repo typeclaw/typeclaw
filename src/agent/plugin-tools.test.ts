@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { defineTool as definePiTool } from '@earendil-works/pi-coding-agent'
+import { defineTool as definePiTool, SessionManager } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import { z } from 'zod'
 
@@ -30,7 +30,7 @@ import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
 import { DeclaredSkillBinUnresolvedError, IncidentLedger, readIncidentLedger, RemediationRegistry } from '@/operations'
 import { createPermissionService } from '@/permissions/permissions'
-import { createHookBus, defineTool, type PluginRegistry, type ToolResult } from '@/plugin'
+import { createHookBus, defineTool, type PluginRegistry, type ToolContext, type ToolResult } from '@/plugin'
 import { emptyRegistry } from '@/plugin/registry'
 import {
   buildSandboxedCommand,
@@ -380,12 +380,21 @@ describe('wrapPluginTool', () => {
   })
 
   test('passes parsed args to plugin execute and exposes ToolContext', async () => {
-    const seen: { args: unknown; ctx: { sessionId: string; agentDir: string } }[] = []
+    const seen: { args: unknown; ctx: ToolContext }[] = []
+    const sessionManager = SessionManager.inMemory(tmpdir())
+    const entryId = sessionManager.appendCustomEntry('test-anchor', {})
+    const origin: SessionOrigin = {
+      kind: 'channel',
+      adapter: 'slack',
+      workspace: 'T0123456789',
+      chat: 'C0123456789',
+      thread: null,
+    }
     const tool = defineTool({
       description: '',
       parameters: z.object({ q: z.string() }),
       async execute(args, ctx) {
-        seen.push({ args, ctx: { sessionId: ctx.sessionId, agentDir: ctx.agentDir } })
+        seen.push({ args, ctx })
         return { content: [{ type: 'text', text: `q=${args.q}` }] }
       },
     })
@@ -397,15 +406,20 @@ describe('wrapPluginTool', () => {
       sessionId: 'sess-1',
       logger: noopLogger,
       hooks: createHookBus(),
+      getOrigin: () => origin,
     })
 
-    const result = (await wrapped.execute('call-1', { q: 'hello' }, undefined, undefined, {} as never)) as {
+    const result = (await wrapped.execute('call-1', { q: 'hello' }, undefined, undefined, {
+      sessionManager,
+    } as never)) as {
       content: { type: string; text: string }[]
     }
     expect(result.content[0]?.text).toBe('q=hello')
     expect(seen[0]?.args).toEqual({ q: 'hello' })
     expect(seen[0]?.ctx.sessionId).toBe('sess-1')
     expect(seen[0]?.ctx.agentDir).toBe('/agent')
+    expect(seen[0]?.ctx.origin).toEqual(origin)
+    expect(seen[0]?.ctx.entryId).toBe(entryId)
   })
 
   test('tool.before mutations to args propagate to the plugin tool execute', async () => {
