@@ -20,6 +20,7 @@ import {
 import { createMemoryLoggerSubagent, type MemoryLoggerPayload } from './memory-logger'
 import { preShardBackupPath, streamFilePath, streamsDir, topicsDir } from './paths'
 import { bumpReferenceAccess } from './references/load-references'
+import { createMemoryRememberTool } from './remember-tool'
 import { memoryCommands } from './search-command'
 import { createMemorySearchTool } from './search-tool'
 import { type InjectedMemoryState, partitionRetrievedMemoryItems } from './turn-dedup'
@@ -455,6 +456,10 @@ export function createMemoryPlugin(deps: MemoryPluginDeps = defaultDeps) {
         },
         tools: {
           memory_search: createMemorySearchTool(),
+          memory_remember: createMemoryRememberTool({
+            onFragmentsAppended: makeAppendHook(openAppendVectorStore),
+            onReferenceStored: makeReferenceStoredHook(openAppendVectorStore),
+          }),
         },
         cronJobs: {
           [DREAMING_CRON_KEY]: {
