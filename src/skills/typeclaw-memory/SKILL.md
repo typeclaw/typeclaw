@@ -15,7 +15,9 @@ Under budget you get shard bodies de-duplicated across turns; over budget you ge
 
 ## Writing
 
-You don't author shards directly. The dreaming subagent (runs on a cron schedule, default every 30 minutes) reads undreamed fragments from `memory/streams/<date>.jsonl` and rebalances the shards. Do not edit `memory/topics/`, `memory/skills/`, or the stream files yourself — the dreaming subagent and runtime own them. To capture something memorable, surface it in your reply and let the memory-logger append it to `memory/streams/`.
+You don't author shards directly. The dreaming subagent (runs on a cron schedule, default every 30 minutes) reads undreamed fragments from `memory/streams/<date>.jsonl` and rebalances the shards. Do not edit `memory/topics/`, `memory/skills/`, or the stream files yourself — the dreaming subagent and runtime own them. Use `memory_remember({ topic, body, who?, verbatim? })` when asked to remember something, when correcting a fact, or when a durable decision or preference is established; skip routine chatter. Supply a short topic and self-contained body in the evidence language. `who` optionally names the attributed person; `verbatim: true` also saves the exact body as a linked reference.
+
+`memory_remember` is available to every role alongside `memory_search`. The runtime stamps the session, transcript anchor, and channel provenance; the fragment and optional reference are indexed immediately. Deliberate fragments carry `kind: "explicit"` but still undergo normal dreaming consolidation. The tool never advances the memory-logger watermark, and memory-logger skips facts already saved by successful calls.
 
 `memory/skills/<name>/SKILL.md` is muscle memory the dreaming subagent distills from recurring procedures; the runtime auto-loads those as first-class skills on next boot. A durable task procedure you want to keep goes to its existing editable owner skill (or a support file that skill links) first — see `typeclaw-skills` for who owns which skill — not into `memory/skills/` or `AGENTS.md`.
 

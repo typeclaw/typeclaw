@@ -12,10 +12,10 @@ The plugin is auto-loaded by every agent. There is no `plugins[]` entry to add a
 
 Memory is split across two on-disk surfaces and two subagents that move data between them.
 
-| Surface                           | Shape                                                            | Writer                                    |
-| --------------------------------- | ---------------------------------------------------------------- | ----------------------------------------- |
-| `memory/streams/yyyy-MM-dd.jsonl` | Append-only daily log of `fragment \| watermark \| legacy_prose` | `memory-logger` (runtime)                 |
-| `memory/topics/<slug>.md`         | Consolidated beliefs, one topic per file, with citations         | `dreaming` (body) + runtime (frontmatter) |
+| Surface                           | Shape                                                            | Writer                                          |
+| --------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------- |
+| `memory/streams/yyyy-MM-dd.jsonl` | Append-only daily log of `fragment \| watermark \| legacy_prose` | `memory-logger` and `memory_remember` (runtime) |
+| `memory/topics/<slug>.md`         | Consolidated beliefs, one topic per file, with citations         | `dreaming` (body) + runtime (frontmatter)       |
 
 | Subagent        | Cadence                                                   | Job                                                                                                                                                                                                                                                                                                              |
 | --------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -23,6 +23,16 @@ Memory is split across two on-disk surfaces and two subagents that move data bet
 | `dreaming`      | cron (`memory.dreaming.schedule`, default `*/30 * * * *`) | Consolidates undreamed fragments into topic shards; rebalances the set.                                                                                                                                                                                                                                          |
 
 The loop is **observe → dream → apply**: `memory-logger` observes, `dreaming` consolidates, and the next prompt applies the updated shards automatically.
+
+### Deliberate capture
+
+The memory plugin also exposes `memory_remember({ topic, body, who?, verbatim? })` wherever `memory_search` is available, across roles and standard session origins. The main agent can capture an explicit request to remember, a correction, or a durable decision/preference immediately without waiting for the memory-logger idle debounce. Routine chatter does not warrant a call.
+
+`remember-tool.ts` and the logger's `append` share `append-fragment.ts`: credential rejection, duplicate-content detection, `who` sanitization, fragment construction, reference validation, stream append, and the vector-index hook. The runtime stamps `source` from the current session id, `entry` from the transcript leaf at tool invocation, and `where` through `provenanceFromOrigin` from the live origin. `ToolContext` exposes the origin and entry id from the wrapper in `src/agent/plugin-tools.ts`; direct calls without a transcript use an empty entry anchor rather than an invented id. No model argument supplies provenance or a local path.
+
+Each call writes one fragment with optional, backwards-compatible `kind: "explicit"`. It writes no watermark and is excluded from legacy fragment-derived logger progress, so it cannot skip pending extraction. With `verbatim: true`, the existing `store_reference` writer also preserves the exact body and links its slug. Both fragment and reference vector hooks run immediately. Memory-logger skips facts already saved by successful tool calls in its transcript.
+
+Dreaming gives the deliberate intent weight while applying its usual consolidation and contradiction rules. It remains the only writer of topic-shard bodies; citation-superset protection and runtime-owned frontmatter remain unchanged.
 
 ### Extraction pages and checkpoint safety
 
