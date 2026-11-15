@@ -135,6 +135,10 @@ Every vector verdict leaves genuine keyword hits intact. The policy adds no lang
 
 ## Provenance-aware lexical recall and scoping
 
+The main-agent `memory_search` tool uses semantic+keyword `hybridSearch` by default for free-text `query` (`mode: "hybrid"`), with the same relevance gates and RRF ranking as automatic retrieval. Use `mode: "lexical"` for the original case-insensitive phrase-first search with token-OR fallback. `asRegex: true` always uses lexical regex matching without token fallback, and `topic` always looks up one exact topic/reference slug. Supply exactly one of `query` or `topic`.
+
+Each hybrid call opens `memory/.vectors/index.db` and closes it before returning. A missing index or semantic-search failure falls back to lexical search for that call, with a short notice in the tool text and the reason in the plugin log. `maxResults` is hybrid top-K. Results retain topic/stream/reference shapes and eligible provenance; `full: true` loads complete bodies by key. Reference `since`/`before` filters apply to the returned candidates, and surfaced references record an access.
+
 `ProvenanceIndex` (`provenance-index.ts`) is rebuilt from the authoritative `readAllStreamDays` stream view plus each shard's canonical active `fragments:` citations. It is a child-posting index: a topic's searchable origin text, scope eligibility, and returned provenance all come from the same resolved active cited children. `superseded:` children never participate. A citation whose stream event is unavailable remains an explicit `{ citation, resolved: false }` result; the runtime never fabricates an origin for it.
 
 Both `memory_search` and the hybrid keyword lane add child `who`, workspace/chat/thread IDs, names, and Discord parent-room coordinates to their **lexical documents only**. `fragmentEmbeddableText` and topic passage text are unchanged, so adding or renaming origin metadata cannot change embedding inputs or vector scores. A keyword hit on child provenance collapses to its parent topic through the same parent-child path as a fragment hit.

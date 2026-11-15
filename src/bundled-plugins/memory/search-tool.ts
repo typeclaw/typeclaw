@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 
 import { z } from 'zod'
@@ -13,9 +14,13 @@ import {
 } from './provenance-index'
 import { sanitizeProvenanceName } from './provenance-sanitize'
 import { renderReference } from './references/frontmatter'
-import { loadAllReferences, loadReference, type Reference } from './references/load-references'
+import { bumpReferenceAccess, loadAllReferences, loadReference, type Reference } from './references/load-references'
+import { vectorDbPath } from './search-command'
+import { hydrateHybridMatches } from './search-tool-hybrid'
 import type { FragmentEvent, FragmentProvenance, LegacyProseEvent, StreamEvent } from './stream-events'
 import { filterUndreamedEvents, readAllStreamDays, type UndreamedStreamDay } from './stream-io'
+import { hybridSearch, type EmbedFn, type HybridSearchResult } from './vector/hybrid'
+import { VectorStore } from './vector/store'
 
 const DEFAULT_MAX_RESULTS = 10
 const EXCERPT_CONTEXT_LINES = 3
@@ -59,12 +64,13 @@ export type MemorySearchResult = { matches: MemorySearchMatch[]; truncatedAt?: n
 
 export type Matcher = (haystack: string) => boolean
 
-export function createMemorySearchTool() {
+export function createMemorySearchTool(embedFn?: EmbedFn) {
   return defineTool({
     description:
-      'Search long-term memory and recent undreamed fragments, or look up one exact topic/reference slug. Plain search is case-insensitive phrase-first with token-OR fallback; regex mode has no token fallback. Runtime-owned provenance from active topic citations is searchable but never embedded. `workspace`, `chat`, and `thread` scope both topics and recent fragments to matching captured origin IDs or names; legacy `where` remains an alias for `chat`. Scoped topic eligibility, lexical matching, and returned provenance use the same eligible active cited children. Unresolved citations remain explicit in unscoped results and never gain invented metadata.',
+      'Search long-term memory and recent undreamed fragments by meaning and keywords (default mode: hybrid). Use mode: lexical for case-insensitive phrase-first search with token-OR fallback. Use asRegex: true for exact regex semantics without token fallback, or topic for one exact topic/reference slug; both bypass semantic search. If the semantic index is unavailable, the result reports lexical fallback. full: true returns complete bodies. Runtime-owned provenance from active topic citations is searchable but never embedded. `workspace`, `chat`, and `thread` scope both topics and recent fragments to matching captured origin IDs or names; legacy `where` remains an alias for `chat`. Scoped topic eligibility, lexical matching, and returned provenance use the same eligible active cited children. Unresolved citations remain explicit in unscoped results and never gain invented metadata.',
     parameters: z.object({
       query: z.string().optional(),
+      mode: z.enum(['hybrid', 'lexical']).default('hybrid'),
       topic: z.string().optional(),
       asRegex: z.boolean().default(false),
       full: z.boolean().default(false),
@@ -82,9 +88,12 @@ export function createMemorySearchTool() {
     // with an agent-root dir, or a `since` date like "2026-01-01", is not
     // misread as a file operand.
     fileOperands: {
-      nonFile: ['query', 'topic', 'since', 'before', 'where', 'workspace', 'chat', 'thread'],
+      nonFile: ['query', 'mode', 'topic', 'since', 'before', 'where', 'workspace', 'chat', 'thread'],
     },
-    async execute({ query, topic, asRegex, full, maxResults, since, before, where, workspace, chat, thread }, ctx) {
+    async execute(
+      { query, mode, topic, asRegex, full, maxResults, since, before, where, workspace, chat, thread },
+      ctx,
+    ) {
       if ((query === undefined) === (topic === undefined)) {
         return resultToToolResult({ error: 'provide exactly one of `query` or `topic`' })
       }
@@ -104,6 +113,37 @@ export function createMemorySearchTool() {
       const matcherOrError = buildMatcher(query!, asRegex)
       if (typeof matcherOrError === 'string') {
         return resultToToolResult({ error: matcherOrError })
+      }
+      const dateFilter = parseReferenceDateFilter(since, before)
+      if ('error' in dateFilter) return resultToToolResult(dateFilter)
+      let fallbackReason: string | undefined
+      if (query !== undefined && mode === 'hybrid' && !asRegex) {
+        const dbPath = vectorDbPath(ctx.agentDir)
+        if (!existsSync(dbPath)) {
+          fallbackReason = 'memory/.vectors/index.db is absent'
+        } else {
+          try {
+            const store = VectorStore.open(dbPath)
+            let hits: HybridSearchResult[]
+            try {
+              hits = await hybridSearch(query, store, ctx.agentDir, maxResults, embedFn, { scope })
+            } finally {
+              store.close()
+            }
+            const matches = (await hydrateHybridMatches(ctx.agentDir, hits, full)).filter(
+              (match) => match.source !== 'reference' || referenceDateAllowed(match.created, dateFilter),
+            )
+            await bumpReferenceAccess(
+              ctx.agentDir,
+              matches.flatMap((match) => (match.source === 'reference' ? [match.slug] : [])),
+              { logger: ctx.logger },
+            )
+            return resultToToolResult({ matches })
+          } catch (err) {
+            fallbackReason = err instanceof Error ? err.message : String(err)
+          }
+        }
+        ctx.logger.warn(`[memory-search] semantic index unavailable: ${fallbackReason}`)
       }
       const [shards, allStreamDays, allReferences] = await Promise.all([
         loadAllShards(ctx.agentDir, { logger: ctx.logger }),
@@ -126,8 +166,6 @@ export function createMemorySearchTool() {
         }
         return events.length === 0 ? [] : [{ date: day.date, path: day.path, name: day.name, events }]
       })
-      const dateFilter = parseReferenceDateFilter(since, before)
-      if ('error' in dateFilter) return resultToToolResult(dateFilter)
 
       const roomFilteredDays = streamDays
       const scopedShards = shards.filter((shard) => provenanceIndex.topicEligible(shard.slug, scope))
@@ -154,7 +192,7 @@ export function createMemorySearchTool() {
       }
 
       if (scopedShards.length === 0 && roomFilteredDays.length === 0 && references.length === 0) {
-        return resultToToolResult({ matches: [], truncatedAt: 0 })
+        return resultToToolResult({ matches: [], truncatedAt: 0 }, fallbackReason)
       }
 
       const searchOptions = { full, maxResults, references, topicDocuments, topicProvenance, streamDocuments }
@@ -164,7 +202,7 @@ export function createMemorySearchTool() {
         if (fallback !== null) result = fallback
       }
       if ('matches' in result) await bumpReturnedReferences(allReferences, result.matches)
-      return resultToToolResult(result)
+      return resultToToolResult(result, fallbackReason)
     },
   })
 }
@@ -661,7 +699,11 @@ function parseDateParam(name: string, value: string): Date | string {
 
 function referenceCandidateAllowed(reference: Reference, filter: ReferenceDateFilter): boolean {
   if (reference.frontmatter.demoted) return false
-  const created = new Date(reference.frontmatter.created)
+  return referenceDateAllowed(reference.frontmatter.created, filter)
+}
+
+function referenceDateAllowed(createdAt: string, filter: ReferenceDateFilter): boolean {
+  const created = new Date(createdAt)
   if (filter.since !== undefined && created < filter.since) return false
   if (filter.before !== undefined && created >= filter.before) return false
   return true
@@ -702,9 +744,13 @@ const EMPTY_RESULT_GUIDANCE =
 // The empty-set note rides in the LLM-facing `text` ONLY. `details` stays the
 // pure struct: `keywordLane` reads `searchAll` directly (never this layer) and
 // the structured tests assert on `details`, so both must see no `note`.
-function resultToToolResult(result: MemorySearchResult) {
+function resultToToolResult(result: MemorySearchResult, fallbackReason?: string) {
   const isEmpty = 'matches' in result && result.matches.length === 0
-  const text = isEmpty ? JSON.stringify({ ...result, note: EMPTY_RESULT_GUIDANCE }) : JSON.stringify(result)
+  const text = JSON.stringify({
+    ...result,
+    ...(isEmpty ? { note: EMPTY_RESULT_GUIDANCE } : {}),
+    ...(fallbackReason === undefined ? {} : { notice: 'Semantic index unavailable; lexical results are shown.' }),
+  })
   return {
     content: [{ type: 'text' as const, text }],
     details: result,
