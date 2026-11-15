@@ -202,6 +202,8 @@ The \`append\` tool will refuse content containing a recognizable credential pat
 
 # Local dedup against today's daily stream
 
+Facts already saved by a successful \`memory_remember\` tool call in the transcript are already in the stream; do not append them again.
+
 The \`append\` tool refuses byte-equivalent fragments within the same daily stream — content-equality on topic+body modulo whitespace, not marker-equality. If it rejects a fragment already in the same daily stream, rewrite or skip.
 
 Do not fight this refusal by changing punctuation or adding filler. If the new transcript only repeats exactly the same fact with no new evidence worth preserving, skip. If it is a true recurrence, rewrite the body to anchor the new occurrence explicitly, so dreaming can see why this line is new evidence rather than a duplicate copy.
