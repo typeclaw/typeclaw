@@ -57,7 +57,8 @@ function findProgress(events: StreamEvent[], source: string): { checkpoint: stri
   let legacy: string | null = null
   for (const event of events) {
     if (event.type === 'watermark' && event.source === source) checkpoint = event.entry
-    if (event.type === 'fragment' && event.source === source) legacy = event.entry
+    // Explicit captures have not evaluated the logger's pending transcript.
+    if (event.type === 'fragment' && event.kind !== 'explicit' && event.source === source) legacy = event.entry
   }
   return { checkpoint, legacy }
 }
