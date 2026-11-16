@@ -23,6 +23,7 @@ import {
   createSlackListCallback,
   createSlackMembershipResolver,
   createSlackMessageGetCallback,
+  createSlackOpenDmCallback,
   createSlackReferenceFetch,
   createSlackTypingTracker,
   createSlashCommandHandler,
@@ -102,6 +103,8 @@ function lifecycleRouter(): ChannelRouter {
     unregisterList: noop,
     registerEditMessage: noop,
     unregisterEditMessage: noop,
+    registerOpenDm: noop,
+    unregisterOpenDm: noop,
     registerFetchAttachment: noop,
     unregisterFetchAttachment: noop,
   } as unknown as ChannelRouter
@@ -1993,6 +1996,47 @@ describe('createSlackMessageGetCallback', () => {
     const result = await cb({ chat: 'CBAD', thread: null, messageId: '1.1' })
     // then
     expect(result).toEqual({ ok: false, error: 'channel_not_found' })
+  })
+})
+
+describe('createSlackOpenDmCallback', () => {
+  type FetchCall = { url: string; init: RequestInit }
+
+  function fakeFetch(status: number, body: unknown): { fn: typeof fetch; calls: FetchCall[] } {
+    const calls: FetchCall[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      calls.push({ url, init: init ?? {} })
+      return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    return { fn, calls }
+  }
+
+  const silentLogger = () => ({ info: () => {}, warn: () => {}, error: () => {} })
+
+  test('opens the DM with conversations.open and returns its coordinates', async () => {
+    // given
+    const { fn, calls } = fakeFetch(200, { ok: true, channel: { id: 'D0DM' } })
+    const cb = createSlackOpenDmCallback({ token: 'tok', logger: silentLogger(), fetchImpl: fn })
+    // when
+    const result = await cb({ user: 'U0USER', workspace: 'T0' })
+    // then
+    expect(result).toEqual({ ok: true, workspace: '@dm', chat: 'D0DM' })
+    expect(calls[0]!.url).toBe('https://slack.com/api/conversations.open')
+    expect(new URLSearchParams(String(calls[0]!.init.body)).get('users')).toBe('U0USER')
+  })
+
+  test('surfaces a slack api error verbatim', async () => {
+    const { fn } = fakeFetch(200, { ok: false, error: 'user_not_found' })
+    const cb = createSlackOpenDmCallback({ token: 'tok', logger: silentLogger(), fetchImpl: fn })
+
+    const result = await cb({ user: 'U0GONE' })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'could not open a DM with user U0GONE: user_not_found',
+      code: 'adapter-error',
+    })
   })
 })
 

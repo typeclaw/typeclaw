@@ -30,6 +30,7 @@ import type {
   OutboundMessage,
   ResolvedChannelNames,
   SendResult,
+  OpenDmCallback,
 } from '@/channels/types'
 import { chunkMarkdown } from '@/markdown'
 import type { SlackAccountRecord } from '@/secrets/schema'
@@ -265,6 +266,14 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
     createSlackOutboundCallback({ client, logger, formatChannelTag }),
     (workspace) => recoveryCallbacks.cachedAccountIdentity?.(workspace),
   )
+  const openDmCallback: OpenDmCallback = async ({ user }) => {
+    try {
+      const opened = await client.openConversation(user)
+      return { ok: true, workspace: '@dm', chat: opened.channel_id }
+    } catch (err) {
+      return { ok: false, error: `could not open a DM with user ${user}: ${describeError(err)}`, code: 'adapter-error' }
+    }
+  }
   const fetchAttachmentCallback = createSlackFetchAttachmentCallback({
     client,
     logger,
@@ -429,6 +438,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       options.router.registerPrepareOwnReaction('slack', ownReaction.prepare)
       options.router.registerRemoveOwnReaction('slack', ownReaction.remove)
       options.router.registerEditMessage('slack', editMessageCallback)
+      options.router.registerOpenDm('slack', openDmCallback)
 
       const rollbackStart = (reason: string, cause: Error): never => {
         options.router.unregisterOutbound('slack', outboundCallback)
@@ -444,6 +454,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
         options.router.unregisterPrepareOwnReaction('slack', ownReaction.prepare)
         options.router.unregisterRemoveOwnReaction('slack', ownReaction.remove)
         options.router.unregisterEditMessage('slack', editMessageCallback)
+        options.router.unregisterOpenDm('slack', openDmCallback)
         clearTimeout(startupTimer)
         listener?.stop()
         listener = null
@@ -481,6 +492,7 @@ export function createSlackAdapter(options: SlackAdapterOptions): SlackAdapter {
       options.router.unregisterPrepareOwnReaction('slack', ownReaction.prepare)
       options.router.unregisterRemoveOwnReaction('slack', ownReaction.remove)
       options.router.unregisterEditMessage('slack', editMessageCallback)
+      options.router.unregisterOpenDm('slack', openDmCallback)
       listener?.stop()
       listener = null
       connected = false
