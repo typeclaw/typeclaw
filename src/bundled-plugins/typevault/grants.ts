@@ -89,7 +89,9 @@ export function sessionLabel(sessionId: string): string {
 // typevault CLI, a project's own included, to the agent's vault. The agent's
 // project member identity, when provisioned, sits where any typevault CLI
 // looks for this device's identity, so joining and opening a project's vault
-// needs no password.
+// needs no password. XDG_CONFIG_HOME pins that lookup to the binds: a command
+// that also runs git gets HOME=<agentDir> (resolvePrivilegedSandboxRuntime), and
+// a HOME-derived config root would miss the socket and report the vault locked.
 export function bashVaultAccess(
   agentDir: string,
   token: string,
@@ -97,7 +99,11 @@ export function bashVaultAccess(
 ): { env: Record<string, string>; reveal: BashSandboxReveal } {
   const sandboxConfigRoot = join(DEFAULT_SANDBOX_ENV.HOME ?? '/tmp', '.config')
   return {
-    env: { TYPECLAW_VAULT_GRANT: token, TYPECLAW_VAULT_DIR: typevaultDir(agentDir) },
+    env: {
+      TYPECLAW_VAULT_GRANT: token,
+      TYPECLAW_VAULT_DIR: typevaultDir(agentDir),
+      XDG_CONFIG_HOME: sandboxConfigRoot,
+    },
     reveal: [
       { type: 'ro-bind', source: typevaultDir(agentDir), dest: typevaultDir(agentDir) },
       {

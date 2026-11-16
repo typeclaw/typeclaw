@@ -6,15 +6,18 @@ import { join } from 'node:path'
 
 import { createClient, parseEntryName } from 'typevault'
 
+import { buildSandboxEnvPolicy } from '@/agent/bash-sandbox-env'
 import { TYPECLAW_INTERNAL_BASH_ENV, TYPECLAW_INTERNAL_BASH_REVEAL } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { createPermissionService } from '@/permissions/permissions'
 import { rolesConfigSchema } from '@/permissions/schema'
 import type { ToolAfterEvent, ToolBeforeEvent } from '@/plugin'
+import { resolvePrivilegedSandboxRuntime } from '@/sandbox/privileged-runtime'
 import { typevaultCliPath } from '@/typevault/cli-path'
 import { reconcileTypevault } from '@/typevault/lifecycle'
 import { vaultSecretValues } from '@/typevault/redaction'
 import {
+  agentSocketPath,
   ensureRoleTiers,
   grantAccess,
   projectIdentityPath,
@@ -173,6 +176,7 @@ describe('vaultBashHook', () => {
       GH_REPO: 'acme/widgets',
       TYPECLAW_VAULT_GRANT: 'tvl1.1',
       TYPECLAW_VAULT_DIR: join('/agent', '.typevault'),
+      XDG_CONFIG_HOME: join('/tmp', '.config'),
     })
     const reveal = event.args[TYPECLAW_INTERNAL_BASH_REVEAL] as { type: string; source: string; dest: string }[]
     const runtimeRoot = join('/agent', '.typeclaw', 'typevault', 'config')
@@ -201,6 +205,29 @@ describe('vaultBashHook', () => {
       source: projectIdentityPath('/agent'),
       dest: join('/tmp', '.config', 'typevault', 'identity.json'),
     })
+  })
+
+  test('a command that also runs git keeps its isolated HOME and still reaches the vault socket and identity', async () => {
+    // given a member command that runs typevault and git together
+    const { issuer } = fakeIssuer()
+    const hook = vaultBashHook('/agent', createPermissionService(), createSessionGrants(issuer), silent, {
+      projectIdentity: true,
+    })
+    const command = 'typevault whoami; git status --short'
+    const event = bashEvent(spawnedBy('member'), { command })
+
+    // when the hook's overlay is combined with the git runtime env, as model bash does
+    await hook(event, {} as never)
+    const runtime = await resolvePrivilegedSandboxRuntime({ agentDir: '/agent', command })
+    const env = buildSandboxEnvPolicy(event.args[TYPECLAW_INTERNAL_BASH_ENV] as Record<string, string>, runtime.env).set
+
+    // then git keeps HOME=/agent, and typevault's config root (XDG_CONFIG_HOME,
+    // else $HOME/.config) is where the socket and identity are bound
+    expect(env?.HOME).toBe('/agent')
+    const configRoot = env?.XDG_CONFIG_HOME ?? join(env?.HOME ?? '', '.config')
+    const dests = (event.args[TYPECLAW_INTERNAL_BASH_REVEAL] as { dest: string }[]).map((mount) => mount.dest)
+    expect(dests).toContain(agentSocketPath('/agent', configRoot))
+    expect(dests).toContain(join(configRoot, 'typevault', 'identity.json'))
   })
 
   test('a custom role named runtime never receives a grant for the runtime tier', async () => {
