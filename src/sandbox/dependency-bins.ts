@@ -59,10 +59,10 @@ async function reconcileDependencyBinWrappersUnlocked(
   const wrappers = new Map<string, string>()
   for (const resolution of validation.resolutions) {
     if (resolution.kind !== 'package' || wrappers.has(resolution.declaration.bin)) continue
-    wrappers.set(resolution.declaration.bin, renderWrapper(resolution.containerEntrypoint))
+    wrappers.set(resolution.declaration.bin, renderBinWrapper(resolution.containerEntrypoint))
   }
   for (const [bin, entrypoint] of Object.entries(options.runtimeBins ?? {})) {
-    wrappers.set(bin, renderWrapper(entrypoint))
+    wrappers.set(bin, renderBinWrapper(entrypoint))
   }
   for (const entry of await readdir(dir).catch(() => [])) {
     if (entry.startsWith('.')) continue
@@ -123,7 +123,7 @@ async function isCurrentWrapper(path: string, expected: string): Promise<boolean
   }
 }
 
-function renderWrapper(entrypoint: string): string {
+export function renderBinWrapper(entrypoint: string): string {
   return `#!/bin/sh\nexec bun ${shellQuote(entrypoint)} "$@"\n`
 }
 

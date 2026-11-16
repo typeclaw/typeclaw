@@ -27,6 +27,7 @@ import { clearTodosForOrigin, markRestartAbortPendingForOrigin } from '@/agent/t
 import { embed, warmEmbedder } from '@/bundled-plugins/memory/vector/embedder'
 import { buildStartupVectorIndex } from '@/bundled-plugins/memory/vector/startup'
 import { resolveCapOptionsFromConfig } from '@/bundled-plugins/tool-result-cap'
+import { cronExecVaultEnv } from '@/bundled-plugins/typevault/runtime'
 import { createRuntimeCapabilities, type RuntimeCapabilities } from '@/capabilities'
 import {
   createChannelManager,
@@ -723,6 +724,7 @@ async function startAgentRuntime(
       // the unreachable case where a fire somehow predates the holder.
       increment: (id, job, at) => cronCountStore?.increment(id, job, at) ?? Promise.resolve(false),
     },
+    execEnv: cronExecVaultEnv,
     invokeHandler: async (job) => {
       const snap = pluginRuntime.get()
       const registered = snap.registry.cronJobs.find((j) => j.globalId === job.id)

@@ -13,6 +13,14 @@ import type { CronJob, ExecJob, HandlerJob, PromptJob } from './schema'
 
 export type CronHandlerInvoker = (job: HandlerJob) => Promise<void>
 
+// Extra environment for one exec fire, released after the process exits
+// (e.g. a TypeVault grant revoked once the job is done).
+export type CronExecEnvLease = { env: Record<string, string>; release: () => Promise<void> }
+export type CronExecEnvProvider = (
+  origin: Extract<SessionOrigin, { kind: 'cron' }>,
+  fireId: string,
+) => Promise<CronExecEnvLease | undefined>
+
 // `hooks`, `sessionId`, `agentDir`, and `getTranscriptPath` are optional so
 // test fakes can stay one-liners. When present, the consumer fires
 // `session.turn.start`/`session.turn.end` around `prompt()`, then
@@ -59,6 +67,10 @@ export type CreateCronConsumerOptions = {
   // `ctx.exec`. Optional so unit-test fakes that never schedule handler jobs
   // stay one-liners.
   invokeHandler?: CronHandlerInvoker
+  // Adds per-fire environment to exec jobs. Wired by `src/run/index.ts` to
+  // the TypeVault plugin, so an exec job scheduled by a role with `vault.use`
+  // gets a grant without an LLM session. Optional for test fakes.
+  execEnv?: CronExecEnvProvider
   // Authoritative count gate. The consumer — not the scheduler — owns
   // accepted-fire accounting: it re-checks the durable count and increments
   // only for runs that pass coalescing, so a coalesced skip never consumes a
@@ -93,6 +105,7 @@ export function createCronConsumer({
   cwd,
   createSessionForCron,
   invokeHandler,
+  execEnv,
   countStore,
   now = Date.now,
   intervalNow = () => performance.now(),
@@ -145,7 +158,7 @@ export function createCronConsumer({
           if (job.kind === 'prompt') {
             if (!(await runPrompt(job, createSessionForCron, stream, logger))) outcome = 'failed'
           } else if (job.kind === 'exec') {
-            await runExec(job, cwd, logger)
+            await runExec(job, cwd, fireId, execEnv, logger)
           } else {
             if (invokeHandler === undefined) {
               throw new Error(
@@ -349,7 +362,13 @@ function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-async function runExec(job: ExecJob, cwd: string, logger: CronConsumerLogger): Promise<void> {
+async function runExec(
+  job: ExecJob,
+  cwd: string,
+  fireId: string,
+  execEnv: CronExecEnvProvider | undefined,
+  logger: CronConsumerLogger,
+): Promise<void> {
   const [cmd, ...args] = job.command
   if (!cmd) throw new Error(`exec job ${job.id}: empty command`)
   // Inject TYPECLAW_PARENT_ORIGIN_JSON so a child that proxies into the
@@ -358,26 +377,48 @@ async function runExec(job: ExecJob, cwd: string, logger: CronConsumerLogger): P
   // spawnedByOrigin with the cron job's provenance. Without this the
   // proxy would default to a synthetic owner origin and silently elevate
   // a guest- or member-scheduled cron job to owner.
-  const parentOrigin = {
+  const parentOrigin: Extract<SessionOrigin, { kind: 'cron' }> = {
     kind: 'cron',
     jobId: job.id,
     jobKind: 'exec',
     ...(job.scheduledByRole !== undefined ? { scheduledByRole: job.scheduledByRole } : {}),
-    ...(job.scheduledByOrigin !== undefined ? { scheduledByOrigin: job.scheduledByOrigin } : {}),
+    ...(job.scheduledByOrigin !== undefined
+      ? {
+          scheduledByOrigin: job.scheduledByOrigin as NonNullable<
+            Extract<SessionOrigin, { kind: 'cron' }>['scheduledByOrigin']
+          >,
+        }
+      : {}),
   }
-  const oomBefore = readOomEvents()
-  const proc = Bun.spawn({
-    cmd: withToolOomPriorityArgv([cmd, ...args]),
-    cwd,
-    stdout: 'ignore',
-    stderr: 'pipe',
-    env: {
-      ...process.env,
-      TYPECLAW_PARENT_ORIGIN_JSON: JSON.stringify(parentOrigin),
-    },
+  // A failed lease still runs the job: without the extra env the command
+  // reports what it lacks (e.g. `typevault` names the missing grant) instead
+  // of the whole fire disappearing.
+  const lease = await execEnv?.(parentOrigin, fireId).catch((err: unknown) => {
+    logger.warn(`[cron] ${job.id}: could not prepare exec environment: ${describe(err)}`)
+    return undefined
   })
-  const stderrText = new Response(proc.stderr).text()
-  const [code, stderr] = await Promise.all([proc.exited, stderrText])
+  let code: number
+  let stderr: string
+  const oomBefore = readOomEvents()
+  try {
+    const proc = Bun.spawn({
+      cmd: withToolOomPriorityArgv([cmd, ...args]),
+      cwd,
+      stdout: 'ignore',
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        ...lease?.env,
+        TYPECLAW_PARENT_ORIGIN_JSON: JSON.stringify(parentOrigin),
+      },
+    })
+    const stderrText = new Response(proc.stderr).text()
+    ;[code, stderr] = await Promise.all([proc.exited, stderrText])
+  } finally {
+    await lease?.release().catch((err: unknown) => {
+      logger.warn(`[cron] ${job.id}: could not release exec environment: ${describe(err)}`)
+    })
+  }
   const note = toolOomNote(oomBefore, code, 'cron exec', { log: logger.warn })
   if (code !== 0) {
     throw new Error(

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,13 +8,14 @@ import { createClient, parseEntryName } from 'typevault'
 
 import type { FillSecretOptions } from '@/browser/fill-secret'
 import { createFillSecretTool } from '@/bundled-plugins/managed-browser'
+import { createPermissionService } from '@/permissions'
 import { typevaultCliPath } from '@/typevault/cli-path'
 import { reconcileTypevault } from '@/typevault/lifecycle'
 import { ensureRoleTiers, typevaultDir, typevaultEnv, vaultAdmin } from '@/typevault/vault'
 
 import { createSessionGrants } from './grants'
 import { createVaultRequestTool } from './request'
-import { activateVaultRuntime, readVaultValue } from './runtime'
+import { activateVaultRuntime, cronExecVaultEnv, readVaultValue } from './runtime'
 
 const logger = { info: () => {}, warn: () => {}, error: () => {} }
 let dir: string
@@ -42,7 +43,12 @@ beforeEach(async () => {
       await admin.revoke({ label })
     },
   })
-  activateVaultRuntime({ agentDir: dir, grants, roles: new Map([['s1', 'member']]) })
+  activateVaultRuntime({
+    agentDir: dir,
+    grants,
+    roles: new Map([['s1', 'member']]),
+    permissions: createPermissionService(),
+  })
 })
 
 afterEach(async () => {
@@ -106,5 +112,77 @@ describe.skipIf(process.platform === 'win32')('vault references', () => {
 
     expect(calls.map((call) => call.value)).toEqual(['member-password-value'])
     expect(JSON.stringify(result)).not.toContain('member-password-value')
+  })
+})
+
+describe.skipIf(process.platform === 'win32')('exec cron vault access', () => {
+  const cronOrigin = (scheduledByRole: string) => ({
+    kind: 'cron' as const,
+    jobId: 'monitor',
+    jobKind: 'exec' as const,
+    scheduledByRole,
+  })
+
+  const runTypevault = async (env: Record<string, string>, args: string) => {
+    const child = Bun.spawn(['/bin/sh', '-c', `typevault ${args}`], {
+      cwd: dir,
+      env: { ...process.env, ...env },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ])
+    return { stdout, stderr, code }
+  }
+
+  test("a fire reaches its scheduling role's tier through the typevault command until released", async () => {
+    // given
+    const lease = await cronExecVaultEnv(cronOrigin('member'), 'fire-1')
+    if (lease === undefined) throw new Error('expected a lease for a member-scheduled job')
+
+    // when
+    const listed = await runTypevault(lease.env, 'ls')
+
+    // then
+    expect(listed.code).toBe(0)
+    expect(listed.stdout).toContain('member/login')
+    expect(listed.stdout).not.toContain('owner/login')
+
+    // when the fire ends
+    await lease.release()
+    const afterRelease = await runTypevault(lease.env, 'ls')
+
+    // then the grant no longer opens the vault
+    expect(afterRelease.code).not.toBe(0)
+  })
+
+  test('a job scheduled by a role without vault.use gets no grant', async () => {
+    expect(await cronExecVaultEnv(cronOrigin('guest'), 'fire-2')).toBeUndefined()
+  })
+
+  test('a fire whose typevault command cannot be prepared is issued no grant', async () => {
+    // given a bin path the wrapper directory cannot be created at
+    const issued: string[] = []
+    activateVaultRuntime({
+      agentDir: dir,
+      grants: createSessionGrants({
+        issue: async ({ label }) => {
+          issued.push(label)
+          return 'tvl1.unused'
+        },
+        revoke: async () => {},
+      }),
+      roles: new Map(),
+      permissions: createPermissionService(),
+    })
+    mkdirSync(join(dir, '.typeclaw', 'typevault'), { recursive: true })
+    writeFileSync(join(dir, '.typeclaw', 'typevault', 'bin'), 'not a directory')
+
+    // when / then
+    await expect(cronExecVaultEnv(cronOrigin('member'), 'fire-3')).rejects.toThrow()
+    expect(issued).toEqual([])
   })
 })

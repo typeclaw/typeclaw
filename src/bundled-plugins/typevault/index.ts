@@ -52,7 +52,7 @@ export default definePlugin({
       },
     })
     const roles = new Map<string, string>()
-    activateVaultRuntime({ agentDir: ctx.agentDir, grants, roles })
+    activateVaultRuntime({ agentDir: ctx.agentDir, grants, roles, permissions: ctx.permissions })
     const bashHook = vaultBashHook(ctx.agentDir, ctx.permissions, grants, ctx.logger, { projectIdentity })
 
     return {
