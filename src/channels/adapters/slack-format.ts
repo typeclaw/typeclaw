@@ -4,11 +4,12 @@
 // human types it (`**bold**`, `## heading`, `[text](url)`, tables). For a
 // normal chat post the slack-bot adapter wraps that GFM in a Slack
 // `markdown` block and Slack renders it natively — so no conversion is
-// needed there. But two outbound fields cannot carry a `markdown` block:
+// needed there. But some outbound fields cannot carry a `markdown` block:
 // a file upload's `initial_comment` (files.uploadV2 has no `blocks`
-// param). That field is parsed as Slack *mrkdwn*, where bold is a SINGLE
-// `*`, so raw GFM `**bold**` renders as literal double asterisks. This
-// converter bridges GFM -> mrkdwn for exactly those constrained fields.
+// param) and the user-account adapter's plain `chat.postMessage` text.
+// Those are parsed as Slack *mrkdwn*, where bold is a SINGLE `*`, so raw
+// GFM `**bold**` renders as literal double asterisks. This converter
+// bridges GFM -> mrkdwn for exactly those constrained fields.
 //
 // Slack mrkdwn is forgiving (unlike Telegram MarkdownV2, there is no
 // escaping that can crash the parser), so this is a best-effort semantic

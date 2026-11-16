@@ -38,6 +38,22 @@ describe('createSlackUserEditMessageCallback', () => {
     expect(calls).toEqual([{ channel: 'C1', ts: '1700000000.000100', text: 'edited body' }])
   })
 
+  it('converts the agent Markdown to Slack mrkdwn before updating', async () => {
+    const texts: string[] = []
+    const cb = createSlackUserEditMessageCallback({
+      client: {
+        updateMessage: async (_channel, ts, text) => {
+          texts.push(text)
+          return { ts, text, type: 'message' }
+        },
+      },
+    })
+
+    await cb(req({ text: '**장애 없음** and [docs](https://example.com)' }))
+
+    expect(texts).toEqual(['*장애 없음* and <https://example.com|docs>'])
+  })
+
   it('rejects a mismatched adapter as not-supported', async () => {
     const cb = createSlackUserEditMessageCallback({
       client: { updateMessage: async () => ({ ts: 'x', text: 'x', type: 'message' }) },

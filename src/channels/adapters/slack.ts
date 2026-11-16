@@ -42,6 +42,7 @@ import { slackTsToMillis } from './slack-bot-time'
 import { createSlackChannelResolver } from './slack-channel-resolver'
 import { classifyInbound, type InboundDropReason, type SlackConversationType, splitSlackFiles } from './slack-classify'
 import { createSlackUserEditMessageCallback } from './slack-edit'
+import { toSlackMrkdwn } from './slack-format'
 import { createSlackReactionCallback, createSlackRemoveReactionCallback } from './slack-reactions'
 import { createSlackOwnReactionCallbacks } from './slack-reactions'
 import { invalidSlackThreadTs } from './slack-thread-ts'
@@ -104,7 +105,10 @@ export function createSlackOutboundCallback(deps: {
     )
     try {
       if (text !== '') {
-        for (const chunk of chunkMarkdown(text, 11_500)) await deps.client.sendMessage(msg.chat, chunk, threadTs)
+        // chat.postMessage `text` is parsed as mrkdwn, so translate the agent's GFM.
+        for (const chunk of chunkMarkdown(text, 11_500)) {
+          await deps.client.sendMessage(msg.chat, toSlackMrkdwn(chunk), threadTs)
+        }
       }
       for (const attachment of attachments) {
         const path = deps.resolvePath ? deps.resolvePath(attachment.path) : attachment.path

@@ -445,6 +445,29 @@ describe('createSlackAdapter', () => {
     expect(sent).toEqual([['C0123456789', 'hello', undefined]])
   })
 
+  test('outbound converts the agent Markdown to Slack mrkdwn', async () => {
+    const sent: unknown[] = []
+    const r = router()
+    const adapter = createSlackAdapter({
+      router: r,
+      configRef: () => config,
+      logger: logger(),
+      credentialsStore: { getAccount: async () => account() },
+      createClient: () => fakeClient({ sendMessage: async (...args: unknown[]) => void sent.push(args) }),
+      createListener: () => new FakeListener() as unknown as SlackListener,
+    })
+
+    await adapter.start()
+    await r.outbound?.({
+      adapter: 'slack',
+      workspace: 'T0123456789',
+      chat: 'C0123456789',
+      text: '**장애 없음** and [docs](https://example.com)',
+    })
+
+    expect(sent).toEqual([['C0123456789', '*장애 없음* and <https://example.com|docs>', undefined]])
+  })
+
   test('user Slack sends reject malformed thread ids and preserve valid ids', async () => {
     const sent: unknown[] = []
     let uploads = 0
