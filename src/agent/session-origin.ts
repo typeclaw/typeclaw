@@ -552,6 +552,18 @@ function renderChannelOrigin(
     )
   }
 
+  // Both Slack adapters take standard Markdown: slack-bot posts it in a native
+  // `markdown` block, and the user-account adapter converts it to mrkdwn. Models
+  // that know Slack's legacy mrkdwn write `*bold*`, which standard Markdown
+  // renders as italic, so users who ask for bold keep getting italics.
+  if (origin.adapter === 'slack' || origin.adapter === 'slack-bot') {
+    lines.push(
+      '',
+      '**Write standard Markdown, not Slack mrkdwn.** Bold is `**text**`; a single',
+      '`*text*` or `_text_` renders as italic. Links are `[label](url)`.',
+    )
+  }
+
   if (platformInfo.plainTextOnly) {
     lines.push(
       '',
