@@ -74,6 +74,8 @@ Use `exec` only for jobs that are pure mechanics — no judgement required. Exam
 
 `command` is an array. Index 0 is the executable, the rest are argv. Do **not** put a single shell pipeline in `command[0]` — that won't be parsed by a shell. If you need shell features (`|`, `>`, `&&`), wrap explicitly: `["sh", "-c", "your | pipeline | here"]`.
 
+When TypeVault is enabled and the scheduling role has `vault.use`, each `exec` run gets its own vault grant for that role's tier, revoked when the command exits. Use the vault from the command with `typevault run` (see the `typevault` skill) instead of copying a session's grant or a secret into the job.
+
 ## One-shot reminders and future tasks (`at`)
 
 When the user wants something to happen **once at a future time** — "remind me in 3 days to cancel the subscription", "ping me tomorrow at 9", "in 2 hours, check if the build finished" — use `at` instead of `schedule`. The job fires exactly once at that instant, then retires (the scheduler stops arming it; it never fires again).

@@ -36,6 +36,10 @@ DATABASE_URL=typevault://postgres/prod#url typevault run --reason "run migration
 - `run` loads every entry of your own tier; entries from lower tiers load only when `--only` names them exactly.
 - TOTP fields hold the current code, never the seed.
 
+## Scheduled jobs
+
+An `exec` cron job runs without you, yet still reaches the vault: each run gets its own grant for the tier of the role that scheduled it (with `vault.use`), revoked when the command exits. Put `typevault run` in the job's command, e.g. `["typevault", "run", "--only", "typevault://aws", "--reason", "ECS health check", "--", "./check.sh"]`. Never copy your own session's grant into a job; it is revoked when your session ends.
+
 ## A project's own vault
 
 The `typevault` command always opens this agent's vault, even inside a project. For a project that keeps its own `.typevault/`, run the project's CLI from its checkout instead, e.g. `bun typevault ...` when the project depends on `typevault`. Your bash already holds this agent's machine identity for project vaults, so nothing asks for a password.
