@@ -45,6 +45,9 @@ import type {
   ListChannelsArgs,
   ListChannelsResult,
   MessageGetCallback,
+  OpenDmArgs,
+  OpenDmCallback,
+  OpenDmResult,
   OutboundCallback,
   OutboundMessage,
   ResolvedChannelNames,
@@ -767,6 +770,42 @@ export function createDiscordListCallback(deps: {
   }
 }
 
+// POST /users/@me/channels returns the bot's existing DM channel with the user,
+// or creates it, so a DM works even with someone the bot never talked to. It
+// fails only when Discord forbids it (no shared server, or the user blocks DMs),
+// and that error reaches the model verbatim.
+export function createDiscordOpenDmCallback(deps: {
+  token: string
+  logger: DiscordBotAdapterLogger
+  fetchImpl?: typeof fetch
+}): OpenDmCallback {
+  const { token, logger } = deps
+  const fetchFn = deps.fetchImpl ?? fetch
+  return async (args: OpenDmArgs): Promise<OpenDmResult> => {
+    let response: Response
+    try {
+      response = await fetchFn(`${DISCORD_API_BASE}/users/@me/channels`, {
+        method: 'POST',
+        headers: { Authorization: `Bot ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient_id: args.user }),
+      })
+    } catch (err) {
+      const message = describeError(err)
+      logger.warn(`[discord-bot] open dm failed: ${message}`)
+      return { ok: false, error: message, code: 'adapter-error' }
+    }
+    const body = (await response.json().catch(() => ({}))) as { id?: string; message?: string }
+    if (!response.ok || typeof body.id !== 'string') {
+      return {
+        ok: false,
+        error: `could not open a DM with user ${args.user}: ${body.message ?? `http ${response.status}`}`,
+        code: 'adapter-error',
+      }
+    }
+    return { ok: true, workspace: '@dm', chat: body.id }
+  }
+}
+
 const DISCORD_THREAD_TYPES = new Set([10, 11, 12])
 const DISCORD_READABLE_CHANNEL_TYPES = new Set([0, 5, 15, 16, 10, 11, 12])
 
@@ -1197,6 +1236,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
   })
 
   const listCallback = createDiscordListCallback({ token: options.token, logger })
+  const openDmCallback = createDiscordOpenDmCallback({ token: options.token, logger, fetchImpl })
   const missedInbound = createDiscordMissedInboundCallback({
     token: options.token,
     logger,
@@ -1415,6 +1455,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       options.router.registerMissedInbound('discord-bot', missedInbound)
       options.router.registerMessageGet('discord-bot', messageGetCallback)
       options.router.registerList('discord-bot', listCallback)
+      options.router.registerOpenDm('discord-bot', openDmCallback)
       options.router.registerEditMessage('discord-bot', editMessageCallback)
       options.router.registerFetchAttachment('discord-bot', fetchAttachmentCallback)
       options.router.registerMembership('discord-bot', membershipResolver)
@@ -1440,6 +1481,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
         options.router.unregisterMissedInbound('discord-bot', missedInbound)
         options.router.unregisterMessageGet('discord-bot', messageGetCallback)
         options.router.unregisterList('discord-bot', listCallback)
+        options.router.unregisterOpenDm('discord-bot', openDmCallback)
         options.router.unregisterEditMessage('discord-bot', editMessageCallback)
         options.router.unregisterFetchAttachment('discord-bot', fetchAttachmentCallback)
         options.router.unregisterMembership('discord-bot', membershipResolver)
@@ -1511,6 +1553,7 @@ export function createDiscordBotAdapter(options: DiscordBotAdapterOptions): Disc
       options.router.unregisterRecoveryAdapter('discord-bot', recoveryCallbacks)
       options.router.unregisterMessageGet('discord-bot', messageGetCallback)
       options.router.unregisterList('discord-bot', listCallback)
+      options.router.unregisterOpenDm('discord-bot', openDmCallback)
       options.router.unregisterEditMessage('discord-bot', editMessageCallback)
       options.router.unregisterFetchAttachment('discord-bot', fetchAttachmentCallback)
       options.router.unregisterMembership('discord-bot', membershipResolver)

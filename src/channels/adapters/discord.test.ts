@@ -109,6 +109,8 @@ function router(): ChannelRouter & {
     unregisterRemoveOwnReaction: () => {},
     registerEditMessage: (adapter: string) => registered.push(`edit:${adapter}`),
     unregisterEditMessage: (adapter: string) => unregistered.push(`edit:${adapter}`),
+    registerOpenDm: (adapter: string) => registered.push(`openDm:${adapter}`),
+    unregisterOpenDm: (adapter: string) => unregistered.push(`openDm:${adapter}`),
   }
   return r as unknown as ChannelRouter & {
     routed: InboundMessage[]
@@ -146,6 +148,7 @@ describe('createDiscordAdapter', () => {
       'reaction:discord',
       'remove-reaction:discord',
       'edit:discord',
+      'openDm:discord',
     ])
   })
 
