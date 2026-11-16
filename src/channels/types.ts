@@ -593,6 +593,24 @@ export type ListChannelsResult =
 // history; the router answers 'list-not-supported' when none is registered.
 export type ListCallback = (args: ListChannelsArgs) => Promise<ListChannelsResult>
 
+// Resolves a person's platform user id to the direct-message conversation the
+// bot can post into, opening it when the platform requires that (Discord, Slack).
+// The result carries the full coordinates because the DM workspace differs per
+// adapter ('@dm', '@line-dm', 'telegram'). `workspace` is the scope the user id
+// was seen in; adapters whose user ids are global ignore it.
+export type OpenDmArgs = {
+  user: string
+  workspace?: string
+}
+
+export type OpenDmResult =
+  | { ok: true; workspace: string; chat: string }
+  | { ok: false; error: string; code?: 'not-supported' | 'adapter-error' }
+
+// Backs `channel_send`'s `user` target. Opt-in per adapter; the router answers
+// 'not-supported' when none is registered.
+export type OpenDmCallback = (args: OpenDmArgs) => Promise<OpenDmResult>
+
 export type FetchAttachmentArgs = {
   ref: string
   filename?: string

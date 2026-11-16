@@ -123,6 +123,8 @@ import type {
   HistoryCallback,
   InboundMessage,
   ListChannelsArgs,
+  OpenDmArgs,
+  OpenDmResult,
   RemoveOwnReactionRequest,
   RemoveOwnReactionResult,
   OutboundCallback,
@@ -13048,6 +13050,57 @@ describe('ChannelRouter message-get dispatch', () => {
     if (result.ok) throw new Error('expected a failed message-get')
     expect(result.code).toBe('adapter-error')
     expect(result.error).not.toContain('not-supported')
+  })
+})
+
+describe('ChannelRouter open-DM dispatch', () => {
+  test('openDm returns the DM coordinates the registered callback resolves', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const seen: OpenDmArgs[] = []
+    router.registerOpenDm('discord-bot', async (args) => {
+      seen.push(args)
+      return { ok: true, workspace: '@dm', chat: 'D1' }
+    })
+
+    const result = await router.openDm('discord-bot', { user: 'U1', workspace: 'G1' })
+
+    expect(result).toEqual({ ok: true, workspace: '@dm', chat: 'D1' })
+    expect(seen).toEqual([{ user: 'U1', workspace: 'G1' }])
+  })
+
+  test('openDm tells the model a running adapter cannot start a DM when none is registered', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    router.registerOutbound('teams', async () => ({ ok: true }))
+
+    const result = await router.openDm('teams', { user: 'U1' })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected a failed openDm')
+    expect(result.code).toBe('not-supported')
+  })
+
+  test('openDm reports an adapter that is not running', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+
+    const result = await router.openDm('discord-bot', { user: 'U1' })
+
+    expect(result).toEqual({ ok: false, error: 'no adapter registered for "discord-bot"', code: 'adapter-error' })
+  })
+
+  test('openDm converts a throwing callback into an adapter error', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const cb = async (): Promise<OpenDmResult> => {
+      throw new Error('http 500')
+    }
+    router.registerOpenDm('slack-bot', cb)
+
+    const result = await router.openDm('slack-bot', { user: 'U1' })
+
+    expect(result).toMatchObject({ ok: false, code: 'adapter-error' })
   })
 })
 
