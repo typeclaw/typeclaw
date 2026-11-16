@@ -11,6 +11,7 @@ function fakeRouter(
   options: {
     consecutiveCount?: number
     finishGithubReviewThreadCloseout?: ChannelRouter['finishGithubReviewThreadCloseout']
+    openDm?: ChannelRouter['openDm']
   } = {},
 ): ChannelRouter & { searchSessions: () => [] } {
   return {
@@ -75,7 +76,7 @@ function fakeRouter(
     listChannels: async () => ({ ok: false, error: 'list-not-supported', code: 'not-supported' }),
     registerOpenDm: () => {},
     unregisterOpenDm: () => {},
-    openDm: async () => ({ ok: false, error: 'open-dm-not-supported', code: 'not-supported' }),
+    openDm: options.openDm ?? (async () => ({ ok: false, error: 'open-dm-not-supported', code: 'not-supported' })),
     registerEditMessage: () => {},
     unregisterEditMessage: () => {},
     editMessage: async () => ({ ok: false, error: 'message-edit-not-supported', code: 'not-supported' }),
@@ -153,6 +154,78 @@ describe('createChannelSendTool', () => {
     if (block?.type !== 'text') throw new Error('Expected text receipt')
     expect(block.text).not.toContain('message_id=')
     expect(block.text).not.toContain('message_ids=')
+  })
+
+  test('direct-messages a user by resolving the DM conversation the adapter opens', async () => {
+    // given
+    const calls: OutboundMessage[] = []
+    const openDmCalls: Array<{ adapter: string; user: string; workspace?: string }> = []
+    const tool = createChannelSendTool({
+      router: fakeRouter(
+        async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        },
+        {
+          openDm: async (adapter, args) => {
+            openDmCalls.push({ adapter, ...args })
+            return { ok: true, workspace: '@dm', chat: 'dm-channel-1' }
+          },
+        },
+      ),
+    })
+
+    // when
+    const result = await runTool(tool, { adapter: 'discord-bot', workspace: 'g1', user: 'user-42', text: '안녕' })
+
+    // then
+    expect(openDmCalls).toEqual([{ adapter: 'discord-bot', user: 'user-42', workspace: 'g1' }])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ adapter: 'discord-bot', workspace: '@dm', chat: 'dm-channel-1', text: '안녕' })
+    expect(result.details).toEqual({ ok: true })
+    expect((result.content[0] as { text: string }).text).toContain('posted to discord-bot:@dm/dm-channel-1')
+  })
+
+  test('reports an adapter that cannot open a DM without posting anything', async () => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelSendTool({
+      router: fakeRouter(
+        async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        },
+        { openDm: async () => ({ ok: false, error: 'teams cannot open a direct message', code: 'not-supported' }) },
+      ),
+    })
+
+    const result = await runTool(tool, { adapter: 'teams', user: 'u1', text: 'hi' })
+
+    expect(calls).toHaveLength(0)
+    expect(result.details).toEqual({ ok: false, error: 'teams cannot open a direct message' })
+    expect((result.content[0] as { text: string }).text).toContain('channel_send denied')
+  })
+
+  test.each([
+    { label: 'both chat and user', params: { workspace: '@dm', chat: 'c1', user: 'u1' } },
+    { label: 'neither chat nor user', params: { workspace: 'g1' } },
+    { label: 'chat without workspace', params: { chat: 'c1' } },
+    { label: 'user and a thread from another conversation', params: { user: 'u1', thread: 't-guild' } },
+  ])('denies a send addressed with $label', async ({ params }) => {
+    const calls: OutboundMessage[] = []
+    const tool = createChannelSendTool({
+      router: fakeRouter(
+        async (msg) => {
+          calls.push(msg)
+          return { ok: true }
+        },
+        { openDm: async () => ({ ok: true, workspace: '@dm', chat: 'dm-channel-1' }) },
+      ),
+    })
+
+    const result = await runTool(tool, { adapter: 'discord-bot', text: 'hi', ...params })
+
+    expect(calls).toHaveLength(0)
+    expect(result.details).toMatchObject({ ok: false })
   })
 
   test('passes preview suppression to the router for an outbound post', async () => {
