@@ -29,13 +29,42 @@ console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
 ```
 
-Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for the next script; a popup tab the script attached (from `window.open`) closes with the connection, so do work that must continue later in an agent tab.
+Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for the next script.
 
 A "Command timed out" result after the script printed output means the script did not exit, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen.
 
 A later script continues in the same tab with `const page = await browser.attachPage(targetId)`. `browser.listTargets()` lists open tabs when the id is lost.
 
 Refs like `e14` belong to the script that took the snapshot. A new script has none, so `page.locator('e14')` from an earlier run always throws `RefStaleError`. In every script that acts on refs, call `page.snapshot()` first and use the refs from that snapshot in the same script. A page change (a click that navigates, a modal opening) also invalidates refs: snapshot again in the same script before the next ref action. When a ref stays stale, use a semantic locator instead, such as `page.getByRole('link', { name: '로그인' })` or `page.locator('#userId')`.
+
+A button that opens a popup (`window.open`) leaves its own page unchanged; the popup is a new tab. `page.waitForEvent('popup')` never fires for tabs from `createAgentTabs(browser)` or `attachPage`, so find the popup through the tab that opened it. Chrome records that tab as the popup's `openerId`, which keeps out tabs that other sessions open at the same moment:
+
+```js
+// targetId is the tab you click in (from tabs.create or the id you passed to attachPage).
+const popupsOf = async (openerId) =>
+  (await browser.cdp.send('Target.getTargets')).targetInfos.filter(
+    (target) => target.type === 'page' && target.openerId === openerId,
+  )
+const before = new Set((await popupsOf(targetId)).map((target) => target.targetId))
+await page.snapshot()
+// A real click. `window.open` called from `page.evaluate` is blocked as an unrequested popup.
+await page.locator('e7').click()
+let opened = []
+for (let i = 0; i < 50 && opened.length === 0; i++) {
+  opened = (await popupsOf(targetId)).filter((target) => !before.has(target.targetId))
+  if (opened.length === 0) await new Promise((resolve) => setTimeout(resolve, 100))
+}
+if (opened.length === 0) {
+  const earlier = (await popupsOf(targetId)).map((target) => [target.targetId, target.url])
+  console.log('no new popup; popups this tab opened earlier:', earlier)
+} else {
+  console.log(opened.map((target) => [target.targetId, target.url])) // later scripts reattach by id
+  const popupPage = await browser.attachPage(opened[0].targetId)
+  console.log(compactSnapshot(await popupPage.snapshot()))
+}
+```
+
+A popup attached this way stays open after the script ends. When the script prints no new popup, the site may have reused a popup it opened earlier under the same window name: attach that one from the printed list and check what it shows instead of clicking again. When several new tabs appear, pick the one whose URL matches where the button leads.
 
 Reuse your tab across retries with `attachPage` instead of opening another `tabs.create` for the same site, and close tabs you no longer need (`await page.close()`). Duplicate tabs of one site make it unclear which tab later steps (and `browser_fill_secret`) act on.
 
