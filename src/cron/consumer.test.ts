@@ -367,6 +367,72 @@ describe('createCronConsumer', () => {
     consumer.stop()
   })
 
+  test('exec job runs with the per-fire env lease and releases it after the process exits', async () => {
+    // given
+    const stream = createStream()
+    const leases: Array<{ jobId: string; role: string | undefined; fireId: string }> = []
+    const released: string[] = []
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: makeFakeSessionFactory().createSessionForCron,
+      execEnv: async (origin, fireId) => {
+        leases.push({ jobId: origin.jobId, role: origin.scheduledByRole, fireId })
+        return {
+          env: { CRON_LEASE_VALUE: `lease-${fireId}` },
+          release: async () => {
+            released.push(fireId)
+          },
+        }
+      },
+      logger: silentLogger,
+    })
+    consumer.start()
+
+    // when
+    publishCron(stream, {
+      ...execJob('leased', [
+        process.execPath,
+        '-e',
+        'await Bun.write("lease.txt", process.env.CRON_LEASE_VALUE ?? "")',
+      ]),
+      scheduledByRole: 'member',
+    })
+    const contents = await waitForFile(join(root, 'lease.txt'))
+    await waitForConsumerIdle(consumer)
+
+    // then
+    expect(leases).toEqual([{ jobId: 'leased', role: 'member', fireId: expect.any(String) }])
+    expect(contents).toBe(`lease-${leases[0]!.fireId}`)
+    expect(released).toEqual([leases[0]!.fireId])
+
+    consumer.stop()
+  })
+
+  test('exec job still runs when its env lease cannot be prepared', async () => {
+    const stream = createStream()
+    const warnings: string[] = []
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      createSessionForCron: makeFakeSessionFactory().createSessionForCron,
+      execEnv: async () => {
+        throw new Error('vault daemon unreachable')
+      },
+      logger: { ...silentLogger, warn: (m) => warnings.push(m) },
+    })
+    consumer.start()
+
+    publishCron(stream, execJob('unleased', [process.execPath, '-e', 'await Bun.write("ran.txt", "ok")']))
+    const contents = await waitForFile(join(root, 'ran.txt'))
+    await waitForConsumerIdle(consumer)
+
+    expect(contents).toBe('ok')
+    expect(warnings.some((w) => w.includes('vault daemon unreachable'))).toBe(true)
+
+    consumer.stop()
+  })
+
   test('exec job exiting non-zero is logged but does not crash the consumer', async () => {
     const stream = createStream()
     const factory = makeFakeSessionFactory()
