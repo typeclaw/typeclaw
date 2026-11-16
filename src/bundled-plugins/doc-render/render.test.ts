@@ -1,25 +1,46 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { chromePath, DEFAULT_CHROME_PATH, loadPlaywright, PLAYWRIGHT_PACKAGE, PLAYWRIGHT_VERSION } from './render'
+import { chromePath, DEFAULT_CHROME_PATH } from './render'
 
-async function writeFakePackage(
-  baseDir: string,
-  source: string,
-  version = PLAYWRIGHT_VERSION,
-  name = PLAYWRIGHT_PACKAGE,
-): Promise<void> {
-  const pkgDir = join(baseDir, 'node_modules', ...name.split('/'))
-  await mkdir(pkgDir, { recursive: true })
-  await writeFile(
-    join(pkgDir, 'package.json'),
-    JSON.stringify({ name, version, type: 'module', exports: './index.js' }),
+const scriptPath = fileURLToPath(new URL('./render.ts', import.meta.url))
+// The fake Chrome is a POSIX shell script; the renderer itself only runs in the Linux container.
+const testPosix = test.skipIf(process.platform === 'win32')
+
+function fakeChrome(dir: string, { writePdf }: { writePdf: boolean }): { bin: string; argvLog: string } {
+  const bin = join(dir, 'chrome')
+  const argvLog = join(dir, 'argv.log')
+  writeFileSync(
+    bin,
+    [
+      '#!/bin/sh',
+      `printf '%s\\n' "$@" > ${argvLog}`,
+      writePdf
+        ? 'for a in "$@"; do case "$a" in --print-to-pdf=*) printf "%%PDF-1.4" > "${a#--print-to-pdf=}";; esac; done'
+        : 'echo "boom" >&2',
+      'exit 0',
+    ].join('\n'),
   )
-  await writeFile(join(pkgDir, 'index.js'), source)
+  chmodSync(bin, 0o755)
+  return { bin, argvLog }
+}
+
+async function runRender(args: string[], chrome: string, cwd: string) {
+  const proc = Bun.spawn(['bun', 'run', scriptPath, ...args], {
+    cwd,
+    env: { ...process.env, AGENT_BROWSER_EXECUTABLE_PATH: chrome },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const [exitCode, stdout, stderr] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ])
+  return { exitCode, stdout, stderr }
 }
 
 describe('chromePath', () => {
@@ -30,60 +51,66 @@ describe('chromePath', () => {
 })
 
 describe('render script CLI', () => {
-  const scriptPath = fileURLToPath(new URL('./render.ts', import.meta.url))
-
   test('exits 2 with usage when args are missing', async () => {
     const proc = Bun.spawn(['bun', 'run', scriptPath], { stdout: 'pipe', stderr: 'pipe' })
     await proc.exited
     expect(proc.exitCode).toBe(2)
     expect(await new Response(proc.stderr).text()).toContain('usage:')
   })
-})
 
-describe('playwright resolution', () => {
-  test('loads playwright-core from the writable scratch runtime', async () => {
-    const runtimeDir = join(mkdtempSync(join(tmpdir(), 'doc-render-scratch-')), 'runtime')
-    await writeFakePackage(runtimeDir, 'export const chromium = { marker: 2 }')
+  testPosix('prints the document with headless Chrome and no package install', async () => {
+    // given
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'doc-render-ok-')))
+    writeFileSync(join(dir, '보고서.html'), '<p>안녕</p>')
+    const { bin, argvLog } = fakeChrome(dir, { writePdf: true })
 
-    const pw = (await loadPlaywright(runtimeDir)) as unknown as { chromium: { marker: number } }
+    // when
+    const result = await runRender(['보고서.html', 'out.pdf'], bin, dir)
 
-    expect(pw.chromium.marker).toBe(2)
+    // then
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('wrote out.pdf')
+    const argv = (await Bun.file(argvLog).text()).trim().split('\n')
+    expect(argv).toContain('--headless')
+    expect(argv).toContain('--no-pdf-header-footer')
+    expect(argv).toContain(`--print-to-pdf=${join(dir, 'out.pdf')}`)
+    expect(argv.at(-1)).toBe(pathToFileURL(join(dir, '보고서.html')).href)
   })
 
-  test('ignores a conflicting playwright-core beneath the document cwd', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'doc-render-shadow-'))
-    const docDir = join(root, 'documents')
-    const runtimeDir = join(root, 'runtime')
-    await writeFakePackage(docDir, 'export const chromium = { marker: 1 }')
-    await writeFakePackage(runtimeDir, 'export const chromium = { marker: 2 }')
+  testPosix('creates a missing output directory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'doc-render-outdir-'))
+    writeFileSync(join(dir, 'doc.html'), '<p>x</p>')
+    const { bin } = fakeChrome(dir, { writePdf: true })
 
-    expect(Bun.resolveSync(PLAYWRIGHT_PACKAGE, docDir)).toContain(docDir)
+    const result = await runRender(['doc.html', 'exports/brief.pdf'], bin, dir)
 
-    const pw = (await loadPlaywright(runtimeDir)) as unknown as { chromium: { marker: number } }
-    expect(pw.chromium.marker).toBe(2)
+    expect(result.exitCode).toBe(0)
+    expect(await Bun.file(join(dir, 'exports', 'brief.pdf')).exists()).toBeTrue()
   })
 
-  test('rejects an ancestor playwright-core when the runtime-local package is absent', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'doc-render-ancestor-'))
-    const runtimeDir = join(root, 'scratch', 'runtime')
-    const marker = join(root, 'hostile-executed')
-    await mkdir(runtimeDir, { recursive: true })
-    await writeFakePackage(
-      root,
-      `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'x')`,
-    )
+  testPosix('fails when Chrome exits without writing the PDF, even if a stale one existed', async () => {
+    // given
+    const dir = mkdtempSync(join(tmpdir(), 'doc-render-nopdf-'))
+    writeFileSync(join(dir, 'doc.html'), '<p>x</p>')
+    writeFileSync(join(dir, 'out.pdf'), 'stale')
+    const { bin } = fakeChrome(dir, { writePdf: false })
 
-    expect(Bun.resolveSync(PLAYWRIGHT_PACKAGE, runtimeDir)).toContain(root)
-    await expect(loadPlaywright(runtimeDir)).rejects.toThrow(
-      `${PLAYWRIGHT_PACKAGE}@${PLAYWRIGHT_VERSION} is not installed`,
-    )
-    expect(await Bun.file(marker).exists()).toBeFalse()
+    // when
+    const result = await runRender(['doc.html', 'out.pdf'], bin, dir)
+
+    // then
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('without writing out.pdf')
+    expect(result.stderr).toContain('boom')
   })
 
-  test('rejects a runtime-local playwright-core at a different version', async () => {
-    const runtimeDir = mkdtempSync(join(tmpdir(), 'doc-render-version-'))
-    await writeFakePackage(runtimeDir, 'export const chromium = {}', '0.0.0')
+  test('names the missing Chrome and how to point at one', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'doc-render-nochrome-'))
+    writeFileSync(join(dir, 'doc.html'), '<p>x</p>')
 
-    await expect(loadPlaywright(runtimeDir)).rejects.toThrow(PLAYWRIGHT_VERSION)
+    const result = await runRender(['doc.html', 'out.pdf'], join(dir, 'missing-chrome'), dir)
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('AGENT_BROWSER_EXECUTABLE_PATH')
   })
 })
