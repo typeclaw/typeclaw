@@ -3,6 +3,7 @@ import type { SlackClient } from 'agent-messenger/slack'
 import type { EditMessageCallback, EditMessageResult } from '@/channels/types'
 
 import { describeError } from '../describe-error'
+import { toSlackMrkdwn } from './slack-format'
 
 export function createSlackUserEditMessageCallback(deps: {
   client: Pick<SlackClient, 'updateMessage'>
@@ -12,7 +13,8 @@ export function createSlackUserEditMessageCallback(deps: {
       return { ok: false, error: `unknown adapter: ${req.adapter}`, code: 'not-supported' }
     }
     try {
-      await deps.client.updateMessage(req.chat, req.messageId, req.text)
+      // chat.update `text` is parsed as mrkdwn, like the outbound send path.
+      await deps.client.updateMessage(req.chat, req.messageId, toSlackMrkdwn(req.text))
     } catch (err) {
       const code = slackErrorCode(err)
       return { ok: false, error: describeError(err), code: classifyEditError(code) }
