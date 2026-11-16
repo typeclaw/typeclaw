@@ -25,6 +25,7 @@ import type {
   OutboundMessage,
   ResolvedChannelNames,
   SendResult,
+  OpenDmCallback,
 } from '@/channels/types'
 
 import { describeError } from '../describe-error'
@@ -218,6 +219,9 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
     selfUserIdRef: () => selfUserId,
   })
 
+  // LINE addresses a 1:1 chat by the user's mid, so no lookup is needed.
+  const openDmCallback: OpenDmCallback = async ({ user }) => ({ ok: true, workspace: '@line-dm', chat: user })
+
   const outboundCallback = withOutboundAccount(
     createOutboundCallback({ client, logger, formatChannelTag }),
     (workspace) => fallbackChannelAccountIdentity('line', workspace, selfUserId),
@@ -409,6 +413,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       options.router.registerSelfIdentity('line', selfIdentityResolver)
       options.router.registerChannelNameResolver('line', channelResolver.resolve)
       options.router.registerHistory('line', historyCallback)
+      options.router.registerOpenDm('line', openDmCallback)
     },
 
     async stop(): Promise<void> {
@@ -422,6 +427,7 @@ export function createLineAdapter(options: LineAdapterOptions): LineAdapter {
       options.router.unregisterSelfIdentity('line', selfIdentityResolver)
       options.router.unregisterChannelNameResolver('line', channelResolver.resolve)
       options.router.unregisterHistory('line', historyCallback)
+      options.router.unregisterOpenDm('line', openDmCallback)
       if (inflightInbounds > 0) {
         await new Promise<void>((resolve) => {
           stopWaiters.push(resolve)

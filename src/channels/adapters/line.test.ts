@@ -499,6 +499,8 @@ function makeRouterStub(onRoute: (m: InboundMessage) => void) {
     unregisterChannelNameResolver: () => {
       registered.nameResolver = false
     },
+    registerOpenDm: () => {},
+    unregisterOpenDm: () => {},
   } as unknown as Parameters<typeof createLineAdapter>[0]['router'] & {
     registered: { outbound: boolean; history: boolean; nameResolver: boolean }
   }
