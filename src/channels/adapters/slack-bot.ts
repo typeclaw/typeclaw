@@ -39,6 +39,9 @@ import type {
   SendResult,
   TypingCallback,
   TypingTarget,
+  OpenDmArgs,
+  OpenDmCallback,
+  OpenDmResult,
 } from '@/channels/types'
 import { chunkMarkdown } from '@/markdown'
 import type { ChannelMessageObservedEvent, ChannelOutboundBeforeEvent, SlackObservedMessage } from '@/plugin'
@@ -1047,6 +1050,45 @@ export function createSlackListCallback(deps: {
   }
 }
 
+// conversations.open returns the bot's existing DM with the user or opens one
+// (needs the `im:write` scope the shipped manifest requests). Slack errors such
+// as `user_not_found` reach the model verbatim.
+export function createSlackOpenDmCallback(deps: {
+  token: string
+  logger: SlackBotAdapterLogger
+  fetchImpl?: typeof fetch
+}): OpenDmCallback {
+  const { token, logger } = deps
+  const fetchFn = deps.fetchImpl ?? fetch
+  return async (args: OpenDmArgs): Promise<OpenDmResult> => {
+    let raw: { ok?: boolean; error?: string; channel?: { id?: string } }
+    try {
+      const response = await fetchFn(`${SLACK_API_BASE}/conversations.open`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        },
+        body: new URLSearchParams({ users: args.user }).toString(),
+      })
+      raw = (await response.json()) as typeof raw
+    } catch (err) {
+      const message = describeError(err)
+      logger.warn(`[slack-bot] open dm failed: ${message}`)
+      return { ok: false, error: message, code: 'adapter-error' }
+    }
+    const chat = raw.channel?.id
+    if (raw.ok !== true || chat === undefined) {
+      return {
+        ok: false,
+        error: `could not open a DM with user ${args.user}: ${raw.error ?? 'unknown slack error'}`,
+        code: 'adapter-error',
+      }
+    }
+    return { ok: true, workspace: '@dm', chat }
+  }
+}
+
 function mapSlackChannelEntry(c: SlackConversationsListChannel): ChannelListEntry {
   const kind: ChannelListEntry['kind'] = c.is_im === true ? 'dm' : c.is_mpim === true ? 'group' : 'channel'
   const name = c.name !== undefined && c.name !== '' ? `#${c.name}` : (c.id ?? 'unknown')
@@ -1397,6 +1439,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
   })
 
   const listCallback = createSlackListCallback({ token: options.token, logger })
+  const openDmCallback = createSlackOpenDmCallback({ token: options.token, logger, fetchImpl })
   const missedInbound = createSlackMissedInboundCallback({
     token: options.token,
     logger,
@@ -1731,6 +1774,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       options.router.registerMissedInbound('slack-bot', missedInbound)
       options.router.registerMessageGet('slack-bot', messageGetCallback)
       options.router.registerList('slack-bot', listCallback)
+      options.router.registerOpenDm('slack-bot', openDmCallback)
       options.router.registerEditMessage('slack-bot', editMessageCallback)
       options.router.registerFetchAttachment('slack-bot', fetchAttachmentCallback)
       options.router.registerMembership('slack-bot', membershipResolver)
@@ -1756,6 +1800,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         options.router.unregisterMissedInbound('slack-bot', missedInbound)
         options.router.unregisterMessageGet('slack-bot', messageGetCallback)
         options.router.unregisterList('slack-bot', listCallback)
+        options.router.unregisterOpenDm('slack-bot', openDmCallback)
         options.router.unregisterEditMessage('slack-bot', editMessageCallback)
         options.router.unregisterFetchAttachment('slack-bot', fetchAttachmentCallback)
         options.router.unregisterMembership('slack-bot', membershipResolver)
@@ -1787,6 +1832,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
       options.router.unregisterRecoveryAdapter('slack-bot', recoveryCallbacks)
       options.router.unregisterMessageGet('slack-bot', messageGetCallback)
       options.router.unregisterList('slack-bot', listCallback)
+      options.router.unregisterOpenDm('slack-bot', openDmCallback)
       options.router.unregisterEditMessage('slack-bot', editMessageCallback)
       options.router.unregisterFetchAttachment('slack-bot', fetchAttachmentCallback)
       options.router.unregisterMembership('slack-bot', membershipResolver)

@@ -21,6 +21,7 @@ import {
   createDiscordListCallback,
   createDiscordMembershipResolver,
   createDiscordMessageGetCallback,
+  createDiscordOpenDmCallback,
   createInteractionHandler,
   createOutboundCallback,
   createTypingCallback,
@@ -1558,6 +1559,48 @@ describe('createDiscordMessageGetCallback', () => {
   })
 })
 
+describe('createDiscordOpenDmCallback', () => {
+  type FetchCall = { url: string; init: RequestInit }
+
+  function fakeFetch(status: number, body: unknown): { fn: typeof fetch; calls: FetchCall[] } {
+    const calls: FetchCall[] = []
+    const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      calls.push({ url, init: init ?? {} })
+      return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    return { fn, calls }
+  }
+
+  const silentLogger = () => ({ info: () => {}, warn: () => {}, error: () => {} })
+
+  test('opens the DM channel with the recipient and returns its coordinates', async () => {
+    // given
+    const { fn, calls } = fakeFetch(200, { id: 'D1', type: 1 })
+    const cb = createDiscordOpenDmCallback({ token: 'tok', logger: silentLogger(), fetchImpl: fn })
+    // when
+    const result = await cb({ user: 'U1', workspace: 'G0' })
+    // then
+    expect(result).toEqual({ ok: true, workspace: '@dm', chat: 'D1' })
+    expect(calls[0]!.url).toBe('https://discord.com/api/v10/users/@me/channels')
+    expect(calls[0]!.init.method).toBe('POST')
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ recipient_id: 'U1' })
+  })
+
+  test('surfaces the Discord refusal so the model can report it', async () => {
+    const { fn } = fakeFetch(403, { message: 'Cannot send messages to this user', code: 50007 })
+    const cb = createDiscordOpenDmCallback({ token: 'tok', logger: silentLogger(), fetchImpl: fn })
+
+    const result = await cb({ user: 'U1' })
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'could not open a DM with user U1: Cannot send messages to this user',
+      code: 'adapter-error',
+    })
+  })
+})
+
 describe('createDiscordListCallback', () => {
   type FetchCall = { url: string; init: RequestInit }
 
@@ -2324,6 +2367,8 @@ class FakeDiscordBotRouter {
     unregisterList: () => this.unregistered.push('list'),
     registerEditMessage: () => this.registered.push('editMessage'),
     unregisterEditMessage: () => this.unregistered.push('editMessage'),
+    registerOpenDm: () => this.registered.push('openDm'),
+    unregisterOpenDm: () => this.unregistered.push('openDm'),
     registerFetchAttachment: () => this.registered.push('fetchAttachment'),
     unregisterFetchAttachment: () => this.unregistered.push('fetchAttachment'),
     registerMembership: () => this.registered.push('membership'),

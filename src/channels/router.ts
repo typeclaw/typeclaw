@@ -147,6 +147,9 @@ import type {
   ListChannelsArgs,
   ListChannelsResult,
   MessageGetCallback,
+  OpenDmArgs,
+  OpenDmCallback,
+  OpenDmResult,
   RemoveReactionCallback,
   RemoveReactionRequest,
   OwnReactionTarget,
@@ -1585,6 +1588,9 @@ export type ChannelRouter = {
   registerList: (adapter: ChannelKey['adapter'], cb: ListCallback) => void
   unregisterList: (adapter: ChannelKey['adapter'], cb: ListCallback) => void
   listChannels: (adapter: ChannelKey['adapter'], args: ListChannelsArgs) => Promise<ListChannelsResult>
+  registerOpenDm: (adapter: ChannelKey['adapter'], cb: OpenDmCallback) => void
+  unregisterOpenDm: (adapter: ChannelKey['adapter'], cb: OpenDmCallback) => void
+  openDm: (adapter: ChannelKey['adapter'], args: OpenDmArgs) => Promise<OpenDmResult>
   // Message editing is opt-in per adapter, Set-based like reactions/outbound so
   // future multi-account setups can register more than one. A missing callback
   // resolves to `code: 'not-supported'`, or `code: 'adapter-unavailable'` when
@@ -2061,6 +2067,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const historyCallbacks = new Map<ChannelKey['adapter'], Set<HistoryCallback>>()
   const messageGetCallbacks = new Map<ChannelKey['adapter'], MessageGetCallback>()
   const listCallbacks = new Map<ChannelKey['adapter'], ListCallback>()
+  const openDmCallbacks = new Map<ChannelKey['adapter'], OpenDmCallback>()
   const editMessageCallbacks = new Map<ChannelKey['adapter'], Set<EditMessageCallback>>()
   const fetchAttachmentCallbacks = new Map<ChannelKey['adapter'], Set<FetchAttachmentCallback>>()
   const reviewThreadResolvers = new Map<ChannelKey['adapter'], ReviewThreadResolver>()
@@ -7009,6 +7016,36 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
+  const registerOpenDm = (adapter: ChannelKey['adapter'], cb: OpenDmCallback): void => {
+    openDmCallbacks.set(adapter, cb)
+  }
+
+  const unregisterOpenDm = (adapter: ChannelKey['adapter'], cb: OpenDmCallback): void => {
+    if (openDmCallbacks.get(adapter) === cb) openDmCallbacks.delete(adapter)
+  }
+
+  const openDm = async (adapter: ChannelKey['adapter'], args: OpenDmArgs): Promise<OpenDmResult> => {
+    const cb = openDmCallbacks.get(adapter)
+    if (cb === undefined) {
+      const running = (outboundCallbacks.get(adapter)?.size ?? 0) > 0
+      return running
+        ? {
+            ok: false,
+            error:
+              `${adapter} cannot open a direct message from a user id. Post to an existing DM conversation ` +
+              'by its chat id instead, or ask the person to message the bot first.',
+            code: 'not-supported',
+          }
+        : { ok: false, error: `no adapter registered for "${adapter}"`, code: 'adapter-error' }
+    }
+    try {
+      return await raceWithTimeout(cb(args), fetchHistoryTimeoutMs, `[channels] ${adapter} open dm`)
+    } catch (err) {
+      logger.warn(`[channels] open dm threw for ${adapter}: ${describeError(err)}`)
+      return { ok: false, error: `${adapter} failed to open the direct message`, code: 'adapter-error' }
+    }
+  }
+
   const registerEditMessage = (adapter: ChannelKey['adapter'], cb: EditMessageCallback): void => {
     let set = editMessageCallbacks.get(adapter)
     if (!set) {
@@ -9830,6 +9867,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     registerList,
     unregisterList,
     listChannels,
+    registerOpenDm,
+    unregisterOpenDm,
+    openDm,
     registerEditMessage,
     unregisterEditMessage,
     editMessage,

@@ -1,6 +1,6 @@
 ---
 name: typeclaw-channels
-description: "TypeClaw channel behavior: how the agent decides to engage vs. stay silent on external messenger inbound (Discord, Slack, Telegram, LINE, KakaoTalk). Covers the `channels.<adapter>.engagement` triggers (mention/reply/dm), reply stickiness, the non-configurable solo-human fallback, history-prefetch windows, and the `alias` system — plain-text names the agent answers to, substring match semantics, peer-name suppressors, and engagement priority. Load when the user asks why the agent did or did not respond in a channel, wants to change when it auto-replies, asks to 'be quieter'/'stop auto-replying', wants it to answer to a nickname, or mentions engagement, stickiness, aliases, mentions, trigger words, suppressors, or '응답', '호출', '채널', '별칭', '왜 답을 안 해'. Access control (who is admitted at all) lives in `roles` — see typeclaw-permissions. The `channels`/`alias` schema, defaults, and safe-edit workflow live in typeclaw-config."
+description: "TypeClaw channel behavior: how the agent decides to engage vs. stay silent on external messenger inbound (Discord, Slack, Telegram, LINE, KakaoTalk). Covers the `channels.<adapter>.engagement` triggers (mention/reply/dm), reply stickiness, the non-configurable solo-human fallback, history-prefetch windows, and the `alias` system — plain-text names the agent answers to, substring match semantics, peer-name suppressors, and engagement priority. Load when the user asks why the agent did or did not respond in a channel, wants to change when it auto-replies, asks to 'be quieter'/'stop auto-replying', wants it to answer to a nickname, asks it to DM or privately message a person, or mentions engagement, stickiness, aliases, mentions, trigger words, suppressors, or '응답', '호출', '채널', '별칭', '왜 답을 안 해'. Access control (who is admitted at all) lives in `roles` — see typeclaw-permissions. The `channels`/`alias` schema, defaults, and safe-edit workflow live in typeclaw-config."
 ---
 
 # typeclaw-channels
@@ -96,6 +96,10 @@ The second is usually what people mean by "be quieter".
 1. **Read `typeclaw.json`**, list each adapter under `channels`: which is enabled, the engagement triggers and stickiness window.
 2. Also read `roles.<role>.match` for every role — those are the actual admit lists.
 3. Note that the live runtime may have a different view if `typeclaw.json` was edited but `reload` hasn't run yet — say so when relevant.
+
+### When the user asks "DM someone" / "message X privately"
+
+Pass the person's platform user id as `user` to `channel_send` (no `workspace`/`chat`). The runtime finds or opens the DM, even with someone the bot never talked to, and the receipt names the DM's `chat` id. Get the user id from the message author, the conversation's participants, or `channel_read` membership. Never put a user id in `chat` — `chat` is always a conversation id, and a user id there fails with errors like `Unknown Channel`. Don't tell the user the person must message first unless the adapter says it cannot open a DM.
 
 ## Alias
 

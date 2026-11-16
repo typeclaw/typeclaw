@@ -34,6 +34,7 @@ import type {
   OutboundMessage,
   ResolvedChannelNames,
   SendResult,
+  OpenDmCallback,
 } from '@/channels/types'
 import { chunkMarkdown } from '@/markdown'
 import type { DiscordAccountRecord } from '@/secrets/schema'
@@ -313,6 +314,14 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
   }
   const historyCallback = createDiscordHistoryCallback({ client, logger })
   const membershipResolver = createDiscordMembershipResolver({ historyCallback })
+  const openDmCallback: OpenDmCallback = async ({ user }) => {
+    try {
+      const dm = await client.createDM(user)
+      return { ok: true, workspace: '@dm', chat: dm.id }
+    } catch (err) {
+      return { ok: false, error: `could not open a DM with user ${user}: ${describeError(err)}`, code: 'adapter-error' }
+    }
+  }
   const outboundCallback = withOutboundAccount(
     createDiscordOutboundCallback({
       client,
@@ -548,6 +557,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
     router.registerPrepareOwnReaction('discord', ownReaction.prepare)
     router.registerRemoveOwnReaction('discord', ownReaction.remove)
     router.registerEditMessage('discord', editMessageCallback)
+    router.registerOpenDm('discord', openDmCallback)
   }
 
   function unregisterCallbacks(router: ChannelRouter): void {
@@ -563,6 +573,7 @@ export function createDiscordAdapter(options: DiscordAdapterOptions): DiscordAda
     router.unregisterPrepareOwnReaction('discord', ownReaction.prepare)
     router.unregisterRemoveOwnReaction('discord', ownReaction.remove)
     router.unregisterEditMessage('discord', editMessageCallback)
+    router.unregisterOpenDm('discord', openDmCallback)
   }
 }
 

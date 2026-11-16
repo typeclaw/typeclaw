@@ -59,6 +59,10 @@ export function createChannelSendTool({
       'Post a message to an external messenger channel. Specify adapter, workspace, chat, and text. ' +
       'For Discord guild channels, workspace is the guild id; for Slack team channels, workspace is ' +
       'the team id (e.g. "T0ACME"). For DMs on either platform, workspace is the literal "@dm". ' +
+      'To direct-message a person, pass their platform user id as `user` instead of `workspace`/`chat`: the runtime ' +
+      'finds or opens the DM conversation, even one that never existed, and the receipt names its chat id. Find the ' +
+      "user id from the message author, the conversation's participants, or `channel_read` membership. Never put a " +
+      'user id in `chat`; `chat` is always a conversation id. ' +
       'On failure (no adapter registered, or the adapter-level send failed), the call returns ' +
       '{ ok: false, error }. On success it returns { ok: true } and, when reported, `messageId` ' +
       '(an adapter-reported id of a posted message) and `messageIds` (reported posted-message ids in ' +
@@ -74,16 +78,27 @@ export function createChannelSendTool({
         ADAPTER_IDS.map((a) => Type.Literal(a)),
         { description: 'Adapter id. Supported: "discord-bot", "slack-bot".' },
       ),
-      workspace: Type.String({
-        description:
-          'Discord guild id or Slack team id (e.g. "T0ACME"); use "@dm" for direct-message channels on either platform.',
-        minLength: 1,
-      }),
-      chat: Type.String({
-        description:
-          'Channel id. Discord channel id (numeric snowflake) or Slack channel id (e.g. "C0CHANNEL", "D0DMID").',
-        minLength: 1,
-      }),
+      workspace: Type.Optional(
+        Type.String({
+          description:
+            'Discord guild id or Slack team id (e.g. "T0ACME"); use "@dm" for direct-message channels on either platform. Required with `chat`. With `user`, optionally the workspace the user id was seen in.',
+          minLength: 1,
+        }),
+      ),
+      chat: Type.Optional(
+        Type.String({
+          description:
+            'Conversation id, never a user id. Discord channel id (numeric snowflake) or Slack channel id (e.g. "C0CHANNEL", "D0DMID"). Pass either `chat` or `user`.',
+          minLength: 1,
+        }),
+      ),
+      user: Type.Optional(
+        Type.String({
+          description:
+            'Platform user id of a person to direct-message (e.g. a Discord user snowflake or Slack "U0USER"). The runtime resolves or opens the DM conversation. Pass either `chat` or `user`; omit `thread` with `user`.',
+          minLength: 1,
+        }),
+      ),
       thread: Type.Optional(
         Type.String({
           description:
@@ -153,6 +168,16 @@ export function createChannelSendTool({
         }
       }
 
+      const target = await resolveSendTarget(router, adapter, params)
+      if (!target.ok) {
+        logger.warn(formatChannelToolFailure('channel_send', `${params.adapter}: ${target.error}`))
+        return {
+          content: [{ type: 'text' as const, text: `${TOOL_RESULT_PREFIX}channel_send denied: ${target.error}` }],
+          details: { ok: false, error: target.error },
+        }
+      }
+      const { workspace, chat } = target
+
       const noReplyError = noReplyMisuseError(bodyText)
       if (noReplyError) {
         logger.warn(formatChannelToolFailure('channel_send', noReplyError))
@@ -204,7 +229,7 @@ export function createChannelSendTool({
       // guarded. A send is always terminal, so there is no more-work exemption.
       const missingResolveChoice = missingReviewThreadResolveChoiceError({
         adapter,
-        chat: params.chat,
+        chat: chat,
         thread: params.thread ?? null,
         text: bodyText,
         resolveReviewThread: params.resolve_review_thread,
@@ -221,8 +246,8 @@ export function createChannelSendTool({
       const falseReceipt = checkFalseReceipt({
         sessionId,
         adapter,
-        workspace: params.workspace,
-        chat: params.chat,
+        workspace: workspace,
+        chat: chat,
         thread: params.thread ?? null,
         text: bodyText,
         continueAfterReply: false,
@@ -242,8 +267,8 @@ export function createChannelSendTool({
       // CHANGES_REQUESTED on this PR, before the resolve mutates the thread.
       const rereview = await evaluateRereviewGuard({
         adapter,
-        workspace: params.workspace,
-        chat: params.chat,
+        workspace: workspace,
+        chat: chat,
         thread: params.thread ?? null,
         text: bodyText,
         wantsResolve,
@@ -251,8 +276,8 @@ export function createChannelSendTool({
         getReviewState: (req) => router.getReviewState(req),
         ...(origin !== undefined &&
         origin.adapter === adapter &&
-        origin.workspace === params.workspace &&
-        origin.chat === params.chat &&
+        origin.workspace === workspace &&
+        origin.chat === chat &&
         origin.thread === (params.thread ?? null) &&
         origin.githubReviewRound !== undefined
           ? { round: origin.githubReviewRound }
@@ -274,8 +299,8 @@ export function createChannelSendTool({
       if (wantsResolve) {
         const resolve = await resolveReviewThreadBeforeSend(router, {
           adapter,
-          workspace: params.workspace,
-          chat: params.chat,
+          workspace: workspace,
+          chat: chat,
           thread: params.thread ?? null,
         })
         if (resolve.kind === 'block') {
@@ -288,8 +313,8 @@ export function createChannelSendTool({
         if (resolve.kind === 'already-resolved') {
           router.finishGithubReviewThreadCloseout?.({
             sessionId,
-            workspace: params.workspace,
-            prNumber: parseGithubPrNumber(params.chat),
+            workspace: workspace,
+            prNumber: parseGithubPrNumber(chat),
             thread: params.thread ?? null,
             decision: 'resolved',
           })
@@ -307,11 +332,11 @@ export function createChannelSendTool({
         if (resolve.kind === 'no-match') {
           resolveMissNotice = resolveMissHint(params.thread ?? null)
         } else {
-          recordResolvedThreadFromSend(sessionId, params.workspace, params.chat, params.thread ?? null)
+          recordResolvedThreadFromSend(sessionId, workspace, chat, params.thread ?? null)
           router.finishGithubReviewThreadCloseout?.({
             sessionId,
-            workspace: params.workspace,
-            prNumber: parseGithubPrNumber(params.chat),
+            workspace: workspace,
+            prNumber: parseGithubPrNumber(chat),
             thread: params.thread ?? null,
             decision: 'resolved',
           })
@@ -329,8 +354,8 @@ export function createChannelSendTool({
         origin !== undefined &&
         sessionId !== '' &&
         origin.adapter === adapter &&
-        origin.workspace === params.workspace &&
-        origin.chat === params.chat &&
+        origin.workspace === workspace &&
+        origin.chat === chat &&
         origin.thread === thread
       const backgroundCoverage = settlesOrigin
         ? ((await router.captureBackgroundResultCoverage?.(sessionId)) ?? [])
@@ -340,8 +365,8 @@ export function createChannelSendTool({
       const result = await router.send(
         {
           adapter,
-          workspace: params.workspace,
-          chat: params.chat,
+          workspace: workspace,
+          chat: chat,
           ...(params.thread !== undefined ? { thread: params.thread } : {}),
           ...(bodyText !== undefined ? { text: bodyText } : {}),
           ...(params.link_previews !== undefined ? { link_previews: params.link_previews } : {}),
@@ -351,24 +376,19 @@ export function createChannelSendTool({
       )
 
       if (!result.ok) {
-        logger.warn(
-          formatChannelToolFailure(
-            'channel_send',
-            `${params.adapter}:${params.workspace}/${params.chat}: ${result.error}`,
-          ),
-        )
+        logger.warn(formatChannelToolFailure('channel_send', `${params.adapter}:${workspace}/${chat}: ${result.error}`))
       }
       if (
         result.ok &&
         params.resolve_review_thread === false &&
         adapter === 'github' &&
         params.thread != null &&
-        /^pr:\d+$/.test(params.chat)
+        /^pr:\d+$/.test(chat)
       ) {
         router.finishGithubReviewThreadCloseout?.({
           sessionId,
-          workspace: params.workspace,
-          prNumber: parseGithubPrNumber(params.chat),
+          workspace: workspace,
+          prNumber: parseGithubPrNumber(chat),
           thread: params.thread ?? null,
           decision: 'left-open',
         })
@@ -397,15 +417,15 @@ export function createChannelSendTool({
       if (result.ok) {
         const echo = renderOutboundEcho(result.deliveredText ?? bodyText, attachments)
         const receipt =
-          `posted to ${params.adapter}:${params.workspace}/${params.chat}: ${echo}` +
+          `posted to ${params.adapter}:${workspace}/${chat}: ${echo}` +
           (result.messageId !== undefined ? `\nmessage_id=${JSON.stringify(result.messageId)}` : '') +
           (result.messageIds !== undefined ? `\nmessage_ids=${JSON.stringify(result.messageIds)}` : '')
         const hints: string[] = []
         const consecutive = consecutiveSendHint(
           router.getConsecutiveSendCount({
             adapter,
-            workspace: params.workspace,
-            chat: params.chat,
+            workspace: workspace,
+            chat: chat,
             thread: params.thread ?? null,
           }),
         )
@@ -413,8 +433,8 @@ export function createChannelSendTool({
 
         const threadMismatch = threadMismatchHint(origin, {
           adapter,
-          workspace: params.workspace,
-          chat: params.chat,
+          workspace: workspace,
+          chat: chat,
           thread: params.thread,
         })
         if (threadMismatch) hints.push(threadMismatch)
@@ -434,6 +454,41 @@ export function createChannelSendTool({
       }
     },
   })
+}
+
+type SendTarget = { ok: true; workspace: string; chat: string } | { ok: false; error: string }
+
+async function resolveSendTarget(
+  router: Pick<ChannelRouter, 'openDm'>,
+  adapter: AdapterId,
+  params: { workspace?: string; chat?: string; thread?: string; user?: string },
+): Promise<SendTarget> {
+  if (params.user !== undefined) {
+    if (params.chat !== undefined) {
+      return { ok: false, error: 'pass either `chat` (a conversation id) or `user` (a person to DM), not both.' }
+    }
+    // A thread id names a thread in some other conversation, and adapters such
+    // as discord-bot post to the thread over the chat, so it would publish the
+    // private message there instead of the DM.
+    if (params.thread !== undefined) {
+      return {
+        ok: false,
+        error: '`thread` cannot be combined with `user`; a direct message starts at the DM root, so omit `thread`.',
+      }
+    }
+    const dm = await router.openDm(adapter, {
+      user: params.user,
+      ...(params.workspace !== undefined ? { workspace: params.workspace } : {}),
+    })
+    return dm.ok ? { ok: true, workspace: dm.workspace, chat: dm.chat } : { ok: false, error: dm.error }
+  }
+  if (params.workspace === undefined || params.chat === undefined) {
+    return {
+      ok: false,
+      error: 'pass `workspace` and `chat` for a conversation, or `user` to direct-message a person.',
+    }
+  }
+  return { ok: true, workspace: params.workspace, chat: params.chat }
 }
 
 function parseGithubPrNumber(chat: string): number {
