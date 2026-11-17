@@ -28,11 +28,14 @@ export type BrowserPromptOptions = {
   // True only when the vault is live (enabled and secrets.json migrated), the
   // same boot gate the typevault plugin uses before it registers anything.
   typevault?: boolean
+  // True when `browser_fill_secret` is registered, i.e. the managed browser
+  // runs (see needsManagedBrowser); never advertise a tool the worker lacks.
+  secureFill?: boolean
 }
 
 export function buildBrowserSystemPrompt(
   { engines, extensions }: BrowserDrivers,
-  { typevault = false }: BrowserPromptOptions = {},
+  { typevault = false, secureFill = false }: BrowserPromptOptions = {},
 ): string {
   const skills = [...engines, ...extensions].map((id) => `- \`${id}\` — ${driverSkillPath(id)}`).join('\n')
   return `You are a web-browsing subagent running inside TypeClaw. Your job: drive a real browser to complete one browsing task for the main agent and report what happened.
@@ -54,9 +57,7 @@ Drive the browser with \`bash\`. Use \`write\` only to save requested artifacts 
 
 When the user wants to see a page, when the outcome is visual (a layout, a chart, a rendered result, an error dialog), or when you hand a step to a human, save a screenshot of that state under \`workspace/\` and list it under Artifacts so the main agent can send it. Never report "the page is open", "you can see it in the browser", or a step the user should check on screen as if they could look. Close every browser session you opened before you finish, except one waiting on a human.
 
-To enter a password or other secret, click the field with your driver, then call \`${FILL_SECRET_TOOL}\` with the \`.env\` variable name or \`typevault://\` vault reference you were given and the tab's \`url\`; pass \`submit: true\` on the last field. The value never reaches you. Never type, read back, or screenshot a secret yourself.
-
-If a step needs a human (login, 2FA, CAPTCHA, payment confirmation), follow the skill's human-handoff instructions (e.g. start the dashboard), leave that session open, and stop. Report the session name, the dashboard URL or how the user reaches the page (they cannot reach your local browser window), a screenshot of what they will face, and exactly what the human must do, so the main agent can hand it over and spawn you again to continue in the same session once they are done.
+${secureFill ? SECURE_FILL_SECTION : ''}If a step needs a human (login, 2FA, CAPTCHA, payment confirmation), follow the skill's human-handoff instructions (e.g. start the dashboard), leave that session open, and stop. Report the session name, the dashboard URL or how the user reaches the page (they cannot reach your local browser window), a screenshot of what they will face, and exactly what the human must do, so the main agent can hand it over and spawn you again to continue in the same session once they are done.
 ${typevault ? TYPEVAULT_SECTION : ''}
 ## Final report
 
@@ -65,6 +66,10 @@ ${typevault ? TYPEVAULT_SECTION : ''}
 3. **Artifacts** — absolute paths of anything you saved.
 4. **Blockers** — anything that stopped you and what would unblock it, including any session left open for a human.`
 }
+
+const SECURE_FILL_SECTION = `To enter a password or other secret, click the field with your driver, then call \`${FILL_SECRET_TOOL}\` with the \`.env\` variable name or \`typevault://\` vault reference you were given and the tab's \`url\`; pass \`submit: true\` on the last field. The value never reaches you. Never type, read back, or screenshot a secret yourself.
+
+`
 
 const TYPEVAULT_SECTION = `
 ## Credentials

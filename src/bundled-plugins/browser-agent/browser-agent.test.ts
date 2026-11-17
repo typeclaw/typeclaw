@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
 
 import { BROWSER_ENGINE_IDS, BROWSER_EXTENSION_IDS } from '@/browser/registry'
+import { FILL_SECRET_TOOL } from '@/bundled-plugins/managed-browser'
 
 import {
   browserPayloadSchema,
@@ -40,6 +41,12 @@ describe('browser subagent', () => {
     expect(existsSync(TYPEVAULT_SKILL_PATH)).toBe(true)
     expect(createBrowserSubagent(drivers, { typevault: true }).systemPrompt).toContain(TYPEVAULT_SKILL_PATH)
     expect(createBrowserSubagent(drivers).systemPrompt).not.toContain(TYPEVAULT_SKILL_PATH)
+  })
+
+  test('advertises the secure-fill tool only when it is registered', () => {
+    const drivers = { engines: ['agent-browser'], extensions: [] } as const
+    expect(buildBrowserSystemPrompt(drivers, { secureFill: true })).toContain(FILL_SECRET_TOOL)
+    expect(buildBrowserSystemPrompt(drivers)).not.toContain(FILL_SECRET_TOOL)
   })
 
   test('a BrowserSkill-only config still hands the worker its driver skill', () => {
