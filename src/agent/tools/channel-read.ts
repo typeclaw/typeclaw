@@ -201,7 +201,7 @@ async function readHistory(args: {
     logger.warn(formatChannelToolFailure('channel_read', `${adapter}:${params.chat}: ${result.error}`))
     return fail(result.error)
   }
-  const rendered = renderHistoryMessages(result.messages)
+  const rendered = renderHistoryMessages(result.messages, adapter)
   const cursorLine =
     result.nextCursor !== undefined
       ? `\n\n(more older messages available — call channel_read again with cursor: ${JSON.stringify(result.nextCursor)})`
@@ -240,7 +240,7 @@ async function readMessage(args: {
   }
   const header = `## ${adapter}:${params.workspace}/${params.chat} message ${params.message_id}`
   return {
-    content: [{ type: 'text' as const, text: `${header}\n${renderHistoryMessage(result.message)}` }],
+    content: [{ type: 'text' as const, text: `${header}\n${renderHistoryMessage(result.message, adapter)}` }],
     details: { ok: true, count: 1 } satisfies Details,
   }
 }

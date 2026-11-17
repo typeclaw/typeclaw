@@ -245,24 +245,24 @@ describe('createChannelHistoryTool', () => {
     const content = result.content[0]
     if (content?.type !== 'text') throw new Error('expected text content')
     const text = content.text
-    expect(text).toContain('[message_id=001700000000.000001] Alice (<@UALICE>): first')
-    expect(text).toContain('[message_id=001700000000.000002] Alice (<@UALICE>): second')
+    expect(text).toContain('[message_id=001700000000.000001] Alice <@UALICE>: first')
+    expect(text).toContain('[message_id=001700000000.000002] Alice <@UALICE>: second')
   })
 
   test('keeps the existing line when an adapter supplies no message id', () => {
     const message = userMessage()
     const withoutId = { ...message, externalMessageId: undefined } as unknown as ChannelHistoryMessage
 
-    expect(renderHistoryMessage(withoutId)).toBe('[2023-11-14T22:13:20.000Z] Alice (<@UALICE>): hello')
+    expect(renderHistoryMessage(withoutId, 'slack-bot')).toBe('[2023-11-14T22:13:20.000Z] Alice <@UALICE>: hello')
   })
 
   test('keeps the existing line when an adapter supplies an empty message id', () => {
-    expect(renderHistoryMessage(userMessage({ externalMessageId: '' }))).toBe(
-      '[2023-11-14T22:13:20.000Z] Alice (<@UALICE>): hello',
+    expect(renderHistoryMessage(userMessage({ externalMessageId: '' }), 'slack-bot')).toBe(
+      '[2023-11-14T22:13:20.000Z] Alice <@UALICE>: hello',
     )
   })
 
-  test('renders bot entries with a BOT marker and user entries with @mention', async () => {
+  test('renders bot entries with a [bot] tag and keeps every author mentionable', async () => {
     // given
     const cb: HistoryCallback = async () => ({
       ok: true,
@@ -280,8 +280,28 @@ describe('createChannelHistoryTool', () => {
 
     // then
     const text = (result.content[0] as { text: string }).text
-    expect(text).toContain('Alice (<@UALICE>): hi')
-    expect(text).toContain('BOT (typeclaw): auto-reply')
+    expect(text).toContain('Alice <@UALICE>: hi')
+    expect(text).toContain('typeclaw <@UBOT> [bot]: auto-reply')
+  })
+
+  test('keeps a peer bot mention id so the agent can address it on Discord', () => {
+    const peerBot = userMessage({ authorId: '1517092810472427540', authorName: 'Typeey', isBot: true, text: 'hi' })
+
+    expect(renderHistoryMessage(peerBot, 'discord-bot')).toBe(
+      '[2023-11-14T22:13:20.000Z] [message_id=m1] Typeey <@1517092810472427540> [bot]: hi',
+    )
+  })
+
+  test('uses the adapter mention syntax instead of Slack/Discord ids everywhere', () => {
+    const githubBot = userMessage({ authorId: '41898282', authorName: 'typeey[bot]', isBot: true, text: 'LGTM' })
+    const kakaoUser = userMessage({ authorId: '999000111', authorName: '민준', text: '안녕' })
+
+    expect(renderHistoryMessage(githubBot, 'github')).toBe(
+      '[2023-11-14T22:13:20.000Z] [message_id=m1] @typeey[bot] [bot]: LGTM',
+    )
+    expect(renderHistoryMessage(kakaoUser, 'kakaotalk')).toBe(
+      '[2023-11-14T22:13:20.000Z] [message_id=m1] 민준 <999000111>: 안녕',
+    )
   })
 
   test('renders an empty history with the (no messages) marker', async () => {
