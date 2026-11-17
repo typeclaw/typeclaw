@@ -60,24 +60,12 @@ private key conversationally or read the resulting secret store.
 
 The default GitHub event allowlist already covers reviews. If you want to narrow it to just the review path, the relevant events are `pull_request.review_requested`, `pull_request.review_request_removed`, `pull_request_review.submitted`, and `pull_request_review_comment.created` — keep `review_request_removed` so the agent still sees when a review request is withdrawn. Tell the agent to tighten `channels.github.eventAllowlist`, or adjust it and run `typeclaw reload`. See the [`github` adapter reference](/docs/reference/github) for the full event list.
 
-<Callout type="info" title="App auth and the Contents permission">
-  On a **public** repo an App only needs **Pull requests: read/write** to read the diff and post reviews. On a
-  **private** repo the agent also needs **Contents: read** — the runtime-owned exact-SHA review fetch (and any raw
-  file-tree access) of a private repo fails with 403/404 without it; **Metadata: read** alone lets the App _see_ the
-  repo but not read its files. Model-driven review, commenting, and triage do not require **Contents: write**, so keep
-  that permission disabled for this recipe. If a finding needs a fix, a host-stage operator performs checkout and pull-
-  request creation. The agent performs an eligible push to a configured GitHub remote through the broker, using GitHub
-  App auth, an authorized declared PAT, or the automatically refreshed trusted host `gh` store. To show each review as a
-  `typeclaw/review` PR check (on by default, `review.check`), the App also needs **Checks: read/write**; a PAT needs
-  **Commit statuses: read/write** instead. Without it the check is skipped and reviews still post. The wizard's
-  permission note lists exactly what to enable.
-</Callout>
-
-<Callout type="warn" title="The preflight won't catch a missing Contents grant">
-  TypeClaw's App permission preflight only checks permissions tied to your configured `eventAllowlist` (issues, pull
-  requests, discussions), so a private-repo reviewer missing **Contents: read** passes preflight cleanly and then fails
-  at runtime when the reviewer action fetches or reads files. If reviews on a private repo error with "Resource not
-  accessible by integration," add **Contents: read** to the App.
+<Callout type="info" title="App permissions">
+  Grant the permissions in the [GitHub App permissions table](/docs/reference/github#app-permissions). For this recipe,
+  keep **Contents** at **Read-only**: a private-repo reviewer needs it to read files, and review, commenting, and triage
+  never need write. The preflight does not separately validate that **Contents** read access, so if private-repo reviews
+  fail with "Resource not accessible by integration," that grant is missing. With a PAT, the `typeclaw/review` check
+  needs **Commit statuses: Read and write** instead of **Checks**.
 </Callout>
 
 ## Set up the decoy reviewer
