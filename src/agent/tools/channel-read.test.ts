@@ -61,14 +61,20 @@ describe('createChannelReadTool — mode: history', () => {
     expect(seen).toEqual([{ workspace: 'T0', chat: 'C9', thread: 'th1', limit: 5 }])
   })
 
-  test('renders messages oldest-first with a BOT marker for the agent own replies', async () => {
+  test('renders messages oldest-first with a [bot] tag that keeps the bot mentionable', async () => {
     // given
     const router = makeRouter()
     router.registerHistory('slack-bot', async () => ({
       ok: true,
       messages: [
         userMessage({ externalMessageId: '001700000000.000001', text: 'first' }),
-        userMessage({ externalMessageId: '001700000000.000002', authorName: 'Bot', isBot: true, text: 'second' }),
+        userMessage({
+          externalMessageId: '001700000000.000002',
+          authorId: 'UBOT',
+          authorName: 'Bot',
+          isBot: true,
+          text: 'second',
+        }),
       ],
     }))
     const tool = createChannelReadTool({ router })
@@ -78,10 +84,8 @@ describe('createChannelReadTool — mode: history', () => {
 
     // then
     const text = (result.content[0] as { text: string }).text
-    expect(text).toContain('[message_id=001700000000.000001] Alice (<@UALICE>): first')
-    expect(text).toContain('[message_id=001700000000.000002] BOT (Bot): second')
-    expect(text).toContain('Alice (<@UALICE>): first')
-    expect(text).toContain('BOT (Bot): second')
+    expect(text).toContain('[message_id=001700000000.000001] Alice <@UALICE>: first')
+    expect(text).toContain('[message_id=001700000000.000002] Bot <@UBOT> [bot]: second')
     expect(text.indexOf('first')).toBeLessThan(text.indexOf('second'))
   })
 

@@ -97,7 +97,7 @@ export function createChannelHistoryTool({
 
       router.registerHistoryAttachments(origin, result.messages)
 
-      const rendered = renderHistoryMessages(result.messages)
+      const rendered = renderHistoryMessages(result.messages, origin.adapter)
       const cursorLine =
         result.nextCursor !== undefined
           ? `\n\n(more older messages available — call channel_history again with cursor: ${JSON.stringify(result.nextCursor)})`
