@@ -13,6 +13,7 @@ import type { PermissionService } from '@/permissions'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin, defineTool, type Hooks } from '@/plugin'
 import { resolveFillableEnvNames, SECRET_ENV_PREFIX } from '@/sandbox/env-exposure'
+import { isTypevaultLive } from '@/typevault/envelope-store'
 
 const SKILLS_ROOT = join(import.meta.dir, 'skills')
 
@@ -20,9 +21,10 @@ export default definePlugin({
   plugin: async (ctx) => {
     // Boot snapshot: `browser` is restart-required, matching the image layers
     // and the browser process started below.
-    const browser = getConfig().browser
+    const config = getConfig()
+    const browser = config.browser
     const skillsDirs = browserSkillDirs(browser)
-    if (!needsManagedBrowser(browser)) return { skillsDirs }
+    if (!needsManagedBrowser(browser, isTypevaultLive(config.typevault.enabled, ctx.agentDir))) return { skillsDirs }
 
     let managed: ManagedBrowser
     try {

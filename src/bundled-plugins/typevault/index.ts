@@ -7,7 +7,7 @@ import { getConfig } from '@/config'
 import type { PermissionService } from '@/permissions'
 import { BUILTIN_ROLE_NAMES, CORE_PERMISSIONS } from '@/permissions/builtins'
 import { definePlugin, type Hooks } from '@/plugin'
-import { isTypevaultMarkerFile } from '@/typevault/envelope-store'
+import { isTypevaultLive } from '@/typevault/envelope-store'
 import { vaultSecretValues } from '@/typevault/redaction'
 import { ensureProjectIdentity, ensureRoleTiers, isRoleTier, projectMemberName, vaultAdmin } from '@/typevault/vault'
 
@@ -24,7 +24,7 @@ export default definePlugin({
     // Boot snapshot: typevault is restart-required, and start() settles whether
     // secrets.json moved into the vault before the container boots.
     const config = getConfig()
-    if (!config.typevault.enabled || !isTypevaultMarkerFile(join(ctx.agentDir, 'secrets.json'))) return {}
+    if (!isTypevaultLive(config.typevault.enabled, ctx.agentDir)) return {}
 
     try {
       const skipped = await ensureRoleTiers(ctx.agentDir, [...BUILTIN_ROLE_NAMES, ...Object.keys(config.roles ?? {})])

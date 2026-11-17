@@ -33,6 +33,12 @@ export function isTypevaultMarkerFile(secretsPath: string): boolean {
   return existsSync(secretsPath) && isTypevaultMarker(readFileSync(secretsPath, 'utf8'))
 }
 
+// The boot gate every vault-aware plugin shares: enabled, and secrets.json
+// already moved into the vault.
+export function isTypevaultLive(enabled: boolean, agentDir: string): boolean {
+  return enabled && isTypevaultMarkerFile(join(agentDir, 'secrets.json'))
+}
+
 type CachedEnvelope = { text: string; stamp: string }
 
 const cache = new Map<string, CachedEnvelope>()

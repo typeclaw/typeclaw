@@ -6,6 +6,7 @@ import { basename, join } from 'node:path'
 import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
 import type { FillSecretOptions } from '@/browser/fill-secret'
+import { needsManagedBrowser } from '@/browser/registry'
 import { createPermissionService } from '@/permissions'
 import { rolesConfigSchema } from '@/permissions/schema'
 
@@ -49,6 +50,14 @@ describe('shared browser bash access', () => {
 })
 
 describe('browser engine wiring', () => {
+  test('keeps the default agent-browser on its own browser, but a live vault starts the managed one for secure fill', () => {
+    const defaults = { engines: ['agent-browser'], extensions: [] } as const
+
+    expect(needsManagedBrowser(defaults, false)).toBe(false)
+    expect(needsManagedBrowser(defaults, true)).toBe(true)
+    expect(needsManagedBrowser({ engines: ['omowright'], extensions: [] }, false)).toBe(true)
+  })
+
   test('attaches the always-installed agent-browser to the shared browser even when it is not a listed engine', () => {
     const env = browserEnvOverlay(
       { engines: ['omowright'], extensions: [] },
