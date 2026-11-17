@@ -98,11 +98,12 @@ export type BrowserConfig = {
   extensions: readonly BrowserExtensionId[]
 }
 
-// The managed Chrome exists only for engines that attach over CDP or for
-// extensions. The default `["agent-browser"]` keeps today's per-session
-// agent-browser browser, so existing agents see no change.
-export function needsManagedBrowser(config: BrowserConfig): boolean {
-  return config.extensions.length > 0 || config.engines.some((id) => id !== 'agent-browser')
+// The managed Chrome exists for engines that attach over CDP, for extensions,
+// and for a live TypeVault: `browser_fill_secret` can type a vault login only
+// into the managed Chrome, so a vault agent on the default `["agent-browser"]`
+// joins it too. Otherwise agent-browser keeps its own per-session browser.
+export function needsManagedBrowser(config: BrowserConfig, typevault: boolean): boolean {
+  return typevault || config.extensions.length > 0 || config.engines.some((id) => id !== 'agent-browser')
 }
 
 export function extensionDir(id: BrowserExtensionId): string {

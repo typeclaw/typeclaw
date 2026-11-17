@@ -13,7 +13,7 @@ export default definePlugin({
       subagents: {
         browser: createBrowserSubagent(config.browser, {
           typevault,
-          secureFill: needsManagedBrowser(config.browser),
+          secureFill: needsManagedBrowser(config.browser, typevault),
         }),
       },
     }
