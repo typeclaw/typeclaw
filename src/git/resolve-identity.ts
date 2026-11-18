@@ -153,7 +153,7 @@ async function writeLocalConfig(
 ): Promise<boolean> {
   try {
     const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', ...flags, key, value], {
-      env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+      env: localGitConfigEnv(),
     })
     return result.exitCode === 0
   } catch {
@@ -164,7 +164,7 @@ async function writeLocalConfig(
 async function unsetLocalConfig(cwd: string, gitArgs: readonly string[], key: string): Promise<boolean> {
   try {
     const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', '--unset-all', key], {
-      env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+      env: localGitConfigEnv(),
     })
     return result.exitCode === 0
   } catch {
@@ -179,7 +179,7 @@ async function readRepositoryIdentity(cwd: string, gitArgs: readonly string[]): 
       cwd,
       [...gitArgs, 'config', '--null', '--get-regexp', '^(user\\.(name|email)|typeclaw\\.fallbackidentity)$'],
       {
-        env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+        env: localGitConfigEnv(),
       },
     )
     if (result.exitCode !== 0) return new Map()
@@ -202,6 +202,12 @@ function parseNullConfigEntries(output: string): Map<string, string[]> {
     else existing.push(value)
   }
   return values
+}
+
+// Reads and writes the agent repo's own config only: ambient GIT_CONFIG_* and
+// repository-redirecting variables are dropped, and global/system config is off.
+export function localGitConfigEnv(): NodeJS.ProcessEnv {
+  return { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV }
 }
 
 function withoutGitOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
