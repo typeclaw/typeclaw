@@ -7827,9 +7827,9 @@ describe('managed config commit check', () => {
     },
   )
 
-  test.skipIf(lacksInodeAnchoring)(
-    'the real managedConfig guard rejects at commit what preflight allowed',
-    async () => {
+  test.skipIf(lacksInodeAnchoring).each(['plain path', 'file: URI'])(
+    'the real managedConfig guard rejects at commit what preflight allowed (%s)',
+    async (form) => {
       // given: cron.json already holds an expired job, so rewriting it unchanged is
       // allowed at preflight; a concurrent change then drops that job, which turns
       // the same bytes into adding a new expired job
@@ -7870,7 +7870,13 @@ describe('managed config commit check', () => {
         // when
         const execution = write.execute(
           'c',
-          { path: 'cron.json', content: JSON.stringify({ jobs: [expired, fresh] }, null, 2) } as never,
+          {
+            path: form === 'file: URI' ? pathToFileURL(cron).href : 'cron.json',
+            content: JSON.stringify({ jobs: [expired, fresh] }, null, 2),
+            // nonWorkspaceWrite does not decode file: URIs, so it asks for an
+            // acknowledgement on that form; the commit check carries it along.
+            ...(form === 'file: URI' ? { acknowledgeGuards: { guard: { nonWorkspaceWrite: true } } } : {}),
+          } as never,
           undefined,
           undefined,
           {} as never,
