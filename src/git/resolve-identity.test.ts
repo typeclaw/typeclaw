@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
@@ -202,6 +202,19 @@ describe('resolveGitIdentity', () => {
 
     expect(await readFile(config, 'utf8')).toBe(original)
     expect(await Bun.file(`${config}.lock`).exists()).toBe(false)
+  })
+
+  test.skipIf(process.platform === 'win32')('editLocalConfigAtomically keeps a private config private', async () => {
+    const repo = await tempDir('typeclaw-git-identity-txn-mode-')
+    await git(repo, ['init', '-q'])
+    const config = join(repo, '.git', 'config')
+    await chmod(config, 0o600)
+
+    await expect(editLocalConfigAtomically(repo, [['--replace-all', 'user.name', 'After']])).resolves.toBe(true)
+
+    expect((await stat(config)).mode & 0o777).toBe(0o600)
+    await expect(resolveGitIdentity(repo)).resolves.toBeNull()
+    expect(await readFile(config, 'utf8')).toContain('name = After')
   })
 
   test('editLocalConfigAtomically leaves config to a git writer that holds the lock', async () => {

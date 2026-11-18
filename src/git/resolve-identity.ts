@@ -1,4 +1,5 @@
-import { open, readFile, rename, rm } from 'node:fs/promises'
+import { mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
 import { resolveAgentGit } from './resolve-agent-git'
@@ -114,26 +115,33 @@ export async function syncConfiguredGitIdentity(cwd: string, user: GitIdentity |
   return committed && matches(await resolveGitIdentity(cwd))
 }
 
-// Applies `git config --file` edits to a copy held as git's own config.lock,
-// then renames it over the agent repo's config, so every edit lands or none
-// does. Callers must run while no sandbox holds the read-only config bind.
+// Applies `git config --file` edits to a private scratch copy, then installs
+// the result through git's own config.lock with the original file mode, so
+// every edit lands or none does and a private config stays private. Callers
+// must run while no sandbox holds the read-only config bind.
 export async function editLocalConfigAtomically(cwd: string, edits: readonly (readonly string[])[]): Promise<boolean> {
   const repo = resolveAgentGit(cwd)
   if (repo === null) return false
   const configPath = await localConfigPath(cwd, repo.gitArgs)
   if (configPath === null) return false
   const lockPath = `${configPath}.lock`
-  const lock = await open(lockPath, 'wx').catch(() => null)
+  const lock = await open(lockPath, 'wx', 0o600).catch(() => null)
   if (lock === null) return false
+  let scratch: string | undefined
   let committed = false
   try {
-    await lock.writeFile(await readFile(configPath))
-    await lock.close()
+    const { mode } = await stat(configPath)
+    scratch = await mkdtemp(join(tmpdir(), 'typeclaw-git-config-'))
+    const draft = join(scratch, 'config')
+    await writeFile(draft, await readFile(configPath), { mode: 0o600 })
     for (const edit of edits) {
-      const result = await runGit(Bun, cwd, ['config', '--file', lockPath, ...edit], { env: localGitConfigEnv() })
+      const result = await runGit(Bun, cwd, ['config', '--file', draft, ...edit], { env: localGitConfigEnv() })
       // `--unset-all` exits 5 when the key is already absent, the desired end state.
       if (result.exitCode !== 0 && !(edit[0] === '--unset-all' && result.exitCode === 5)) return false
     }
+    await lock.writeFile(await readFile(draft))
+    await lock.chmod(mode & 0o7777)
+    await lock.close()
     await rename(lockPath, configPath)
     committed = true
     return true
@@ -142,6 +150,7 @@ export async function editLocalConfigAtomically(cwd: string, edits: readonly (re
   } finally {
     await lock.close().catch(() => {})
     if (!committed) await rm(lockPath, { force: true })
+    if (scratch !== undefined) await rm(scratch, { recursive: true, force: true })
   }
 }
 
