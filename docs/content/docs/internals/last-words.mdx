@@ -1,0 +1,82 @@
+---
+title: Last words
+description: What the agent was doing when its container died, recorded before the death and sealed by the host after it
+icon: ScrollText
+---
+
+An OOM kill is a `SIGKILL`: the runtime gets no chance to say anything. So the runtime writes its last words **ahead of time** and keeps them current, and the host, which survives the death, stamps the cause afterwards. The result is `<agentDir>/.typeclaw/last-words/last-words.json`, a short history of runs and how each one ended.
+
+## Who writes what
+
+| Writer                                                   | When                                                                                             | What                                                                                                                                                                                    |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime (`src/last-words/recorder.ts`)                   | Boot                                                                                             | Appends an `alive` entry for this run. Any earlier entry still `alive` becomes `vanished`.                                                                                              |
+| Runtime                                                  | Every 30 s, every 2 s once the container uses 85% of its memory limit                            | Rewrites the run's `words`. If the boot write failed, each tick retries it first.                                                                                                       |
+| Runtime                                                  | Graceful shutdown                                                                                | Marks the run `stopped` and drops its `words`. A clean stop is not a death. Shutdown waits at most 1 s for the lock; if it stays busy, `typeclaw stop` seals the run instead.           |
+| Host (`src/container/exit-reason.ts` `sealObservedExit`) | hostd's container probe, `typeclaw start` before it removes a stopped container, `typeclaw stop` | Marks the newest `alive` run `died` and adds `death`. A container that `typeclaw stop` itself shut down is sealed `stopped` instead, even when Docker had to `SIGKILL` a slow shutdown. |
+
+Every read-modify-write of the file, by the runtime or the host, holds one per-agent lock and rereads under it. hostd and a standalone `start` or `stop` can seal the same exit, and a seal of the previous execution can still be in flight when a restarted container's runtime opens its run, so no writer may publish a stale snapshot over a newer one. A lock left by a runtime killed mid-write goes stale after 10 s and is taken over. hostd seals run in the background, once per observed stop, so a stale lock never delays probes of other containers. A seal still pending when hostd itself shuts down is lost; if the container has meanwhile restarted, the next probe cannot observe that exit again, and the run stays `vanished`. A later `typeclaw start` or `stop` of a still-stopped container seals it as usual. Each write stages a copy and renames it over the file, so a reader never sees a torn file.
+
+A seal applies only to the run recorded by the execution that exited: same container ID, and booted between that execution's Docker `StartedAt` and `FinishedAt`. Docker keeps a container's ID across restarts, so without the time window an unobserved crash followed by a boot that dies before recording anything would pair the first run's words with the second exit. The runtime records only inside a container (`TYPECLAW_CONTAINER_NAME` set); an ad-hoc run outside Docker has no host to seal it.
+
+Memory is sampled every tick, so `recent` holds about the last minute of usage even between writes. Under pressure every tick writes, because the last write before the kill is the one the host keeps.
+
+## Shape
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "run": { "containerId": "5546e7d70c9e", "startedAt": "2026-11-16T14:25:59.313Z", "typeclawVersion": "1.2.3" },
+      "status": "died",
+      "writtenAt": "2026-11-18T05:18:31.000Z",
+      "words": {
+        "memory": {
+          "currentMb": 5980,
+          "limitMb": 6144,
+          "oomKills": 0,
+          "recent": [{ "at": "2026-11-18T05:18:31.000Z", "currentMb": 5980 }]
+        },
+        "runtime": { "rssMb": 2482, "heapUsedMb": 1155, "externalMb": 809 },
+        "turns": [
+          {
+            "origin": "channel",
+            "key": "github:acme:pr:279:",
+            "startedAt": "2026-11-18T05:17:06.000Z",
+            "tool": "webfetch"
+          }
+        ],
+        "children": [{ "kind": "readability", "rssMb": 314 }]
+      },
+      "death": {
+        "finishedAt": "2026-11-18T05:18:30.123456789Z",
+        "exitCode": 137,
+        "oomKilled": true,
+        "reason": "agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB). Restart the agent and reduce memory-heavy parallel work.",
+        "log": ".typeclaw/logs/<container-id>-<timestamp>.log",
+        "observedBy": "hostd"
+      }
+    }
+  ]
+}
+```
+
+- `status`: `alive` (running or not yet sealed), `stopped` (clean shutdown), `died` (unexpected exit, cause in `death`), `vanished` (the next run started before any host sealed this one, such as after a manual `docker rm`, a host reboot, or a Docker-level restart; words kept, and a host that still observes the exit seals it as `died`).
+- `writtenAt` vs `death.finishedAt` shows how stale the words were at the moment of death.
+- `memory` comes from the container's cgroup (`memory.current`, `memory.max`, `memory.events` `oom_kill`). Each field is `null` where the cgroup does not expose it.
+- `turns` lists agent turns in flight across every session (`tui`, `channel`, `cron`, `subagent`, `system`), with the tool each one was executing.
+- `children` lists each direct child process of the runtime with the RSS of its whole subtree, largest first, classified as `readability`, `sandbox` (bwrap bash), `browser`, `coding-agent`, or `other`.
+- `death.log` is the archived container log, relative to the agent directory, filled in by whichever host step archived it. hostd seals without a log; a later `start` or `stop` of the same exit adds it.
+
+The file keeps the newest 20 runs.
+
+## What never goes in
+
+Last words describe shape, not content. They hold origin keys, tool names, process kinds, and sizes. They never hold message text, tool arguments, URLs, command lines, or environment values: `src/last-words/probe.ts` reads command lines only to classify a process and discards them.
+
+The file, its staging copy, and the lock live in `.typeclaw/last-words/`, which the sandbox masks as a directory for every role (`CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS` in `src/sandbox/runtime-private.ts`). A directory mask has a stable target even though the file inside is replaced on every write, a leftover staging file stays hidden, and a model cannot rewrite its own last words. Read it on the host, or through `docker exec`.
+
+## Failure handling
+
+Last words are a diagnostic and never block anything. A missing or malformed file reads as empty. A runtime write failure is logged once (`[last-words] write failed: …`) and recording continues. A host seal failure is logged and the lifecycle step carries on. A run that fails to boot is left `alive` so the host seals it as a death.
