@@ -4,7 +4,6 @@ import {
   chmodSync,
   closeSync,
   constants,
-  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -26,6 +25,15 @@ export const CREDENTIAL_STAGING_RELATIVE_DIR = '.typeclaw/credential-staging'
 
 export type Rename = (from: string, to: string) => void
 export type WriteInPlace = (path: string, content: string | Buffer) => void
+// Test seams for a config (+ credential) publication: fail or observe a step
+// after writing has begun, or take the Windows path on any platform.
+export type PublishSeams = {
+  rename?: Rename
+  writeInPlace?: WriteInPlace
+  // Writes the bytes into the staged (already created, 0600) config copy.
+  writeStaged?: WriteInPlace
+  platform?: NodeJS.Platform
+}
 
 export function credentialStagingDir(agentDir: string): string {
   return join(agentDir, CREDENTIAL_STAGING_RELATIVE_DIR)
@@ -86,8 +94,10 @@ export function replaceFile(
 // is the link's target, so the link survives and keeps pointing at the updated
 // file, as an in-place write through it would. A read-only destination is
 // refused, as an in-place write to it would be. Elsewhere the content is
-// written in full to a gitignored copy beside the target, with its mode, for
-// `publishReplacement` to rename over it. On Windows no copy is made: a new
+// written in full to a gitignored copy beside the target for
+// `publishReplacement` to rename over it. The copy is created 0600 before any
+// byte is written (config can hold inline credentials, e.g. an MCP server's
+// env) and given the target's mode, or a new file's default, only once complete. On Windows no copy is made: a new
 // file object would take the directory's ACL in place of the file's own (a
 // config with a stricter explicit ACL would lose it), so the file is written
 // in place instead, with its prior bytes kept in memory for a failed write.
@@ -95,6 +105,7 @@ export function stageReplacement(
   path: string,
   content: string | Buffer,
   platform: NodeJS.Platform = process.platform,
+  writeStaged: WriteInPlace = writeExistingInPlace,
 ): StagedReplacement {
   const target = linkTarget(path)
   const mode = modeOrUndefined(target)
@@ -103,8 +114,9 @@ export function stageReplacement(
   if (platform === 'win32') return { path: target, content: bytes, temp: undefined, prior: readFileOrUndefined(target) }
   const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.typeclaw-tmp`)
   try {
-    writeFileSync(temp, bytes, { flag: 'wx' })
-    if (mode !== undefined) chmodSync(temp, mode)
+    closeSync(openSync(temp, 'wx', 0o600))
+    writeStaged(temp, bytes)
+    chmodSync(temp, mode ?? 0o666 & ~process.umask())
   } catch (error) {
     rmSync(temp, { force: true })
     throw error
@@ -135,7 +147,7 @@ export function publishReplacement(
       writeInPlace(staged.path, staged.prior)
     } catch (restoreError) {
       throw new ConfigRestoreError(
-        `${staged.path} could not be restored (${describe(restoreError)}) after a failed write (${describe(error)}); restore it with \`git checkout -- ${basename(staged.path)}\` in the agent folder.`,
+        `${staged.path} could not be restored (${describe(restoreError)}) after a failed write (${describe(error)}); restore it with \`git checkout -- ${basename(staged.path)}\` in the agent folder`,
       )
     }
     throw error
@@ -227,17 +239,8 @@ export function stageCredential(
 // unmasked one. On a failed write it is emptied in place instead.
 export function publishCredential(staged: StagedCredential, writeInPlace: WriteInPlace = writeExistingInPlace): void {
   if (staged.prior === undefined) {
-    const fd = openSync(staged.path, 'wx', 0o600)
+    closeSync(openSync(staged.path, 'wx', 0o600))
     staged.created = true
-    try {
-      writeFileSync(fd, staged.content)
-    } catch (error) {
-      ftruncateSync(fd, 0)
-      throw error
-    } finally {
-      closeSync(fd)
-    }
-    return
   }
   try {
     writeInPlace(staged.path, staged.content)
@@ -261,7 +264,7 @@ export function restoreCredential(
     const failure = `${staged.path} could not be restored (${describe(restoreError)})${cause === undefined ? '' : ` after a failed write (${describe(cause)})`}`
     throw new CredentialRestoreError(
       staged.prior === undefined
-        ? `${failure}; it did not exist before this command and now holds the new token(s); empty it by hand.`
+        ? `${failure}; it did not exist before this command and may still hold part of the new token(s). Empty ${staged.path} in place before retrying; do not delete it (a running sandbox may mask it).`
         : staged.priorCopy === undefined
           ? `${failure}; the previous token(s) in it could not be restored and must be re-entered in ${staged.path}.`
           : `${failure}; its previous content is saved at ${staged.priorCopy}. Copy that file's content back into ${staged.path} by hand.`,
@@ -283,7 +286,7 @@ export function publishConfigWithCredential(
   configPath: string,
   configBytes: string,
   credential: CredentialUpdate | undefined,
-  seams: { rename?: Rename; writeInPlace?: WriteInPlace; platform?: NodeJS.Platform } = {},
+  seams: PublishSeams = {},
 ): { ok: true } | { ok: false; reason: string } {
   const rename = seams.rename ?? renameSync
   const credentialName = credential === undefined ? undefined : basename(credential.path)
@@ -294,7 +297,7 @@ export function publishConfigWithCredential(
     if (credential !== undefined) {
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
-    configStaged = stageReplacement(configPath, configBytes, seams.platform)
+    configStaged = stageReplacement(configPath, configBytes, seams.platform, seams.writeStaged)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
       publishReplacement(configStaged, rename, seams.writeInPlace)

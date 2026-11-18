@@ -9,13 +9,7 @@ import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import {
-  credentialStagingDir,
-  publishConfigWithCredential,
-  type Rename,
-  replaceFile,
-  type WriteInPlace,
-} from '@/init/staged-write'
+import { credentialStagingDir, publishConfigWithCredential, type PublishSeams, replaceFile } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -940,7 +934,7 @@ export function writeConfigAndToken(
   raw: Record<string, unknown>,
   token: { env: string; value: string } | undefined,
   rerun: string,
-  seams: { rename?: Rename; writeInPlace?: WriteInPlace } = {},
+  seams: PublishSeams = {},
 ): LiveResult<void> {
   if (token !== undefined && hasEnvKey(cwd, token.env)) {
     return {

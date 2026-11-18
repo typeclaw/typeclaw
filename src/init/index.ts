@@ -46,7 +46,7 @@ import { buildHatchingPrompt } from './hatching'
 import type { OAuthLoginRunner, OAuthLoginResult } from './oauth-login'
 import { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 import { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
-import { credentialStagingDir, publishConfigWithCredential, type Rename } from './staged-write'
+import { credentialStagingDir, publishConfigWithCredential, type PublishSeams } from './staged-write'
 import { linkWindowsDevTypeclaw, type RunBunLink } from './windows-dev-link'
 
 export { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
@@ -1324,8 +1324,8 @@ export type AddChannelOptions = {
       repos: string[]
       auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
       fetchImpl?: typeof fetch
-      // Test seam: publishes the staged typeclaw.json (default renameSync).
-      configRename?: Rename
+      // Test seams for publishing typeclaw.json (and the token) together.
+      configPublishSeams?: PublishSeams
     }
 )
 
@@ -1581,7 +1581,7 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
       path,
       `${JSON.stringify(parsed, null, 2)}\n`,
       token,
-      options.channel === 'github' ? options.configRename : undefined,
+      options.channel === 'github' ? options.configPublishSeams : undefined,
     )
   })
 }
@@ -1595,7 +1595,7 @@ function writeConfigWithToken(
   configPath: string,
   configBytes: string,
   token: { env: string; value: string } | undefined,
-  rename?: Rename,
+  seams: PublishSeams = {},
 ): void {
   if (token !== undefined && hasEnvKey(cwd, token.env)) {
     throw new Error(
@@ -1611,12 +1611,7 @@ function writeConfigWithToken(
           content: withEnvKey(existsSync(envPath) ? readFileSync(envPath, 'utf8') : '', token.env, token.value),
           stagingDir: credentialStagingDir(cwd),
         }
-  const published = publishConfigWithCredential(
-    configPath,
-    configBytes,
-    credential,
-    rename === undefined ? {} : { rename },
-  )
+  const published = publishConfigWithCredential(configPath, configBytes, credential, seams)
   if (!published.ok) throw new Error(`failed to write ${CONFIG_FILE}: ${published.reason}`)
 }
 
