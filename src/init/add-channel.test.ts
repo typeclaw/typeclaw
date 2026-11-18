@@ -4,6 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { failingConfigPublish, INJECTED_CONFIG_PUBLISH_FAILURE } from '@/test-helpers/config-publish-seams'
+
 import { type AddChannelStepEvent, readConfiguredChannels, runAddChannel, scaffold, writeSecrets } from './index'
 import { runKakaotalkBootstrap } from './kakaotalk-auth'
 
@@ -642,6 +644,175 @@ describe('runAddChannel', () => {
     expect(cfg.channels?.github?.repos).toEqual(['acme/widgets'])
     expect(cfg.docker?.file?.cloudflared).toBe(true)
     expect(cfg.tunnels).toEqual([
+      { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } },
+    ])
+  })
+
+  test('refuses a named-tunnel github add over a standalone github-webhook, storing no token', async () => {
+    // given: an operator-added github-webhook tunnel, and an existing .env
+    const config = join(root, 'typeclaw.json')
+    const env = join(root, '.env')
+    const scaffolded = JSON.parse(await readFile(config, 'utf8')) as Record<string, unknown>
+    await writeFile(
+      config,
+      `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    await writeFile(env, 'OTHER=1\n')
+    const configBefore = await readFile(config, 'utf8')
+
+    // when/then: the add (carrying the token the operator was just prompted
+    // for) fails with the conflict, and neither typeclaw.json nor .env changes
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-named',
+        hostname: 'https://agent.example.com',
+        tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+        tokenValue: 'prompted-token',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+      }),
+    ).rejects.toThrow('already exists in typeclaw.json and is not owned by the GitHub channel')
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+  })
+
+  test('keeps typeclaw.json and .env byte-identical when the github config fails to publish', async () => {
+    // given: an existing .env and the scaffolded typeclaw.json
+    const config = join(root, 'typeclaw.json')
+    const env = join(root, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    const configBefore = await readFile(config, 'utf8')
+
+    // when/then: the token is written to .env, then publishing typeclaw.json
+    // fails on this path, and the add reports it
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-named',
+        hostname: 'https://agent.example.com',
+        tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+        tokenValue: 'prompted-token',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+        configPublishSeams: failingConfigPublish(),
+      }),
+    ).rejects.toThrow(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed; .env was restored.`)
+
+    // then: both files keep their original bytes
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+  })
+
+  test('stores the prompted named-tunnel token with the github config', async () => {
+    await runAddChannel({
+      cwd: root,
+      channel: 'github',
+      auth: { type: 'pat', pat: 'ghp_test' },
+      webhookSecret: 'wh-secret',
+      tunnelProvider: 'cloudflare-named',
+      hostname: 'https://agent.example.com',
+      tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+      tokenValue: 'prompted-token',
+      webhookPort: 8975,
+      repos: ['acme/widgets'],
+    })
+
+    expect(await readFile(join(root, '.env'), 'utf8')).toContain('CLOUDFLARE_TUNNEL_TOKEN=prompted-token\n')
+    const cfg = (await readConfig()) as { tunnels?: Array<{ name?: string; tokenEnv?: string }> }
+    expect(cfg.tunnels).toEqual([
+      expect.objectContaining({ name: 'github-webhook', tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN' }),
+    ])
+  })
+
+  test('refuses github when a standalone tunnel already owns the github-webhook name, writing nothing', async () => {
+    // given: an operator-added tunnel that happens to use the GitHub tunnel's name
+    const config = join(root, 'typeclaw.json')
+    const scaffolded = JSON.parse(await readFile(config, 'utf8')) as Record<string, unknown>
+    await writeFile(
+      config,
+      `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    const before = await readFile(config, 'utf8')
+
+    // when/then: the add fails with the conflict and typeclaw.json is untouched
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-quick',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+      }),
+    ).rejects.toThrow('already exists in typeclaw.json and is not owned by the GitHub channel')
+    expect(await readFile(config, 'utf8')).toBe(before)
+  })
+
+  test('replaces a github-webhook tunnel the GitHub channel already owns instead of duplicating it', async () => {
+    // given: a GitHub-owned tunnel left from an earlier attempt
+    const config = join(root, 'typeclaw.json')
+    const scaffolded = JSON.parse(await readFile(config, 'utf8')) as Record<string, unknown>
+    await writeFile(
+      config,
+      `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'other', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+            {
+              name: 'github-webhook',
+              provider: 'external',
+              externalUrl: 'https://old.example.com/gh',
+              for: { kind: 'channel', name: 'github' },
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    )
+
+    // when
+    await runAddChannel({
+      cwd: root,
+      channel: 'github',
+      auth: { type: 'pat', pat: 'ghp_test' },
+      webhookSecret: 'wh-secret',
+      tunnelProvider: 'cloudflare-quick',
+      webhookPort: 8975,
+      repos: ['acme/widgets'],
+    })
+
+    // then: the GitHub tunnel is replaced in place and the other tunnel is kept
+    const cfg = (await readConfig()) as { tunnels?: unknown[] }
+    expect(cfg.tunnels).toEqual([
+      { name: 'other', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
       { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } },
     ])
   })

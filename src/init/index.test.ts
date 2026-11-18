@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import * as z from 'zod'
 
 import { configSchema, dockerfileSchema } from '@/config/config'
+import { configFileLockPath } from '@/config/config-file-lock'
 import type { DockerExec } from '@/container'
 
 import { buildDockerfile, BUN_BASE_IMAGE } from './dockerfile'
@@ -951,6 +952,43 @@ describe('scaffold', () => {
 
     expect(await readFile(join(root, 'cron.json'), 'utf8')).toBe(original)
   })
+
+  test('an init retry replaces an existing typeclaw.json', async () => {
+    await writeFile(join(root, 'typeclaw.json'), '{"alias":["stale"]}\n')
+
+    await scaffold(root, { model: 'zai/glm-4.6' })
+
+    const config = JSON.parse(await readFile(join(root, 'typeclaw.json'), 'utf8')) as {
+      alias?: unknown
+      models: unknown
+    }
+    expect(config.alias).toBeUndefined()
+    expect(config.models).toEqual({ default: 'zai/glm-4.6' })
+    expect(existsSync(configFileLockPath(join(root, 'typeclaw.json')))).toBe(false)
+  })
+
+  test('an init retry does not replace typeclaw.json while another process holds its lock', async () => {
+    // given: an existing typeclaw.json whose lock another process holds
+    const config = join(root, 'typeclaw.json')
+    await writeFile(config, '{"alias":["mine"]}\n')
+    await writeFile(configFileLockPath(config), '')
+
+    // when/then: the retry waits for the lock, times out with the recovery
+    // step, and leaves the other writer's file untouched
+    await expect(scaffold(root)).rejects.toThrow(`rm "${configFileLockPath(config)}"`)
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["mine"]}\n')
+  }, 15_000)
+
+  test('a first init does not create typeclaw.json while another process holds its lock', async () => {
+    // given: no typeclaw.json yet, and another process holds its lock
+    const config = join(root, 'typeclaw.json')
+    await writeFile(configFileLockPath(config), '')
+
+    // when/then: scaffold waits for the lock, times out with the recovery
+    // step, and never creates the file
+    await expect(scaffold(root)).rejects.toThrow(`rm "${configFileLockPath(config)}"`)
+    expect(existsSync(config)).toBe(false)
+  }, 15_000)
 
   test('writes typeclaw.json that passes configSchema validation', async () => {
     await scaffold(root)
@@ -2101,6 +2139,88 @@ describe('channel secret reuse (init re-run preserves existing tokens)', () => {
       auth: { type: 'pat', token: { value: 'ghp_test' } },
       webhookSecret: { value: 'whsec_test' },
     })
+  })
+
+  test('runInit stores the prompted named-tunnel token with the github config', async () => {
+    await runInit({
+      cwd: root,
+      apiKey: 'fw_test_key',
+      withGithub: true,
+      githubCredentials: {
+        webhookSecret: 'whsec_test',
+        tunnelProvider: 'cloudflare-named',
+        hostname: 'https://agent.example.com',
+        tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+        tokenValue: 'prompted-token',
+        webhookPort: 8975,
+        repos: ['acme/repo-a'],
+        auth: { type: 'pat', pat: 'ghp_test' },
+      },
+      githubFetchImpl: okGithubFetch,
+      runHatching: okHatch,
+      runBunInstall: okInstall,
+      dockerExec: okDocker,
+    })
+
+    expect(await readFile(join(root, '.env'), 'utf8')).toContain('CLOUDFLARE_TUNNEL_TOKEN=prompted-token\n')
+    const config = JSON.parse(await readFile(join(root, 'typeclaw.json'), 'utf8')) as { tunnels?: unknown[] }
+    expect(config.tunnels).toEqual([
+      expect.objectContaining({ name: 'github-webhook', tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN' }),
+    ])
+  })
+
+  test('runInit stores no token when a tunnel add claims github-webhook before its locked github write', async () => {
+    // given: right after scaffolding, a concurrent `typeclaw tunnel add` claims
+    // the github-webhook name with a standalone tunnel
+    const config = join(root, 'typeclaw.json')
+    const env = join(root, '.env')
+    let configAtCheck = ''
+    let envAtCheck: string | undefined
+    const onProgress = (event: InitStepEvent) => {
+      if (event.step !== 'scaffold' || event.phase !== 'done') return
+      const scaffolded = JSON.parse(readFileSync(config, 'utf8')) as Record<string, unknown>
+      configAtCheck = `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+          ],
+        },
+        null,
+        2,
+      )}\n`
+      writeFileSync(config, configAtCheck)
+      envAtCheck = existsSync(env) ? readFileSync(env, 'utf8') : undefined
+    }
+
+    // when/then: the wizard's github write hits the collision under the lock
+    await expect(
+      runInit({
+        cwd: root,
+        apiKey: 'fw_test_key',
+        withGithub: true,
+        githubCredentials: {
+          webhookSecret: 'whsec_test',
+          tunnelProvider: 'cloudflare-named',
+          hostname: 'https://agent.example.com',
+          tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+          tokenValue: 'prompted-token',
+          webhookPort: 8975,
+          repos: ['acme/repo-a'],
+          auth: { type: 'pat', pat: 'ghp_test' },
+        },
+        onProgress,
+        githubFetchImpl: okGithubFetch,
+        runHatching: okHatch,
+        runBunInstall: okInstall,
+        dockerExec: okDocker,
+      }),
+    ).rejects.toThrow('already exists in typeclaw.json and is not owned by the GitHub channel')
+
+    // then: typeclaw.json and .env are exactly as the locked check found them
+    expect(configAtCheck).not.toBe('')
+    expect(await readFile(config, 'utf8')).toBe(configAtCheck)
+    expect(existsSync(env) ? readFileSync(env, 'utf8') : undefined).toBe(envAtCheck)
   })
 
   test('runInit with withGithub=true but no credentials is a no-op for github', async () => {

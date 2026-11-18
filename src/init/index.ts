@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
@@ -11,6 +11,8 @@ import {
   type Config,
   type CustomModelMeta,
 } from '@/config'
+import { isGithubChannelTunnel } from '@/config/channels-mutation'
+import { withConfigFileLock } from '@/config/config-file-lock'
 import {
   DEFAULT_MODEL_REF,
   KNOWN_PROVIDERS,
@@ -36,6 +38,7 @@ import { createTui } from '@/tui'
 
 import { resolveBaseImageVersion, resolveTypeclawSpec, typeclawCheckoutRoot } from './cli-version'
 import { buildDockerfile, DOCKERFILE } from './dockerfile'
+import { hasEnvKey, withEnvKey } from './env-file'
 import { CONFIG_FILE, findAgentDir, isInitialized } from './find-agent-dir'
 import { installGithubWebhooksEagerly, type EagerGithubWebhookInstallResult } from './github-webhook-install'
 import { buildGitignore, GITIGNORE_FILE } from './gitignore'
@@ -43,6 +46,7 @@ import { buildHatchingPrompt } from './hatching'
 import type { OAuthLoginRunner, OAuthLoginResult } from './oauth-login'
 import { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 import { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
+import { credentialStagingDir, publishConfigWithCredential, type PublishSeams } from './staged-write'
 import { linkWindowsDevTypeclaw, type RunBunLink } from './windows-dev-link'
 
 export { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
@@ -52,7 +56,7 @@ export { formatEagerGithubWebhookInstallResult, installGithubWebhooksEagerly } f
 
 export { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 
-export { appendOrReplaceEnvKey, hasEnvKey, readEnvFile } from './env-file'
+export { appendOrReplaceEnvKey, hasEnvKey, readEnvFile, storeEnvKeyUnlessPresent, withEnvKey } from './env-file'
 
 export { CONFIG_FILE, findAgentDir, isInitialized }
 
@@ -123,6 +127,9 @@ export type GithubInitCredentials = {
   // `externalUrl`.
   hostname?: string
   tokenEnv?: string
+  // A token the operator was just prompted for, stored in .env under
+  // `tokenEnv` together with the GitHub config write (see writeGithubChannelForInit).
+  tokenValue?: string
   repos: string[]
   auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
 }
@@ -728,7 +735,21 @@ export async function scaffold(root: string, options: ScaffoldOptions = {}): Pro
   // `owner` (runOwnerClaim, post-hatch) and explicitly grants others. GitHub is
   // wired separately and seeds per-repo `member.match` entries scoped to the
   // opted-in repos. See runOwnerClaim for the mute-until-claimed warning.
-  await writeFile(join(root, CONFIG_FILE), `${JSON.stringify(config, null, 2)}\n`)
+  // Both the first creation and an init retry's replacement happen under the
+  // config lock, taken before the file is opened: an exclusive create alone
+  // only protects the open, so a concurrent writer could otherwise rewrite the
+  // file while this one is still writing it. The create stays exclusive so a
+  // first init never clobbers a file another writer created meanwhile.
+  const configPath = join(root, CONFIG_FILE)
+  const configBytes = `${JSON.stringify(config, null, 2)}\n`
+  await withConfigFileLock(configPath, async () => {
+    try {
+      await writeFile(configPath, configBytes, { flag: 'wx' })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      await writeFile(configPath, configBytes)
+    }
+  })
 
   const cron = {
     $schema: './node_modules/typeclaw/cron.schema.json',
@@ -1297,9 +1318,14 @@ export type AddChannelOptions = {
       webhookPort?: number
       hostname?: string
       tokenEnv?: string
+      // A token the operator was just prompted for, stored in .env under
+      // `tokenEnv` together with the config write (see mergeChannelIntoConfig).
+      tokenValue?: string
       repos: string[]
       auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
       fetchImpl?: typeof fetch
+      // Test seams for publishing typeclaw.json (and the token) together.
+      configPublishSeams?: PublishSeams
     }
 )
 
@@ -1509,43 +1535,84 @@ export async function readConfiguredChannels(cwd: string): Promise<Set<ChannelKi
 }
 
 async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): Promise<void> {
-  const path = join(cwd, CONFIG_FILE)
-  let parsed: Record<string, unknown>
-  try {
-    const raw = await readFile(path, 'utf8')
-    parsed = JSON.parse(raw) as Record<string, unknown>
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(
-        `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` before adding channels, or run this command from inside an agent folder.`,
-      )
+  await withConfigFileLock(join(cwd, CONFIG_FILE), async () => {
+    const path = join(cwd, CONFIG_FILE)
+    let parsed: Record<string, unknown>
+    try {
+      const raw = await readFile(path, 'utf8')
+      parsed = JSON.parse(raw) as Record<string, unknown>
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error(
+          `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` before adding channels, or run this command from inside an agent folder.`,
+        )
+      }
+      throw error
     }
-    throw error
+
+    const existingChannels =
+      typeof parsed.channels === 'object' && parsed.channels !== null && !Array.isArray(parsed.channels)
+        ? (parsed.channels as Record<string, unknown>)
+        : {}
+
+    if (options.channel in existingChannels) {
+      // Defense in depth — the CLI already filters configured channels out of
+      // the picker and rejects them as the positional arg. Hitting this branch
+      // means a programmatic caller passed a duplicate; better to fail loudly
+      // than silently overwrite the user's existing config.
+      throw new Error(`Channel "${options.channel}" is already configured in ${CONFIG_FILE}.`)
+    }
+
+    const nextChannelConfig = options.channel === 'github' ? buildGithubChannelConfig(options) : {}
+
+    parsed.channels = {
+      ...existingChannels,
+      [options.channel]: nextChannelConfig,
+    }
+
+    if (options.channel === 'github') mergeGithubTunnelConfig(parsed, options)
+
+    const token =
+      options.channel === 'github' && options.tokenEnv !== undefined && options.tokenValue !== undefined
+        ? { env: options.tokenEnv, value: options.tokenValue }
+        : undefined
+    writeConfigWithToken(
+      cwd,
+      path,
+      `${JSON.stringify(parsed, null, 2)}\n`,
+      token,
+      options.channel === 'github' ? options.configPublishSeams : undefined,
+    )
+  })
+}
+
+// Runs under the config lock after every config check passed (for GitHub, the
+// github-webhook collision check), so a rejected add never touches .env. The
+// token is stored only if no other command stored the key since the prompt, and
+// it and typeclaw.json land together or not at all (`publishConfigWithCredential`).
+function writeConfigWithToken(
+  cwd: string,
+  configPath: string,
+  configBytes: string,
+  token: { env: string; value: string } | undefined,
+  seams: PublishSeams = {},
+): void {
+  if (token !== undefined && hasEnvKey(cwd, token.env)) {
+    throw new Error(
+      `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun the command to use the stored token.`,
+    )
   }
-
-  const existingChannels =
-    typeof parsed.channels === 'object' && parsed.channels !== null && !Array.isArray(parsed.channels)
-      ? (parsed.channels as Record<string, unknown>)
-      : {}
-
-  if (options.channel in existingChannels) {
-    // Defense in depth — the CLI already filters configured channels out of
-    // the picker and rejects them as the positional arg. Hitting this branch
-    // means a programmatic caller passed a duplicate; better to fail loudly
-    // than silently overwrite the user's existing config.
-    throw new Error(`Channel "${options.channel}" is already configured in ${CONFIG_FILE}.`)
-  }
-
-  const nextChannelConfig = options.channel === 'github' ? buildGithubChannelConfig(options) : {}
-
-  parsed.channels = {
-    ...existingChannels,
-    [options.channel]: nextChannelConfig,
-  }
-
-  if (options.channel === 'github') mergeGithubTunnelConfig(parsed, options)
-
-  await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+  const envPath = join(cwd, '.env')
+  const credential =
+    token === undefined
+      ? undefined
+      : {
+          path: envPath,
+          content: withEnvKey(existsSync(envPath) ? readFileSync(envPath, 'utf8') : '', token.env, token.value),
+          stagingDir: credentialStagingDir(cwd),
+        }
+  const published = publishConfigWithCredential(configPath, configBytes, credential, seams)
+  if (!published.ok) throw new Error(`failed to write ${CONFIG_FILE}: ${published.reason}`)
 }
 
 function buildGithubChannelConfig(options: Extract<AddChannelOptions, { channel: 'github' }>): Record<string, unknown> {
@@ -1576,9 +1643,21 @@ function mergeGithubTunnelConfig(
     }
   }
 
-  const existingTunnels = Array.isArray(parsed.tunnels) ? parsed.tunnels : []
+  const existingTunnels: unknown[] = Array.isArray(parsed.tunnels) ? parsed.tunnels : []
   const tunnel = buildGithubTunnelEntry(options)
-  parsed.tunnels = [...existingTunnels, tunnel]
+  // Callers run this on the config as read under the lock. A tunnel already
+  // using the name is replaced only when the GitHub channel owns it (an init
+  // retry); a standalone one is the operator's, so nothing is written.
+  const sameName = existingTunnels.find((entry) => isObjectRecord(entry) && entry.name === tunnel.name)
+  if (sameName !== undefined && !isGithubChannelTunnel(sameName)) {
+    throw new Error(
+      `A tunnel named "${String(tunnel.name)}" already exists in ${CONFIG_FILE} and is not owned by the GitHub channel; nothing was written. Remove or rename it (\`typeclaw tunnel remove ${String(tunnel.name)}\`), then rerun.`,
+    )
+  }
+  parsed.tunnels =
+    sameName === undefined
+      ? [...existingTunnels, tunnel]
+      : existingTunnels.map((entry) => (entry === sameName ? tunnel : entry))
 
   if (options.tunnelProvider === 'cloudflare-quick' || options.tunnelProvider === 'cloudflare-named') {
     const docker = isObjectRecord(parsed.docker) ? { ...parsed.docker } : {}
@@ -1625,16 +1704,22 @@ function buildGithubTunnelEntry(options: Extract<AddChannelOptions, { channel: '
 // because its set-union is already idempotent.
 async function writeGithubChannelForInit(cwd: string, credentials: GithubInitCredentials): Promise<void> {
   const configPath = join(cwd, CONFIG_FILE)
-  const parsed = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>
-  const existingChannels = isObjectRecord(parsed.channels) ? { ...parsed.channels } : {}
-  existingChannels.github = {
-    ...(credentials.webhookUrl !== undefined ? { webhookUrl: credentials.webhookUrl } : {}),
-    webhookPort: credentials.webhookPort ?? 8975,
-    repos: credentials.repos,
-  }
-  parsed.channels = existingChannels
-  mergeGithubTunnelConfig(parsed, { channel: 'github', ...credentials, cwd })
-  await writeFile(configPath, `${JSON.stringify(parsed, null, 2)}\n`)
+  await withConfigFileLock(configPath, async () => {
+    const parsed = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>
+    const existingChannels = isObjectRecord(parsed.channels) ? { ...parsed.channels } : {}
+    existingChannels.github = {
+      ...(credentials.webhookUrl !== undefined ? { webhookUrl: credentials.webhookUrl } : {}),
+      webhookPort: credentials.webhookPort ?? 8975,
+      repos: credentials.repos,
+    }
+    parsed.channels = existingChannels
+    mergeGithubTunnelConfig(parsed, { channel: 'github', ...credentials, cwd })
+    const token =
+      credentials.tokenEnv !== undefined && credentials.tokenValue !== undefined
+        ? { env: credentials.tokenEnv, value: credentials.tokenValue }
+        : undefined
+    writeConfigWithToken(cwd, configPath, `${JSON.stringify(parsed, null, 2)}\n`, token)
+  })
 
   const backend = new SecretsBackend(join(cwd, 'secrets.json'))
   const channels: Record<string, unknown> = backend.readChannelsSync()
@@ -1685,17 +1770,19 @@ async function appendGithubSecrets(
 }
 
 async function appendGithubMatchRules(cwd: string, repos: readonly string[]): Promise<void> {
-  const path = join(cwd, CONFIG_FILE)
-  const parsed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
-  const roles = isObjectRecord(parsed.roles) ? { ...parsed.roles } : {}
-  const member = isObjectRecord(roles.member) ? { ...roles.member } : {}
-  const existing = Array.isArray(member.match) ? member.match.filter((v): v is string => typeof v === 'string') : []
-  const merged = new Set(existing)
-  for (const repo of repos) merged.add(`github:${repo}`)
-  member.match = Array.from(merged)
-  roles.member = member
-  parsed.roles = roles
-  await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+  await withConfigFileLock(join(cwd, CONFIG_FILE), async () => {
+    const path = join(cwd, CONFIG_FILE)
+    const parsed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+    const roles = isObjectRecord(parsed.roles) ? { ...parsed.roles } : {}
+    const member = isObjectRecord(roles.member) ? { ...roles.member } : {}
+    const existing = Array.isArray(member.match) ? member.match.filter((v): v is string => typeof v === 'string') : []
+    const merged = new Set(existing)
+    for (const repo of repos) merged.add(`github:${repo}`)
+    member.match = Array.from(merged)
+    roles.member = member
+    parsed.roles = roles
+    await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+  })
 }
 
 // Writes per-adapter field values into `secrets.json#channels.<adapter>`.

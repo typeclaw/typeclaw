@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { commitSystemFileSync } from '@/git/system-commit'
 
 import { BUILTIN_ROLES, isBuiltinRoleName } from './builtins'
@@ -33,37 +34,39 @@ export type GrantPermissionOptions = {
 }
 
 export function grantRole(opts: GrantOptions): GrantResult {
-  const validation = parseMatchRule(opts.matchRule)
-  if (!validation.ok) {
-    return { ok: false, reason: `invalid match rule '${opts.matchRule}': ${validation.error}` }
-  }
+  const result = underConfigLock(opts.cwd, () => {
+    const validation = parseMatchRule(opts.matchRule)
+    if (!validation.ok) {
+      return { ok: false, reason: `invalid match rule '${opts.matchRule}': ${validation.error}` }
+    }
 
-  const loaded = loadConfigObject(opts.cwd, opts.roleName)
-  if (!loaded.ok) return loaded
+    const loaded = loadConfigObject(opts.cwd, opts.roleName)
+    if (!loaded.ok) return loaded
 
-  const { obj, roles, role } = loaded
-  const existingMatch = Array.isArray(role.match) ? [...(role.match as unknown[])] : []
+    const { obj, roles, role } = loaded
+    const existingMatch = Array.isArray(role.match) ? [...(role.match as unknown[])] : []
 
-  // Dedup by exact string equality — match rules canonicalize during load,
-  // and a literal duplicate in the file is a noise source the schema doesn't
-  // currently dedupe for us.
-  if (existingMatch.includes(opts.matchRule)) {
-    return { ok: true, added: false }
-  }
+    // Dedup by exact string equality — match rules canonicalize during load,
+    // and a literal duplicate in the file is a noise source the schema doesn't
+    // currently dedupe for us.
+    if (existingMatch.includes(opts.matchRule)) {
+      return { ok: true, added: false }
+    }
 
-  role.match = [...existingMatch, opts.matchRule]
-  roles[opts.roleName] = role
-  obj.roles = roles
+    role.match = [...existingMatch, opts.matchRule]
+    roles[opts.roleName] = role
+    obj.roles = roles
 
-  const written = writeConfigObject(opts.cwd, obj)
-  if (!written.ok) return written
+    return writeConfigObject(opts.cwd, obj)
+  })
 
   // Best-effort commit so a claimed role survives a fresh clone/rebuild — a
   // failing commit leaves the on-disk grant intact (history, not correctness).
   // Subject stays neutral: every grantRole caller hits this, not just claim.
-  commitSystemFileSync(opts.cwd, CONFIG_FILE, `${CONFIG_FILE}: grant ${opts.roleName} role`)
-
-  return written
+  if (result.ok && result.added) {
+    commitSystemFileSync(opts.cwd, CONFIG_FILE, `${CONFIG_FILE}: grant ${opts.roleName} role`)
+  }
+  return result
 }
 
 // Appends `permission` to `typeclaw.json#roles.<name>.permissions`. For a
@@ -79,21 +82,33 @@ export function grantRole(opts: GrantOptions): GrantResult {
 // lands on disk but does not take effect until the next container restart.
 // Callers must surface that to the operator.
 export function grantRolePermission(opts: GrantPermissionOptions): GrantResult {
-  const loaded = loadConfigObject(opts.cwd, opts.roleName)
-  if (!loaded.ok) return loaded
+  return underConfigLock(opts.cwd, () => {
+    const loaded = loadConfigObject(opts.cwd, opts.roleName)
+    if (!loaded.ok) return loaded
 
-  const { obj, roles, role } = loaded
-  const effective = effectivePermissions(opts.roleName, role)
+    const { obj, roles, role } = loaded
+    const effective = effectivePermissions(opts.roleName, role)
 
-  if (effective.includes(opts.permission)) {
-    return { ok: true, added: false }
+    if (effective.includes(opts.permission)) {
+      return { ok: true, added: false }
+    }
+
+    role.permissions = [...effective, opts.permission]
+    roles[opts.roleName] = role
+    obj.roles = roles
+
+    return writeConfigObject(opts.cwd, obj)
+  })
+}
+
+// A busy config lock is a grant failure like any other, so role claim and
+// grant_role reply with it instead of throwing past their error paths.
+function underConfigLock(cwd: string, grant: () => GrantResult): GrantResult {
+  try {
+    return withConfigFileLockSync(join(cwd, CONFIG_FILE), grant)
+  } catch (error) {
+    return { ok: false, reason: describeError(error) }
   }
-
-  role.permissions = [...effective, opts.permission]
-  roles[opts.roleName] = role
-  obj.roles = roles
-
-  return writeConfigObject(opts.cwd, obj)
 }
 
 function effectivePermissions(roleName: string, role: Record<string, unknown>): string[] {

@@ -38,7 +38,6 @@ import {
   type DockerAvailability,
 } from '@/container'
 import {
-  appendOrReplaceEnvKey,
   findAgentDir,
   formatEagerGithubWebhookInstallResult,
   hasEnvKey,
@@ -1813,7 +1812,11 @@ async function runGithubFlow(cwd: string): Promise<StepResult<CollectedInputs['c
   })
 }
 
-async function promptGithubCloudflareNamedTunnel(cwd: string): Promise<{ hostname: string; tokenEnv: string } | null> {
+// Returns the token rather than storing it: runInit stores it under the config
+// lock with the GitHub config, once the github-webhook collision check passed.
+async function promptGithubCloudflareNamedTunnel(
+  cwd: string,
+): Promise<{ hostname: string; tokenEnv: string; tokenValue?: string } | null> {
   const tokenEnv = 'CLOUDFLARE_TUNNEL_TOKEN'
   note(
     [
@@ -1836,7 +1839,7 @@ async function promptGithubCloudflareNamedTunnel(cwd: string): Promise<{ hostnam
       validate: (v) => (v && v.length > 0 ? undefined : 'Token is required'),
     })
     if (isCancel(token)) return null
-    appendOrReplaceEnvKey(cwd, tokenEnv, token)
+    return { hostname, tokenEnv, tokenValue: token }
   }
   return { hostname, tokenEnv }
 }

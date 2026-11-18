@@ -2,6 +2,7 @@ import {
   AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
   LEGACY_AGENT_MESSENGER_CONFIG_RELATIVE_DIR,
 } from '@/agent-messenger/config-dir'
+import { CREDENTIAL_STAGING_RELATIVE_DIR } from '@/init/staged-write'
 
 // The managed Chrome profile: cookies and logins persist across container restarts.
 export const BROWSER_PROFILE_RELATIVE_DIR = '.typeclaw/browser-profile'
@@ -16,6 +17,7 @@ export const RUNTIME_OWNED_SECRET_DIRS = [
   '.typeclaw/home',
   '.typeclaw/logs',
   BROWSER_PROFILE_RELATIVE_DIR,
+  CREDENTIAL_STAGING_RELATIVE_DIR,
   // TypeVault (typevault.enabled): the agent's machine key and typevault's
   // private state, and the vault itself, which holds the secrets.json envelope.
   // Mirrors src/typevault/vault.ts; kept as literals so the sandbox does not

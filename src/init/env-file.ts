@@ -1,6 +1,16 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { withConfigFileLockSync } from '@/config/config-file-lock'
+
+import {
+  CredentialRestoreError,
+  credentialStagingDir,
+  discardCredentialStaging,
+  publishCredential,
+  stageCredential,
+} from './staged-write'
+
 const ENV_FILE = '.env'
 
 // Parse the agent's `.env` into a key-value map, mirroring Docker's
@@ -69,6 +79,59 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
   } catch (err) {
     if (!(err instanceof Error) || !('code' in err) || err.code !== 'ENOENT') throw err
   }
+  writeFileSync(path, withEnvKey(raw, key, value), 'utf8')
+}
+
+// Stores a token an operator was just prompted for, unless another typeclaw
+// command stored `key` while the prompt was open. The recheck and the write
+// happen under the typeclaw.json config lock, the same lock `typeclaw tunnel`
+// holds while it writes its token, so no command overwrites another's
+// credential. The update is staged in the masked credential staging dir and
+// written over .env in place (a running sandbox's mask is bound to its inode),
+// with the prior content put back if the write fails.
+export function storeEnvKeyUnlessPresent(
+  cwd: string,
+  key: string,
+  value: string,
+): { ok: true } | { ok: false; reason: string } {
+  try {
+    return withConfigFileLockSync(join(cwd, 'typeclaw.json'), () => {
+      if (hasEnvKey(cwd, key)) {
+        return {
+          ok: false,
+          reason: `${key} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun this command to use the stored token.`,
+        }
+      }
+      const path = join(cwd, ENV_FILE)
+      let raw = ''
+      try {
+        raw = readFileSync(path, 'utf8')
+      } catch (err) {
+        if (!(err instanceof Error) || !('code' in err) || err.code !== 'ENOENT') throw err
+      }
+      const staged = stageCredential(path, withEnvKey(raw, key, value), credentialStagingDir(cwd))
+      let keepPriorCopy = false
+      try {
+        publishCredential(staged)
+      } catch (error) {
+        keepPriorCopy = error instanceof CredentialRestoreError
+        throw error
+      } finally {
+        discardCredentialStaging(staged, keepPriorCopy)
+      }
+      return { ok: true }
+    })
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `could not store ${key} in .env: ${error instanceof Error ? error.message : String(error)}`,
+    }
+  }
+}
+
+// The `.env` content `appendOrReplaceEnvKey` writes, for callers that write it
+// themselves.
+export function withEnvKey(raw: string, key: string, value: string): string {
   const lines = raw.length === 0 ? [] : raw.split(/\r?\n/)
   // `"foo\n".split(/\r?\n/)` returns `["foo", ""]` — strip that phantom
   // trailing empty element so the rebuilt output ends in exactly one newline
@@ -85,6 +148,5 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
     return `${bom}${key}=${value}`
   })
   if (!replaced) next.push(`${key}=${value}`)
-  const out = `${next.join('\n')}\n`
-  writeFileSync(path, out, 'utf8')
+  return `${next.join('\n')}\n`
 }

@@ -1,9 +1,61 @@
 import { describe, expect, test } from 'bun:test'
+import { readdirSync, statSync } from 'node:fs'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { appendOrReplaceEnvKey, hasEnvKey, readEnvFile } from './env-file'
+import { configFileLockPath } from '@/config/config-file-lock'
+
+import { appendOrReplaceEnvKey, hasEnvKey, readEnvFile, storeEnvKeyUnlessPresent } from './env-file'
+import { credentialStagingDir } from './staged-write'
+
+describe('storeEnvKeyUnlessPresent', () => {
+  test.skipIf(process.platform === 'win32')('stores the token in a new owner-only .env', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+
+    expect(storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'tok')).toEqual({ ok: true })
+
+    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe('CLOUDFLARE_TUNNEL_TOKEN=tok\n')
+    expect(statSync(join(cwd, '.env')).mode & 0o777).toBe(0o600)
+    expect(readdirSync(credentialStagingDir(cwd))).toEqual([])
+  })
+
+  test('refuses to overwrite a key another command stored, leaving .env untouched', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    await writeFile(join(cwd, '.env'), 'CLOUDFLARE_TUNNEL_TOKEN=theirs\n')
+
+    const result = storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'mine')
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('was stored in .env by another typeclaw command')
+    expect(await readFile(join(cwd, '.env'), 'utf8')).toBe('CLOUDFLARE_TUNNEL_TOKEN=theirs\n')
+  })
+
+  test('rechecks the key under the config lock after another holder releases it', async () => {
+    // given: another process holds the typeclaw.json lock, stores the key, then releases
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-envfile-'))
+    const env = join(cwd, '.env')
+    const lock = configFileLockPath(join(cwd, 'typeclaw.json'))
+    await writeFile(lock, '')
+    const holder = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(env)}, 'CLOUDFLARE_TUNNEL_TOKEN=theirs\\n'); fs.unlinkSync(${JSON.stringify(lock)})`,
+      ],
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+
+    // when: this command stores the same key while the lock is held
+    const result = storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'mine')
+
+    // then: it waited for the holder, saw its token, and kept it
+    expect(await holder.exited).toBe(0)
+    expect(result.ok).toBe(false)
+    expect(await readFile(env, 'utf8')).toBe('CLOUDFLARE_TUNNEL_TOKEN=theirs\n')
+  })
+})
 
 describe('readEnvFile', () => {
   test('returns an empty map when .env is missing', async () => {

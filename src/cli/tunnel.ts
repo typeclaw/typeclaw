@@ -1,12 +1,20 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
-import { loadConfigSync, validateConfig } from '@/config'
+import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
+import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
-import { appendOrReplaceEnvKey, findAgentDir, hasEnvKey, isInitialized } from '@/init'
+import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
+import {
+  credentialStagingDir,
+  publishConfigWithCredential,
+  type PublishSeams,
+  writeConfigInPlace,
+} from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -307,6 +315,7 @@ export async function runTunnelAddFlow(
   }
   let hostname: string | undefined
   let tokenEnv: string | undefined
+  let tokenValue: string | undefined
   if (provider === 'cloudflare-named') {
     hostname =
       args.hostname ??
@@ -326,6 +335,7 @@ export async function runTunnelAddFlow(
     if (args.provider === undefined) {
       const tokenPromptResult = await maybePromptTunnelTokenValue(cwd, tokenEnv, prompts)
       if (!tokenPromptResult.ok) return tokenPromptResult
+      tokenValue = tokenPromptResult.value
     }
   }
 
@@ -338,34 +348,53 @@ export async function runTunnelAddFlow(
     ...(hostname !== undefined ? { hostname } : {}),
     ...(tokenEnv !== undefined ? { tokenEnv } : {}),
   }
-  const raw = readRawConfig(cwd)
-  raw.tunnels = [...config.tunnels, tunnel]
-  if (provider === 'cloudflare-quick' || provider === 'cloudflare-named') {
-    raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
-  }
-  writeRawConfig(cwd, raw)
-  loadConfigSync(cwd)
-  return { ok: true, value: tunnel }
+  // The prompts above can take a while, so another writer may have changed the
+  // tunnels since they were read; append to the tunnels as they are now.
+  const added = withConfigFileLockSync(join(cwd, 'typeclaw.json'), (): LiveResult<TunnelConfig> => {
+    const current = readTunnelsInLock(cwd)
+    if (!current.ok) return current
+    if (current.value.some((entry) => entry.name === name)) {
+      return {
+        ok: false,
+        reason: `tunnel "${name}" was added by another typeclaw.json writer while this add was in progress; nothing was written. Rerun \`typeclaw tunnel add\` with a different name.`,
+      }
+    }
+    const raw = readRawConfig(cwd)
+    raw.tunnels = [...current.value, tunnel]
+    if (provider === 'cloudflare-quick' || provider === 'cloudflare-named') {
+      raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
+    }
+    const token = tokenEnv !== undefined && tokenValue !== undefined ? { env: tokenEnv, value: tokenValue } : undefined
+    const written = writeConfigAndToken(cwd, raw, token, 'typeclaw tunnel add')
+    if (!written.ok) return written
+    return { ok: true, value: tunnel }
+  })
+  if (added.ok) loadConfigSync(cwd)
+  return added
 }
 
 export function runTunnelRemoveFlow(cwd: string, args: RemoveArgs): LiveResult<{ removed: TunnelConfig }> {
   // Same strict gate as `runTunnelAddFlow`. See the comment there for why.
   const validation = validateConfig(cwd)
   if (!validation.ok) return { ok: false, reason: validation.reason }
-  const config = loadConfigSync(cwd)
-  const tunnel = config.tunnels.find((entry) => entry.name === args.name)
-  if (tunnel === undefined) return { ok: false, reason: `unknown tunnel: ${args.name}` }
-  if (tunnel.for.kind === 'channel') {
-    return {
-      ok: false,
-      reason: `tunnel "${args.name}" is owned by channel "${tunnel.for.name}". Use \`typeclaw tunnel set ${args.name}\` to change its provider/URL, or hand-edit typeclaw.json to remove both the channel block and the tunnel.`,
+  const removed = withConfigFileLockSync(join(cwd, 'typeclaw.json'), (): LiveResult<{ removed: TunnelConfig }> => {
+    const current = readTunnelsInLock(cwd)
+    if (!current.ok) return current
+    const tunnel = current.value.find((entry) => entry.name === args.name)
+    if (tunnel === undefined) return { ok: false, reason: `unknown tunnel: ${args.name}` }
+    if (tunnel.for.kind === 'channel') {
+      return {
+        ok: false,
+        reason: `tunnel "${args.name}" is owned by channel "${tunnel.for.name}". Use \`typeclaw tunnel set ${args.name}\` to change its provider/URL, or hand-edit typeclaw.json to remove both the channel block and the tunnel.`,
+      }
     }
-  }
-  const raw = readRawConfig(cwd)
-  raw.tunnels = config.tunnels.filter((entry) => entry.name !== args.name)
-  writeRawConfig(cwd, raw)
-  loadConfigSync(cwd)
-  return { ok: true, value: { removed: tunnel } }
+    const raw = readRawConfig(cwd)
+    raw.tunnels = current.value.filter((entry) => entry.name !== args.name)
+    writeRawConfig(cwd, raw)
+    return { ok: true, value: { removed: tunnel } }
+  })
+  if (removed.ok) loadConfigSync(cwd)
+  return removed
 }
 
 export async function runTunnelSetFlow(
@@ -511,31 +540,46 @@ export async function runTunnelSetFlow(
     ...(nextTokenEnv !== undefined ? { tokenEnv: nextTokenEnv } : {}),
   }
 
+  let tokenValue: string | undefined
   if (interactive && next.provider === 'cloudflare-named' && next.tokenEnv !== undefined) {
     const tokenPromptResult = await maybePromptTunnelTokenValue(cwd, next.tokenEnv, prompts)
     if (!tokenPromptResult.ok) return tokenPromptResult
+    tokenValue = tokenPromptResult.value
   }
 
-  const raw = readRawConfig(cwd)
-  raw.tunnels = config.tunnels.map((entry) => (entry.name === existing.name ? next : entry))
-  if (nextProvider === 'cloudflare-quick' || nextProvider === 'cloudflare-named') {
-    raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
-  }
-  writeRawConfig(cwd, raw)
-  // The strict gate above already validated the on-disk shape; calling
-  // validateConfig again here catches any post-write schema violation (e.g.
-  // a provider/field combination the explicit checks above missed) and
-  // surfaces it as a clean LiveResult instead of a thrown error on the next
-  // `loadConfigSync`. We roll back the file on failure so the user's
-  // typeclaw.json doesn't end up in an invalid state.
-  const postWrite = validateConfig(cwd)
-  if (!postWrite.ok) {
-    raw.tunnels = config.tunnels
-    writeRawConfig(cwd, raw)
-    return { ok: false, reason: postWrite.reason }
-  }
-  loadConfigSync(cwd)
-  return { ok: true, value: next }
+  // The prompts above can take a while, so another writer may have changed or
+  // removed this tunnel since it was read. Edit it only if it is still exactly
+  // the entry the new values were built from.
+  const updated = withConfigFileLockSync(join(cwd, 'typeclaw.json'), (): LiveResult<TunnelConfig> => {
+    const current = readTunnelsInLock(cwd)
+    if (!current.ok) return current
+    const fresh = current.value.find((entry) => entry.name === existing.name)
+    if (fresh === undefined || !isDeepStrictEqual(fresh, existing)) {
+      return {
+        ok: false,
+        reason: `tunnel "${existing.name}" was ${fresh === undefined ? 'removed' : 'changed'} by another typeclaw.json writer while this edit was in progress; nothing was written. Rerun \`typeclaw tunnel set ${existing.name}\` against the current config.`,
+      }
+    }
+    const raw = readRawConfig(cwd)
+    raw.tunnels = current.value.map((entry) => (entry.name === existing.name ? next : entry))
+    if (nextProvider === 'cloudflare-quick' || nextProvider === 'cloudflare-named') {
+      raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
+    }
+    // The strict gate above already validated the on-disk shape; validating the
+    // new bytes here catches any schema violation (e.g. a provider/field
+    // combination the explicit checks above missed) and surfaces it as a clean
+    // LiveResult before anything is written, so typeclaw.json never ends up
+    // in an invalid state.
+    const check = parseConfigJson(JSON.stringify(raw))
+    if (!check.ok) return check
+    const token =
+      next.tokenEnv !== undefined && tokenValue !== undefined ? { env: next.tokenEnv, value: tokenValue } : undefined
+    const written = writeConfigAndToken(cwd, raw, token, `typeclaw tunnel set ${existing.name}`)
+    if (!written.ok) return written
+    return { ok: true, value: next }
+  })
+  if (updated.ok) loadConfigSync(cwd)
+  return updated
 }
 
 function collectSetFlagFields(args: SetArgs): TunnelSetField[] {
@@ -773,11 +817,13 @@ async function resolveExistingTunnelName(
   return { ok: true, value: choice }
 }
 
+// Prompts for the token value; the caller stores it in .env only once its
+// typeclaw.json write has won.
 async function maybePromptTunnelTokenValue(
   cwd: string,
   tokenEnv: string,
   prompts: TunnelPrompts,
-): Promise<LiveResult<void>> {
+): Promise<LiveResult<string | undefined>> {
   if (hasEnvKey(cwd, tokenEnv)) return { ok: true, value: undefined }
   if (prompts.password === undefined) return { ok: true, value: undefined }
   const value = await prompts.password(`Cloudflare tunnel token (will be written to .env as ${tokenEnv})`, (v) =>
@@ -787,8 +833,7 @@ async function maybePromptTunnelTokenValue(
     cancel('Aborted.')
     process.exit(0)
   }
-  appendOrReplaceEnvKey(cwd, tokenEnv, value)
-  return { ok: true, value: undefined }
+  return { ok: true, value }
 }
 
 async function resolveProvider(input: string | undefined, prompts: TunnelPrompts): Promise<TunnelProvider> {
@@ -885,6 +930,59 @@ function ensureAgentDir(): string {
   return cwd
 }
 
+// Called under the config lock once a flow has won its typeclaw.json write.
+// The prompted token is stored only if no other command stored that key since
+// the prompt; the token and config then land together or not at all
+// (`publishConfigWithCredential`). `seams` let tests fail a publish step.
+export function writeConfigAndToken(
+  cwd: string,
+  raw: Record<string, unknown>,
+  token: { env: string; value: string } | undefined,
+  rerun: string,
+  seams: PublishSeams = {},
+): LiveResult<void> {
+  if (token !== undefined && hasEnvKey(cwd, token.env)) {
+    return {
+      ok: false,
+      reason: `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun \`${rerun}\` to use the stored token.`,
+    }
+  }
+  const envPath = join(cwd, '.env')
+  const credential =
+    token === undefined
+      ? undefined
+      : {
+          path: envPath,
+          content: withEnvKey(readFileOrUndefined(envPath)?.toString('utf8') ?? '', token.env, token.value),
+          stagingDir: credentialStagingDir(cwd),
+        }
+  const published = publishConfigWithCredential(
+    join(cwd, 'typeclaw.json'),
+    `${JSON.stringify(raw, null, 2)}\n`,
+    credential,
+    seams,
+  )
+  return published.ok
+    ? { ok: true, value: undefined }
+    : { ok: false, reason: `failed to store the tunnel: ${published.reason}` }
+}
+
+function readFileOrUndefined(path: string): Buffer | undefined {
+  try {
+    return readFileSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+// Tunnels as typeclaw.json holds them now. Parsed without persisting a
+// migration, so nothing under the config lock commits to git.
+function readTunnelsInLock(cwd: string): LiveResult<TunnelConfig[]> {
+  const parsed = parseConfigJson(readFileSync(join(cwd, 'typeclaw.json'), 'utf8'))
+  return parsed.ok ? { ok: true, value: parsed.config.tunnels } : parsed
+}
+
 function readRawConfig(cwd: string): Record<string, unknown> {
   const file = join(cwd, 'typeclaw.json')
   try {
@@ -896,7 +994,7 @@ function readRawConfig(cwd: string): Record<string, unknown> {
 }
 
 function writeRawConfig(cwd: string, config: Record<string, unknown>): void {
-  writeFileSync(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+  writeConfigInPlace(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

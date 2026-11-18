@@ -1,7 +1,9 @@
+import type { Stats } from 'node:fs'
 import { lstat, mkdir, opendir, writeFile } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { CREDENTIAL_STAGING_RELATIVE_DIR, ensureOwnerOnlyDir } from '@/init/staged-write'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import type { PermissionService } from '@/permissions/permissions'
 
@@ -100,9 +102,22 @@ export async function verifyHiddenMaskTargets(hidden: HiddenPaths): Promise<void
 }
 
 async function ensureRequiredDirMaskTarget(target: string): Promise<string> {
-  await mkdir(target, { recursive: true }).catch(() => {})
+  if (isCredentialStagingDir(target)) {
+    // Credentials are staged here, so it is created (or tightened) owner-only.
+    // Staging itself refuses a directory it cannot make 0700, so a failure here
+    // only leaves the mask to verify, as for any other directory.
+    try {
+      ensureOwnerOnlyDir(target)
+    } catch {}
+  } else {
+    await mkdir(target, { recursive: true }).catch(() => {})
+  }
   await verifyRequiredMaskTarget(target, 'dir')
   return target
+}
+
+function isCredentialStagingDir(target: string): boolean {
+  return target.endsWith(`${sep}${CREDENTIAL_STAGING_RELATIVE_DIR.split('/').join(sep)}`)
 }
 
 async function ensureRequiredFileMaskTarget(target: string): Promise<string> {
@@ -139,7 +154,11 @@ async function rejectHardlinksUnderCanonicalDir(root: string): Promise<void> {
   await rejectHardlinkAliases(root, MAX_CANONICAL_SECRET_SCAN_ENTRIES)
 }
 
-export async function rejectHardlinkAliases(root: string, maxEntries = Number.POSITIVE_INFINITY): Promise<void> {
+export async function rejectHardlinkAliases(
+  root: string,
+  maxEntries = Number.POSITIVE_INFINITY,
+  lstatEntry: (path: string) => Promise<Stats> = lstat,
+): Promise<void> {
   const pending = [root]
   let visited = 0
   while (pending.length > 0) {
@@ -154,8 +173,14 @@ export async function rejectHardlinkAliases(root: string, maxEntries = Number.PO
           throw new SandboxMaskTargetError(root, 'canonical secret directory exceeds bounded hardlink scan')
         }
         const child = join(current, entry.name)
-        const stats = await lstat(child)
-        if (stats.isSymbolicLink()) continue
+        // A child removed between enumeration and lstat (a staged credential
+        // copy cleaned up mid-scan) can no longer alias anything; skip it. The
+        // root and every other error stay fail-closed.
+        const stats = await lstatEntry(child).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        })
+        if (stats === undefined || stats.isSymbolicLink()) continue
         if (stats.isDirectory()) pending.push(child)
         if (stats.isFile() && stats.nlink !== 1) {
           throw new SandboxMaskTargetError(root, `file under canonical secret directory has hardlink aliases: ${child}`)

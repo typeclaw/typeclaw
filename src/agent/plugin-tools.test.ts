@@ -27,6 +27,7 @@ import guardPlugin from '@/bundled-plugins/guard'
 import { createDreamingSubagent } from '@/bundled-plugins/memory/dreaming'
 import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report'
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
+import { configFileLockPath } from '@/config/config-file-lock'
 import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
 import { DeclaredSkillBinUnresolvedError, IncidentLedger, readIncidentLedger, RemediationRegistry } from '@/operations'
@@ -7734,6 +7735,47 @@ describe('managed config commit check', () => {
       }
     },
   )
+
+  test.skipIf(lacksInodeAnchoring)('the commit check waits for another process holding the config lock', async () => {
+    // given: another process holds the config lock; once the write passes its
+    // pre-check, that process changes the locked alias and releases
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-lock-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const lock = configFileLockPath(config)
+    await writeFile(config, `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    await writeFile(lock, '')
+    let otherWriter: ReturnType<typeof Bun.spawn> | undefined
+    const { hooks, checks } = aliasLockedHooks(agentDir, async () => {
+      otherWriter = Bun.spawn({
+        cmd: [
+          process.execPath,
+          '-e',
+          `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(config)}, '{"alias":["renamed"]}\\n'); fs.unlinkSync(${JSON.stringify(lock)})`,
+        ],
+        stdout: 'ignore',
+        stderr: 'inherit',
+      })
+    })
+    try {
+      // when: the write commits while the lock is held
+      const execution = builtin('write', agentDir, hooks).execute(
+        'c',
+        { path: 'typeclaw.json', content: `${JSON.stringify({ alias: ['atlas'], branding: false })}\n` } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      // then: its commit check ran after the release, saw the other write, and
+      // refused to overwrite it
+      await expect(execution).rejects.toThrow(/alias may not change/)
+      expect(await otherWriter?.exited).toBe(0)
+      expect(checks()).toBe(2)
+      expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['renamed'] })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 
   test.skipIf(lacksInodeAnchoring)('writes nothing when the call is cancelled after its guard check', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-abort-'))

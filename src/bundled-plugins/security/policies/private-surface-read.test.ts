@@ -587,6 +587,10 @@ describe('private-surface-read guard — traversal + scope', () => {
     // Upgraded agents may retain the old bind-mounted credential overlay. It
     // remains canonical-secret territory even though new boots no longer use it.
     expect(check('read', { path: '/agent/.typeclaw/home/.codex/auth.json' }, privilegedHidden)?.block).toBe(true)
+    // A staged .env replacement a crash left behind holds the same credentials.
+    expect(
+      check('read', { path: '/agent/.typeclaw/credential-staging/..env.0123.typeclaw-tmp' }, privilegedHidden)?.block,
+    ).toBe(true)
   })
 
   test('canonical HOME credential profiles are denied to privileged non-bash tools', () => {
