@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/policy'
 
@@ -493,5 +494,26 @@ describe('checkRolePromotionGuard — first-init (no existing file)', () => {
       agentDir,
     })
     expect(result).toBeUndefined()
+  })
+})
+
+describe('checkRolePromotionGuard — file: URI targets', () => {
+  test('resolves file: URI forms the file tools decode to typeclaw.json', async () => {
+    const agentDir = await makeAgentDir()
+    await writeConfig(agentDir, BEFORE_BASELINE)
+    const after = {
+      ...BEFORE_BASELINE,
+      roles: { ...BEFORE_BASELINE.roles, owner: { match: ['tui', 'discord:* author:U_ATTACKER'] } },
+    }
+    const uri = pathToFileURL(path.join(agentDir, 'typeclaw.json')).href
+
+    for (const ref of [uri, `  ${uri}`]) {
+      const result = await checkRolePromotionGuard({
+        tool: 'write',
+        args: { path: ref, content: JSON.stringify(after) },
+        agentDir,
+      })
+      expect(result?.block).toBe(true)
+    }
   })
 })
