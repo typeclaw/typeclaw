@@ -1,4 +1,4 @@
-import { readFileSync, renameSync, rmSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -10,16 +10,10 @@ import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
 import {
-  CredentialRestoreError,
   credentialStagingDir,
-  discardCredentialStaging,
-  publishCredential,
+  publishConfigWithCredential,
   type Rename,
   replaceFile,
-  restoreCredential,
-  type StagedCredential,
-  stageCredential,
-  stageReplacement,
   type WriteInPlace,
 } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
@@ -939,11 +933,8 @@ function ensureAgentDir(): string {
 
 // Called under the config lock once a flow has won its typeclaw.json write.
 // The prompted token is stored only if no other command stored that key since
-// the prompt, and the token and config land together or not at all: the .env
-// update and typeclaw.json are staged in full first, then .env is written in
-// place (never renamed: a running sandbox's mask is bound to its inode) and
-// typeclaw.json is renamed into place, and .env is put back in place if
-// typeclaw.json cannot be. `seams` let tests fail a publish after writing began.
+// the prompt; the token and config then land together or not at all
+// (`publishConfigWithCredential`). `seams` let tests fail a publish step.
 export function writeConfigAndToken(
   cwd: string,
   raw: Record<string, unknown>,
@@ -951,65 +942,30 @@ export function writeConfigAndToken(
   rerun: string,
   seams: { rename?: Rename; writeInPlace?: WriteInPlace } = {},
 ): LiveResult<void> {
-  const rename = seams.rename ?? renameSync
-  const configPath = join(cwd, 'typeclaw.json')
-  const configBytes = `${JSON.stringify(raw, null, 2)}\n`
-  if (token === undefined) {
-    replaceFile(configPath, configBytes, rename)
-    return { ok: true, value: undefined }
-  }
-  if (hasEnvKey(cwd, token.env)) {
+  if (token !== undefined && hasEnvKey(cwd, token.env)) {
     return {
       ok: false,
       reason: `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun \`${rerun}\` to use the stored token.`,
     }
   }
   const envPath = join(cwd, '.env')
-  const priorEnv = readFileOrUndefined(envPath)
-  let envStaged: StagedCredential | undefined
-  let configTemp: string | undefined
-  let keepPriorCopy = false
-  try {
-    envStaged = stageCredential(
-      envPath,
-      withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value),
-      credentialStagingDir(cwd),
-    )
-    configTemp = stageReplacement(configPath, configBytes).temp
-    publishCredential(envStaged, seams.writeInPlace)
-    try {
-      rename(configTemp, configPath)
-    } catch (error) {
-      let envState = '.env was restored.'
-      try {
-        restoreCredential(envStaged, seams.writeInPlace)
-      } catch (restoreError) {
-        keepPriorCopy = true
-        envState = `${describeError(restoreError)} Until then it still sets ${token.env}, which no tunnel in typeclaw.json uses.`
-      }
-      return {
-        ok: false,
-        reason: `failed to store the tunnel: ${describeError(error)}. typeclaw.json was not changed; ${envState}`,
-      }
-    }
-  } catch (error) {
-    if (error instanceof CredentialRestoreError) {
-      keepPriorCopy = true
-      return { ok: false, reason: `failed to store the tunnel: typeclaw.json was not changed; ${error.message}` }
-    }
-    return {
-      ok: false,
-      reason: `failed to store the tunnel: ${describeError(error)}. Neither .env nor typeclaw.json was changed.`,
-    }
-  } finally {
-    if (configTemp !== undefined) rmSync(configTemp, { force: true })
-    if (envStaged !== undefined) discardCredentialStaging(envStaged, keepPriorCopy)
-  }
-  return { ok: true, value: undefined }
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  const credential =
+    token === undefined
+      ? undefined
+      : {
+          path: envPath,
+          content: withEnvKey(readFileOrUndefined(envPath)?.toString('utf8') ?? '', token.env, token.value),
+          stagingDir: credentialStagingDir(cwd),
+        }
+  const published = publishConfigWithCredential(
+    join(cwd, 'typeclaw.json'),
+    `${JSON.stringify(raw, null, 2)}\n`,
+    credential,
+    seams,
+  )
+  return published.ok
+    ? { ok: true, value: undefined }
+    : { ok: false, reason: `failed to store the tunnel: ${published.reason}` }
 }
 
 function readFileOrUndefined(path: string): Buffer | undefined {

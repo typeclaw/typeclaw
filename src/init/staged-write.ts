@@ -159,6 +159,58 @@ export function restoreCredential(
   }
 }
 
+export type CredentialUpdate = { path: string; content: string; stagingDir: string }
+
+// Publishes typeclaw.json together with an optional credential (.env) update,
+// all or nothing, for callers holding the config lock. Both are staged in full
+// first; then the credential is written in place (`publishCredential`) and
+// typeclaw.json renamed into place, and the credential is put back if the
+// rename fails. A failure never leaves either file partly written. `seams` let
+// tests fail a step after writing has begun.
+export function publishConfigWithCredential(
+  configPath: string,
+  configBytes: string,
+  credential: CredentialUpdate | undefined,
+  seams: { rename?: Rename; writeInPlace?: WriteInPlace } = {},
+): { ok: true } | { ok: false; reason: string } {
+  const rename = seams.rename ?? renameSync
+  const credentialName = credential === undefined ? undefined : basename(credential.path)
+  let staged: StagedCredential | undefined
+  let configTemp: string | undefined
+  let keepPriorCopy = false
+  try {
+    if (credential !== undefined) staged = stageCredential(credential.path, credential.content, credential.stagingDir)
+    configTemp = stageReplacement(configPath, configBytes).temp
+    if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
+    try {
+      rename(configTemp, configPath)
+    } catch (error) {
+      if (staged === undefined) return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed.` }
+      try {
+        restoreCredential(staged, seams.writeInPlace)
+      } catch (restoreError) {
+        keepPriorCopy = true
+        return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed; ${describe(restoreError)}` }
+      }
+      return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed; ${credentialName} was restored.` }
+    }
+  } catch (error) {
+    if (error instanceof CredentialRestoreError) {
+      keepPriorCopy = true
+      return { ok: false, reason: `typeclaw.json was not changed; ${error.message}` }
+    }
+    const unchanged =
+      credentialName === undefined
+        ? 'typeclaw.json was not changed'
+        : `Neither ${credentialName} nor typeclaw.json was changed`
+    return { ok: false, reason: `${describe(error)}. ${unchanged}.` }
+  } finally {
+    if (configTemp !== undefined) rmSync(configTemp, { force: true })
+    if (staged !== undefined) discardCredentialStaging(staged, keepPriorCopy)
+  }
+  return { ok: true }
+}
+
 export function discardCredentialStaging(staged: StagedCredential, keepPrior = false): void {
   rmSync(staged.newCopy, { force: true })
   if (staged.priorCopy !== undefined && !keepPrior) rmSync(staged.priorCopy, { force: true })

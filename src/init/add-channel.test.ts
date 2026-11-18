@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync } from 'node:fs'
+import { existsSync, renameSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -683,6 +683,38 @@ describe('runAddChannel', () => {
         repos: ['acme/widgets'],
       }),
     ).rejects.toThrow('already exists in typeclaw.json and is not owned by the GitHub channel')
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+  })
+
+  test('keeps typeclaw.json and .env byte-identical when the github config fails to publish', async () => {
+    // given: an existing .env and the scaffolded typeclaw.json
+    const config = join(root, 'typeclaw.json')
+    const env = join(root, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    const configBefore = await readFile(config, 'utf8')
+
+    // when: the token is written to .env, then publishing typeclaw.json fails
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-named',
+        hostname: 'https://agent.example.com',
+        tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+        tokenValue: 'prompted-token',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+        configRename: (from, to) => {
+          if (to.endsWith('typeclaw.json')) throw new Error('injected config publish failure')
+          renameSync(from, to)
+        },
+      }),
+    ).rejects.toThrow('typeclaw.json was not changed; .env was restored.')
+
+    // then: both files keep their original bytes
     expect(await readFile(config, 'utf8')).toBe(configBefore)
     expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
   })

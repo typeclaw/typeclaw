@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
@@ -46,14 +46,7 @@ import { buildHatchingPrompt } from './hatching'
 import type { OAuthLoginRunner, OAuthLoginResult } from './oauth-login'
 import { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 import { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
-import {
-  CredentialRestoreError,
-  credentialStagingDir,
-  discardCredentialStaging,
-  publishCredential,
-  restoreCredential,
-  stageCredential,
-} from './staged-write'
+import { credentialStagingDir, publishConfigWithCredential, type Rename } from './staged-write'
 import { linkWindowsDevTypeclaw, type RunBunLink } from './windows-dev-link'
 
 export { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
@@ -134,6 +127,9 @@ export type GithubInitCredentials = {
   // `externalUrl`.
   hostname?: string
   tokenEnv?: string
+  // A token the operator was just prompted for, stored in .env under
+  // `tokenEnv` together with the GitHub config write (see writeGithubChannelForInit).
+  tokenValue?: string
   repos: string[]
   auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
 }
@@ -1328,6 +1324,8 @@ export type AddChannelOptions = {
       repos: string[]
       auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
       fetchImpl?: typeof fetch
+      // Test seam: publishes the staged typeclaw.json (default renameSync).
+      configRename?: Rename
     }
 )
 
@@ -1578,48 +1576,48 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
       options.channel === 'github' && options.tokenEnv !== undefined && options.tokenValue !== undefined
         ? { env: options.tokenEnv, value: options.tokenValue }
         : undefined
-    await writeConfigWithToken(cwd, path, `${JSON.stringify(parsed, null, 2)}\n`, token)
+    writeConfigWithToken(
+      cwd,
+      path,
+      `${JSON.stringify(parsed, null, 2)}\n`,
+      token,
+      options.channel === 'github' ? options.configRename : undefined,
+    )
   })
 }
 
 // Runs under the config lock after every config check passed (for GitHub, the
 // github-webhook collision check), so a rejected add never touches .env. The
-// token is stored only if no other command stored the key since the prompt,
-// written in place (a running sandbox's .env mask is bound to its inode), and
-// put back if typeclaw.json then cannot be written.
-async function writeConfigWithToken(
+// token is stored only if no other command stored the key since the prompt, and
+// it and typeclaw.json land together or not at all (`publishConfigWithCredential`).
+function writeConfigWithToken(
   cwd: string,
   configPath: string,
   configBytes: string,
   token: { env: string; value: string } | undefined,
-): Promise<void> {
-  if (token === undefined) {
-    await writeFile(configPath, configBytes)
-    return
-  }
-  if (hasEnvKey(cwd, token.env)) {
+  rename?: Rename,
+): void {
+  if (token !== undefined && hasEnvKey(cwd, token.env)) {
     throw new Error(
       `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun the command to use the stored token.`,
     )
   }
   const envPath = join(cwd, '.env')
-  const priorEnv = existsSync(envPath) ? await readFile(envPath, 'utf8') : ''
-  const staged = stageCredential(envPath, withEnvKey(priorEnv, token.env, token.value), credentialStagingDir(cwd))
-  let keepPriorCopy = false
-  try {
-    publishCredential(staged)
-    try {
-      await writeFile(configPath, configBytes)
-    } catch (error) {
-      restoreCredential(staged, undefined, error)
-      throw error
-    }
-  } catch (error) {
-    keepPriorCopy = error instanceof CredentialRestoreError
-    throw error
-  } finally {
-    discardCredentialStaging(staged, keepPriorCopy)
-  }
+  const credential =
+    token === undefined
+      ? undefined
+      : {
+          path: envPath,
+          content: withEnvKey(existsSync(envPath) ? readFileSync(envPath, 'utf8') : '', token.env, token.value),
+          stagingDir: credentialStagingDir(cwd),
+        }
+  const published = publishConfigWithCredential(
+    configPath,
+    configBytes,
+    credential,
+    rename === undefined ? {} : { rename },
+  )
+  if (!published.ok) throw new Error(`failed to write ${CONFIG_FILE}: ${published.reason}`)
 }
 
 function buildGithubChannelConfig(options: Extract<AddChannelOptions, { channel: 'github' }>): Record<string, unknown> {
@@ -1721,7 +1719,11 @@ async function writeGithubChannelForInit(cwd: string, credentials: GithubInitCre
     }
     parsed.channels = existingChannels
     mergeGithubTunnelConfig(parsed, { channel: 'github', ...credentials, cwd })
-    await writeFile(configPath, `${JSON.stringify(parsed, null, 2)}\n`)
+    const token =
+      credentials.tokenEnv !== undefined && credentials.tokenValue !== undefined
+        ? { env: credentials.tokenEnv, value: credentials.tokenValue }
+        : undefined
+    writeConfigWithToken(cwd, configPath, `${JSON.stringify(parsed, null, 2)}\n`, token)
   })
 
   const backend = new SecretsBackend(join(cwd, 'secrets.json'))
