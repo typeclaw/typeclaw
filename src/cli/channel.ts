@@ -15,7 +15,6 @@ import {
 import { resolveController } from '@/container'
 import {
   CHANNEL_KINDS,
-  appendOrReplaceEnvKey,
   findAgentDir,
   formatEagerGithubWebhookInstallResult,
   hasEnvKey,
@@ -25,6 +24,7 @@ import {
   runAddChannel,
   setChannelSecrets,
   setGithubSecrets,
+  storeEnvKeyUnlessPresent,
   type AddChannelStepEvent,
   type ChannelKind,
   type DiscordAuthResult,
@@ -1267,7 +1267,11 @@ async function promptCloudflareNamedTunnel(cwd: string): Promise<{ hostname: str
       cancel('Aborted.')
       process.exit(0)
     }
-    appendOrReplaceEnvKey(cwd, tokenEnv, token)
+    const stored = storeEnvKeyUnlessPresent(cwd, tokenEnv, token)
+    if (!stored.ok) {
+      console.error(errorLine(stored.reason))
+      process.exit(1)
+    }
   }
   return { hostname, tokenEnv }
 }

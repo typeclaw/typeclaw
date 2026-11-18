@@ -38,7 +38,6 @@ import {
   type DockerAvailability,
 } from '@/container'
 import {
-  appendOrReplaceEnvKey,
   findAgentDir,
   formatEagerGithubWebhookInstallResult,
   hasEnvKey,
@@ -49,6 +48,7 @@ import {
   isInitialized,
   readExistingProviderApiKey,
   runInit,
+  storeEnvKeyUnlessPresent,
   type GithubInitCredentials,
   type GithubTunnelProvider,
   type InitStep,
@@ -1836,7 +1836,11 @@ async function promptGithubCloudflareNamedTunnel(cwd: string): Promise<{ hostnam
       validate: (v) => (v && v.length > 0 ? undefined : 'Token is required'),
     })
     if (isCancel(token)) return null
-    appendOrReplaceEnvKey(cwd, tokenEnv, token)
+    const stored = storeEnvKeyUnlessPresent(cwd, tokenEnv, token)
+    if (!stored.ok) {
+      log.error(stored.reason)
+      return null
+    }
   }
   return { hostname, tokenEnv }
 }
