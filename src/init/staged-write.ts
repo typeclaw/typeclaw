@@ -4,6 +4,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -52,39 +53,93 @@ export function ensureOwnerOnlyDir(dir: string): void {
   }
 }
 
-export type StagedReplacement = { temp: string; path: string }
+export type StagedReplacement = {
+  // The file to update: `path` itself, or through a symlink, its target.
+  path: string
+  content: Buffer
+  // The fully written copy renamed over `path`; none on Windows (see below).
+  temp: string | undefined
+  // The bytes `path` held, to put back if an in-place write fails.
+  prior: Buffer | undefined
+}
 
-// Renaming a fully written copy over `path` means a failure part-way through
-// never leaves a truncated file. Only for files no sandbox masks (typeclaw.json):
-// a masked credential goes through `publishCredential`.
-export function replaceFile(path: string, content: string | Buffer, rename: Rename = renameSync): void {
-  const staged = stageReplacement(path, content)
+// A failed in-place config write whose prior content could not be put back.
+export class ConfigRestoreError extends Error {}
+
+// Replaces a file no sandbox masks (typeclaw.json) without ever leaving it
+// partly written: a masked credential goes through `publishCredential`.
+export function replaceFile(
+  path: string,
+  content: string | Buffer,
+  rename: Rename = renameSync,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const staged = stageReplacement(path, content, platform)
   try {
-    rename(staged.temp, staged.path)
+    publishReplacement(staged, rename)
   } finally {
-    rmSync(staged.temp, { force: true })
+    if (staged.temp !== undefined) rmSync(staged.temp, { force: true })
   }
 }
 
-// Writes the replacement for `path` in full, with a gitignored suffix and the
-// destination's mode; the caller renames `temp` over the returned `path`. If
-// `path` is a symlink, that is the link's target (staged beside it, so the
-// rename stays on one filesystem), so the link survives and keeps pointing at
-// the updated file, as an in-place write through it would. A read-only
-// destination is refused, as an in-place write to it would be.
-export function stageReplacement(path: string, content: string | Buffer): StagedReplacement {
+// Prepares the replacement for `path`. If `path` is a symlink, the file updated
+// is the link's target, so the link survives and keeps pointing at the updated
+// file, as an in-place write through it would. A read-only destination is
+// refused, as an in-place write to it would be. Elsewhere the content is
+// written in full to a gitignored copy beside the target, with its mode, for
+// `publishReplacement` to rename over it. On Windows no copy is made: a new
+// file object would take the directory's ACL in place of the file's own (a
+// config with a stricter explicit ACL would lose it), so the file is written
+// in place instead, with its prior bytes kept in memory for a failed write.
+export function stageReplacement(
+  path: string,
+  content: string | Buffer,
+  platform: NodeJS.Platform = process.platform,
+): StagedReplacement {
   const target = linkTarget(path)
   const mode = modeOrUndefined(target)
   if (mode !== undefined) accessSync(target, constants.W_OK)
+  const bytes = Buffer.from(content)
+  if (platform === 'win32') return { path: target, content: bytes, temp: undefined, prior: readFileOrUndefined(target) }
   const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.typeclaw-tmp`)
   try {
-    writeFileSync(temp, content, { flag: 'wx' })
+    writeFileSync(temp, bytes, { flag: 'wx' })
     if (mode !== undefined) chmodSync(temp, mode)
   } catch (error) {
     rmSync(temp, { force: true })
     throw error
   }
-  return { temp, path: target }
+  return { path: target, content: bytes, temp, prior: undefined }
+}
+
+// Renames the staged copy over the target, or on Windows writes the target in
+// place (creating it if it did not exist), putting the prior bytes back if the
+// write fails; a failed restore throws `ConfigRestoreError`.
+export function publishReplacement(
+  staged: StagedReplacement,
+  rename: Rename = renameSync,
+  writeInPlace: WriteInPlace = writeExistingInPlace,
+): void {
+  if (staged.temp !== undefined) {
+    rename(staged.temp, staged.path)
+    return
+  }
+  if (staged.prior === undefined) {
+    writeFileSync(staged.path, staged.content, { flag: 'wx' })
+    return
+  }
+  try {
+    writeInPlace(staged.path, staged.content)
+  } catch (error) {
+    try {
+      writeInPlace(staged.path, staged.prior)
+    } catch (restoreError) {
+      throw new ConfigRestoreError(
+        `${staged.path} could not be restored (${describe(restoreError)}) after a failed write (${describe(error)}); restore it with \`git checkout -- ${basename(staged.path)}\` in the agent folder.`,
+      )
+    }
+    throw error
+  }
 }
 
 // The file a write to `path` lands in: its real path through any symlinks, or
@@ -109,6 +164,8 @@ export type StagedCredential = {
   path: string
   content: Buffer
   prior: Buffer | undefined
+  // Set once `publishCredential` created the file (there was none before).
+  created: boolean
   // Owner-only copies in the staging dir (never on Windows, see
   // `stageCredential`). `priorCopy` is kept for manual recovery when a
   // restore fails; both are removed otherwise.
@@ -139,13 +196,14 @@ export function stageCredential(
   const prior = readFileOrUndefined(path)
   if (prior !== undefined) accessSync(path, constants.W_OK)
   if (platform === 'win32') {
-    return { path, content: Buffer.from(content), prior, newCopy: undefined, priorCopy: undefined }
+    return { path, content: Buffer.from(content), prior, created: false, newCopy: undefined, priorCopy: undefined }
   }
   ensureOwnerOnlyDir(stagingDir)
   const staged: StagedCredential = {
     path,
     content: Buffer.from(content),
     prior,
+    created: false,
     newCopy: join(stagingDir, `.${basename(path)}.${randomUUID()}.new.typeclaw-tmp`),
     priorCopy:
       prior === undefined ? undefined : join(stagingDir, `.${basename(path)}.${randomUUID()}.prior.typeclaw-tmp`),
@@ -163,18 +221,22 @@ export function stageCredential(
 // Writes the staged content over the credential's existing inode (O_TRUNC, no
 // rename), or creates it 0600 if it did not exist. If the write fails, the prior
 // content is written back in place; a failed restore throws
-// `CredentialRestoreError` and the prior copy is kept for recovery.
+// `CredentialRestoreError` and the prior copy is kept for recovery. A file this
+// creates is never unlinked again: a sandbox started meanwhile may have bound
+// its .env mask to that inode, and a later write would then create a new,
+// unmasked one. On a failed write it is emptied in place instead.
 export function publishCredential(staged: StagedCredential, writeInPlace: WriteInPlace = writeExistingInPlace): void {
   if (staged.prior === undefined) {
     const fd = openSync(staged.path, 'wx', 0o600)
+    staged.created = true
     try {
       writeFileSync(fd, staged.content)
     } catch (error) {
-      closeSync(fd)
-      rmSync(staged.path, { force: true })
+      ftruncateSync(fd, 0)
       throw error
+    } finally {
+      closeSync(fd)
     }
-    closeSync(fd)
     return
   }
   try {
@@ -186,24 +248,23 @@ export function publishCredential(staged: StagedCredential, writeInPlace: WriteI
 }
 
 // Puts the credential back as it was before `publishCredential`: the prior
-// content written in place, or the file removed if there was none.
+// content written in place, or, if `publishCredential` created the file, the
+// file emptied in place (never unlinked; see `publishCredential`).
 export function restoreCredential(
   staged: StagedCredential,
   writeInPlace: WriteInPlace = writeExistingInPlace,
   cause?: unknown,
 ): void {
-  if (staged.prior === undefined) {
-    rmSync(staged.path, { force: true })
-    return
-  }
   try {
-    writeInPlace(staged.path, staged.prior)
+    writeInPlace(staged.path, staged.prior ?? Buffer.alloc(0))
   } catch (restoreError) {
     const failure = `${staged.path} could not be restored (${describe(restoreError)})${cause === undefined ? '' : ` after a failed write (${describe(cause)})`}`
     throw new CredentialRestoreError(
-      staged.priorCopy === undefined
-        ? `${failure}; the previous token(s) in it could not be restored and must be re-entered in ${staged.path}.`
-        : `${failure}; its previous content is saved at ${staged.priorCopy}. Copy that file's content back into ${staged.path} by hand.`,
+      staged.prior === undefined
+        ? `${failure}; it did not exist before this command and now holds the new token(s); empty it by hand.`
+        : staged.priorCopy === undefined
+          ? `${failure}; the previous token(s) in it could not be restored and must be re-entered in ${staged.path}.`
+          : `${failure}; its previous content is saved at ${staged.priorCopy}. Copy that file's content back into ${staged.path} by hand.`,
     )
   }
 }
@@ -211,11 +272,13 @@ export function restoreCredential(
 export type CredentialUpdate = { path: string; content: string; stagingDir: string }
 
 // Publishes typeclaw.json together with an optional credential (.env) update,
-// all or nothing, for callers holding the config lock. Both are staged in full
-// first; then the credential is written in place (`publishCredential`) and
-// typeclaw.json renamed into place, and the credential is put back if the
-// rename fails. A failure never leaves either file partly written. `seams` let
-// tests fail a step after writing has begun.
+// all or nothing, for callers holding the config lock. Both are staged first;
+// then the credential is written in place (`publishCredential`) and
+// typeclaw.json published (`publishReplacement`: renamed into place, or on
+// Windows written in place), and the credential is put back if typeclaw.json
+// cannot be. A failure never leaves either file partly written; a .env this
+// created is left empty rather than removed. `seams` let tests fail a step
+// after writing has begun and take the Windows path on any platform.
 export function publishConfigWithCredential(
   configPath: string,
   configBytes: string,
@@ -231,19 +294,22 @@ export function publishConfigWithCredential(
     if (credential !== undefined) {
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
-    configStaged = stageReplacement(configPath, configBytes)
+    configStaged = stageReplacement(configPath, configBytes, seams.platform)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      rename(configStaged.temp, configStaged.path)
+      publishReplacement(configStaged, rename, seams.writeInPlace)
     } catch (error) {
-      if (staged === undefined) return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed.` }
+      const configState = error instanceof ConfigRestoreError ? error.message : 'typeclaw.json was not changed'
+      const cause = error instanceof ConfigRestoreError ? '' : `${describe(error)}. `
+      if (staged === undefined) return { ok: false, reason: `${cause}${configState}.` }
       try {
         restoreCredential(staged, seams.writeInPlace)
       } catch (restoreError) {
         keepPriorCopy = true
-        return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed; ${describe(restoreError)}` }
+        return { ok: false, reason: `${cause}${configState}; ${describe(restoreError)}` }
       }
-      return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed; ${credentialName} was restored.` }
+      const credentialState = staged.created ? 'was left empty' : 'was restored'
+      return { ok: false, reason: `${cause}${configState}; ${credentialName} ${credentialState}.` }
     }
   } catch (error) {
     if (error instanceof CredentialRestoreError) {
@@ -253,10 +319,12 @@ export function publishConfigWithCredential(
     const unchanged =
       credentialName === undefined
         ? 'typeclaw.json was not changed'
-        : `Neither ${credentialName} nor typeclaw.json was changed`
+        : staged?.created === true
+          ? `typeclaw.json was not changed; ${credentialName} was left empty`
+          : `Neither ${credentialName} nor typeclaw.json was changed`
     return { ok: false, reason: `${describe(error)}. ${unchanged}.` }
   } finally {
-    if (configStaged !== undefined) rmSync(configStaged.temp, { force: true })
+    if (configStaged?.temp !== undefined) rmSync(configStaged.temp, { force: true })
     if (staged !== undefined) discardCredentialStaging(staged, keepPriorCopy)
   }
   return { ok: true }

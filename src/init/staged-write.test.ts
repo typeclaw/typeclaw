@@ -136,9 +136,9 @@ describe('credential staging', () => {
   })
 
   describe('on Windows', () => {
-    // Exercised on every platform through the platform seam: no credential byte
-    // may be written to the staging dir, whose files would carry the agent
-    // folder's ACL rather than .env's.
+    // Exercised on every platform through the platform seam. No credential byte
+    // is written to the staging dir, and typeclaw.json is written in place, so
+    // neither file is replaced by a new file object carrying the folder's ACL.
     async function agentWithEnv() {
       const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-win32-'))
       await writeFile(join(cwd, '.env'), 'OLD=1\n')
@@ -146,85 +146,109 @@ describe('credential staging', () => {
       return { cwd, env: join(cwd, '.env'), config: join(cwd, 'typeclaw.json'), staging: credentialStagingDir(cwd) }
     }
 
-    function inPlace(failCalls: number[], onWrite: () => void) {
-      let calls = 0
-      return (path: string, content: string | Buffer) => {
-        onWrite()
-        calls += 1
-        const fails = failCalls.includes(calls)
+    // An in-place writer that records the agent folder's entries on each call and
+    // fails (truncating first, like a write that dies part-way) on the listed
+    // calls for each file.
+    function inPlace(cwd: string, fail: { config?: number[]; env?: number[] } = {}) {
+      const calls = { config: 0, env: 0 }
+      const entriesSeen: string[][] = []
+      const write = (path: string, content: string | Buffer) => {
+        entriesSeen.push(readdirSync(cwd).sort())
+        const kind = path.endsWith('typeclaw.json') ? 'config' : 'env'
+        calls[kind] += 1
+        const fails = (fail[kind] ?? []).includes(calls[kind])
         writeFileSync(path, fails ? '' : content, { flag: 'w' })
-        if (fails) throw new Error(`injected write failure ${calls}`)
+        if (fails) throw new Error(`injected ${kind} write failure ${calls[kind]}`)
       }
+      return { write, entriesSeen }
     }
 
-    test('a successful publish writes nothing to the staging dir', async () => {
+    test('a successful publish writes both files in place, with no staged copy of either', async () => {
       const { cwd, env, config, staging } = await agentWithEnv()
-      const stagingExisted: boolean[] = []
+      const configFile = statSync(config).ino
+      const writer = inPlace(cwd)
 
       const result = publishConfigWithCredential(
         config,
         '{"tunnels":[]}\n',
         { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
-        { platform: 'win32', writeInPlace: inPlace([], () => stagingExisted.push(existsSync(staging))) },
+        { platform: 'win32', writeInPlace: writer.write },
       )
 
       expect(result).toEqual({ ok: true })
-      expect(stagingExisted).toEqual([false])
+      expect(writer.entriesSeen).toEqual([
+        ['.env', 'typeclaw.json'],
+        ['.env', 'typeclaw.json'],
+      ])
       expect(existsSync(staging)).toBe(false)
       expect(readFileSync(env, 'utf8')).toBe('OLD=1\nTOKEN=new\n')
+      expect(readFileSync(config, 'utf8')).toBe('{"tunnels":[]}\n')
+      expect(statSync(config).ino).toBe(configFile)
       expect(readdirSync(cwd).sort()).toEqual(['.env', 'typeclaw.json'])
     })
 
-    test("a failed publish's rollback restores .env from memory, writing nothing to staging", async () => {
-      const { env, config, staging } = await agentWithEnv()
-      const stagingExisted: boolean[] = []
+    test('a failed config write leaves typeclaw.json and .env byte-identical, with no staged copy', async () => {
+      // given: the in-place config write truncates typeclaw.json and then fails
+      const { cwd, env, config, staging } = await agentWithEnv()
+      const writer = inPlace(cwd, { config: [1] })
 
+      // when
       const result = publishConfigWithCredential(
         config,
         '{"tunnels":[]}\n',
         { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
-        {
-          platform: 'win32',
-          writeInPlace: inPlace([], () => stagingExisted.push(existsSync(staging))),
-          rename: () => {
-            throw new Error('injected config publish failure')
-          },
-        },
+        { platform: 'win32', writeInPlace: writer.write },
       )
 
+      // then: both are back from memory, and nothing was ever written beside them
       expect(result.ok).toBe(false)
       if (!result.ok) expect(result.reason).toContain('typeclaw.json was not changed; .env was restored.')
-      expect(stagingExisted).toEqual([false, false])
-      expect(existsSync(staging)).toBe(false)
-      expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
       expect(readFileSync(config, 'utf8')).toBe('{}\n')
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+      expect(writer.entriesSeen.every((entries) => entries.join() === '.env,typeclaw.json')).toBe(true)
+      expect(existsSync(staging)).toBe(false)
+      expect(readdirSync(cwd).sort()).toEqual(['.env', 'typeclaw.json'])
     })
 
-    test('a failed restore says the token must be re-entered, writing nothing to staging', async () => {
-      const { env, config, staging } = await agentWithEnv()
-      const stagingExisted: boolean[] = []
+    test('a failed .env restore says the token must be re-entered, writing nothing to staging', async () => {
+      const { cwd, env, config, staging } = await agentWithEnv()
+      const writer = inPlace(cwd, { config: [1], env: [2] })
 
       const result = publishConfigWithCredential(
         config,
         '{"tunnels":[]}\n',
         { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
-        {
-          platform: 'win32',
-          writeInPlace: inPlace([2], () => stagingExisted.push(existsSync(staging))),
-          rename: () => {
-            throw new Error('injected config publish failure')
-          },
-        },
+        { platform: 'win32', writeInPlace: writer.write },
       )
 
       expect(result.ok).toBe(false)
       if (!result.ok) {
-        expect(result.reason).toContain(`${env} could not be restored (injected write failure 2)`)
+        expect(result.reason).toContain(`${env} could not be restored (injected env write failure 2)`)
         expect(result.reason).toContain(`must be re-entered in ${env}`)
       }
-      expect(stagingExisted).toEqual([false, false])
-      expect(existsSync(staging)).toBe(false)
       expect(readFileSync(config, 'utf8')).toBe('{}\n')
+      expect(existsSync(staging)).toBe(false)
+      expect(readdirSync(cwd).sort()).toEqual(['.env', 'typeclaw.json'])
+    })
+
+    test('a failed config restore names typeclaw.json and how to recover it', async () => {
+      const { cwd, env, config, staging } = await agentWithEnv()
+      const writer = inPlace(cwd, { config: [1, 2] })
+
+      const result = publishConfigWithCredential(
+        config,
+        '{"tunnels":[]}\n',
+        { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
+        { platform: 'win32', writeInPlace: writer.write },
+      )
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) {
+        expect(result.reason).toContain(`${config} could not be restored (injected config write failure 2)`)
+        expect(result.reason).toContain('git checkout -- typeclaw.json')
+        expect(result.reason).toContain('.env was restored.')
+      }
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
     })
   })
 

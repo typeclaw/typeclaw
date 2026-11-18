@@ -1025,16 +1025,27 @@ describe('writeConfigAndToken', () => {
     expect(leftoverTemps(cwd)).toEqual([])
   })
 
-  test('removes the .env it created when there was none and typeclaw.json fails to publish', async () => {
+  test('empties, never removes, the .env it created when typeclaw.json fails to publish', async () => {
+    // given: no .env yet; record the inode the publish creates it with
     const cwd = await makeAgentDir({ tunnels: [] })
+    const env = join(cwd, '.env')
     const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+    let createdInode: number | undefined
 
+    // when: the config publish fails after .env was created
     const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
-      rename: failConfigPublish,
+      rename: (from, to) => {
+        if (to.endsWith('typeclaw.json')) createdInode = statSync(env).ino
+        failConfigPublish(from, to)
+      },
     })
 
+    // then: .env is kept on that inode (a sandbox may have masked it) but empty
     expect(result.ok).toBe(false)
-    expect(existsSync(join(cwd, '.env'))).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('typeclaw.json was not changed; .env was left empty.')
+    expect(await readFile(env, 'utf8')).toBe('')
+    expect(statSync(env).ino).toBe(createdInode!)
     expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
     expect(leftoverTemps(cwd)).toEqual([])
   })
