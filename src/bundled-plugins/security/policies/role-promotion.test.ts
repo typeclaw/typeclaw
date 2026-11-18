@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, symlink, writeFile, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -516,4 +516,38 @@ describe('checkRolePromotionGuard — file: URI targets', () => {
       expect(result?.block).toBe(true)
     }
   })
+})
+
+describe('checkRolePromotionGuard — pinned descriptor targets', () => {
+  // The commit-time check hands guards the writer's /proc/self/fd/N path, so the
+  // baseline comes from the inode the write lands on.
+  test.skipIf(process.platform !== 'linux')(
+    'treats a descriptor of typeclaw.json as typeclaw.json and reads its baseline',
+    async () => {
+      const agentDir = await makeAgentDir()
+      await writeConfig(agentDir, BEFORE_BASELINE)
+      const handle = await open(path.join(agentDir, 'typeclaw.json'), 'r+')
+      try {
+        const after = {
+          ...BEFORE_BASELINE,
+          roles: { ...BEFORE_BASELINE.roles, owner: { match: ['tui', 'discord:* author:U_ATTACKER'] } },
+        }
+        const descriptor = `/proc/self/fd/${handle.fd}`
+        const blocked = await checkRolePromotionGuard({
+          tool: 'write',
+          args: { path: descriptor, content: JSON.stringify(after) },
+          agentDir,
+        })
+        expect(blocked?.block).toBe(true)
+        const unchanged = await checkRolePromotionGuard({
+          tool: 'write',
+          args: { path: descriptor, content: JSON.stringify(BEFORE_BASELINE) },
+          agentDir,
+        })
+        expect(unchanged).toBeUndefined()
+      } finally {
+        await handle.close()
+      }
+    },
+  )
 })

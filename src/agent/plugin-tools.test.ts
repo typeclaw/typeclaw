@@ -7550,7 +7550,8 @@ describe('managed config commit check', () => {
     let checks = 0
     hooks.registerAll('alias-lock', agentDir, noopLogger, {
       'tool.before': async (event) => {
-        if (!String(event.args.path).endsWith('typeclaw.json')) return undefined
+        if (!(await realpath(String(event.args.path)).catch(() => String(event.args.path))).endsWith('typeclaw.json'))
+          return undefined
         if (event.tool === 'edit') {
           // An edit's pre-check cannot see its final bytes; the commit check can.
           checks += 1
@@ -7621,13 +7622,14 @@ describe('managed config commit check', () => {
     hooks.registerAll('pausable', agentDir, noopLogger, {
       'tool.before': async (event) => {
         if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
-        if (!String(event.args.path).endsWith('typeclaw.json')) return undefined
+        if (!(await realpath(String(event.args.path)).catch(() => String(event.args.path))).endsWith('typeclaw.json'))
+          return undefined
         if (event.callId === 'first' && paused === undefined) {
           paused = new Promise<void>((resolve) => {
             release = resolve
           })
           // Only the commit check of the first call carries the destination path.
-          if (path.isAbsolute(String(event.args.path))) {
+          if (String(event.args.path).startsWith('/proc/self/fd/') || path.isAbsolute(String(event.args.path))) {
             onPaused?.()
             await paused
           } else {

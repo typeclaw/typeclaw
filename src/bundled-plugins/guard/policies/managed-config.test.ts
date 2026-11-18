@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, symlink, writeFile, open } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -549,5 +549,23 @@ describe('managedConfig guard — file: URI targets', () => {
         agentDir,
       }),
     ).toBeUndefined()
+  })
+})
+
+describe('managedConfig guard — pinned descriptor targets', () => {
+  test.skipIf(process.platform !== 'linux')('validates typeclaw.json addressed by its pinned descriptor', async () => {
+    const agentDir = await makeAgentDir()
+    await writeFile(path.join(agentDir, 'typeclaw.json'), '{}')
+    const handle = await open(path.join(agentDir, 'typeclaw.json'), 'r+')
+    try {
+      const result = await checkManagedConfigGuard({
+        tool: 'write',
+        args: { path: `/proc/self/fd/${handle.fd}`, content: '{ not json' },
+        agentDir,
+      })
+      expect(result?.block).toBe(true)
+    } finally {
+      await handle.close()
+    }
   })
 })

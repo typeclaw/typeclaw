@@ -873,7 +873,9 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
   if (commit === undefined || destination === undefined) return writeOutputNoFollow(targetPath, content)
   const write = checkedWrites.then(async () => {
     commit.signal?.throwIfAborted()
-    await commit.check(content, destination)
+    // The pinned descriptor path makes the guards read their baseline from the
+    // very inode this write lands on; a new file has no pinned baseline.
+    await commit.check(content, /^\/proc\/self\/fd\/\d+$/.test(targetPath) ? targetPath : destination)
     // A call cancelled while queued or while its guards ran must not write.
     commit.signal?.throwIfAborted()
     await writeOutputNoFollow(targetPath, content)
