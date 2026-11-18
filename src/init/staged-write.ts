@@ -6,6 +6,7 @@ import {
   constants,
   lstatSync,
   mkdirSync,
+  ftruncateSync,
   openSync,
   readFileSync,
   readlinkSync,
@@ -291,8 +292,12 @@ export function discardCredentialStaging(staged: StagedCredential, keepPrior = f
 }
 
 function writeExistingInPlace(path: string, content: string | Buffer): void {
-  const fd = openSync(path, constants.O_WRONLY | constants.O_TRUNC)
+  // 'r+' opens the existing file only (numeric O_WRONLY|O_TRUNC flags are
+  // rejected with EINVAL on Windows); truncating the same descriptor keeps the
+  // file object, its ACL, and any sandbox mask bound to its inode.
+  const fd = openSync(path, 'r+')
   try {
+    ftruncateSync(fd, 0)
     writeFileSync(fd, content)
   } finally {
     closeSync(fd)
