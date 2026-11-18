@@ -55,7 +55,7 @@ export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null
 }
 
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it
-// over an identity hatching or the user sets while the container runs.
+// over an identity the operator sets while the container runs.
 export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity): Promise<boolean> {
   const repo = resolveAgentGit(cwd)
   if (repo === null) return false

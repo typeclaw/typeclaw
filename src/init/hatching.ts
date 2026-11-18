@@ -55,9 +55,8 @@ Routing answers:
 Do these in order. Do **not** ask further questions.
 
 1. Flesh out all four markdown files to a short but complete first draft. \`write\` replaces the partial versions. First person. Specific and genuine, not generic.
-2. Configure local git identity with \`bash\`: \`git config user.name "<your name>"\` and \`git config user.email "<reasonable placeholder>@typeclaw.local"\` (unless the user provided an email).
-3. Stage and commit **only the files you authored** with commit message \`Hatched 🐣\`. This is the hatching-specific commit message — it overrides the normal version-control style guidance for this one commit.
-4. Send **one final short message** — two sentences at most — telling the user hatching is complete and they can leave the TUI with \`/quit\` (or Ctrl+C). Do not ask further questions. Do not offer more work. The container keeps running once they quit; keeping the TUI open here wastes time.
+2. Stage and commit **only the files you authored** with commit message \`Hatched 🐣\`. This is the hatching-specific commit message — it overrides the normal version-control style guidance for this one commit. TypeClaw already provides your git identity, so do not set one: \`bash\` cannot write \`.git/config\`, and the identity variables TypeClaw sets take precedence over \`-c user.*\`.
+3. Send **one final short message** — two sentences at most — telling the user hatching is complete and they can leave the TUI with \`/quit\` (or Ctrl+C). Do not ask further questions. Do not offer more work. The container keeps running once they quit; keeping the TUI open here wastes time.
 
 After that final message, stop. If the user keeps talking, answer briefly and remind them they can \`/quit\` (or Ctrl+C) whenever they are ready.
 
