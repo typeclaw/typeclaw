@@ -20,7 +20,6 @@ export const TRULY_IGNORED_PATTERNS = [
   '.DS_Store',
   'typeclaw.json.lock',
   'cron.json.lock',
-  '*.typeclaw-tmp',
 ] as const
 
 // Gitignored but force-committed by TypeClaw (auto-backup, dreaming, channels).
@@ -52,9 +51,7 @@ export function buildGitignore(config: GitignoreConfig = { append: [] }): string
 # Local-only; never commit.
 #
 # typeclaw.json.lock and cron.json.lock exist only while a writer holds the
-# cross-process config lock, and *.typeclaw-tmp files only while a replacement
-# for .env or typeclaw.json is staged (one can hold a token); a backup that
-# runs meanwhile, or after a crash, must not commit them.
+# cross-process config lock; a backup that runs meanwhile must not commit them.
 ${TRULY_IGNORED_PATTERNS.join('\n')}
 
 # System-managed: gitignored by default so the agent never stages them by hand,
