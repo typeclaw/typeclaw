@@ -38,6 +38,7 @@ import { createTui } from '@/tui'
 
 import { resolveBaseImageVersion, resolveTypeclawSpec, typeclawCheckoutRoot } from './cli-version'
 import { buildDockerfile, DOCKERFILE } from './dockerfile'
+import { hasEnvKey, withEnvKey } from './env-file'
 import { CONFIG_FILE, findAgentDir, isInitialized } from './find-agent-dir'
 import { installGithubWebhooksEagerly, type EagerGithubWebhookInstallResult } from './github-webhook-install'
 import { buildGitignore, GITIGNORE_FILE } from './gitignore'
@@ -45,6 +46,14 @@ import { buildHatchingPrompt } from './hatching'
 import type { OAuthLoginRunner, OAuthLoginResult } from './oauth-login'
 import { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 import { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
+import {
+  CredentialRestoreError,
+  credentialStagingDir,
+  discardCredentialStaging,
+  publishCredential,
+  restoreCredential,
+  stageCredential,
+} from './staged-write'
 import { linkWindowsDevTypeclaw, type RunBunLink } from './windows-dev-link'
 
 export { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
@@ -1313,6 +1322,9 @@ export type AddChannelOptions = {
       webhookPort?: number
       hostname?: string
       tokenEnv?: string
+      // A token the operator was just prompted for, stored in .env under
+      // `tokenEnv` together with the config write (see mergeChannelIntoConfig).
+      tokenValue?: string
       repos: string[]
       auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string }
       fetchImpl?: typeof fetch
@@ -1562,8 +1574,52 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
 
     if (options.channel === 'github') mergeGithubTunnelConfig(parsed, options)
 
-    await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+    const token =
+      options.channel === 'github' && options.tokenEnv !== undefined && options.tokenValue !== undefined
+        ? { env: options.tokenEnv, value: options.tokenValue }
+        : undefined
+    await writeConfigWithToken(cwd, path, `${JSON.stringify(parsed, null, 2)}\n`, token)
   })
+}
+
+// Runs under the config lock after every config check passed (for GitHub, the
+// github-webhook collision check), so a rejected add never touches .env. The
+// token is stored only if no other command stored the key since the prompt,
+// written in place (a running sandbox's .env mask is bound to its inode), and
+// put back if typeclaw.json then cannot be written.
+async function writeConfigWithToken(
+  cwd: string,
+  configPath: string,
+  configBytes: string,
+  token: { env: string; value: string } | undefined,
+): Promise<void> {
+  if (token === undefined) {
+    await writeFile(configPath, configBytes)
+    return
+  }
+  if (hasEnvKey(cwd, token.env)) {
+    throw new Error(
+      `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun the command to use the stored token.`,
+    )
+  }
+  const envPath = join(cwd, '.env')
+  const priorEnv = existsSync(envPath) ? await readFile(envPath, 'utf8') : ''
+  const staged = stageCredential(envPath, withEnvKey(priorEnv, token.env, token.value), credentialStagingDir(cwd))
+  let keepPriorCopy = false
+  try {
+    publishCredential(staged)
+    try {
+      await writeFile(configPath, configBytes)
+    } catch (error) {
+      restoreCredential(staged, undefined, error)
+      throw error
+    }
+  } catch (error) {
+    keepPriorCopy = error instanceof CredentialRestoreError
+    throw error
+  } finally {
+    discardCredentialStaging(staged, keepPriorCopy)
+  }
 }
 
 function buildGithubChannelConfig(options: Extract<AddChannelOptions, { channel: 'github' }>): Record<string, unknown> {

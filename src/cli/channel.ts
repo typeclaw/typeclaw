@@ -24,7 +24,6 @@ import {
   runAddChannel,
   setChannelSecrets,
   setGithubSecrets,
-  storeEnvKeyUnlessPresent,
   type AddChannelStepEvent,
   type ChannelKind,
   type DiscordAuthResult,
@@ -1140,6 +1139,7 @@ async function promptGithubCredentials(cwd: string): Promise<{
   webhookPort?: number
   hostname?: string
   tokenEnv?: string
+  tokenValue?: string
   repos: string[]
   auth: { type: 'pat'; pat: string } | { type: 'app'; appId: number; privateKey: string; installationId?: number }
 }> {
@@ -1238,7 +1238,11 @@ async function promptGithubCredentials(cwd: string): Promise<{
   }
 }
 
-async function promptCloudflareNamedTunnel(cwd: string): Promise<{ hostname: string; tokenEnv: string }> {
+// Returns the token rather than storing it: runAddChannel stores it under the
+// config lock once the tunnel config has passed its checks.
+async function promptCloudflareNamedTunnel(
+  cwd: string,
+): Promise<{ hostname: string; tokenEnv: string; tokenValue?: string }> {
   const tokenEnv = 'CLOUDFLARE_TUNNEL_TOKEN'
   note(
     [
@@ -1267,11 +1271,7 @@ async function promptCloudflareNamedTunnel(cwd: string): Promise<{ hostname: str
       cancel('Aborted.')
       process.exit(0)
     }
-    const stored = storeEnvKeyUnlessPresent(cwd, tokenEnv, token)
-    if (!stored.ok) {
-      console.error(errorLine(stored.reason))
-      process.exit(1)
-    }
+    return { hostname, tokenEnv, tokenValue: token }
   }
   return { hostname, tokenEnv }
 }
