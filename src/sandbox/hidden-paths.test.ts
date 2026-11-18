@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -267,6 +267,24 @@ describe('ensureHiddenMaskTargets', () => {
     expect(await isDir(workspace)).toBe(true)
     expect(result.dirs).toEqual([workspace])
   })
+
+  test.skipIf(process.platform === 'win32')(
+    'creates the credential staging dir owner-only, and tightens an existing one',
+    async () => {
+      // given: one agent with no staging dir yet, one with a world-readable one
+      const fresh = join(dir, 'fresh', '.typeclaw', 'credential-staging')
+      const loose = join(dir, 'loose', '.typeclaw', 'credential-staging')
+      await mkdir(loose, { recursive: true })
+      await chmod(loose, 0o755)
+
+      // when
+      await ensureHiddenMaskTargets({ dirs: [fresh, loose], files: [] })
+
+      // then: both are 0700, so a staged credential is never readable by others
+      expect((await lstat(fresh)).mode & 0o777).toBe(0o700)
+      expect((await lstat(loose)).mode & 0o777).toBe(0o700)
+    },
+  )
 
   test('leaves an existing secret file untouched and keeps it in the mask', async () => {
     const secrets = join(dir, 'secrets.json')

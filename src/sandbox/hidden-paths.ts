@@ -2,6 +2,7 @@ import { lstat, mkdir, opendir, writeFile } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { CREDENTIAL_STAGING_RELATIVE_DIR, ensureOwnerOnlyDir } from '@/init/staged-write'
 import { CORE_PERMISSIONS } from '@/permissions/builtins'
 import type { PermissionService } from '@/permissions/permissions'
 
@@ -100,9 +101,22 @@ export async function verifyHiddenMaskTargets(hidden: HiddenPaths): Promise<void
 }
 
 async function ensureRequiredDirMaskTarget(target: string): Promise<string> {
-  await mkdir(target, { recursive: true }).catch(() => {})
+  if (isCredentialStagingDir(target)) {
+    // Credentials are staged here, so it is created (or tightened) owner-only.
+    // Staging itself refuses a directory it cannot make 0700, so a failure here
+    // only leaves the mask to verify, as for any other directory.
+    try {
+      ensureOwnerOnlyDir(target)
+    } catch {}
+  } else {
+    await mkdir(target, { recursive: true }).catch(() => {})
+  }
   await verifyRequiredMaskTarget(target, 'dir')
   return target
+}
+
+function isCredentialStagingDir(target: string): boolean {
+  return target.endsWith(`${sep}${CREDENTIAL_STAGING_RELATIVE_DIR.split('/').join(sep)}`)
 }
 
 async function ensureRequiredFileMaskTarget(target: string): Promise<string> {
