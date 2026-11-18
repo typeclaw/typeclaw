@@ -41,7 +41,9 @@ const NO_RESOLVER_REASON =
 const NO_PAT_RESOLVER_REASON =
   'No GitHub channel PAT is available; the GitHub channel is not configured with PAT auth, or its adapter is not running.'
 
-export function createGithubTokenBridge(): GithubTokenBridge {
+export function createGithubTokenBridge(
+  options: { onSelfChange?: (self: GithubSelfUser | null) => void } = {},
+): GithubTokenBridge {
   let currentSelf: { readonly user: GithubSelfUser } | null = null
   let current: ((repoSlug: string) => Promise<GithubTokenCredential>) | null = null
   let currentSelfLogin: (() => string | null) | null = null
@@ -52,8 +54,11 @@ export function createGithubTokenBridge(): GithubTokenBridge {
     registerSelf: (self) => {
       const registration = { user: self }
       currentSelf = registration
+      options.onSelfChange?.(self)
       return () => {
-        if (currentSelf === registration) currentSelf = null
+        if (currentSelf !== registration) return
+        currentSelf = null
+        options.onSelfChange?.(null)
       }
     },
     resolvePatForRepo: async (repoSlug) => {

@@ -29,6 +29,21 @@ describe('createGithubTokenBridge', () => {
     expect(bridge.getSelf()).toEqual({ login: 'octocat', id: 67890 })
   })
 
+  it('reports self changes but not a stale unregister', () => {
+    // given
+    const changes: unknown[] = []
+    const bridge = createGithubTokenBridge({ onSelfChange: (self) => changes.push(self) })
+
+    // when
+    const unregisterOld = bridge.registerSelf({ login: 'my-app[bot]', id: 12345 })
+    const unregisterNew = bridge.registerSelf({ login: 'octocat', id: 67890 })
+    unregisterOld()
+    unregisterNew()
+
+    // then
+    expect(changes).toEqual([{ login: 'my-app[bot]', id: 12345 }, { login: 'octocat', id: 67890 }, null])
+  })
+
   it('in-flight resolver rotation preserves the credential actor pair', async () => {
     const bridge = createGithubTokenBridge()
     const release = Promise.withResolvers<void>()
