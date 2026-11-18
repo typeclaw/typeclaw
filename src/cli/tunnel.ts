@@ -5,6 +5,7 @@ import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
 import { loadConfigSync, validateConfig } from '@/config'
+import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { appendOrReplaceEnvKey, findAgentDir, hasEnvKey, isInitialized } from '@/init'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
@@ -338,34 +339,39 @@ export async function runTunnelAddFlow(
     ...(hostname !== undefined ? { hostname } : {}),
     ...(tokenEnv !== undefined ? { tokenEnv } : {}),
   }
-  const raw = readRawConfig(cwd)
-  raw.tunnels = [...config.tunnels, tunnel]
-  if (provider === 'cloudflare-quick' || provider === 'cloudflare-named') {
-    raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
-  }
-  writeRawConfig(cwd, raw)
-  loadConfigSync(cwd)
+  // The prompts above can take a while; append to the tunnels on disk now.
+  withConfigFileLockSync(join(cwd, 'typeclaw.json'), () => {
+    const raw = readRawConfig(cwd)
+    raw.tunnels = [...loadConfigSync(cwd).tunnels, tunnel]
+    if (provider === 'cloudflare-quick' || provider === 'cloudflare-named') {
+      raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
+    }
+    writeRawConfig(cwd, raw)
+    loadConfigSync(cwd)
+  })
   return { ok: true, value: tunnel }
 }
 
 export function runTunnelRemoveFlow(cwd: string, args: RemoveArgs): LiveResult<{ removed: TunnelConfig }> {
-  // Same strict gate as `runTunnelAddFlow`. See the comment there for why.
-  const validation = validateConfig(cwd)
-  if (!validation.ok) return { ok: false, reason: validation.reason }
-  const config = loadConfigSync(cwd)
-  const tunnel = config.tunnels.find((entry) => entry.name === args.name)
-  if (tunnel === undefined) return { ok: false, reason: `unknown tunnel: ${args.name}` }
-  if (tunnel.for.kind === 'channel') {
-    return {
-      ok: false,
-      reason: `tunnel "${args.name}" is owned by channel "${tunnel.for.name}". Use \`typeclaw tunnel set ${args.name}\` to change its provider/URL, or hand-edit typeclaw.json to remove both the channel block and the tunnel.`,
+  return withConfigFileLockSync(join(cwd, 'typeclaw.json'), () => {
+    // Same strict gate as `runTunnelAddFlow`. See the comment there for why.
+    const validation = validateConfig(cwd)
+    if (!validation.ok) return { ok: false, reason: validation.reason }
+    const config = loadConfigSync(cwd)
+    const tunnel = config.tunnels.find((entry) => entry.name === args.name)
+    if (tunnel === undefined) return { ok: false, reason: `unknown tunnel: ${args.name}` }
+    if (tunnel.for.kind === 'channel') {
+      return {
+        ok: false,
+        reason: `tunnel "${args.name}" is owned by channel "${tunnel.for.name}". Use \`typeclaw tunnel set ${args.name}\` to change its provider/URL, or hand-edit typeclaw.json to remove both the channel block and the tunnel.`,
+      }
     }
-  }
-  const raw = readRawConfig(cwd)
-  raw.tunnels = config.tunnels.filter((entry) => entry.name !== args.name)
-  writeRawConfig(cwd, raw)
-  loadConfigSync(cwd)
-  return { ok: true, value: { removed: tunnel } }
+    const raw = readRawConfig(cwd)
+    raw.tunnels = config.tunnels.filter((entry) => entry.name !== args.name)
+    writeRawConfig(cwd, raw)
+    loadConfigSync(cwd)
+    return { ok: true, value: { removed: tunnel } }
+  })
 }
 
 export async function runTunnelSetFlow(
@@ -516,26 +522,30 @@ export async function runTunnelSetFlow(
     if (!tokenPromptResult.ok) return tokenPromptResult
   }
 
-  const raw = readRawConfig(cwd)
-  raw.tunnels = config.tunnels.map((entry) => (entry.name === existing.name ? next : entry))
-  if (nextProvider === 'cloudflare-quick' || nextProvider === 'cloudflare-named') {
-    raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
-  }
-  writeRawConfig(cwd, raw)
-  // The strict gate above already validated the on-disk shape; calling
-  // validateConfig again here catches any post-write schema violation (e.g.
-  // a provider/field combination the explicit checks above missed) and
-  // surfaces it as a clean LiveResult instead of a thrown error on the next
-  // `loadConfigSync`. We roll back the file on failure so the user's
-  // typeclaw.json doesn't end up in an invalid state.
-  const postWrite = validateConfig(cwd)
-  if (!postWrite.ok) {
-    raw.tunnels = config.tunnels
+  // The prompts above can take a while; edit the tunnels on disk now.
+  return withConfigFileLockSync(join(cwd, 'typeclaw.json'), () => {
+    const current = loadConfigSync(cwd).tunnels
+    const raw = readRawConfig(cwd)
+    raw.tunnels = current.map((entry) => (entry.name === existing.name ? next : entry))
+    if (nextProvider === 'cloudflare-quick' || nextProvider === 'cloudflare-named') {
+      raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
+    }
     writeRawConfig(cwd, raw)
-    return { ok: false, reason: postWrite.reason }
-  }
-  loadConfigSync(cwd)
-  return { ok: true, value: next }
+    // The strict gate above already validated the on-disk shape; calling
+    // validateConfig again here catches any post-write schema violation (e.g.
+    // a provider/field combination the explicit checks above missed) and
+    // surfaces it as a clean LiveResult instead of a thrown error on the next
+    // `loadConfigSync`. We roll back the file on failure so the user's
+    // typeclaw.json doesn't end up in an invalid state.
+    const postWrite = validateConfig(cwd)
+    if (!postWrite.ok) {
+      raw.tunnels = current
+      writeRawConfig(cwd, raw)
+      return { ok: false, reason: postWrite.reason }
+    }
+    loadConfigSync(cwd)
+    return { ok: true, value: next }
+  })
 }
 
 function collectSetFlagFields(args: SetArgs): TunnelSetField[] {
