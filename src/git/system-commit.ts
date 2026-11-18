@@ -5,7 +5,8 @@ import { resolveAgentGit } from './resolve-agent-git'
 // typeclaw.json) if any are dirty in git. Skips silently when the agent
 // folder is not a git repo, when Bun is unavailable, or when every named
 // file is clean. Uses Git's ambient identity: host config in host-stage calls,
-// or the agent repo identity injected into the container process at start.
+// or the identity in the container process env (the agent repo identity from
+// start, or the linked GitHub account while its adapter runs).
 //
 // Accepts a single file or an array; the array form produces a single
 // atomic commit covering all listed paths (used for migrations that touch
@@ -48,6 +49,9 @@ export async function commitSystemFile(cwd: string, file: string | readonly stri
   const commit = bun.spawn({
     cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'commit', '-m', message, '--only', '--', ...files])],
     cwd,
+    // Bun spawns with the launch-time env unless given one; the runtime swaps
+    // the identity variables in process.env while the GitHub adapter runs.
+    env: process.env,
     stdout: 'pipe',
     stderr: 'pipe',
   })
@@ -104,6 +108,9 @@ export function commitSystemFileSync(cwd: string, file: string | readonly string
   bun.spawnSync({
     cmd: ['git', ...hooklessGitArgs([...repo.gitArgs, 'commit', '-m', message, '--only', '--', ...files])],
     cwd,
+    // Bun spawns with the launch-time env unless given one; the runtime swaps
+    // the identity variables in process.env while the GitHub adapter runs.
+    env: process.env,
     stdout: 'pipe',
     stderr: 'pipe',
     timeout: SPAWN_SYNC_TIMEOUT_MS,

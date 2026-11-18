@@ -4,6 +4,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { trackGithubGitIdentityEnv } from './resolve-identity'
 import { commitSystemFile, commitSystemFileSync } from './system-commit'
 
 async function runGit(cwd: string, args: string[]): Promise<string> {
@@ -197,6 +198,43 @@ describe('commitSystemFileSync', () => {
       expect(await readFile(join(dir, 'AGENTS.md'), 'utf8')).toBe('user wip\n')
       expect(await runGit(dir, ['show', 'HEAD:AGENTS.md'])).toBe('original')
     } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('commitSystemFile runtime identity', () => {
+  test('commits as the GitHub account registered after startup, then as the repo identity again', async () => {
+    // given: a repo with its own identity and a tracker over the live runtime env
+    const dir = await mkdtemp(join(tmpdir(), 'sys-commit-github-identity-'))
+    const track = trackGithubGitIdentityEnv(new Set())
+    try {
+      await gitInit(dir)
+      await writeFile(join(dir, 'typeclaw.json'), '{"a":1}\n')
+      await runGit(dir, ['add', 'typeclaw.json'])
+      await runGit(dir, ['commit', '-m', 'initial'])
+
+      // when: the GitHub adapter registers its account
+      track({ login: 'typeey[bot]', id: 42 })
+      await writeFile(join(dir, 'typeclaw.json'), '{"a":2}\n')
+      await commitSystemFile(dir, 'typeclaw.json', 'as github')
+
+      // then
+      expect(await runGit(dir, ['log', '-1', '--format=%an <%ae>|%cn <%ce>'])).toBe(
+        'typeey[bot] <42+typeey[bot]@users.noreply.github.com>|typeey[bot] <42+typeey[bot]@users.noreply.github.com>',
+      )
+
+      // when: the adapter stops
+      track(null)
+      await writeFile(join(dir, 'typeclaw.json'), '{"a":3}\n')
+      await commitSystemFile(dir, 'typeclaw.json', 'as repo')
+
+      // then
+      expect(await runGit(dir, ['log', '-1', '--format=%an <%ae>|%cn <%ce>'])).toBe(
+        'Test User <test@example.com>|Test User <test@example.com>',
+      )
+    } finally {
+      track(null)
       await rm(dir, { recursive: true, force: true })
     }
   })

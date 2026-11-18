@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 
 import type { GithubSelfUser } from '@/channels/adapters/github/auth'
-import { isFallbackGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
+import { githubGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { readEnvFile } from '@/init/env-file'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 type BashEnvOverlay = Record<string, string>
@@ -77,14 +77,18 @@ export function spreadSandboxEnv(policy: ReturnType<typeof buildSandboxEnvPolicy
   return Object.keys(policy).length > 0 ? { env: policy } : {}
 }
 
-export function resolveExposableBashEnvNames(agentDir: string): { exposable: string[]; withheld: string[] } {
+export function resolveExposableBashEnvNames(agentDir: string): {
+  exposable: string[]
+  withheld: string[]
+  declared: string[]
+} {
   const declaredEnv = readEnvFile(agentDir)
   const exposable = resolveExposableEnvNames(declaredEnv, process.env)
   const exposableSet = new Set(exposable)
-  const withheld = [...declaredEnv]
-    .filter(([name, value]) => value.length > 0 && !exposableSet.has(name))
-    .map(([name]) => name)
-  return { exposable, withheld }
+  const nonEmpty = [...declaredEnv].filter(([, value]) => value.length > 0).map(([name]) => name)
+  const withheld = nonEmpty.filter((name) => !exposableSet.has(name))
+  const declared = nonEmpty.filter((name) => exposableSet.has(name))
+  return { exposable, withheld, declared }
 }
 
 // `typeclaw start` withholds a synthesized fallback identity from the container
@@ -92,12 +96,17 @@ export function resolveExposableBashEnvNames(agentDir: string): { exposable: str
 // commits in any other repository (workspace clones, /tmp worktrees) fail with
 // "Author identity unknown" and the model invents an identity, which can credit a
 // stranger's GitHub account. Reading the agent repo per command keeps it live.
+// The running GitHub adapter's account outranks the repo identity, so commits
+// are credited to the App bot (or PAT account) the agent acts as on GitHub.
+// Every name the operator did not declare in .env is set explicitly, even when
+// the runtime env carries it, so the values are fixed when the command is
+// resolved: the GitHub adapter stopping mid-preparation must not strip them.
 export async function resolveAgentGitIdentityEnv(
   agentDir: string,
-  exposableEnvNames: readonly string[],
+  operatorEnvNames: readonly string[],
   githubSelf: GithubSelfUser | null = null,
 ): Promise<BashEnvOverlay> {
-  const exposable = new Set(exposableEnvNames)
+  const exposable = new Set(operatorEnvNames)
   const names = {
     GIT_AUTHOR_NAME: 'name',
     GIT_AUTHOR_EMAIL: 'email',
@@ -106,11 +115,7 @@ export async function resolveAgentGitIdentityEnv(
   } as const
   const missing = Object.entries(names).filter(([name]) => !exposable.has(name))
   if (missing.length === 0) return {}
-  const repoIdentity = await resolveGitIdentity(agentDir)
-  const identity =
-    githubSelf !== null && (repoIdentity === null || (await isFallbackGitIdentity(agentDir, repoIdentity)))
-      ? { name: githubSelf.login, email: `${githubSelf.id}+${githubSelf.login}@users.noreply.github.com` }
-      : repoIdentity
+  const identity = githubSelf !== null ? githubGitIdentity(githubSelf) : await resolveGitIdentity(agentDir)
   if (identity === null) return {}
   return Object.fromEntries(missing.map(([name, field]) => [name, identity[field]]))
 }

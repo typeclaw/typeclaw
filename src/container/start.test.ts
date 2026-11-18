@@ -241,7 +241,7 @@ describe('planStart', () => {
   test('resolves repository-local Git identity through the production host-to-container path', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
-    await writeFile(join(root, '.env'), 'GIT_AUTHOR_NAME=stale\n')
+    await writeFile(join(root, '.env'), 'OTHER=value\n')
     await gitInit(root)
     await runGit(root, ['config', '--local', 'user.name', 'Resolved Agent'])
     await runGit(root, ['config', '--local', 'user.email', 'resolved@example.com'])
@@ -262,7 +262,7 @@ describe('planStart', () => {
   test('injects repository-local Git identity after the operator env file', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
-    await writeFile(join(root, '.env'), 'GIT_AUTHOR_NAME=stale\n')
+    await writeFile(join(root, '.env'), 'OTHER=value\n')
 
     const plan = await planStart({
       cwd: root,
@@ -295,8 +295,8 @@ describe('planStart', () => {
     expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([])
   })
 
-  test('forwards a configured identity that matches the folder name over stale .env values', async () => {
-    // given: folder Paul, configured name Paul with a custom email, stale .env identity
+  test('forwards a configured identity that matches the folder name, except names .env declares', async () => {
+    // given: folder Paul, configured name Paul with a custom email, a partial .env identity
     const cwd = join(root, 'Paul')
     await mkdir(cwd)
     await writeDockerfile(cwd)
@@ -324,14 +324,13 @@ describe('planStart', () => {
     // when
     const plan = await planStart({ cwd, hostPort: 8973, imageExists: true })
 
-    // then
-    const envFileIndex = plan.runArgs.indexOf('--env-file')
-    for (const value of [
-      'GIT_AUTHOR_NAME=Paul',
+    // then: the operator's .env names win, the rest come from the repo
+    expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([
       'GIT_AUTHOR_EMAIL=paul@example.com',
       'GIT_COMMITTER_NAME=Paul',
-      'GIT_COMMITTER_EMAIL=paul@example.com',
-    ]) {
+    ])
+    const envFileIndex = plan.runArgs.indexOf('--env-file')
+    for (const value of ['GIT_AUTHOR_EMAIL=paul@example.com', 'GIT_COMMITTER_NAME=Paul']) {
       const index = plan.runArgs.indexOf(value)
       expect(plan.runArgs[index - 1]).toBe('-e')
       expect(index).toBeGreaterThan(envFileIndex)

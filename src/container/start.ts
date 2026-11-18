@@ -26,6 +26,7 @@ import {
 import { resolveBaseImageVersion, resolveTypeclawSpec, typeclawCheckoutRoot } from '@/init/cli-version'
 import { buildDockerfile, classifyDockerfileAppend, DOCKERFILE } from '@/init/dockerfile'
 import { ensureDepsInstalled, type EnsureDepsResult } from '@/init/ensure-deps'
+import { readEnvFile } from '@/init/env-file'
 import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
 import { localSourceFingerprint, readLocalSourceStamp, writeLocalSourceStamp } from '@/init/local-source-stamp'
 import { refreshPackageJson } from '@/init/packagejson'
@@ -1188,16 +1189,16 @@ export async function planStart({
   }
   const resolvedGitIdentity = gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity
   if (resolvedGitIdentity !== null && !(await isFallbackGitIdentity(cwd, resolvedGitIdentity))) {
-    runArgs.push(
-      '-e',
-      `GIT_AUTHOR_NAME=${resolvedGitIdentity.name}`,
-      '-e',
-      `GIT_AUTHOR_EMAIL=${resolvedGitIdentity.email}`,
-      '-e',
-      `GIT_COMMITTER_NAME=${resolvedGitIdentity.name}`,
-      '-e',
-      `GIT_COMMITTER_EMAIL=${resolvedGitIdentity.email}`,
-    )
+    // A name the operator declared in .env wins, so it is not exported over it.
+    const declared = readEnvFile(cwd)
+    for (const [name, field] of [
+      ['GIT_AUTHOR_NAME', 'name'],
+      ['GIT_AUTHOR_EMAIL', 'email'],
+      ['GIT_COMMITTER_NAME', 'name'],
+      ['GIT_COMMITTER_EMAIL', 'email'],
+    ] as const) {
+      if (!declared.get(name)) runArgs.push('-e', `${name}=${resolvedGitIdentity[field]}`)
+    }
   }
   const agentMessengerPolicy = resolveAgentMessengerConfigPolicy(cwd)
   if (agentMessengerPolicy.override === null) {

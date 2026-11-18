@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { ensureGitIdentity } from '@/git/resolve-identity'
 
-import { resolveAgentGitIdentityEnv } from './bash-sandbox-env'
+import { buildSandboxEnvPolicy, resolveAgentGitIdentityEnv } from './bash-sandbox-env'
 
 const roots: string[] = []
 
@@ -59,14 +59,45 @@ describe('resolveAgentGitIdentityEnv', () => {
     await git(agentDir, ['config', '--local', 'user.email', 'agent@example.com'])
 
     // when
-    const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'octocat', id: 12345 })
+    const env = await resolveAgentGitIdentityEnv(agentDir, [])
 
     // then
     expect(env['GIT_AUTHOR_EMAIL']).toBe('agent@example.com')
     expect(env['GIT_COMMITTER_NAME']).toBe('Agent Smith')
   })
 
-  test('leaves identity names the runtime env already exposes to bash', async () => {
+  test('pins the GitHub identity even if the adapter stops before the command is built', async () => {
+    // given: the runtime env carries the identity the tracker set from the adapter
+    const agentDir = await agentRepo()
+    await ensureGitIdentity(agentDir)
+    const names = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'] as const
+    const previous = names.map((name) => [name, process.env[name]] as const)
+    for (const name of names)
+      process.env[name] = name.endsWith('EMAIL') ? '1+octocat@users.noreply.github.com' : 'octocat'
+    try {
+      const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'octocat', id: 1 })
+
+      // when: the adapter unregisters and the tracker clears the runtime env
+      for (const name of names) delete process.env[name]
+      const policy = buildSandboxEnvPolicy(env, undefined, names)
+
+      // then
+      expect(policy.set).toEqual({
+        GIT_AUTHOR_NAME: 'octocat',
+        GIT_AUTHOR_EMAIL: '1+octocat@users.noreply.github.com',
+        GIT_COMMITTER_NAME: 'octocat',
+        GIT_COMMITTER_EMAIL: '1+octocat@users.noreply.github.com',
+      })
+      expect(policy.inherit).toBeUndefined()
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
+  })
+
+  test('leaves identity names the operator declared in .env', async () => {
     // given
     const agentDir = await agentRepo()
     await ensureGitIdentity(agentDir)
@@ -90,26 +121,33 @@ describe('resolveAgentGitIdentityEnv', () => {
     await expect(resolveAgentGitIdentityEnv(agentDir, [])).resolves.toEqual({})
   })
 
-  test.each(['fallback', 'missing'] as const)('uses GitHub self when the repo identity is %s', async (kind) => {
-    // given
-    const agentDir = await agentRepo()
-    if (kind === 'fallback') await ensureGitIdentity(agentDir)
+  test.each(['fallback', 'missing', 'operator-set'] as const)(
+    'uses GitHub self when the repo identity is %s',
+    async (kind) => {
+      // given
+      const agentDir = await agentRepo()
+      if (kind === 'fallback') await ensureGitIdentity(agentDir)
+      if (kind === 'operator-set') {
+        await git(agentDir, ['config', '--local', 'user.name', 'Agent Smith'])
+        await git(agentDir, ['config', '--local', 'user.email', 'agent@example.com'])
+      }
 
-    // when
-    const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'my-app[bot]', id: 12345 })
+      // when
+      const env = await resolveAgentGitIdentityEnv(agentDir, [], { login: 'my-app[bot]', id: 12345 })
 
-    await git(
-      agentDir,
-      ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'test'],
-      env,
-    )
+      await git(
+        agentDir,
+        ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'test'],
+        env,
+      )
 
-    // then
-    const committedIdentity = await git(agentDir, ['log', '-1', '--format=%an|%ae|%cn|%ce'])
-    expect(committedIdentity.trim()).toBe(
-      'my-app[bot]|12345+my-app[bot]@users.noreply.github.com|my-app[bot]|12345+my-app[bot]@users.noreply.github.com',
-    )
-  })
+      // then
+      const committedIdentity = await git(agentDir, ['log', '-1', '--format=%an|%ae|%cn|%ce'])
+      expect(committedIdentity.trim()).toBe(
+        'my-app[bot]|12345+my-app[bot]@users.noreply.github.com|my-app[bot]|12345+my-app[bot]@users.noreply.github.com',
+      )
+    },
+  )
 
   test('adds nothing when all identity names are exposed', async () => {
     const agentDir = await agentRepo()

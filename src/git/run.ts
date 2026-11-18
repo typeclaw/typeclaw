@@ -38,7 +38,9 @@ export async function runGit(
   const proc = bun.spawn({
     cmd: ['git', ...hooklessGitArgs(args)],
     cwd,
-    env: options.env,
+    // Omitting env makes Bun use the launch-time environment, missing identity
+    // variables the runtime sets later (the linked GitHub account).
+    env: options.env ?? process.env,
     stdout: 'pipe',
     stderr: 'pipe',
   })
