@@ -859,6 +859,11 @@ export type ManagedConfigCommitCheck = {
   check(content: string, destination: string): Promise<void>
 }
 
+// The queue serializes checked writes only. Writers outside it, namely privileged
+// model bash (roles that keep agent-root writes, which already bypass the
+// medium-tier config guards) and host-side typeclaw config commands, can still
+// land between a queued write's check and its write and then be overwritten.
+// Coordinating them needs a lock shared across processes; see #1718.
 const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
 const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
 let checkedWrites: Promise<unknown> = Promise.resolve()

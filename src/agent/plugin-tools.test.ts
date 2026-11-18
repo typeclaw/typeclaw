@@ -7827,6 +7827,65 @@ describe('managed config commit check', () => {
     },
   )
 
+  test.skipIf(lacksInodeAnchoring)(
+    'the real managedConfig guard rejects at commit what preflight allowed',
+    async () => {
+      // given: cron.json already holds an expired job, so rewriting it unchanged is
+      // allowed at preflight; a concurrent change then drops that job, which turns
+      // the same bytes into adding a new expired job
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-real-commit-'))
+      const cron = path.join(agentDir, 'cron.json')
+      const expired = {
+        id: 'expired',
+        schedule: '0 9 * * *',
+        until: '2020-01-01T00:00:00Z',
+        kind: 'prompt',
+        prompt: 'x',
+        scheduledByRole: 'owner',
+      }
+      const fresh = { id: 'fresh', schedule: '0 10 * * *', kind: 'prompt', prompt: 'y', scheduledByRole: 'owner' }
+      await writeFile(cron, JSON.stringify({ jobs: [expired, fresh] }, null, 2))
+      const hooks = createHookBus()
+      hooks.registerAll('guard', agentDir, noopLogger, {})
+      let preflightPassed = false
+      hooks.registerAll('concurrent', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          if (preflightPassed || path.isAbsolute(String(event.args.path))) return undefined
+          preflightPassed = true
+          await writeFile(cron, JSON.stringify({ jobs: [fresh] }, null, 2))
+          return undefined
+        },
+      })
+      const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check-real-commit' }
+      const write = buildBuiltinPiToolOverrides({
+        agentDir,
+        sessionId: 'commit-check-real-commit',
+        hooks,
+        guards: buildInternalGuards(agentDir),
+        getOrigin: () => tui,
+        permissions: createPermissionService(),
+      }).find((candidate) => candidate.name === 'write')
+      if (write === undefined) throw new Error('missing write builtin')
+      try {
+        // when
+        const execution = write.execute(
+          'c',
+          { path: 'cron.json', content: JSON.stringify({ jobs: [expired, fresh] }, null, 2) } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: preflight let it through, the commit check blocked it, nothing was written
+        await expect(execution).rejects.toThrow(/managedConfig/)
+        expect(preflightPassed).toBe(true)
+        expect(JSON.parse(await readFile(cron, 'utf8'))).toEqual({ jobs: [fresh] })
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
   function writeTool(agentDir: string, hooks: ReturnType<typeof createHookBus>) {
     const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check' }
     const write = buildBuiltinPiToolOverrides({
