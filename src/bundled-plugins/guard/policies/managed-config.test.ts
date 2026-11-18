@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { checkManagedConfigGuard } from './managed-config'
 
@@ -525,5 +526,28 @@ describe('managedConfig guard — scope', () => {
       agentDir,
     })
     expect(result).toBeUndefined()
+  })
+})
+
+describe('managedConfig guard — file: URI targets', () => {
+  test('validates typeclaw.json addressed by a file: URI, including one with leading whitespace', async () => {
+    const agentDir = await makeAgentDir()
+    const uri = pathToFileURL(path.join(agentDir, 'typeclaw.json')).href
+
+    for (const ref of [uri, `  ${uri}`]) {
+      const result = await checkManagedConfigGuard({
+        tool: 'write',
+        args: { path: ref, content: '{ not json' },
+        agentDir,
+      })
+      expect(result?.block).toBe(true)
+    }
+    expect(
+      await checkManagedConfigGuard({
+        tool: 'write',
+        args: { path: uri, content: JSON.stringify({ port: 9000 }) },
+        agentDir,
+      }),
+    ).toBeUndefined()
   })
 })

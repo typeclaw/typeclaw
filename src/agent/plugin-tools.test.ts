@@ -7607,6 +7607,104 @@ describe('managed config commit check', () => {
     }
   })
 
+  // Hooks whose commit-time check (a write carrying the final bytes, second or
+  // later check of a call) can be held open by the test.
+  function pausableCommitHooks(agentDir: string) {
+    const hooks = createHookBus()
+    const commits: string[] = []
+    let release: (() => void) | undefined
+    let paused: Promise<void> | undefined
+    let onPaused: (() => void) | undefined
+    const reachedPause = new Promise<void>((resolve) => {
+      onPaused = resolve
+    })
+    hooks.registerAll('pausable', agentDir, noopLogger, {
+      'tool.before': async (event) => {
+        if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
+        if (!String(event.args.path).endsWith('typeclaw.json')) return undefined
+        if (event.callId === 'first' && paused === undefined) {
+          paused = new Promise<void>((resolve) => {
+            release = resolve
+          })
+          // Only the commit check of the first call carries the destination path.
+          if (path.isAbsolute(String(event.args.path))) {
+            onPaused?.()
+            await paused
+          } else {
+            paused = undefined
+          }
+        }
+        commits.push(`${event.callId}:${event.args.content}`)
+        return undefined
+      },
+    })
+    return { hooks, commits, reachedPause, release: () => release?.() }
+  }
+
+  test.skipIf(lacksInodeAnchoring)('writes nothing when the call is cancelled during its commit check', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-abort-commit-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    await writeFile(config, '{}\n')
+    const controller = new AbortController()
+    const { hooks, reachedPause, release } = pausableCommitHooks(agentDir)
+    try {
+      const execution = builtin('write', agentDir, hooks).execute(
+        'first',
+        { path: 'typeclaw.json', content: '{"alias":["atlas"]}\n' } as never,
+        controller.signal,
+        undefined,
+        {} as never,
+      )
+      await reachedPause
+      controller.abort()
+      release()
+      await expect(execution).rejects.toThrow()
+      expect(await readFile(config, 'utf8')).toBe('{}\n')
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(lacksInodeAnchoring)('serializes an edit behind a write that is still in its commit check', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-overlap-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const { hooks, commits, reachedPause, release } = pausableCommitHooks(agentDir)
+    try {
+      // given: a write held inside its commit check
+      const write = builtin('write', agentDir, hooks).execute(
+        'first',
+        { path: 'typeclaw.json', content: '{"alias":["renamed"]}\n' } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+      await reachedPause
+
+      // when: an edit of the same file starts, then the write is released
+      const edit = builtin('edit', agentDir, hooks).execute(
+        'second',
+        { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"atlas","아틀라스"' }] } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+      release()
+      await write
+      await edit.catch(() => undefined)
+
+      // then: the edit's commit check ran only after the write landed, and the
+      // edit (which read the pre-write file) never overwrote the write
+      const writeCommit = commits.findIndex((c) => c.startsWith('first:') && c.includes('renamed'))
+      const editCommit = commits.findIndex((c) => c.startsWith('second:') && c.includes('아틀라스'))
+      expect(writeCommit).toBeGreaterThanOrEqual(0)
+      if (editCommit !== -1) expect(editCommit).toBeGreaterThan(writeCommit)
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["renamed"]}\n')
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test.skipIf(lacksInodeAnchoring)('writes nothing when the call is cancelled after its guard check', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-abort-'))
     const config = path.join(agentDir, 'typeclaw.json')
