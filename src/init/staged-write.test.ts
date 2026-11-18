@@ -8,6 +8,7 @@ import {
   CredentialRestoreError,
   credentialStagingDir,
   discardCredentialStaging,
+  publishConfigWithCredential,
   publishCredential,
   replaceFile,
   stageCredential,
@@ -60,9 +61,9 @@ describe('credential staging', () => {
 
       // then: both copies are owner-only in an owner-only dir, and .env is untouched
       expect(mode(staging)).toBe(0o700)
-      expect(readFileSync(staged.newCopy, 'utf8')).toBe('NEW=1\n')
+      expect(readFileSync(staged.newCopy!, 'utf8')).toBe('NEW=1\n')
       expect(readFileSync(staged.priorCopy!, 'utf8')).toBe('OLD=1\n')
-      expect(mode(staged.newCopy)).toBe(0o600)
+      expect(mode(staged.newCopy!)).toBe(0o600)
       expect(mode(staged.priorCopy!)).toBe(0o600)
       expect(readdirSync(cwd).sort()).toEqual(['.env', '.typeclaw'])
       expect(readFileSync(join(cwd, '.env'), 'utf8')).toBe('OLD=1\n')
@@ -104,7 +105,7 @@ describe('credential staging', () => {
     expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
   })
 
-  test('names .env and the kept prior copy when the restore fails too', async () => {
+  test('names .env, and where a copy is kept the prior copy, when the restore fails too', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
     const env = join(cwd, '.env')
     await writeFile(env, 'OLD=1\n')
@@ -123,9 +124,108 @@ describe('credential staging', () => {
 
     expect(thrown).toBeInstanceOf(CredentialRestoreError)
     expect((thrown as Error).message).toContain(`${env} could not be restored`)
-    expect((thrown as Error).message).toContain(`its previous content is saved at ${staged.priorCopy}`)
-    expect(readFileSync(staged.priorCopy!, 'utf8')).toBe('OLD=1\n')
-    expect(existsSync(staged.newCopy)).toBe(false)
+    if (process.platform === 'win32') {
+      // Windows keeps no copy on disk, so the token has to be re-entered.
+      expect((thrown as Error).message).toContain(`must be re-entered in ${env}`)
+      expect(existsSync(credentialStagingDir(cwd))).toBe(false)
+    } else {
+      expect((thrown as Error).message).toContain(`its previous content is saved at ${staged.priorCopy}`)
+      expect(readFileSync(staged.priorCopy!, 'utf8')).toBe('OLD=1\n')
+      expect(existsSync(staged.newCopy!)).toBe(false)
+    }
+  })
+
+  describe('on Windows', () => {
+    // Exercised on every platform through the platform seam: no credential byte
+    // may be written to the staging dir, whose files would carry the agent
+    // folder's ACL rather than .env's.
+    async function agentWithEnv() {
+      const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-win32-'))
+      await writeFile(join(cwd, '.env'), 'OLD=1\n')
+      await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
+      return { cwd, env: join(cwd, '.env'), config: join(cwd, 'typeclaw.json'), staging: credentialStagingDir(cwd) }
+    }
+
+    function inPlace(failCalls: number[], onWrite: () => void) {
+      let calls = 0
+      return (path: string, content: string | Buffer) => {
+        onWrite()
+        calls += 1
+        const fails = failCalls.includes(calls)
+        writeFileSync(path, fails ? '' : content, { flag: 'w' })
+        if (fails) throw new Error(`injected write failure ${calls}`)
+      }
+    }
+
+    test('a successful publish writes nothing to the staging dir', async () => {
+      const { cwd, env, config, staging } = await agentWithEnv()
+      const stagingExisted: boolean[] = []
+
+      const result = publishConfigWithCredential(
+        config,
+        '{"tunnels":[]}\n',
+        { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
+        { platform: 'win32', writeInPlace: inPlace([], () => stagingExisted.push(existsSync(staging))) },
+      )
+
+      expect(result).toEqual({ ok: true })
+      expect(stagingExisted).toEqual([false])
+      expect(existsSync(staging)).toBe(false)
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\nTOKEN=new\n')
+      expect(readdirSync(cwd).sort()).toEqual(['.env', 'typeclaw.json'])
+    })
+
+    test("a failed publish's rollback restores .env from memory, writing nothing to staging", async () => {
+      const { env, config, staging } = await agentWithEnv()
+      const stagingExisted: boolean[] = []
+
+      const result = publishConfigWithCredential(
+        config,
+        '{"tunnels":[]}\n',
+        { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
+        {
+          platform: 'win32',
+          writeInPlace: inPlace([], () => stagingExisted.push(existsSync(staging))),
+          rename: () => {
+            throw new Error('injected config publish failure')
+          },
+        },
+      )
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.reason).toContain('typeclaw.json was not changed; .env was restored.')
+      expect(stagingExisted).toEqual([false, false])
+      expect(existsSync(staging)).toBe(false)
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+      expect(readFileSync(config, 'utf8')).toBe('{}\n')
+    })
+
+    test('a failed restore says the token must be re-entered, writing nothing to staging', async () => {
+      const { env, config, staging } = await agentWithEnv()
+      const stagingExisted: boolean[] = []
+
+      const result = publishConfigWithCredential(
+        config,
+        '{"tunnels":[]}\n',
+        { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: staging },
+        {
+          platform: 'win32',
+          writeInPlace: inPlace([2], () => stagingExisted.push(existsSync(staging))),
+          rename: () => {
+            throw new Error('injected config publish failure')
+          },
+        },
+      )
+
+      expect(result.ok).toBe(false)
+      if (!result.ok) {
+        expect(result.reason).toContain(`${env} could not be restored (injected write failure 2)`)
+        expect(result.reason).toContain(`must be re-entered in ${env}`)
+      }
+      expect(stagingExisted).toEqual([false, false])
+      expect(existsSync(staging)).toBe(false)
+      expect(readFileSync(config, 'utf8')).toBe('{}\n')
+    })
   })
 
   test.skipIf(process.platform === 'win32')(

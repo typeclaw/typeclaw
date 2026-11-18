@@ -1073,17 +1073,23 @@ describe('writeConfigAndToken', () => {
       writeInPlace: inPlaceWriter([2]),
     })
 
-    // then: the failure names .env and the staged copy of its prior content,
-    // which is kept so the operator can recover it
+    // then: the failure names .env and how to recover: from the kept staged
+    // copy of its prior content, or on Windows (which keeps no copy on disk)
+    // by re-entering the token
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('unreachable')
-    const kept = readdirSync(stagingDir(cwd))
-    expect(kept).toHaveLength(1)
-    const priorCopy = join(stagingDir(cwd), kept[0]!)
     expect(result.reason).toContain(`${env} could not be restored (injected in-place write failure 2)`)
-    expect(result.reason).toContain(`its previous content is saved at ${priorCopy}`)
-    expect(await readFile(priorCopy, 'utf8')).toBe('OTHER=1\n')
-    if (process.platform !== 'win32') expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
+    if (process.platform === 'win32') {
+      expect(result.reason).toContain(`must be re-entered in ${env}`)
+      expect(existsSync(stagingDir(cwd))).toBe(false)
+    } else {
+      const kept = readdirSync(stagingDir(cwd))
+      expect(kept).toHaveLength(1)
+      const priorCopy = join(stagingDir(cwd), kept[0]!)
+      expect(result.reason).toContain(`its previous content is saved at ${priorCopy}`)
+      expect(await readFile(priorCopy, 'utf8')).toBe('OTHER=1\n')
+      expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
+    }
     expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
   })
 

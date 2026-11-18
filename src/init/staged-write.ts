@@ -109,9 +109,10 @@ export type StagedCredential = {
   path: string
   content: Buffer
   prior: Buffer | undefined
-  // Owner-only copies in the staging dir. `priorCopy` is kept for manual
-  // recovery when a restore fails; both are removed otherwise.
-  newCopy: string
+  // Owner-only copies in the staging dir (never on Windows, see
+  // `stageCredential`). `priorCopy` is kept for manual recovery when a
+  // restore fails; both are removed otherwise.
+  newCopy: string | undefined
   priorCopy: string | undefined
 }
 
@@ -124,9 +125,22 @@ export class CredentialRestoreError extends Error {}
 // (the full new content and a copy of the prior content, both 0600 in the
 // owner-only staging dir) and then written in place by `publishCredential`.
 // A read-only destination is refused, as an in-place write to it would be.
-export function stageCredential(path: string, content: string | Buffer, stagingDir: string): StagedCredential {
+// On Windows nothing is written to the staging dir: a file there inherits the
+// agent folder's ACL rather than .env's, so on a shared folder with a
+// restricted .env the copies would be readable by others. There the prior
+// content is held in memory only for rollback, and the new bytes go straight
+// into .env in place, which keeps .env's own ACL.
+export function stageCredential(
+  path: string,
+  content: string | Buffer,
+  stagingDir: string,
+  platform: NodeJS.Platform = process.platform,
+): StagedCredential {
   const prior = readFileOrUndefined(path)
   if (prior !== undefined) accessSync(path, constants.W_OK)
+  if (platform === 'win32') {
+    return { path, content: Buffer.from(content), prior, newCopy: undefined, priorCopy: undefined }
+  }
   ensureOwnerOnlyDir(stagingDir)
   const staged: StagedCredential = {
     path,
@@ -137,7 +151,7 @@ export function stageCredential(path: string, content: string | Buffer, stagingD
       prior === undefined ? undefined : join(stagingDir, `.${basename(path)}.${randomUUID()}.prior.typeclaw-tmp`),
   }
   try {
-    writeOwnerOnly(staged.newCopy, staged.content)
+    writeOwnerOnly(staged.newCopy as string, staged.content)
     if (staged.priorCopy !== undefined && prior !== undefined) writeOwnerOnly(staged.priorCopy, prior)
   } catch (error) {
     discardCredentialStaging(staged)
@@ -185,8 +199,11 @@ export function restoreCredential(
   try {
     writeInPlace(staged.path, staged.prior)
   } catch (restoreError) {
+    const failure = `${staged.path} could not be restored (${describe(restoreError)})${cause === undefined ? '' : ` after a failed write (${describe(cause)})`}`
     throw new CredentialRestoreError(
-      `${staged.path} could not be restored (${describe(restoreError)})${cause === undefined ? '' : ` after a failed write (${describe(cause)})`}; its previous content is saved at ${staged.priorCopy}. Copy that file's content back into ${staged.path} by hand.`,
+      staged.priorCopy === undefined
+        ? `${failure}; the previous token(s) in it could not be restored and must be re-entered in ${staged.path}.`
+        : `${failure}; its previous content is saved at ${staged.priorCopy}. Copy that file's content back into ${staged.path} by hand.`,
     )
   }
 }
@@ -203,7 +220,7 @@ export function publishConfigWithCredential(
   configPath: string,
   configBytes: string,
   credential: CredentialUpdate | undefined,
-  seams: { rename?: Rename; writeInPlace?: WriteInPlace } = {},
+  seams: { rename?: Rename; writeInPlace?: WriteInPlace; platform?: NodeJS.Platform } = {},
 ): { ok: true } | { ok: false; reason: string } {
   const rename = seams.rename ?? renameSync
   const credentialName = credential === undefined ? undefined : basename(credential.path)
@@ -211,7 +228,9 @@ export function publishConfigWithCredential(
   let configStaged: StagedReplacement | undefined
   let keepPriorCopy = false
   try {
-    if (credential !== undefined) staged = stageCredential(credential.path, credential.content, credential.stagingDir)
+    if (credential !== undefined) {
+      staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
+    }
     configStaged = stageReplacement(configPath, configBytes)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
@@ -244,7 +263,7 @@ export function publishConfigWithCredential(
 }
 
 export function discardCredentialStaging(staged: StagedCredential, keepPrior = false): void {
-  rmSync(staged.newCopy, { force: true })
+  if (staged.newCopy !== undefined) rmSync(staged.newCopy, { force: true })
   if (staged.priorCopy !== undefined && !keepPrior) rmSync(staged.priorCopy, { force: true })
 }
 
