@@ -327,12 +327,30 @@ export const gitUserSchema = z.object({
 
 export type GitUserConfig = z.infer<typeof gitUserSchema>
 
-// Same rationale as `dockerSchema`: a `git` namespace carries `git.ignore` and
-// `git.user`, and leaves room for future siblings (e.g. `git.attributes`).
+// Agent-repo remotes by name. Names follow git's remote-name shape, and neither
+// side may start with "-" so a value can never be read as a git option.
+export const gitRemotesSchema = z.record(
+  z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, {
+    message: 'git.remotes names must start with a letter or digit and use only letters, digits, ".", "_" or "-"',
+  }),
+  z
+    .string()
+    .trim()
+    .min(1)
+    .refine((url) => !url.startsWith('-') && !/\p{Cc}/u.test(url), {
+      message: 'git.remotes URLs must be a single line that does not start with "-"',
+    }),
+)
+
+export type GitRemotesConfig = z.infer<typeof gitRemotesSchema>
+
+// Same rationale as `dockerSchema`: a `git` namespace carries `git.ignore`,
+// `git.user` and `git.remotes`, and leaves room for future siblings.
 export const gitSchema = z
   .object({
     ignore: gitignoreSchema,
     user: gitUserSchema.optional(),
+    remotes: gitRemotesSchema.optional(),
   })
   .default(() => ({ ignore: gitignoreObjectSchema.parse({}) }))
 
@@ -1261,6 +1279,9 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   'git.ignore': 'restart-required',
   // Model bash reads it per call and the runtime re-exports it on reload.
   'git.user': 'applied',
+  // Copied into the agent repo only by `typeclaw start` while the container is
+  // down; a live write would detach sandboxes' read-only .git/config bind.
+  'git.remotes': 'restart-required',
   githubCli: 'restart-required',
   typevault: 'restart-required',
   logs: 'ignored',

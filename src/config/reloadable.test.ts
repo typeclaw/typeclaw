@@ -414,6 +414,7 @@ function shouldRecurse(path: string): boolean {
 }
 
 // `roles.match` / `roles.permissions` are optional virtual paths and `git.user`
-// is an optional block: absent from a bare-`{}` parse (so they never show up in
-// the enumerated default-config paths) but classified in FIELD_EFFECTS.
-const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions', 'git.user'])
+// / `git.remotes` are optional blocks: absent from a bare-`{}` parse (so they
+// never show up in the enumerated default-config paths) but classified in
+// FIELD_EFFECTS.
+const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions', 'git.user', 'git.remotes'])
