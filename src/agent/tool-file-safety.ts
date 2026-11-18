@@ -878,9 +878,10 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
     // and again before any byte is truncated.
     await assertPinnedEntry(targetPath, destination)
     await commit.check(content, destination)
-    // A call cancelled while queued or while its guards ran must not write.
-    commit.signal?.throwIfAborted()
     await assertPinnedEntry(targetPath, destination)
+    // A call cancelled while queued, while its guards ran, or during the entry
+    // check above must not write; nothing is awaited between here and the write.
+    commit.signal?.throwIfAborted()
     await writeOutputNoFollow(targetPath, content)
   })
   checkedWrites = write.catch(() => {})
