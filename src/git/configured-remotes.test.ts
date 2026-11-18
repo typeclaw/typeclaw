@@ -122,8 +122,21 @@ describe('syncConfiguredGitRemotes', () => {
     const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
     expect(warnings).toEqual([
-      'backups on branch "main" push to remote "mirror" (set by its upstream, pushRemote, or remote.pushDefault), not to git.remotes.origin',
+      `backups on branch "main" push to remote "mirror" (set by ${key}), not to git.remotes.origin`,
     ])
+  })
+
+  test('names only the routing key when a push routing value is a URL, never the URL itself', async () => {
+    const repo = await agentRepo()
+    await git(repo, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+    await git(repo, ['config', 'remote.pushDefault', 'https://alice:s3cr3t-token@example.com/elsewhere.git'])
+
+    const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(warnings).toEqual([
+      'backups on branch "main" push to a destination that is not a configured remote (set by remote.pushDefault), not to git.remotes.origin',
+    ])
+    expect(warnings.join('\n')).not.toContain('s3cr3t-token')
   })
 
   test('leaves config untouched when every remote already matches or none are configured', async () => {

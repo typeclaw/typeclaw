@@ -44,11 +44,15 @@ export async function syncConfiguredGitRemotes(
       `remote "${name}" pushes somewhere other than git.remotes.${name} because a pushurl or URL rewrite overrides it, so pushes (including backups) do not go to the configured URL`,
     )
   }
-  if ('origin' in remotes) {
+  if (Object.hasOwn(remotes, 'origin')) {
     const pushRemote = await backupPushRemote(git)
     if (pushRemote !== null && pushRemote.remote !== 'origin') {
+      // A routing value that is not a configured remote is used as a URL, which
+      // can carry credentials, so only a verified remote name is printed.
+      const known = lines((await git(['remote'])).stdout).includes(pushRemote.remote)
+      const target = known ? `remote "${pushRemote.remote}"` : 'a destination that is not a configured remote'
       problems.push(
-        `backups on branch "${pushRemote.branch}" push to remote "${pushRemote.remote}" (set by its upstream, pushRemote, or remote.pushDefault), not to git.remotes.origin`,
+        `backups on branch "${pushRemote.branch}" push to ${target} (set by ${pushRemote.key}), not to git.remotes.origin`,
       )
     }
   }
@@ -60,13 +64,13 @@ export async function syncConfiguredGitRemotes(
 // remote; an untracked branch is pushed to origin.
 async function backupPushRemote(
   git: (args: string[]) => ReturnType<typeof runGit>,
-): Promise<{ branch: string; remote: string } | null> {
+): Promise<{ branch: string; remote: string; key: string } | null> {
   const head = await git(['symbolic-ref', '--short', '-q', 'HEAD'])
   const branch = head.exitCode === 0 ? head.stdout.trim() : ''
   if (branch.length === 0) return null
   for (const key of [`branch.${branch}.pushRemote`, 'remote.pushDefault', `branch.${branch}.remote`]) {
     const value = await git(['config', '--get', key])
-    if (value.exitCode === 0 && value.stdout.trim().length > 0) return { branch, remote: value.stdout.trim() }
+    if (value.exitCode === 0 && value.stdout.trim().length > 0) return { branch, remote: value.stdout.trim(), key }
   }
-  return { branch, remote: 'origin' }
+  return { branch, remote: 'origin', key: 'the default' }
 }
