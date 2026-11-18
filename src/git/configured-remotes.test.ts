@@ -35,7 +35,7 @@ describe('syncConfiguredGitRemotes', () => {
   test('adds a missing remote with its default fetch refspec', async () => {
     const repo = await agentRepo()
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toBe(true)
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual([])
 
     expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/acme/agent.git')
     expect(await git(repo, ['config', '--get', 'remote.origin.fetch'])).toBe('+refs/heads/*:refs/remotes/origin/*')
@@ -46,10 +46,24 @@ describe('syncConfiguredGitRemotes', () => {
     await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
     await git(repo, ['remote', 'add', 'upstream', 'https://example.com/upstream.git'])
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })).resolves.toBe(true)
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })).resolves.toEqual([])
 
     expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/new.git')
     expect(await git(repo, ['remote', 'get-url', 'upstream'])).toBe('https://example.com/upstream.git')
+  })
+
+  test('keeps an operator pushurl but reports that pushes still go there', async () => {
+    const repo = await agentRepo()
+    await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
+    await git(repo, ['config', 'remote.origin.pushurl', 'https://example.com/push.git'])
+
+    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(problems).toEqual([
+      'remote "origin" keeps its pushurl https://example.com/push.git, so pushes (including backups) go there instead of git.remotes.origin',
+    ])
+    expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/new.git')
+    expect(await git(repo, ['config', '--get', 'remote.origin.pushurl'])).toBe('https://example.com/push.git')
   })
 
   test('leaves config untouched when every remote already matches or none are configured', async () => {
@@ -58,8 +72,8 @@ describe('syncConfiguredGitRemotes', () => {
     const config = join(repo, '.git', 'config')
     const before = await stat(config)
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toBe(true)
-    await expect(syncConfiguredGitRemotes(repo, undefined)).resolves.toBe(true)
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual([])
+    await expect(syncConfiguredGitRemotes(repo, undefined)).resolves.toEqual([])
 
     expect((await stat(config)).ino).toBe(before.ino)
   })

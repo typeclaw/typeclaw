@@ -434,8 +434,8 @@ async function runStart({
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)
     }
-    if (!(await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes))) {
-      const warning = 'typeclaw: could not copy every typeclaw.json#git.remotes entry into the agent repo.'
+    for (const problem of await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes)) {
+      const warning = `typeclaw: ${problem}.`
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)
     }
