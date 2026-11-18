@@ -54,6 +54,11 @@ export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null
   return identity
 }
 
+// GitHub credits a commit to an account, App bots included, by its noreply email.
+export function githubGitIdentity(self: { login: string; id: number }): GitIdentity {
+  return { name: self.login, email: `${self.id}+${self.login}@users.noreply.github.com` }
+}
+
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it
 // over an identity the operator sets while the container runs.
 export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity): Promise<boolean> {

@@ -139,7 +139,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     preparation = await deferredPreparation?.()
     const command = preparation?.command ?? originalCommand
     const envNames = resolveExposableBashEnvNames(agentDir)
-    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.exposable, options.getGithubSelf?.())
+    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.declared, options.getGithubSelf?.())
     const mergedEnvOverlay = { ...gitIdentityEnv, ...envOverlay, ...preparation?.env }
     const preparedEnvOverlay = Object.keys(mergedEnvOverlay).length > 0 ? mergedEnvOverlay : undefined
     const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)
