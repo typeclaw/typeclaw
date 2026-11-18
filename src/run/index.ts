@@ -1136,7 +1136,6 @@ async function startAgentRuntime(
     // into the next `startAgent`.
     try {
       stopResourceSampler()
-      lastWords?.close()
       scheduler?.stop()
       cronConsumer.stop()
       subagentConsumer.stop()
@@ -1148,6 +1147,7 @@ async function startAgentRuntime(
       setReviewObserver(null)
       setReviewCoverageCapture(null)
       setReviewOutputObserver(null)
+      await lastWords?.close()
       await stopCodingAgents()
       await tunnelManager.stop()
       await recoveryDispatcher?.stop()

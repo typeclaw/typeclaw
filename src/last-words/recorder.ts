@@ -6,6 +6,7 @@ import {
   openRun,
   readLastWords,
   recordWords,
+  withLastWordsLock,
   writeLastWords,
   type LastWords,
   type LastWordsRun,
@@ -18,6 +19,7 @@ export const TICK_MS = 2_000
 export const IDLE_WRITE_MS = 30_000
 export const PRESSURE_RATIO = 0.85
 export const RECENT_SAMPLES = 30
+export const CLOSE_LOCK_WAIT_MS = 1_000
 
 export type LastWordsProbes = {
   memoryCurrentMb: () => number | null
@@ -39,10 +41,12 @@ export type LastWordsRecorderOptions = {
 
 export type LastWordsRecorder = {
   // Graceful shutdown: the run ended cleanly, so its words are dropped.
-  close: () => void
+  close: () => Promise<void>
   // Boot failure: stop recording but leave the run alive for the host to seal,
   // because a runtime that failed to boot did die.
   dispose: () => void
+  // Resolves once the write in flight, if any, has landed.
+  settled: () => Promise<void>
 }
 
 // Memory is sampled every tick so the trend is dense, but the file is only
@@ -59,49 +63,60 @@ export function startLastWordsRecorder(options: LastWordsRecorderOptions): LastW
   let lastWriteAt = Number.NEGATIVE_INFINITY
   let opened = false
   let failing = false
+  let inFlight: Promise<void> | null = null
 
-  const guarded = (step: () => void): void => {
+  // A recorder must never take the agent down, and a persistent failure
+  // (read-only mount, full disk) must not log every two seconds.
+  const guarded = async (
+    update: (file: ReturnType<typeof readLastWords>) => typeof file,
+    lock: { maxWaitMs?: number } = {},
+  ): Promise<boolean> => {
     try {
-      step()
+      await withLastWordsLock(agentDir, async () => writeLastWords(agentDir, update(readLastWords(agentDir))), lock)
       failing = false
+      return true
     } catch (error) {
-      // A recorder must never take the agent down, and a persistent failure
-      // (read-only mount, full disk) must not log every two seconds.
       if (!failing) log(`[last-words] write failed: ${error instanceof Error ? error.message : String(error)}`)
       failing = true
+      return false
     }
   }
 
-  // Opening the run is retried on every tick until it lands: without its entry,
-  // later words have nothing to attach to, so one failed boot write would
-  // otherwise silence the whole run.
-  const tick = (): void =>
-    guarded(() => {
-      if (!opened) {
-        writeLastWords(agentDir, openRun(readLastWords(agentDir), run, now().toISOString()))
-        opened = true
-      }
-      const at = now()
-      const currentMb = probes.memoryCurrentMb()
-      const limitMb = probes.memoryLimitMb()
-      if (currentMb !== null) {
-        recent.push({ at: at.toISOString(), currentMb })
-        if (recent.length > RECENT_SAMPLES) recent.shift()
-      }
-      const underPressure = currentMb !== null && limitMb !== null && currentMb >= limitMb * PRESSURE_RATIO
-      if (!underPressure && at.getTime() - lastWriteAt < IDLE_WRITE_MS) return
-      const words: LastWords = {
-        memory: { currentMb, limitMb, oomKills: probes.oomKills(), recent: [...recent] },
-        runtime: probes.runtime(),
-        turns: probes.turns(),
-        children: probes.children(),
-      }
-      writeLastWords(agentDir, recordWords(readLastWords(agentDir), run, words, at.toISOString()))
-      lastWriteAt = at.getTime()
-    })
+  // Opening the run rides on the first write and is retried by every tick until
+  // it lands: without its entry, later words have nothing to attach to, so one
+  // failed boot write would otherwise silence the whole run.
+  const step = async (): Promise<void> => {
+    const at = now()
+    const currentMb = probes.memoryCurrentMb()
+    const limitMb = probes.memoryLimitMb()
+    if (currentMb !== null) {
+      recent.push({ at: at.toISOString(), currentMb })
+      if (recent.length > RECENT_SAMPLES) recent.shift()
+    }
+    const underPressure = currentMb !== null && limitMb !== null && currentMb >= limitMb * PRESSURE_RATIO
+    if (opened && !underPressure && at.getTime() - lastWriteAt < IDLE_WRITE_MS) return
+    const words: LastWords = {
+      memory: { currentMb, limitMb, oomKills: probes.oomKills(), recent: [...recent] },
+      runtime: probes.runtime(),
+      turns: probes.turns(),
+      children: probes.children(),
+    }
+    const iso = at.toISOString()
+    const wrote = await guarded((file) => recordWords(opened ? file : openRun(file, run, iso), run, words, iso))
+    if (!wrote) return
+    opened = true
+    lastWriteAt = at.getTime()
+  }
 
-  tick()
-  const cancel = schedule(tick, TICK_MS)
+  const tick = (): Promise<void> => {
+    inFlight ??= step().finally(() => {
+      inFlight = null
+    })
+    return inFlight
+  }
+
+  void tick()
+  const cancel = schedule(() => void tick(), TICK_MS)
 
   let stopped = false
   const dispose = (): void => {
@@ -109,12 +124,20 @@ export function startLastWordsRecorder(options: LastWordsRecorderOptions): LastW
     stopped = true
     cancel()
   }
+  const settled = async (): Promise<void> => {
+    await inFlight
+  }
   return {
     dispose,
-    close: () => {
+    settled,
+    // Shutdown has a hard deadline shared with every other teardown step, so
+    // the clean-stop mark gets a short lock budget and is skipped if the lock
+    // stays busy: `typeclaw stop` seals the run as stopped either way. An
+    // in-flight tick is not awaited; its words only apply while the run is alive.
+    close: async () => {
       if (stopped) return
       dispose()
-      if (opened) guarded(() => writeLastWords(agentDir, closeRun(readLastWords(agentDir), run, now().toISOString())))
+      if (opened) await guarded((file) => closeRun(file, run, now().toISOString()), { maxWaitMs: CLOSE_LOCK_WAIT_MS })
     },
   }
 }

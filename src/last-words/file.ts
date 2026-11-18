@@ -108,12 +108,9 @@ export function readLastWords(agentDir: string): LastWordsFile {
   }
 }
 
-// Synchronous temp-file + rename so a reader (or the host after a kill) only
-// ever sees a complete file, and so the graceful-stop write cannot interleave
-// with an in-flight tick. The staging name is fixed so the sandbox masks it like
-// the file itself: a kill between write and rename leaves it behind. Writers
-// never stage concurrently: the runtime writes only while its container lives,
-// and host seals serialize on the agent's lock.
+// Temp-file + rename so a reader (or the host after a kill) only ever sees a
+// complete file. Callers hold the agent's lock, so the fixed staging name is
+// never written concurrently.
 export function writeLastWords(agentDir: string, file: LastWordsFile): void {
   const path = lastWordsPath(agentDir)
   mkdirSync(dirname(path), { recursive: true })
@@ -163,28 +160,29 @@ function parseInstant(value: string): number {
   return Date.parse(value.replace(/(\.\d{3})\d+/, '$1'))
 }
 
-// Host: the newest entry still alive belongs to the container that just
-// stopped, because only one runtime owns an agent directory at a time, but only
-// when it was recorded by that execution: same container, and booted between the
-// container's start and its exit. A run from an earlier execution of the same
-// container whose own exit went unobserved is not paired with a later boot that
-// died before recording anything. An operator stop (`typeclaw stop` ran `docker stop` itself) is a clean stop even
-// when Docker had to SIGKILL a slow shutdown. A later observer of the same exit
-// may fill in the archived log path an earlier one did not have.
+// Host: the entry recorded by the execution that exited is the one whose run
+// matches its container and booted between that execution's start and exit;
+// Docker keeps a container's ID across restarts, so the time window is what
+// tells executions apart. It may still be `alive`, or `vanished` if a restarted
+// runtime opened its own run before this seal took the lock; either way the
+// newer run is left alone. An operator stop (`typeclaw stop` ran `docker stop`
+// itself) is a clean stop even when Docker had to SIGKILL a slow shutdown. A
+// later observer of the same exit may fill in the archived log path an earlier
+// one did not have.
 export function sealExit(
   file: LastWordsFile,
   exit: ObservedExit,
   observedBy: LastWordsDeath['observedBy'],
   options: { operatorStop?: boolean } = {},
 ): LastWordsFile {
-  const index = file.entries.length - 1
+  const index = file.entries.findLastIndex((entry) => recordedBy(entry.run, exit))
   const entry = file.entries[index]
   if (entry === undefined) return file
   if (entry.status === 'died' && entry.death?.finishedAt === exit.finishedAt) {
     if (entry.death.log !== null || exit.log === null) return file
     return replaceEntry(file, index, { ...entry, death: { ...entry.death, log: exit.log } })
   }
-  if (entry.status !== 'alive' || !recordedBy(entry.run, exit)) return file
+  if (entry.status !== 'alive' && entry.status !== 'vanished') return file
   if (options.operatorStop === true) {
     return replaceEntry(file, index, { ...entry, status: 'stopped', words: null })
   }
@@ -211,24 +209,47 @@ export type SealIo = {
   serialize: (agentDir: string, operation: () => Promise<void>) => Promise<void>
 }
 
-const LOCK_RETRIES = { retries: 600, factor: 1, minTimeout: 10, maxTimeout: 10, randomize: false } as const
+const LOCK_STALE_MS = 10_000
+const LOCK_POLL_MS = 10
+// Host seals wait past the stale window, so a lock left by a runtime killed
+// mid-write is taken over instead of failing the seal of that very death.
+const DEFAULT_LOCK_WAIT_MS = 12_000
 
-// hostd's probe and a standalone `start` or `stop` can observe the same exit
-// from different processes. Each seal rereads under the agent's lock, so a
-// logless seal that started first cannot overwrite a seal that added the log.
+// Every read-modify-write of the file holds this per-agent lock, in the runtime
+// and on the host alike: hostd and a standalone `start` or `stop` can seal the
+// same exit, and a seal of the previous execution can still be in flight when a
+// restarted runtime opens its run. Each writer rereads under the lock, so none
+// publishes a stale snapshot over a newer one.
+export async function withLastWordsLock<T>(
+  agentDir: string,
+  operation: () => Promise<T>,
+  options: { maxWaitMs?: number } = {},
+): Promise<T> {
+  const path = lastWordsPath(agentDir)
+  await mkdir(dirname(path), { recursive: true })
+  const release = await lockfile.lock(path, {
+    realpath: false,
+    stale: LOCK_STALE_MS,
+    update: 2_000,
+    retries: {
+      retries: Math.ceil((options.maxWaitMs ?? DEFAULT_LOCK_WAIT_MS) / LOCK_POLL_MS),
+      factor: 1,
+      minTimeout: LOCK_POLL_MS,
+      maxTimeout: LOCK_POLL_MS,
+      randomize: false,
+    },
+  })
+  try {
+    return await operation()
+  } finally {
+    await release().catch(() => undefined)
+  }
+}
+
 export const DEFAULT_SEAL_IO: SealIo = {
   read: async (agentDir) => readLastWords(agentDir),
   write: writeLastWords,
-  serialize: async (agentDir, operation) => {
-    const path = lastWordsPath(agentDir)
-    await mkdir(dirname(path), { recursive: true })
-    const release = await lockfile.lock(path, { realpath: false, stale: 10_000, update: 2_000, retries: LOCK_RETRIES })
-    try {
-      await operation()
-    } finally {
-      await release().catch(() => undefined)
-    }
-  },
+  serialize: withLastWordsLock,
 }
 
 // Host lifecycle steps call this best-effort: a failure to record last words

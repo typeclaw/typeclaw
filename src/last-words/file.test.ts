@@ -124,6 +124,18 @@ describe('sealExit', () => {
     expect(sealExit(file, bootB, 'hostd')).toBe(file)
   })
 
+  test('a restarted run that opened first does not hide the previous execution from its seal', () => {
+    // given: B opened its run under the lock first and marked A vanished
+    const restarted = run('2026-11-18T06:00:00.000Z')
+    const file = openRun(aliveWithWords(), restarted, restarted.startedAt)
+
+    const sealed = sealExit(file, { ...oomExit, finishedAt: '2026-11-18T05:59:00Z' }, 'hostd')
+
+    expect(sealed.entries.map((entry) => entry.status)).toEqual(['died', 'alive'])
+    expect(sealed.entries[0]?.words).toEqual(words)
+    expect(sealed.entries[1]).toEqual(file.entries[1])
+  })
+
   test('an exit of a different container is not this run', () => {
     const file = aliveWithWords()
 
