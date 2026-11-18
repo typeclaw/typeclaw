@@ -443,7 +443,7 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 1000000,
         maxTokens: 128000,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
-        compat: { forceAdaptiveThinking: true },
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false },
       },
       'claude-opus-4-7': {
         id: 'claude-opus-4-7',
