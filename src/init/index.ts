@@ -8,6 +8,7 @@ import {
   GWS_MULTI_ACCOUNT_PLUGIN_PACKAGE,
   GWS_MULTI_ACCOUNT_PLUGIN_VERSION,
   migrateLegacyConfigShape,
+  parseConfigJson,
   type Config,
   type CustomModelMeta,
 } from '@/config'
@@ -585,7 +586,7 @@ export async function defaultRunHatching({
       url: buildTuiUrl(hostPort, launch.tuiToken),
       initialPrompt: buildHatchingPrompt({
         ...(typeclawJsonContent !== undefined ? { typeclawJsonContent } : {}),
-        setGitIdentity: !(await hasExplicitGitIdentity(cwd)),
+        setGitIdentity: await hatchingSetsGitIdentity(cwd, typeclawJsonContent),
       }),
     })
     await tui.run()
@@ -2068,4 +2069,15 @@ export function readGithubAuthType(cwd: string): 'pat' | 'app' | null {
   if (!isObjectRecord(github)) return null
   const auth = (github as { auth?: unknown }).auth
   return readGithubAuthTypeFromObject(auth) ?? null
+}
+
+// Hatching records the agent's name only while no identity was chosen yet: an
+// explicit typeclaw.json#git.user wins even when start could not copy it into
+// the repo, and so does an identity the operator set in the repo.
+export async function hatchingSetsGitIdentity(cwd: string, typeclawJsonContent: string | undefined): Promise<boolean> {
+  if (typeclawJsonContent !== undefined) {
+    const parsed = parseConfigJson(typeclawJsonContent, { migrate: false })
+    if (parsed.ok && parsed.config.git.user !== undefined) return false
+  }
+  return !(await hasExplicitGitIdentity(cwd))
 }

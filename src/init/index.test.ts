@@ -10,6 +10,7 @@ import * as z from 'zod'
 import { configSchema, dockerfileSchema } from '@/config/config'
 import { configFileLockPath } from '@/config/config-file-lock'
 import type { DockerExec } from '@/container'
+import { ensureGitIdentity } from '@/git/resolve-identity'
 
 import { buildDockerfile, BUN_BASE_IMAGE } from './dockerfile'
 import { buildGitignore } from './gitignore'
@@ -20,6 +21,7 @@ import {
   hasExistingOAuthCredentials,
   type HatchingResult,
   hatchingReadinessTimeoutMs,
+  hatchingSetsGitIdentity,
   type HatchRunner,
   initGitRepo,
   type InitStepEvent,
@@ -105,6 +107,39 @@ async function readSecrets(root: string): Promise<{
     channels?: Record<string, Record<string, unknown>>
   }
 }
+
+describe('hatchingSetsGitIdentity', () => {
+  test('asks only while no identity was chosen in the repo or in typeclaw.json#git.user', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-hatch-identity-'))
+    try {
+      const git = async (...args: string[]) => {
+        const proc = Bun.spawn({
+          cmd: ['git', ...args],
+          cwd: dir,
+          env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        })
+        expect(await proc.exited).toBe(0)
+      }
+      await git('init', '-q')
+      await ensureGitIdentity(dir)
+      const withUser = JSON.stringify({ git: { user: { name: '현무', email: 'hyeonmu@typeclaw.local' } } })
+
+      // synthesized repo identity, no git.user: hatching sets it
+      await expect(hatchingSetsGitIdentity(dir, '{}')).resolves.toBe(true)
+      // git.user already chosen, even though start could not copy it into the repo
+      await expect(hatchingSetsGitIdentity(dir, withUser)).resolves.toBe(false)
+
+      // an operator-set repo identity is kept as well
+      await git('config', '--local', 'user.name', 'Operator')
+      await git('config', '--local', 'user.email', 'operator@example.com')
+      await expect(hatchingSetsGitIdentity(dir, '{}')).resolves.toBe(false)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('hatchingReadinessTimeoutMs', () => {
   test('gives Windows a larger cold-boot budget than other platforms', () => {
