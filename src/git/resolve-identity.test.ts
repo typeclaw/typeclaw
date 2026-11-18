@@ -364,11 +364,12 @@ describe('resolveGitIdentity', () => {
     expect(env).toEqual(expected)
   })
 
-  test('removing git.user falls back to the GitHub account, then to the start seed', () => {
-    // given: git.user configured, then the GitHub adapter registers
+  test('removing a git.user added after start falls back to the GitHub account, then to the start seed', () => {
+    // given: git.user added after start, then the GitHub adapter registers
     const env: NodeJS.ProcessEnv = { GIT_AUTHOR_NAME: 'Typeey', GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local' }
-    let configured: { name: string; email: string } | undefined = { name: '현무', email: 'hyeonmu@typeclaw.local' }
+    let configured: { name: string; email: string } | undefined
     const track = trackGithubGitIdentityEnv(new Set(), env, () => configured)
+    configured = { name: '현무', email: 'hyeonmu@typeclaw.local' }
     track({ login: 'typeey[bot]', id: 42 })
     expect(env['GIT_AUTHOR_NAME']).toBe('현무')
 
@@ -382,6 +383,25 @@ describe('resolveGitIdentity', () => {
     // when / then: and once the adapter stops, the start-time seed comes back
     track(null)
     expect(env).toEqual({ GIT_AUTHOR_NAME: 'Typeey', GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local' })
+  })
+
+  test('removing a git.user that start exported leaves runtime Git on the repo identity', () => {
+    // given: start exported git.user, and .env declares the committer email
+    const env: NodeJS.ProcessEnv = {
+      GIT_AUTHOR_NAME: '현무',
+      GIT_AUTHOR_EMAIL: 'hyeonmu@typeclaw.local',
+      GIT_COMMITTER_NAME: '현무',
+      GIT_COMMITTER_EMAIL: 'operator@example.com',
+    }
+    let configured: { name: string; email: string } | undefined = { name: '현무', email: 'hyeonmu@typeclaw.local' }
+    const track = trackGithubGitIdentityEnv(new Set(['GIT_COMMITTER_EMAIL']), env, () => configured)
+
+    // when
+    configured = undefined
+    track.refresh()
+
+    // then: the exported names are cleared so Git reads the repo config
+    expect(env).toEqual({ GIT_COMMITTER_EMAIL: 'operator@example.com' })
   })
 
   test('scrubs Git controls case-insensitively for Windows environment semantics', () => {

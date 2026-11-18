@@ -89,7 +89,11 @@ export function trackGithubGitIdentityEnv(
   env: NodeJS.ProcessEnv = process.env,
   configured: () => GitIdentity | undefined = () => undefined,
 ): GitIdentityEnvTracker {
-  const seed = Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]]))
+  // When git.user was set at start, start exported it, so the env holds git.user
+  // rather than a fallback. Removing it must then leave these names unset, so
+  // runtime Git reads the repo identity, as model bash does.
+  const seed: Record<string, string | undefined> =
+    configured() === undefined ? Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]])) : {}
   let self: { login: string; id: number } | null = null
   const apply = () => {
     const identity = configured() ?? (self === null ? null : githubGitIdentity(self))
