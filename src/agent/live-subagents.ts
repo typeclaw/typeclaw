@@ -44,6 +44,8 @@ export type PendingWorkKeyRegistration = {
 export const MAX_EVENTS_PER_SUBAGENT = 100
 export const MESSAGE_PREVIEW_CHARS = 200
 
+const releasedAbort = async (): Promise<void> => {}
+
 // Newest — not oldest — so a long-running child that crossed a caller's backstop
 // cannot unpin a parent while a more recently spawned sibling is still inside its
 // window. Foreground children are excluded on purpose: they return inline, so a
@@ -169,6 +171,18 @@ export class LiveSubagentRegistry {
     this.events.delete(taskId)
     this.capturedFinalMessages.delete(taskId)
     if (entry) this.notify(entry.parentSessionId)
+  }
+
+  // Called once the child's completion has settled. Its abort and coalesce-key
+  // handles close over the child session, so keeping them would pin the child's
+  // whole transcript for the life of the process. Every caller of those handles
+  // acts only on running entries, so a settled entry never needs them, even when
+  // a spawn timeout settled it before the session was torn down.
+  release(taskId: string): void {
+    const entry = this.entries.get(taskId)
+    if (entry === undefined) return
+    entry.abort = releasedAbort
+    delete entry.releaseCoalesceKey
   }
 
   get(taskId: string): LiveSubagent | undefined {
