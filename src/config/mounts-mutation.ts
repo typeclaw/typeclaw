@@ -11,6 +11,7 @@ import {
   validateMount,
   type Mount,
 } from './config'
+import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
 const MOUNT_TARGET_PREFIX = '/agent/mounts'
@@ -36,47 +37,51 @@ export function listMounts(cwd: string): MountListEntry[] {
 }
 
 export function addMount(cwd: string, name: string, path: string, options: AddMountOptions = {}): AddMountResult {
-  const mount = buildMount(name, path, options)
-  if (!mount.ok) return mount
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const mount = buildMount(name, path, options)
+    if (!mount.ok) return mount
 
-  const check = validateMount(mount.value, cwd)
-  if (!check.ok) return check
+    const check = validateMount(mount.value, cwd)
+    if (!check.ok) return check
 
-  const parsed = readConfigRecord(cwd)
-  if (!parsed.ok) return parsed
+    const parsed = readConfigRecord(cwd)
+    if (!parsed.ok) return parsed
 
-  const current = readMounts(parsed.value)
-  if (!current.ok) return current
-  if (current.value.some((m) => m.name === mount.value.name)) {
-    return {
-      ok: false,
-      reason: `Mount "${mount.value.name}" already exists. Remove it first with \`typeclaw mount remove ${mount.value.name}\`.`,
+    const current = readMounts(parsed.value)
+    if (!current.ok) return current
+    if (current.value.some((m) => m.name === mount.value.name)) {
+      return {
+        ok: false,
+        reason: `Mount "${mount.value.name}" already exists. Remove it first with \`typeclaw mount remove ${mount.value.name}\`.`,
+      }
     }
-  }
 
-  const next = { ...parsed.value, mounts: [...current.value, mount.value] }
-  const write = writeMounts(cwd, next, `mount: add ${mount.value.name}`)
-  if (!write.ok) return write
-  return { ok: true, entry: toListEntry(mount.value, cwd) }
+    const next = { ...parsed.value, mounts: [...current.value, mount.value] }
+    const write = writeMounts(cwd, next, `mount: add ${mount.value.name}`)
+    if (!write.ok) return write
+    return { ok: true, entry: toListEntry(mount.value, cwd) }
+  })
 }
 
 export function removeMount(cwd: string, name: string): RemoveMountResult {
-  const trimmed = name.trim()
-  if (trimmed.length === 0) return { ok: false, reason: 'Mount name cannot be empty.' }
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const trimmed = name.trim()
+    if (trimmed.length === 0) return { ok: false, reason: 'Mount name cannot be empty.' }
 
-  const parsed = readConfigRecord(cwd)
-  if (!parsed.ok) return parsed
+    const parsed = readConfigRecord(cwd)
+    if (!parsed.ok) return parsed
 
-  const current = readMounts(parsed.value)
-  if (!current.ok) return current
+    const current = readMounts(parsed.value)
+    if (!current.ok) return current
 
-  const removed = current.value.find((m) => m.name === trimmed)
-  if (removed === undefined) return { ok: false, reason: `Mount "${trimmed}" not found in ${CONFIG_FILE}.` }
+    const removed = current.value.find((m) => m.name === trimmed)
+    if (removed === undefined) return { ok: false, reason: `Mount "${trimmed}" not found in ${CONFIG_FILE}.` }
 
-  const next = { ...parsed.value, mounts: current.value.filter((m) => m.name !== trimmed) }
-  const write = writeMounts(cwd, next, `mount: remove ${trimmed}`)
-  if (!write.ok) return write
-  return { ok: true, removed: toListEntry(removed, cwd) }
+    const next = { ...parsed.value, mounts: current.value.filter((m) => m.name !== trimmed) }
+    const write = writeMounts(cwd, next, `mount: remove ${trimmed}`)
+    if (!write.ok) return write
+    return { ok: true, removed: toListEntry(removed, cwd) }
+  })
 }
 
 function buildMount(

@@ -20,6 +20,7 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
+import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
   KNOWN_PROVIDERS,
@@ -1370,7 +1371,7 @@ export function loadPluginConfigsSync(cwd: string): Record<string, unknown> {
   }
   const migrated = migrateLegacyConfigShape(json)
   if (migrated.changed) {
-    persistMigratedConfig(cwd, migrated.json, migrated.applied)
+    persistMigratedConfig(cwd)
   }
   return extractPluginConfigs(migrated.json)
 }
@@ -1393,7 +1394,7 @@ export function loadConfigSync(cwd: string): Config {
 
   const migrated = migrateLegacyConfigShape(json)
   if (migrated.changed) {
-    persistMigratedConfig(cwd, migrated.json, migrated.applied)
+    persistMigratedConfig(cwd)
   }
 
   const result = configSchema.safeParse(migrated.json)
@@ -1425,7 +1426,7 @@ export function loadConfigBundleSync(cwd: string): { config: Config; pluginConfi
 
   const migrated = migrateLegacyConfigShape(json)
   if (migrated.changed) {
-    persistMigratedConfig(cwd, migrated.json, migrated.applied)
+    persistMigratedConfig(cwd)
   }
 
   const result = configSchema.safeParse(migrated.json)
@@ -1552,15 +1553,23 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function persistMigratedConfig(cwd: string, json: unknown, applied: readonly MigrationStep[]): void {
+function persistMigratedConfig(cwd: string): void {
+  const file = join(cwd, CONFIG_FILE)
+  let applied: readonly MigrationStep[]
   try {
-    writeFileSync(join(cwd, CONFIG_FILE), `${JSON.stringify(json, null, 2)}\n`)
+    // Migrate the file as it is under the lock, not the caller's earlier read,
+    // so a write that landed in between is not rolled back.
+    applied = withConfigFileLockSync(file, () => {
+      const migrated = migrateLegacyConfigShape(JSON.parse(readFileSync(file, 'utf8')))
+      if (migrated.changed) writeFileSync(file, `${JSON.stringify(migrated.json, null, 2)}\n`)
+      return migrated.applied
+    })
   } catch {
     // Best-effort write-back: the migration is also applied in-memory on every
-    // load, so a read-only filesystem (e.g. snapshotted CI checkout) just
-    // means the rewrite retries next start. Surfacing the error would brick
-    // load paths the user didn't ask to mutate. Bail before the commit step
-    // too — without the write there's nothing to commit.
+    // load, so a read-only filesystem (e.g. snapshotted CI checkout) or a busy
+    // lock just means the rewrite retries next load. Surfacing the error would
+    // brick load paths the user didn't ask to mutate. Bail before the commit
+    // step too — without the write there's nothing to commit.
     return
   }
 
@@ -1672,7 +1681,7 @@ export function parseConfigJson(raw: string, options: ParseConfigJsonOptions = {
     ? migrateLegacyConfigShape(json)
     : { json, changed: false, applied: [] as MigrationStep[] }
   if (migrated.changed && options.persistTarget !== undefined) {
-    persistMigratedConfig(options.persistTarget, migrated.json, migrated.applied)
+    persistMigratedConfig(options.persistTarget)
   }
 
   const result = configSchema.safeParse(migrated.json)

@@ -11,6 +11,7 @@ import {
   type CustomModelMeta,
   type ThinkingLevel,
 } from './config'
+import { withConfigFileLockSync } from './config-file-lock'
 import {
   KNOWN_PROVIDERS,
   isKnownModelRef,
@@ -142,34 +143,36 @@ export function setProfile(
   ref: string,
   options: SetProfileOptions = {},
 ): ModelMutationResult {
-  const trimmed = profile.trim()
-  if (trimmed.length === 0) {
-    return { ok: false, reason: 'Profile name cannot be empty.' }
-  }
-  if (!isModelRef(ref)) {
-    return {
-      ok: false,
-      reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const trimmed = profile.trim()
+    if (trimmed.length === 0) {
+      return { ok: false, reason: 'Profile name cannot be empty.' }
     }
-  }
-  const providerId = providerForModelRef(ref)
-  if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
-    return {
-      ok: false,
-      reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
+    if (!isModelRef(ref)) {
+      return {
+        ok: false,
+        reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
+      }
     }
-  }
+    const providerId = providerForModelRef(ref)
+    if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
+      return {
+        ok: false,
+        reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
+      }
+    }
 
-  const existingBefore = readModelsRaw(cwd)
-  const verb = existingBefore !== null && trimmed in existingBefore ? 'set' : 'add'
-  const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
-  // An explicit `thinkingLevel` key (even `undefined`) overrides the existing
-  // level; an omitted key preserves it. Pass the override as a single-element
-  // tuple so `writeProfile` can tell "clear to undefined" from "don't touch".
-  const thinkingOverride: [ThinkingLevel | undefined] | undefined = Object.hasOwn(options, 'thinkingLevel')
-    ? [options.thinkingLevel]
-    : undefined
-  return writeProfile(cwd, trimmed, ref, `model: ${verb} ${trimmed} → ${ref}`, customModel, thinkingOverride)
+    const existingBefore = readModelsRaw(cwd)
+    const verb = existingBefore !== null && trimmed in existingBefore ? 'set' : 'add'
+    const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
+    // An explicit `thinkingLevel` key (even `undefined`) overrides the existing
+    // level; an omitted key preserves it. Pass the override as a single-element
+    // tuple so `writeProfile` can tell "clear to undefined" from "don't touch".
+    const thinkingOverride: [ThinkingLevel | undefined] | undefined = Object.hasOwn(options, 'thinkingLevel')
+      ? [options.thinkingLevel]
+      : undefined
+    return writeProfile(cwd, trimmed, ref, `model: ${verb} ${trimmed} → ${ref}`, customModel, thinkingOverride)
+  })
 }
 
 // `add` is just `set` with a uniqueness guard; users who want "update" should
@@ -181,14 +184,16 @@ export function addProfile(
   ref: string,
   options: SetProfileOptions = {},
 ): ModelMutationResult {
-  const existing = readModelsRaw(cwd)
-  if (existing !== null && profile in existing) {
-    return {
-      ok: false,
-      reason: `Profile "${profile}" already exists. Use \`typeclaw model set ${profile} ${ref}\` to update it.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const existing = readModelsRaw(cwd)
+    if (existing !== null && profile in existing) {
+      return {
+        ok: false,
+        reason: `Profile "${profile}" already exists. Use \`typeclaw model set ${profile} ${ref}\` to update it.`,
+      }
     }
-  }
-  return setProfile(cwd, profile, ref, options)
+    return setProfile(cwd, profile, ref, options)
+  })
 }
 
 // `default` is required by the schema (`modelsSchema.refine`). Removing it
@@ -196,23 +201,25 @@ export function addProfile(
 // letting the next `validateConfig` failure confuse the user. To change the
 // default model, the user runs `typeclaw model set default <ref>`.
 export function removeProfile(cwd: string, profile: string): ModelMutationResult {
-  if (profile === 'default') {
-    return {
-      ok: false,
-      reason:
-        'Cannot remove the `default` profile. Use `typeclaw model set default <ref>` to change the default model.',
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    if (profile === 'default') {
+      return {
+        ok: false,
+        reason:
+          'Cannot remove the `default` profile. Use `typeclaw model set default <ref>` to change the default model.',
+      }
     }
-  }
-  const existing = readModelsRaw(cwd)
-  if (existing === null) {
-    return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` first.` }
-  }
-  if (!(profile in existing)) {
-    return { ok: false, reason: `Profile "${profile}" not found in ${CONFIG_FILE}.` }
-  }
-  const next = { ...existing }
-  delete next[profile]
-  return writeModels(cwd, next, `model: remove ${profile}`)
+    const existing = readModelsRaw(cwd)
+    if (existing === null) {
+      return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` first.` }
+    }
+    if (!(profile in existing)) {
+      return { ok: false, reason: `Profile "${profile}" not found in ${CONFIG_FILE}.` }
+    }
+    const next = { ...existing }
+    delete next[profile]
+    return writeModels(cwd, next, `model: remove ${profile}`)
+  })
 }
 
 // Sets (or clears) a profile's reasoning effort without touching its refs.
@@ -225,31 +232,33 @@ export function setProfileThinkingLevel(
   profile: string,
   level: ThinkingLevel | undefined,
 ): ModelMutationResult {
-  const trimmed = profile.trim()
-  if (trimmed.length === 0) {
-    return { ok: false, reason: 'Profile name cannot be empty.' }
-  }
-  const existing = readModelsRaw(cwd)
-  if (existing === null) {
-    return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` first.` }
-  }
-  const current = existing[trimmed]
-  if (current === undefined) {
-    return {
-      ok: false,
-      reason: `Profile "${trimmed}" not found. Run \`typeclaw model set ${trimmed} <ref>\` to create it first.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const trimmed = profile.trim()
+    if (trimmed.length === 0) {
+      return { ok: false, reason: 'Profile name cannot be empty.' }
     }
-  }
-  const refs = rawProfileRefs(current)
-  if (refs === undefined) {
-    return { ok: false, reason: `Profile "${trimmed}" has no model to attach a thinking level to.` }
-  }
-  const next: RawModels = { ...existing, [trimmed]: withRawProfileThinkingLevel(refs, level) }
-  const message =
-    level === undefined
-      ? `model: clear thinkingLevel for ${trimmed}`
-      : `model: set thinkingLevel ${level} for ${trimmed}`
-  return writeModels(cwd, next, message)
+    const existing = readModelsRaw(cwd)
+    if (existing === null) {
+      return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}. Run \`typeclaw init\` first.` }
+    }
+    const current = existing[trimmed]
+    if (current === undefined) {
+      return {
+        ok: false,
+        reason: `Profile "${trimmed}" not found. Run \`typeclaw model set ${trimmed} <ref>\` to create it first.`,
+      }
+    }
+    const refs = rawProfileRefs(current)
+    if (refs === undefined) {
+      return { ok: false, reason: `Profile "${trimmed}" has no model to attach a thinking level to.` }
+    }
+    const next: RawModels = { ...existing, [trimmed]: withRawProfileThinkingLevel(refs, level) }
+    const message =
+      level === undefined
+        ? `model: clear thinkingLevel for ${trimmed}`
+        : `model: set thinkingLevel ${level} for ${trimmed}`
+    return writeModels(cwd, next, message)
+  })
 }
 
 function writeProfile(
@@ -387,105 +396,115 @@ export function setOverrideProfile(
   ref: string,
   options: SetOverrideProfileOptions = {},
 ): ModelMutationResult {
-  const trimmed = profile.trim()
-  if (trimmed.length === 0) return { ok: false, reason: 'Profile name cannot be empty.' }
-  if (!isModelRef(ref)) {
-    return {
-      ok: false,
-      reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const trimmed = profile.trim()
+    if (trimmed.length === 0) return { ok: false, reason: 'Profile name cannot be empty.' }
+    if (!isModelRef(ref)) {
+      return {
+        ok: false,
+        reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
+      }
     }
-  }
-  if (options.match !== undefined) {
-    const ruleError = modelOverrideRuleError(options.match)
-    if (ruleError !== undefined) return { ok: false, reason: `Invalid match rule "${options.match}": ${ruleError}` }
-  }
-  const existing = readOverridesRaw(cwd)[name]
-  if (existing === undefined && options.match === undefined) {
-    return {
-      ok: false,
-      reason: `Override "${name}" does not exist. Pass --match <rule> to create it, e.g. --match 'slack:*'.`,
+    if (options.match !== undefined) {
+      const ruleError = modelOverrideRuleError(options.match)
+      if (ruleError !== undefined) return { ok: false, reason: `Invalid match rule "${options.match}": ${ruleError}` }
     }
-  }
-  const providerId = providerForModelRef(ref)
-  if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
-    return {
-      ok: false,
-      reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
+    const existing = readOverridesRaw(cwd)[name]
+    if (existing === undefined && options.match === undefined) {
+      return {
+        ok: false,
+        reason: `Override "${name}" does not exist. Pass --match <rule> to create it, e.g. --match 'slack:*'.`,
+      }
     }
-  }
-  const match = existing?.match ?? []
-  const models = existing?.models ?? {}
-  const level = Object.hasOwn(options, 'thinkingLevel')
-    ? options.thinkingLevel
-    : rawProfileThinkingLevel(models[trimmed])
-  const next: RawOverride = {
-    match: options.match !== undefined && !match.includes(options.match) ? [...match, options.match] : match,
-    models: { ...models, [trimmed]: withRawProfileThinkingLevel(ref, level) },
-  }
-  const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
-  return writeOverride(cwd, name, next, `model: set ${trimmed} → ${ref} in override ${name}`, customModel)
+    const providerId = providerForModelRef(ref)
+    if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
+      return {
+        ok: false,
+        reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
+      }
+    }
+    const match = existing?.match ?? []
+    const models = existing?.models ?? {}
+    const level = Object.hasOwn(options, 'thinkingLevel')
+      ? options.thinkingLevel
+      : rawProfileThinkingLevel(models[trimmed])
+    const next: RawOverride = {
+      match: options.match !== undefined && !match.includes(options.match) ? [...match, options.match] : match,
+      models: { ...models, [trimmed]: withRawProfileThinkingLevel(ref, level) },
+    }
+    const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
+    return writeOverride(cwd, name, next, `model: set ${trimmed} → ${ref} in override ${name}`, customModel)
+  })
 }
 
 // Removing an override's last profile removes the override itself, since an
 // entry with no profiles would be schema-invalid and has nothing to apply.
 export function removeOverrideProfile(cwd: string, name: string, profile: string): ModelMutationResult {
-  const existing = readOverridesRaw(cwd)[name]
-  if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
-  if (!(profile in existing.models)) {
-    return { ok: false, reason: `Profile "${profile}" not found in override "${name}".` }
-  }
-  const models = { ...existing.models }
-  delete models[profile]
-  if (Object.keys(models).length === 0) return removeOverride(cwd, name)
-  return writeOverride(cwd, name, { ...existing, models }, `model: remove ${profile} from override ${name}`)
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const existing = readOverridesRaw(cwd)[name]
+    if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
+    if (!(profile in existing.models)) {
+      return { ok: false, reason: `Profile "${profile}" not found in override "${name}".` }
+    }
+    const models = { ...existing.models }
+    delete models[profile]
+    if (Object.keys(models).length === 0) return removeOverride(cwd, name)
+    return writeOverride(cwd, name, { ...existing, models }, `model: remove ${profile} from override ${name}`)
+  })
 }
 
 export function addOverrideMatch(cwd: string, name: string, rule: string): ModelMutationResult {
-  const ruleError = modelOverrideRuleError(rule)
-  if (ruleError !== undefined) return { ok: false, reason: `Invalid match rule "${rule}": ${ruleError}` }
-  const existing = readOverridesRaw(cwd)[name]
-  if (existing === undefined) {
-    return {
-      ok: false,
-      reason: `Override "${name}" not found. Create it with \`typeclaw model set <profile> <ref> --override ${name} --match '${rule}'\`.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const ruleError = modelOverrideRuleError(rule)
+    if (ruleError !== undefined) return { ok: false, reason: `Invalid match rule "${rule}": ${ruleError}` }
+    const existing = readOverridesRaw(cwd)[name]
+    if (existing === undefined) {
+      return {
+        ok: false,
+        reason: `Override "${name}" not found. Create it with \`typeclaw model set <profile> <ref> --override ${name} --match '${rule}'\`.`,
+      }
     }
-  }
-  if (existing.match.includes(rule)) return { ok: true }
-  return writeOverride(
-    cwd,
-    name,
-    { ...existing, match: [...existing.match, rule] },
-    `model: match ${rule} in override ${name}`,
-  )
+    if (existing.match.includes(rule)) return { ok: true }
+    return writeOverride(
+      cwd,
+      name,
+      { ...existing, match: [...existing.match, rule] },
+      `model: match ${rule} in override ${name}`,
+    )
+  })
 }
 
 export function removeOverrideMatch(cwd: string, name: string, rule: string): ModelMutationResult {
-  const existing = readOverridesRaw(cwd)[name]
-  if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
-  if (!existing.match.includes(rule)) return { ok: false, reason: `Rule "${rule}" not found in override "${name}".` }
-  if (existing.match.length === 1) {
-    return {
-      ok: false,
-      reason: `"${rule}" is the last rule of override "${name}". Run \`typeclaw model override remove ${name}\` to delete the override.`,
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const existing = readOverridesRaw(cwd)[name]
+    if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
+    if (!existing.match.includes(rule)) return { ok: false, reason: `Rule "${rule}" not found in override "${name}".` }
+    if (existing.match.length === 1) {
+      return {
+        ok: false,
+        reason: `"${rule}" is the last rule of override "${name}". Run \`typeclaw model override remove ${name}\` to delete the override.`,
+      }
     }
-  }
-  const match = existing.match.filter((r) => r !== rule)
-  return writeOverride(cwd, name, { ...existing, match }, `model: unmatch ${rule} in override ${name}`)
+    const match = existing.match.filter((r) => r !== rule)
+    return writeOverride(cwd, name, { ...existing, match }, `model: unmatch ${rule} in override ${name}`)
+  })
 }
 
 export function removeOverride(cwd: string, name: string): ModelMutationResult {
-  if (readOverridesRaw(cwd)[name] === undefined) {
-    return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
-  }
-  return writeConfig(
-    cwd,
-    (parsed) => {
-      const overrides = { ...(isObjectRecord(parsed.modelOverrides) ? parsed.modelOverrides : {}) }
-      delete overrides[name]
-      parsed.modelOverrides = overrides
-    },
-    `model: remove override ${name}`,
-  )
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    if (readOverridesRaw(cwd)[name] === undefined) {
+      return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
+    }
+    return writeConfig(
+      cwd,
+      (parsed) => {
+        const overrides = { ...(isObjectRecord(parsed.modelOverrides) ? parsed.modelOverrides : {}) }
+        delete overrides[name]
+        parsed.modelOverrides = overrides
+      },
+      `model: remove override ${name}`,
+    )
+  })
 }
 
 type RawOverride = { match: string[]; models: RawModels }

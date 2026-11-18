@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { configFileLockPath } from './config-file-lock'
 import { addMount, listMounts, removeMount } from './mounts-mutation'
 
 describe('mounts mutation', () => {
@@ -37,6 +38,35 @@ describe('mounts mutation', () => {
 
     const raw = JSON.parse(await readFile(join(cwd, 'typeclaw.json'), 'utf8')) as { mounts?: unknown[] }
     expect(raw.mounts).toEqual([{ name: 'projects', path: './projects', readOnly: false, description: 'work repos' }])
+  })
+
+  test('waits for another typeclaw.json writer and applies on top of its write', async () => {
+    // given: another process holds the config lock and adds an alias before releasing
+    const hostDir = join(cwd, 'projects')
+    await mkdir(hostDir)
+    const config = join(cwd, 'typeclaw.json')
+    const lock = configFileLockPath(config)
+    await writeFile(lock, '')
+    const otherWriter = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `const fs = require('node:fs'); const c = JSON.parse(fs.readFileSync(${JSON.stringify(config)}, 'utf8')); c.alias = ['atlas']; fs.writeFileSync(${JSON.stringify(config)}, JSON.stringify(c)); fs.unlinkSync(${JSON.stringify(lock)})`,
+      ],
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+
+    // when: a mount is added while the lock is held
+    const result = addMount(cwd, 'projects', './projects')
+
+    // then: it read after the other write, so neither change is lost
+    expect(result.ok).toBe(true)
+    expect(await otherWriter.exited).toBe(0)
+    expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({
+      alias: ['atlas'],
+      mounts: [{ name: 'projects', path: './projects', readOnly: false }],
+    })
   })
 
   test('refuses duplicate mount names', async () => {

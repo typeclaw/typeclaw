@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { SecretsBackend } from '@/secrets'
 
+import { withConfigFileLockSync } from './config-file-lock'
+
 const CONFIG_FILE = 'typeclaw.json'
 const SECRETS_FILE = 'secrets.json'
 
@@ -72,53 +74,55 @@ export function listChannels(cwd: string): ChannelListEntry[] {
 }
 
 export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResult {
-  const config = readConfigRecord(cwd)
-  if (!config.ok) return config
+  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+    const config = readConfigRecord(cwd)
+    if (!config.ok) return config
 
-  const channels = isObjectRecord(config.value.channels) ? { ...config.value.channels } : {}
+    const channels = isObjectRecord(config.value.channels) ? { ...config.value.channels } : {}
 
-  // Bail BEFORE touching typeclaw.json when secrets.json exists but cannot be
-  // read. Otherwise the config write below would strip `channels.<kind>` while
-  // the credential block stays on disk yet unreachable — `removeChannelSync`
-  // would throw on the same parse error, and the next invocation would no
-  // longer see the channel in config OR (the swallowed) secrets, stranding the
-  // credentials with no CLI path to clean them. Failing first keeps the retry
-  // able to target both once the file is fixed.
-  const secretsRead = readChannelSecrets(cwd)
-  if (secretsRead.kind === 'unreadable') {
-    return {
-      ok: false,
-      reason: `${SECRETS_FILE} is unreadable (${secretsRead.reason}). Fix it by hand, then retry \`typeclaw channel remove ${kind}\`.`,
+    // Bail BEFORE touching typeclaw.json when secrets.json exists but cannot be
+    // read. Otherwise the config write below would strip `channels.<kind>` while
+    // the credential block stays on disk yet unreachable — `removeChannelSync`
+    // would throw on the same parse error, and the next invocation would no
+    // longer see the channel in config OR (the swallowed) secrets, stranding the
+    // credentials with no CLI path to clean them. Failing first keeps the retry
+    // able to target both once the file is fixed.
+    const secretsRead = readChannelSecrets(cwd)
+    if (secretsRead.kind === 'unreadable') {
+      return {
+        ok: false,
+        reason: `${SECRETS_FILE} is unreadable (${secretsRead.reason}). Fix it by hand, then retry \`typeclaw channel remove ${kind}\`.`,
+      }
     }
-  }
-  const secrets = channelSecretsOrEmpty(secretsRead)
+    const secrets = channelSecretsOrEmpty(secretsRead)
 
-  const inConfig = kind in channels
-  const inSecrets = kind in secrets
-  if (!inConfig && !inSecrets) {
-    return { ok: false, reason: `Channel "${kind}" is not configured in ${CONFIG_FILE} or ${SECRETS_FILE}.` }
-  }
+    const inConfig = kind in channels
+    const inSecrets = kind in secrets
+    if (!inConfig && !inSecrets) {
+      return { ok: false, reason: `Channel "${kind}" is not configured in ${CONFIG_FILE} or ${SECRETS_FILE}.` }
+    }
 
-  const githubRepos = kind === 'github' ? readGithubRepos(channels.github) : []
-  const hadRemoteWebhooks = githubRepos.length > 0
+    const githubRepos = kind === 'github' ? readGithubRepos(channels.github) : []
+    const hadRemoteWebhooks = githubRepos.length > 0
 
-  delete channels[kind]
-  config.value.channels = channels
+    delete channels[kind]
+    config.value.channels = channels
 
-  const githubCleanup = kind === 'github' ? cleanGithubConfig(config.value, githubRepos) : undefined
+    const githubCleanup = kind === 'github' ? cleanGithubConfig(config.value, githubRepos) : undefined
 
-  const write = writeConfig(cwd, config.value, `channel: remove ${kind}`)
-  if (!write.ok) return write
+    const write = writeConfig(cwd, config.value, `channel: remove ${kind}`)
+    if (!write.ok) return write
 
-  const secretsRemoved = new SecretsBackend(join(cwd, SECRETS_FILE)).removeChannelSync(kind)
+    const secretsRemoved = new SecretsBackend(join(cwd, SECRETS_FILE)).removeChannelSync(kind)
 
-  return {
-    ok: true,
-    configRemoved: inConfig,
-    secretsRemoved,
-    ...(githubCleanup !== undefined ? { githubCleanup } : {}),
-    hadRemoteWebhooks,
-  }
+    return {
+      ok: true,
+      configRemoved: inConfig,
+      secretsRemoved,
+      ...(githubCleanup !== undefined ? { githubCleanup } : {}),
+      hadRemoteWebhooks,
+    }
+  })
 }
 
 // GitHub `add` writes three config artifacts beyond `channels.github`: a
