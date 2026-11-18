@@ -1,3 +1,4 @@
+import { hostname } from 'node:os'
 import { join } from 'node:path'
 
 import { SessionManager } from '@earendil-works/pi-coding-agent'
@@ -66,6 +67,7 @@ import {
 } from '@/cron'
 import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
 import { CLI_VERSION } from '@/init/cli-version'
+import { startLastWordsRecorder } from '@/last-words'
 import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
 import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistry, summarizeLoaded } from '@/plugin'
@@ -338,6 +340,16 @@ async function startAgentRuntime(
   // intervals that scan /proc and log after their runtime is gone.
   const stopResourceSampler = startResourceSamplerFor()
   registerBootCleanup(() => stopResourceSampler())
+  // Only a container has a host that seals the run when it dies; an ad-hoc run
+  // outside Docker would leave a run marked alive forever.
+  const lastWords =
+    containerName !== undefined
+      ? startLastWordsRecorder({
+          agentDir: cwd,
+          run: { containerId: hostname(), startedAt: new Date().toISOString(), typeclawVersion: CLI_VERSION },
+        })
+      : null
+  registerBootCleanup(() => lastWords?.dispose())
   const vectorStartupPromise = runVectorStartup(cwd)
   let pluginsLoaded: LoadPluginsResult
   try {
@@ -1135,6 +1147,7 @@ async function startAgentRuntime(
       setReviewObserver(null)
       setReviewCoverageCapture(null)
       setReviewOutputObserver(null)
+      await lastWords?.close()
       await stopCodingAgents()
       await tunnelManager.stop()
       await recoveryDispatcher?.stop()

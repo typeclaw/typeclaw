@@ -3,6 +3,8 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { openRun, readLastWords, writeLastWords } from '@/last-words/file'
+
 import { archiveContainerLogs, type DockerLogArchiveRuntime } from './log-archive'
 import type { DockerExec, DockerExecResult } from './shared'
 import { planStop, stop } from './stop'
@@ -208,7 +210,11 @@ describe('stop (composition)', () => {
     const events: string[] = []
     const exec: DockerExec = async (args, options) => {
       if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
-        return { exitCode: 0, stdout: `${CONTAINER_ID}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`, stderr: '' }
+        return {
+          exitCode: 0,
+          stdout: `${CONTAINER_ID}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
+          stderr: '',
+        }
       }
       if (args[0] === 'rm') events.push('remove')
       return fake.exec(args, options)
@@ -228,6 +234,49 @@ describe('stop (composition)', () => {
       'agent runtime was SIGKILLed (137) and the container recorded an OOM kill during this run (likely container memory limit 6144 MiB). Restart the agent and reduce memory-heavy parallel work.',
       'remove',
     ])
+  })
+
+  test('seals the last words of a corpse that died on its own, keeping its words and the archived log', async () => {
+    const run = { containerId: 'aaaaaaaaaaaa', startedAt: '2026-09-29T04:00:00.000Z', typeclawVersion: '1.0.0' }
+    writeLastWords(root, openRun({ version: 1, entries: [] }, run, run.startedAt))
+    const fake = fakeDockerExec({ scenario: { exists: true, running: false } })
+    const exec: DockerExec = async (args, options) =>
+      args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))
+        ? {
+            exitCode: 0,
+            stdout: `${CONTAINER_ID}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
+            stderr: '',
+          }
+        : fake.exec(args, options)
+
+    await stop({
+      cwd: root,
+      exec,
+      archiveLogs: async () => ({ ok: true, status: 'archived', path: join(root, '.typeclaw', 'logs', 'a.log') }),
+    })
+
+    expect(readLastWords(root).entries[0]).toMatchObject({
+      status: 'died',
+      death: { exitCode: 137, oomKilled: true, log: join('.typeclaw', 'logs', 'a.log'), observedBy: 'stop' },
+    })
+  })
+
+  test('seals a container this stop shut down as a clean stop, even when Docker had to SIGKILL it', async () => {
+    const run = { containerId: 'aaaaaaaaaaaa', startedAt: '2026-09-29T04:00:00.000Z', typeclawVersion: '1.0.0' }
+    writeLastWords(root, openRun({ version: 1, entries: [] }, run, run.startedAt))
+    const fake = fakeDockerExec({ scenario: { exists: true, running: true } })
+    const exec: DockerExec = async (args, options) =>
+      args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))
+        ? {
+            exitCode: 0,
+            stdout: `${CONTAINER_ID}|false|false|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
+            stderr: '',
+          }
+        : fake.exec(args, options)
+
+    await stop({ cwd: root, exec, archiveLogs })
+
+    expect(readLastWords(root).entries[0]).toMatchObject({ status: 'stopped', words: null })
   })
 
   test('tolerates "no such container" from docker rm (user removed it out-of-band)', async () => {

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import type { PortForward } from '@/config'
 import { defaultDockerExec, type DockerExec, type HostDaemonRegisterPayload } from '@/container'
-import { inspectContainerExit } from '@/container/exit-reason'
+import { type ContainerExit, inspectContainerExit, sealObservedExit } from '@/container/exit-reason'
 import type { PortForwardEvent } from '@/portbroker'
 import {
   discordChannelBlockSchema,
@@ -198,7 +198,7 @@ function isValidRestoredPayload(value: unknown, expectedName: string): value is 
 async function restorePersistedRegistrations(
   apply: (payload: RestoredPayload) => Promise<void>,
   log: (event: DaemonLogEvent | SupervisorLogEvent) => void,
-  probe: (name: string) => Promise<'alive' | 'gone' | 'unknown'>,
+  probe: (name: string, agentDir?: string) => Promise<'alive' | 'gone' | 'unknown'>,
   removeFile: (name: string) => Promise<void>,
 ): Promise<void> {
   let entries: string[]
@@ -232,7 +232,7 @@ async function restorePersistedRegistrations(
     // registration if the container is genuinely gone, and we'd rather pay
     // one swap-race attempt than tear down a live registration on a flaky
     // `docker ps`.
-    const status = await probe(expectedName)
+    const status = await probe(expectedName, parsed.cwd)
     if (status === 'gone') {
       await removeFile(expectedName)
       log({ kind: 'registration-skipped', containerName: expectedName, reason: 'container not running' })
@@ -754,13 +754,32 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
   // A stopped container is still present in `docker ps -a` and may be
   // restarted by Docker; retain its registration and tokens. Inspect only
   // for diagnostics, never to decide whether to GC a present container.
-  const probeContainerAlive = async (name: string): Promise<'alive' | 'gone' | 'unknown'> => {
+  // A seal can wait on a lock orphaned by the very OOM it records, so it runs
+  // in the background, once per observed stop, and never holds up the probe
+  // pass for other containers.
+  const sealsInFlight = new Set<string>()
+  const sealInBackground = (agentDir: string, state: Extract<ContainerExit, { kind: 'stopped' }>): void => {
+    const key = `${state.containerId}@${state.finishedAt}`
+    if (sealsInFlight.has(key)) return
+    sealsInFlight.add(key)
+    void sealObservedExit(agentDir, state, null, 'hostd').finally(() => sealsInFlight.delete(key))
+  }
+
+  // Restore probes before the registration is applied, so it passes the
+  // persisted agent dir: an exit observed then must still be sealed even if
+  // Docker restarts the container before the next probe.
+  const probeContainerAlive = async (
+    name: string,
+    restoredAgentDir?: string,
+  ): Promise<'alive' | 'gone' | 'unknown'> => {
     try {
       const result = await exec(['ps', '-a', '--filter', `name=^${name}$`, '--format', '{{.Names}}'])
       if (result.exitCode !== 0) return 'unknown'
       const names = result.stdout.trim().split('\n')
       if (!names.includes(name)) return 'gone'
       const state = await inspectContainerExit(exec, name)
+      const agentDir = restoredAgentDir ?? cwds.get(name)
+      if (state?.kind === 'stopped' && agentDir !== undefined) sealInBackground(agentDir, state)
       // Report each stop once. The container ID survives restarts, so key the
       // report by ID and FinishedAt: repeated probes of one stop share a key,
       // while a restart that crashes again between two probes gets a new one.

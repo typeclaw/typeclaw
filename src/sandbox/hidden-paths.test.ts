@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { lastWordsPath, writeLastWords } from '@/last-words/file'
 import { createPermissionService } from '@/permissions/permissions'
 import { rolesConfigSchema, type RolesConfig } from '@/permissions/schema'
 
@@ -20,7 +21,7 @@ import {
   resolveHiddenPaths,
   verifyHiddenMaskTargets,
 } from './hidden-paths'
-import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
+import { CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS, CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 const AGENT = '/agent'
 const operatorCliCredentialDirs = (agentDir: string) => [
@@ -41,6 +42,7 @@ const canonicalSecretDirs = (agentDir: string) => [
   join(agentDir, '.typeclaw', 'browser-profile'),
   join(agentDir, '.typeclaw', 'typevault'),
   join(agentDir, '.typevault'),
+  join(agentDir, '.typeclaw', 'last-words'),
 ]
 const secretFiles = (agentDir: string) => [
   join(agentDir, '.env'),
@@ -70,9 +72,12 @@ describe('resolveHiddenPaths — builtin tiers', () => {
       '.typeclaw/incidents.json',
       '.typeclaw/coding-agent-tasks.json',
     ])
+    expect(CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS).toEqual(['.typeclaw/last-words'])
     expect(CANONICAL_AGENT_SECRET_FILES).not.toContain('.typeclaw/incidents.json')
     const resolved = resolveHiddenPaths(createPermissionService(), tui, AGENT)
-    expect(resolved.dirs).toEqual(RUNTIME_OWNED_SECRET_DIRS.map((entry) => join(AGENT, entry)))
+    expect(resolved.dirs).toEqual(
+      [...RUNTIME_OWNED_SECRET_DIRS, ...CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS].map((entry) => join(AGENT, entry)),
+    )
     expect(resolved.files).toEqual([
       ...CANONICAL_AGENT_SECRET_FILES.map((entry) => join(AGENT, entry)),
       ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES.map((entry) => join(AGENT, entry)),
@@ -360,5 +365,23 @@ describe('ensureHiddenMaskTargets', () => {
   test('fails closed when an absent canonical mask target cannot be materialized', async () => {
     const env = join(dir, 'missing-parent', '.env')
     await expect(ensureHiddenMaskTargets({ dirs: [], files: [env] })).rejects.toThrow(/mask target/i)
+  })
+})
+
+describe('last words mask', () => {
+  test('a rename-replaced last-words file and a leftover staging file never break mask verification', async () => {
+    // given: a recorder replacing the file by rename while the sandbox prepares,
+    // and a staging file a kill left behind
+    const agentDir = await mkdtemp(join(tmpdir(), 'hidden-last-words-'))
+    const hidden = await ensureHiddenMaskTargets(resolveHiddenPaths(createPermissionService(), tui, agentDir))
+    const file = lastWordsPath(agentDir)
+    writeLastWords(agentDir, { version: 1, entries: [] })
+    await writeFile(`${file}.tmp`, '{}')
+
+    writeLastWords(agentDir, { version: 1, entries: [] })
+    await verifyHiddenMaskTargets(hidden)
+
+    expect(hidden.dirs).toContain(dirname(file))
+    expect(hidden.files.some((path) => path.startsWith(dirname(file)))).toBe(false)
   })
 })

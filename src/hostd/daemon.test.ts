@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { DockerExec } from '@/container'
+import { openRun, readLastWords, writeLastWords } from '@/last-words/file'
 import type { KakaoChannelBlock } from '@/secrets/schema'
 import { isWindows } from '@/shared'
 import { expectStable, waitFor } from '@/test-helpers/wait-for'
@@ -44,7 +45,11 @@ function fakeExec(alive: Set<string> = new Set()): DockerExec {
       return { exitCode: 0, stdout: alive.has(name) ? `${name}\n` : '', stderr: '' }
     }
     if (args[0] === 'inspect') {
-      return { exitCode: 0, stdout: `${'a'.repeat(64)}|true|false|0|0|0001-01-01T00:00:00Z\n`, stderr: '' }
+      return {
+        exitCode: 0,
+        stdout: `${'a'.repeat(64)}|true|false|0|0|0001-01-01T00:00:00Z|2026-09-29T04:00:00Z\n`,
+        stderr: '',
+      }
     }
     return { exitCode: 1, stdout: '', stderr: 'unknown command' }
   }
@@ -218,7 +223,7 @@ describe('startDaemon', () => {
         const stopped = finishedAt !== null
         return {
           exitCode: 0,
-          stdout: `${'b'.repeat(64)}|${!stopped}|${stopped}|${stopped ? 137 : 0}|6442450944|${finishedAt ?? '0001-01-01T00:00:00Z'}\n`,
+          stdout: `${'b'.repeat(64)}|${!stopped}|${stopped}|${stopped ? 137 : 0}|6442450944|${finishedAt ?? '0001-01-01T00:00:00Z'}|2026-09-29T04:00:00Z\n`,
           stderr: '',
         }
       }
@@ -268,7 +273,7 @@ describe('startDaemon', () => {
         if (failInspect) return { exitCode: 1, stdout: '', stderr: 'daemon unavailable' }
         return {
           exitCode: 0,
-          stdout: `${'c'.repeat(64)}|false|false|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stdout: `${'c'.repeat(64)}|false|false|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
           stderr: '',
         }
       }
@@ -1251,7 +1256,7 @@ describe('startDaemon', () => {
       if (args[0] === 'inspect')
         return {
           exitCode: 0,
-          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
           stderr: '',
         }
       return { exitCode: 1, stdout: '', stderr: 'unexpected command' }
@@ -1274,6 +1279,43 @@ describe('startDaemon', () => {
     expect(existsSync(registrationFilePath(name))).toBe(true)
     expect(startCalls).toHaveLength(1)
     expect(exits).toHaveLength(1)
+  })
+
+  test('restore seals an OOM it observes even when the container is running again by the next probe', async () => {
+    // given: an agent whose run is alive on disk, and a persisted registration
+    const agentDir = await mkdtemp(join(tmpdir(), 'hostd-last-words-'))
+    const run = { containerId: 'aaaaaaaaaaaa', startedAt: '2026-09-29T04:10:00.000Z', typeclawVersion: '1.0.0' }
+    writeLastWords(agentDir, openRun({ version: 1, entries: [] }, run, run.startedAt))
+    const name = 'oom-restart'
+    const d1 = await startDaemon({ exec: fakeExec(new Set([name])), gcIntervalMs: 1_000_000 })
+    await send({ kind: 'register', containerName: name, cwd: agentDir })
+    await d1.stop()
+    // when: only the restore probe sees the OOM exit; Docker restarted it after
+    let inspections = 0
+    const exec: DockerExec = async (args) => {
+      if (args[0] === 'ps') return { exitCode: 0, stdout: `${name}\n`, stderr: '' }
+      if (args[0] === 'inspect') {
+        inspections += 1
+        return {
+          exitCode: 0,
+          stdout:
+            inspections === 1
+              ? `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`
+              : `${'a'.repeat(64)}|true|false|0|6442450944|0001-01-01T00:00:00Z|2026-09-29T05:00:00Z\n`,
+          stderr: '',
+        }
+      }
+      return { exitCode: 1, stdout: '', stderr: 'unexpected command' }
+    }
+    daemon = await startDaemon({ exec, gcIntervalMs: 20 })
+
+    // then: the old run still ends as died with the observed OOM
+    await waitFor(() => readLastWords(agentDir).entries[0]?.status === 'died')
+    expect(readLastWords(agentDir).entries[0]?.death).toMatchObject({
+      exitCode: 137,
+      oomKilled: true,
+      observedBy: 'hostd',
+    })
   })
 
   test('boot-time restore skips persisted registrations whose container is gone, and unlinks the leftover file', async () => {

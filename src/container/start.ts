@@ -45,7 +45,7 @@ import { reconcileTypevault } from '@/typevault/lifecycle'
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
 import { acquireManagedBuildCache, type ManagedBuildCacheLease } from './build-cache'
 import { COMPOSE_PROJECT } from './compose-project'
-import { inspectContainerExit } from './exit-reason'
+import { inspectContainerExit, sealObservedExit } from './exit-reason'
 import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
 import { formatMemorySize, readDockerTotalMemory, resolveMemoryLimit } from './memory-limit'
 import {
@@ -340,6 +340,7 @@ async function runStart({
         retentionDays: (await loadTypeclawConfig(cwd)).logs.retentionDays,
       })
       if (!archive.ok && archive.kind === 'failed') return { ok: false as const, reason: archive.reason }
+      if (exit?.kind === 'stopped') await sealObservedExit(cwd, exit, archive.ok ? archive.path : null, 'start')
       // Dispatch on the callback, NOT on streamOutput. `streamOutput` defaults
       // to true, and standalone start/restart both stream Docker build output
       // AND pass a collector so they can render warnings after their spinner
