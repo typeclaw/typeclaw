@@ -7668,45 +7668,72 @@ describe('managed config commit check', () => {
     }
   })
 
-  test.skipIf(lacksInodeAnchoring)('serializes an edit behind a write that is still in its commit check', async () => {
-    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-overlap-'))
-    const config = path.join(agentDir, 'typeclaw.json')
-    await writeFile(config, '{"alias":["atlas"]}\n')
-    const { hooks, commits, reachedPause, release } = pausableCommitHooks(agentDir)
-    try {
-      // given: a write held inside its commit check
-      const write = builtin('write', agentDir, hooks).execute(
-        'first',
-        { path: 'typeclaw.json', content: '{"alias":["renamed"]}\n' } as never,
-        undefined,
-        undefined,
-        {} as never,
-      )
-      await reachedPause
+  test.skipIf(lacksInodeAnchoring)(
+    'a write queued behind an edit in its commit check is rejected as stale',
+    async () => {
+      // given: each change must bump `version` by exactly one over the file as it is
+      // when checked, and the edit is held inside its commit check
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-overlap-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, '{"version":1,"alias":["atlas"]}\n')
+      const hooks = createHookBus()
+      const commits: string[] = []
+      let release: (() => void) | undefined
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let reachedEditCommit: (() => void) | undefined
+      const editAtCommit = new Promise<void>((resolve) => {
+        reachedEditCommit = resolve
+      })
+      hooks.registerAll('versioned', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
+          // Only the commit check carries the absolute managed destination.
+          if (!path.isAbsolute(String(event.args.path))) return undefined
+          commits.push(`${event.callId}:${event.args.content}`)
+          if (event.callId === 'edit') {
+            reachedEditCommit?.()
+            await held
+          }
+          const current = JSON.parse(await readFile(config, 'utf8')) as { version: number }
+          const intended = JSON.parse(event.args.content) as { version: number }
+          return intended.version === current.version + 1
+            ? undefined
+            : { block: true, reason: `stale version ${intended.version} over ${current.version}` }
+        },
+      })
+      try {
+        const edit = builtin('edit', agentDir, hooks).execute(
+          'edit',
+          { path: 'typeclaw.json', edits: [{ oldText: '"version":1', newText: '"version":2' }] } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        await editAtCommit
 
-      // when: an edit of the same file starts, then the write is released
-      const edit = builtin('edit', agentDir, hooks).execute(
-        'second',
-        { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"atlas","아틀라스"' }] } as never,
-        undefined,
-        undefined,
-        {} as never,
-      )
-      release()
-      await write
-      await edit.catch(() => undefined)
+        // when: a write built from the same version-1 file queues behind it
+        const write = builtin('write', agentDir, hooks).execute(
+          'write',
+          { path: 'typeclaw.json', content: '{"version":2,"alias":["renamed"]}\n' } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        release?.()
 
-      // then: the edit's commit check ran only after the write landed, and the
-      // edit (which read the pre-write file) never overwrote the write
-      const writeCommit = commits.findIndex((c) => c.startsWith('first:') && c.includes('renamed'))
-      const editCommit = commits.findIndex((c) => c.startsWith('second:') && c.includes('아틀라스'))
-      expect(writeCommit).toBeGreaterThanOrEqual(0)
-      if (editCommit !== -1) expect(editCommit).toBeGreaterThan(writeCommit)
-      expect(await readFile(config, 'utf8')).toBe('{"alias":["renamed"]}\n')
-    } finally {
-      await rm(agentDir, { recursive: true, force: true })
-    }
-  })
+        // then: the edit lands, the write's commit check sees it and rejects the
+        // stale bytes, and the file holds exactly the edit's bytes
+        await edit
+        await expect(write).rejects.toThrow(/stale version 2 over 2/)
+        expect(commits).toEqual(['edit:{"version":2,"alias":["atlas"]}\n', 'write:{"version":2,"alias":["renamed"]}\n'])
+        expect(await readFile(config, 'utf8')).toBe('{"version":2,"alias":["atlas"]}\n')
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
 
   test.skipIf(lacksInodeAnchoring)('writes nothing when the call is cancelled after its guard check', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-abort-'))
