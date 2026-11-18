@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 
 import type { GetGithubSelf } from '@/channels/github-token-bridge'
-import { config, getSandboxWritablePathSpecs } from '@/config/config'
+import { config, getConfig, getSandboxWritablePathSpecs } from '@/config/config'
 import type { PermissionService } from '@/permissions/permissions'
 import {
   buildSandboxedCommand,
@@ -143,7 +143,12 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     preparation = await deferredPreparation?.()
     const command = preparation?.command ?? originalCommand
     const envNames = resolveExposableBashEnvNames(agentDir)
-    const gitIdentityEnv = await resolveAgentGitIdentityEnv(agentDir, envNames.declared, options.getGithubSelf?.())
+    const gitIdentityEnv = await resolveAgentGitIdentityEnv(
+      agentDir,
+      envNames.declared,
+      options.getGithubSelf?.(),
+      getConfig().git.user,
+    )
     const mergedEnvOverlay = { ...gitIdentityEnv, ...envOverlay, ...preparation?.env }
     const preparedEnvOverlay = Object.keys(mergedEnvOverlay).length > 0 ? mergedEnvOverlay : undefined
     const { dirs, files } = resolveHiddenPaths(permissions, origin, agentDir)

@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 
 import type { GithubSelfUser } from '@/channels/adapters/github/auth'
-import { githubGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
+import { type GitIdentity, githubGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { readEnvFile } from '@/init/env-file'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 type BashEnvOverlay = Record<string, string>
@@ -101,10 +101,13 @@ export function resolveExposableBashEnvNames(agentDir: string): {
 // Every name the operator did not declare in .env is set explicitly, even when
 // the runtime env carries it, so the values are fixed when the command is
 // resolved: the GitHub adapter stopping mid-preparation must not strip them.
+// A typeclaw.json#git.user identity outranks the GitHub account too, since model
+// bash cannot write the read-only .git/config to change its identity there.
 export async function resolveAgentGitIdentityEnv(
   agentDir: string,
   operatorEnvNames: readonly string[],
   githubSelf: GithubSelfUser | null = null,
+  configured: GitIdentity | undefined = undefined,
 ): Promise<BashEnvOverlay> {
   const exposable = new Set(operatorEnvNames)
   const names = {
@@ -115,7 +118,8 @@ export async function resolveAgentGitIdentityEnv(
   } as const
   const missing = Object.entries(names).filter(([name]) => !exposable.has(name))
   if (missing.length === 0) return {}
-  const identity = githubSelf !== null ? githubGitIdentity(githubSelf) : await resolveGitIdentity(agentDir)
+  const identity =
+    configured ?? (githubSelf !== null ? githubGitIdentity(githubSelf) : await resolveGitIdentity(agentDir))
   if (identity === null) return {}
   return Object.fromEntries(missing.map(([name, field]) => [name, identity[field]]))
 }
