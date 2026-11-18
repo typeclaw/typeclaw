@@ -3,7 +3,13 @@ import { join } from 'node:path'
 
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 
-import { credentialStagingDir, replaceFile } from './staged-write'
+import {
+  CredentialRestoreError,
+  credentialStagingDir,
+  discardCredentialStaging,
+  publishCredential,
+  stageCredential,
+} from './staged-write'
 
 const ENV_FILE = '.env'
 
@@ -80,8 +86,9 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
 // command stored `key` while the prompt was open. The recheck and the write
 // happen under the typeclaw.json config lock, the same lock `typeclaw tunnel`
 // holds while it writes its token, so no command overwrites another's
-// credential. The new .env is staged in the masked credential staging dir and
-// renamed into place, so a failure never leaves a truncated .env.
+// credential. The update is staged in the masked credential staging dir and
+// written over .env in place (a running sandbox's mask is bound to its inode),
+// with the prior content put back if the write fails.
 export function storeEnvKeyUnlessPresent(
   cwd: string,
   key: string,
@@ -102,7 +109,16 @@ export function storeEnvKeyUnlessPresent(
       } catch (err) {
         if (!(err instanceof Error) || !('code' in err) || err.code !== 'ENOENT') throw err
       }
-      replaceFile(path, withEnvKey(raw, key, value), { credentialStagingDir: credentialStagingDir(cwd) })
+      const staged = stageCredential(path, withEnvKey(raw, key, value), credentialStagingDir(cwd))
+      let keepPriorCopy = false
+      try {
+        publishCredential(staged)
+      } catch (error) {
+        keepPriorCopy = error instanceof CredentialRestoreError
+        throw error
+      } finally {
+        discardCredentialStaging(staged, keepPriorCopy)
+      }
       return { ok: true }
     })
   } catch (error) {

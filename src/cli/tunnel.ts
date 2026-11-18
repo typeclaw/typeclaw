@@ -9,7 +9,19 @@ import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import { applyPublishMode, credentialStagingDir, type Rename, replaceFile, stageReplacement } from '@/init/staged-write'
+import {
+  CredentialRestoreError,
+  credentialStagingDir,
+  discardCredentialStaging,
+  publishCredential,
+  type Rename,
+  replaceFile,
+  restoreCredential,
+  type StagedCredential,
+  stageCredential,
+  stageReplacement,
+  type WriteInPlace,
+} from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -927,22 +939,23 @@ function ensureAgentDir(): string {
 
 // Called under the config lock once a flow has won its typeclaw.json write.
 // The prompted token is stored only if no other command stored that key since
-// the prompt, and the token and config land together or not at all: both
-// replacements are staged in full (.env in the masked credential staging dir),
-// .env is renamed into place and then typeclaw.json, and .env is put back if
-// typeclaw.json cannot be.
-// `rename` is a seam for tests that fail a publish after writing has begun.
+// the prompt, and the token and config land together or not at all: the .env
+// update and typeclaw.json are staged in full first, then .env is written in
+// place (never renamed: a running sandbox's mask is bound to its inode) and
+// typeclaw.json is renamed into place, and .env is put back in place if
+// typeclaw.json cannot be. `seams` let tests fail a publish after writing began.
 export function writeConfigAndToken(
   cwd: string,
   raw: Record<string, unknown>,
   token: { env: string; value: string } | undefined,
   rerun: string,
-  rename: Rename = renameSync,
+  seams: { rename?: Rename; writeInPlace?: WriteInPlace } = {},
 ): LiveResult<void> {
+  const rename = seams.rename ?? renameSync
   const configPath = join(cwd, 'typeclaw.json')
   const configBytes = `${JSON.stringify(raw, null, 2)}\n`
   if (token === undefined) {
-    replaceFile(configPath, configBytes, { rename })
+    replaceFile(configPath, configBytes, rename)
     return { ok: true, value: undefined }
   }
   if (hasEnvKey(cwd, token.env)) {
@@ -952,52 +965,47 @@ export function writeConfigAndToken(
     }
   }
   const envPath = join(cwd, '.env')
-  const stagingDir = credentialStagingDir(cwd)
   const priorEnv = readFileOrUndefined(envPath)
-  const staged: string[] = []
+  let envStaged: StagedCredential | undefined
+  let configTemp: string | undefined
+  let keepPriorCopy = false
   try {
-    const envStaged = stageReplacement(
+    envStaged = stageCredential(
       envPath,
       withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value),
-      stagingDir,
+      credentialStagingDir(cwd),
     )
-    staged.push(envStaged.temp)
-    const configStaged = stageReplacement(configPath, configBytes)
-    staged.push(configStaged.temp)
-    rename(envStaged.temp, envPath)
+    configTemp = stageReplacement(configPath, configBytes).temp
+    publishCredential(envStaged, seams.writeInPlace)
     try {
-      applyPublishMode(envStaged)
-      rename(configStaged.temp, configPath)
+      rename(configTemp, configPath)
     } catch (error) {
-      const rollbackError = restoreFile(envPath, priorEnv, rename, stagingDir)
-      const envState =
-        rollbackError === undefined
-          ? '.env was restored.'
-          : `.env could not be restored (${describeError(rollbackError)}) and still sets ${token.env}, which no tunnel in typeclaw.json uses; remove the ${token.env} line from ${envPath} by hand.`
+      let envState = '.env was restored.'
+      try {
+        restoreCredential(envStaged, seams.writeInPlace)
+      } catch (restoreError) {
+        keepPriorCopy = true
+        envState = `${describeError(restoreError)} Until then it still sets ${token.env}, which no tunnel in typeclaw.json uses.`
+      }
       return {
         ok: false,
         reason: `failed to store the tunnel: ${describeError(error)}. typeclaw.json was not changed; ${envState}`,
       }
     }
   } catch (error) {
+    if (error instanceof CredentialRestoreError) {
+      keepPriorCopy = true
+      return { ok: false, reason: `failed to store the tunnel: typeclaw.json was not changed; ${error.message}` }
+    }
     return {
       ok: false,
       reason: `failed to store the tunnel: ${describeError(error)}. Neither .env nor typeclaw.json was changed.`,
     }
   } finally {
-    for (const temp of staged) rmSync(temp, { force: true })
+    if (configTemp !== undefined) rmSync(configTemp, { force: true })
+    if (envStaged !== undefined) discardCredentialStaging(envStaged, keepPriorCopy)
   }
   return { ok: true, value: undefined }
-}
-
-function restoreFile(path: string, prior: Buffer | undefined, rename: Rename, stagingDir: string): unknown {
-  try {
-    if (prior === undefined) rmSync(path, { force: true })
-    else replaceFile(path, prior, { rename, credentialStagingDir: stagingDir })
-    return undefined
-  } catch (error) {
-    return error
-  }
 }
 
 function describeError(error: unknown): string {
