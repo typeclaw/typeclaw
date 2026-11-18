@@ -20,7 +20,10 @@ import { KNOWN_PROVIDERS } from './providers'
 
 type CapturedPayload = Record<string, unknown>
 
-async function buildAnthropicPayload(model: Model<'anthropic-messages'>): Promise<CapturedPayload> {
+async function buildAnthropicPayload(
+  model: Model<'anthropic-messages'>,
+  temperature?: number,
+): Promise<CapturedPayload> {
   const context: Context = {
     systemPrompt: 'You are a helpful assistant.',
     messages: [{ role: 'user', content: 'Hi', timestamp: Date.now() }],
@@ -43,6 +46,7 @@ async function buildAnthropicPayload(model: Model<'anthropic-messages'>): Promis
 
   const s = streamSimple(model, normalizeContext(context), {
     apiKey: 'sk-ant-api03-test-key',
+    temperature,
     onPayload: (payload) => {
       captured = payload as CapturedPayload
       throw stopMarker
@@ -91,5 +95,13 @@ describe('anthropic messages payload', () => {
       expect(read!.strict, `${ref} must not send strict tool schemas`).toBeUndefined()
       expect(read!.input_schema.required, `${ref} must not force optionals into required`).toEqual(['path'])
     }
+  })
+
+  test('omits temperature for curated Claude Sonnet 5 with thinking off', async () => {
+    const model = resolveModel('anthropic/claude-sonnet-5') as Model<'anthropic-messages'>
+    const payload = await buildAnthropicPayload(model, 0.5)
+
+    expect(payload.thinking).toEqual({ type: 'disabled' })
+    expect(payload).not.toHaveProperty('temperature')
   })
 })
