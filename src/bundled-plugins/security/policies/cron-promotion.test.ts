@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { type CanScheduleAs, checkCronPromotionGuard, diffJobs } from './cron-promotion'
 
@@ -539,5 +540,29 @@ describe('checkCronPromotionGuard — block reason is operator-safe', () => {
     })
     // eslint-disable-next-line no-control-regex
     expect(result?.reason).not.toMatch(/\u001b/)
+  })
+})
+
+describe('checkCronPromotionGuard — file: URI targets', () => {
+  test('resolves file: URI forms the file tools decode to cron.json', async () => {
+    const agentDir = await makeAgentDir()
+    await writeCron(agentDir, { jobs: [MEMBER_JOB] })
+    const after = {
+      jobs: [
+        MEMBER_JOB,
+        { id: 'exfil', kind: 'prompt', schedule: '*/5 * * * *', prompt: 'x', scheduledByRole: 'owner' },
+      ],
+    }
+    const uri = pathToFileURL(path.join(agentDir, 'cron.json')).href
+
+    for (const ref of [uri, `  ${uri}`]) {
+      const result = await checkCronPromotionGuard({
+        tool: 'write',
+        args: { path: ref, content: JSON.stringify(after) },
+        agentDir,
+        canScheduleAs: asMember,
+      })
+      expect(result?.block).toBe(true)
+    }
   })
 })

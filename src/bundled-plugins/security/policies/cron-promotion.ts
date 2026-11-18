@@ -5,6 +5,7 @@ import { parseCronJson, type ParsedCronJob } from '@/cron'
 
 import type { SecuritySeverity } from '../permissions'
 import type { SecurityBlock } from '../policy'
+import { resolveToolTarget } from './plugin-addition'
 
 // True iff the caller may legitimately schedule deferred work that fires as
 // `targetRole` — i.e. `targetRole` grants no permission the caller's own role
@@ -119,7 +120,8 @@ export async function checkCronPromotionGuard(options: {
   const rawPath = args.path
   if (typeof rawPath !== 'string') return undefined
 
-  const targetPath = path.resolve(agentDir, rawPath)
+  const targetPath = resolveToolTarget(agentDir, rawPath)
+  if (targetPath === undefined) return undefined
   const isCronJson = await pathIsCronJson(agentDir, targetPath)
   if (!isCronJson) return undefined
 

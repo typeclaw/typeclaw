@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { mkdir } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, mkdir, readFile } from 'node:fs/promises'
 import { relative, sep } from 'node:path'
 
 import {
@@ -75,7 +76,7 @@ import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-
 import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-bash-policy'
 import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
-import { enforceAndPinToolFiles, writeToolOutputNoFollow } from './tool-file-safety'
+import { enforceAndPinToolFiles, runWithManagedConfigCommitCheck, writeToolOutputNoFollow } from './tool-file-safety'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
 import { webFetchTool } from './tools/webfetch'
 import { webSearchTool } from './tools/websearch'
@@ -225,7 +226,15 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
       })
     }
     case 'edit':
-      return piCreateEditToolDefinition(cwd)
+      // Same writer as `write`, so an edit of typeclaw.json or cron.json gets the
+      // commit-time guard check too.
+      return piCreateEditToolDefinition(cwd, {
+        operations: {
+          readFile: (absolutePath) => readFile(absolutePath),
+          writeFile: writeToolOutputNoFollow,
+          access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
+        },
+      })
     case 'write':
       return piCreateWriteToolDefinition(cwd, {
         operations: {
@@ -709,9 +718,37 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               : tool.name === 'bash'
                 ? {}
                 : undefined
-          const executed = await bashEnvStore.run(spawnEnvContext, () =>
-            tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
-          )
+          const run = () =>
+            bashEnvStore.run(spawnEnvContext, () =>
+              tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
+            )
+          // A write/edit of typeclaw.json or cron.json re-runs this session's
+          // guards on the exact bytes at commit (see writeToolOutputNoFollow).
+          const executed =
+            tool.name === 'write' || tool.name === 'edit'
+              ? await runWithManagedConfigCommitCheck(
+                  {
+                    agentDir: opts.agentDir,
+                    ...(signal !== undefined ? { signal } : {}),
+                    check: async (content, destination) => {
+                      const block = await opts.hooks.runToolBefore(
+                        {
+                          tool: 'write',
+                          sessionId: opts.sessionId,
+                          callId: toolCallId,
+                          args: { path: destination, content },
+                          toolProvenance: 'first-party',
+                          ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+                        },
+                        opts.guards,
+                        envelope.acknowledgements,
+                      )
+                      if (block !== undefined) throw new Error(`blocked: ${block.reason}`)
+                    },
+                  },
+                  run,
+                )
+              : await run()
           // Pi 0.99 bash returns a nonzero exit as an `isError` result whose text
           // is the message 0.87 threw (tools/bash.js). This wrapper returns only
           // content/details, so rethrow to keep the failure on the error path

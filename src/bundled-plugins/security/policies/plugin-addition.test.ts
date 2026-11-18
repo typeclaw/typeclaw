@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { ACKNOWLEDGE_GUARDS } from '@/bundled-plugins/guard/policy'
 
@@ -149,6 +150,25 @@ describe('checkPluginAdditionGuard', () => {
       })
       expect(result?.block).toBe(true)
       expect(result?.reason).toContain('refuses multi-edit')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('checkPluginAdditionGuard — file: URI targets', () => {
+  test('resolves file: URI forms the file tools decode to typeclaw.json', async () => {
+    const dir = await makeAgentDir({ plugins: [] })
+    try {
+      const uri = pathToFileURL(join(dir, 'typeclaw.json')).href
+      for (const ref of [uri, `  ${uri}`]) {
+        const result = await checkPluginAdditionGuard({
+          tool: 'write',
+          args: { ...writeArgs({ plugins: ['typeclaw-plugin-foo@1.2.3'] }), path: ref },
+          agentDir: dir,
+        })
+        expect(result?.block).toBe(true)
+      }
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

@@ -6,6 +6,7 @@ import { isBuiltinRoleName, type RoleConfig, type RolesConfig } from '@/permissi
 
 import type { SecuritySeverity } from '../permissions'
 import type { SecurityBlock } from '../policy'
+import { resolveToolTarget } from './plugin-addition'
 
 export const GUARD_ROLE_PROMOTION = 'rolePromotion'
 // Classified `medium` (silent-attack axis). Originally `high`; reclassified
@@ -84,7 +85,8 @@ export async function checkRolePromotionGuard(options: {
   const rawPath = args.path
   if (typeof rawPath !== 'string') return undefined
 
-  const targetPath = path.resolve(agentDir, rawPath)
+  const targetPath = resolveToolTarget(agentDir, rawPath)
+  if (targetPath === undefined) return undefined
   const isTypeclawJson = await pathIsTypeclawJson(agentDir, targetPath)
   if (!isTypeclawJson) return undefined
 

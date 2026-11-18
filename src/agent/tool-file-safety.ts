@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { constants, createWriteStream, lstatSync, type Stats } from 'node:fs'
 import {
   chmod,
@@ -16,7 +17,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 
 import {
   checkPrivateSurfaceReadGuard,
@@ -27,6 +28,7 @@ import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
 
+import { normalizeFileReference } from './file-reference'
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from './tools-without-local-file-operands'
 
 export { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS }
@@ -845,7 +847,70 @@ export async function writeFileAnchored(options: {
   if (cleanupError !== undefined) throw cleanupError
 }
 
+// The typeclaw.json and cron.json guards authorize a write/edit in tool.before,
+// against the file as it was then, but the bytes land later. A stale write
+// that passed that check could restore a value a privileged session has since
+// changed. So a write to one of these files re-runs its guards on the exact
+// bytes, against the file as it is now, and checked writes are serialized so
+// no other one lands between a check and its write.
+export type ManagedConfigCommitCheck = {
+  agentDir: string
+  signal?: AbortSignal
+  check(content: string, destination: string): Promise<void>
+}
+
+// The queue serializes checked writes only. Writers outside it, namely privileged
+// model bash (roles that keep agent-root writes, which already bypass the
+// medium-tier config guards) and host-side typeclaw config commands, can still
+// land between a queued write's check and its write and then be overwritten.
+// Coordinating them needs a lock shared across processes; see #1718.
+const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
+const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
+let checkedWrites: Promise<unknown> = Promise.resolve()
+
+export function runWithManagedConfigCommitCheck<T>(check: ManagedConfigCommitCheck, fn: () => Promise<T>): Promise<T> {
+  return managedConfigCommitCheck.run(check, fn)
+}
+
 export async function writeToolOutputNoFollow(targetPath: string, content: string): Promise<void> {
+  const commit = managedConfigCommitCheck.getStore()
+  const destination = commit === undefined ? undefined : await managedConfigDestination(commit.agentDir, targetPath)
+  if (commit === undefined || destination === undefined) return writeOutputNoFollow(targetPath, content)
+  const write = checkedWrites.then(async () => {
+    commit.signal?.throwIfAborted()
+    // Guards decide on the managed path and read their baseline through it, so
+    // the pinned descriptor must still be that entry's inode, before the check
+    // and again before any byte is truncated.
+    await assertPinnedEntry(targetPath, destination)
+    await commit.check(content, destination)
+    await assertPinnedEntry(targetPath, destination)
+    // A call cancelled while queued, while its guards ran, or during the entry
+    // check above must not write; nothing is awaited between here and the write.
+    commit.signal?.throwIfAborted()
+    await writeOutputNoFollow(targetPath, content)
+  })
+  checkedWrites = write.catch(() => {})
+  return write
+}
+
+async function assertPinnedEntry(targetPath: string, destination: string): Promise<void> {
+  if (!/^\/proc\/self\/fd\/\d+$/.test(targetPath)) return
+  const [pinned, entry] = await Promise.all([stat(targetPath), stat(destination).catch(() => undefined)])
+  if (entry === undefined || pinned.dev !== entry.dev || pinned.ino !== entry.ino) {
+    throw new Error(`${destination} was replaced after it was opened; refusing to write the stale file`)
+  }
+}
+
+async function managedConfigDestination(agentDir: string, targetPath: string): Promise<string | undefined> {
+  const destination = await realpath(targetPath).catch(() => path.resolve(targetPath))
+  for (const file of MANAGED_CONFIG_FILES) {
+    const managed = path.join(path.resolve(agentDir), file)
+    if (destination === managed || destination === (await realpath(managed).catch(() => managed))) return managed
+  }
+  return undefined
+}
+
+async function writeOutputNoFollow(targetPath: string, content: string): Promise<void> {
   const trustedDescriptorPath = /^\/proc\/self\/fd\/\d+$/.test(targetPath)
   const flags = trustedDescriptorPath
     ? constants.O_WRONLY | constants.O_TRUNC
@@ -1282,16 +1347,6 @@ function isDeniedSnapshotPath(
       hidden: options.hidden ?? { dirs: [], files: [] },
     }) !== undefined
   )
-}
-
-function normalizeFileReference(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed.toLocaleLowerCase().startsWith('file:')) return value
-  try {
-    return fileURLToPath(trimmed)
-  } catch {
-    throw new Error(`invalid file URI: ${value}`)
-  }
 }
 
 function inputTooLarge(original: string, size: number, maxBytes: number): Error {

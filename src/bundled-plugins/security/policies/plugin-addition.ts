@@ -1,6 +1,7 @@
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
+import { normalizeFileReference } from '@/agent/file-reference'
 import { parseConfigJson } from '@/config'
 import { splitPluginEntrySpec } from '@/plugin'
 
@@ -54,8 +55,8 @@ export async function checkPluginAdditionGuard(options: {
   const rawPath = args.path
   if (typeof rawPath !== 'string') return undefined
 
-  const targetPath = path.resolve(agentDir, rawPath)
-  if (!(await pathIsTypeclawJson(agentDir, targetPath))) return undefined
+  const targetPath = resolveToolTarget(agentDir, rawPath)
+  if (targetPath === undefined || !(await pathIsTypeclawJson(agentDir, targetPath))) return undefined
 
   const editRefusal = refuseRiskyEdit(tool, args, targetPath)
   if (editRefusal) return editRefusal
@@ -129,6 +130,17 @@ async function readExistingPlugins(targetPath: string): Promise<readonly string[
 
 // See the parallel rationale block in role-promotion.ts — Oracle PR #305
 // findings #5 and #6 (symlinked managed file + case-insensitive FS).
+// Resolves a write/edit `path` the way the file tools do before opening it,
+// including `file:` URIs, so a managed-config guard decides on the destination
+// actually written. An undecodable URI is refused by the tool itself.
+export function resolveToolTarget(agentDir: string, rawPath: string): string | undefined {
+  try {
+    return path.resolve(agentDir, normalizeFileReference(rawPath))
+  } catch {
+    return undefined
+  }
+}
+
 export async function pathIsTypeclawJson(agentDir: string, targetPath: string): Promise<boolean> {
   const resolvedAgentDir = path.resolve(agentDir)
   const canonicalManagedPath = path.join(resolvedAgentDir, 'typeclaw.json')
