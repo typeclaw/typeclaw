@@ -40,6 +40,7 @@ export {
 } from './system-prompt-composition'
 import { effectiveModels } from '@/config/model-overrides'
 import { defaultThinkingLevelForRef, isOpenAiFamilyRef, providerForModelRef, type ModelRef } from '@/config/providers'
+import { trackTurnActivity } from '@/last-words/activity'
 import { renderMcpCatalog } from '@/mcp/catalog'
 import type { McpManager } from '@/mcp/manager'
 import { createMcpDispatcherTools, MCP_DISPATCHER_TOOL_NAMES, resolveMcpCallPreflightFileOperands } from '@/mcp/tools'
@@ -657,11 +658,13 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     if (event.type === 'agent_start') cacheKeepalive?.startTurn()
     if (event.type === 'agent_settled') cacheKeepalive?.settle()
   })
+  const untrackTurnActivity = trackTurnActivity(session, getOrigin)
   const innerDispose = session.dispose.bind(session)
   session.dispose = () => {
     void evalRuntime?.dispose()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
+    untrackTurnActivity()
     innerDispose()
   }
 
