@@ -233,6 +233,37 @@ describe('createConfigReloadable', () => {
     expect(diff.restartRequired.map((c) => c.path)).toEqual(['git.ignore'])
   })
 
+  test('git.user applies on reload and re-exports the runtime git identity', async () => {
+    const names = ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'] as const
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+    try {
+      await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A }))
+      const reloadable = createConfigReloadable({ cwd })
+      await reloadable.reload()
+
+      await writeFile(
+        join(cwd, 'typeclaw.json'),
+        JSON.stringify({ model: VALID_MODEL_A, git: { user: { name: '현무', email: 'hyeonmu@typeclaw.local' } } }),
+      )
+      const result = await reloadable.reload()
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect((result.details as { applied: { path: string }[] }).applied.map((c) => c.path)).toEqual(['git.user'])
+      expect(names.map((name) => process.env[name])).toEqual([
+        '현무',
+        'hyeonmu@typeclaw.local',
+        '현무',
+        'hyeonmu@typeclaw.local',
+      ])
+    } finally {
+      for (const name of names) {
+        if (saved[name] === undefined) delete process.env[name]
+        else process.env[name] = saved[name]
+      }
+    }
+  })
+
   test('field fence: sandbox.apparmorProfile changes land in `restartRequired`', async () => {
     await writeFile(
       join(cwd, 'typeclaw.json'),

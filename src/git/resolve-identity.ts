@@ -104,6 +104,15 @@ export async function syncConfiguredGitIdentity(cwd: string, user: GitIdentity |
   return !marked || (await unsetLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY))
 }
 
+// Runtime-owned commits (backup, dreaming, system files) inherit the runtime's
+// environment, so a reloaded git.user reaches them by replacing it here.
+export function exportGitIdentityEnv(identity: GitIdentity, env: NodeJS.ProcessEnv = process.env): void {
+  env['GIT_AUTHOR_NAME'] = identity.name
+  env['GIT_AUTHOR_EMAIL'] = identity.email
+  env['GIT_COMMITTER_NAME'] = identity.name
+  env['GIT_COMMITTER_EMAIL'] = identity.email
+}
+
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it
 // over an identity the operator sets while the container runs.
 export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity): Promise<boolean> {
