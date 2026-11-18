@@ -382,7 +382,7 @@ function shouldRecurse(path: string): boolean {
   return path === 'docker' || path === 'git' || path === 'permissions'
 }
 
-// `roles.match` / `roles.permissions` are optional virtual paths: absent from a
-// bare-`{}` parse (so they never show up in the enumerated default-config
-// paths) but classified in FIELD_EFFECTS.
-const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions'])
+// `roles.match` / `roles.permissions` are optional virtual paths and `git.user`
+// is an optional block: absent from a bare-`{}` parse (so they never show up in
+// the enumerated default-config paths) but classified in FIELD_EFFECTS.
+const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions', 'git.user'])

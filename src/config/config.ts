@@ -309,11 +309,30 @@ export const gitignoreSchema = gitignoreObjectSchema.default(() => gitignoreObje
 
 export type GitignoreConfig = z.infer<typeof gitignoreSchema>
 
-// Same rationale as `dockerSchema`: a `git` namespace today carries `git.ignore`
-// and leaves room for future siblings (e.g. `git.attributes`).
+// The agent's Git author and committer identity. Values must form a valid ident
+// line (`name <email>`), so control characters and angle brackets are rejected.
+export const gitUserSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(1)
+    .refine((name) => !/[\p{Cc}<>]/u.test(name), {
+      message: 'git.user.name must be a single line without "<" or ">"',
+    }),
+  email: z
+    .string()
+    .trim()
+    .regex(/^[^\s<>@]+@[^\s<>@]+$/, { message: 'git.user.email must be one address like name@example.com' }),
+})
+
+export type GitUserConfig = z.infer<typeof gitUserSchema>
+
+// Same rationale as `dockerSchema`: a `git` namespace carries `git.ignore` and
+// `git.user`, and leaves room for future siblings (e.g. `git.attributes`).
 export const gitSchema = z
   .object({
     ignore: gitignoreSchema,
+    user: gitUserSchema.optional(),
   })
   .default(() => ({ ignore: gitignoreObjectSchema.parse({}) }))
 
@@ -1240,6 +1259,8 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   'docker.file': 'restart-required', // Includes omoCli; installation changes rebuild the image.
   browser: 'restart-required',
   'git.ignore': 'restart-required',
+  // Model bash reads it per call and the runtime re-exports it on reload.
+  'git.user': 'applied',
   githubCli: 'restart-required',
   typevault: 'restart-required',
   logs: 'ignored',
