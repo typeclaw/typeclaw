@@ -979,6 +979,17 @@ describe('scaffold', () => {
     expect(await readFile(config, 'utf8')).toBe('{"alias":["mine"]}\n')
   }, 15_000)
 
+  test('a first init does not create typeclaw.json while another process holds its lock', async () => {
+    // given: no typeclaw.json yet, and another process holds its lock
+    const config = join(root, 'typeclaw.json')
+    await writeFile(configFileLockPath(config), '')
+
+    // when/then: scaffold waits for the lock, times out with the recovery
+    // step, and never creates the file
+    await expect(scaffold(root)).rejects.toThrow(`rm "${configFileLockPath(config)}"`)
+    expect(existsSync(config)).toBe(false)
+  }, 15_000)
+
   test('writes typeclaw.json that passes configSchema validation', async () => {
     await scaffold(root)
 
