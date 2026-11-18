@@ -12,10 +12,13 @@ export const GUARD_GIT_REMOTES_CONFIG = 'gitRemotesConfig'
 // remote or changing its URL is therefore the config form of `git remote
 // set-url` followed by a push, so it needs the same authority the bash path
 // needs for that push: `security.bypass.gitRemoteTainted` (high tier, owner by
-// default). Removing a remote only narrows where history can go and is allowed.
+// default). Removing a managed remote needs the same authority: start only
+// reconciles remotes still listed, so a removal can cancel an owner's pending
+// retarget and leave the old destination in place.
 export type GitRemotesFinding =
   | { kind: 'remote-added'; name: string; url: string }
   | { kind: 'url-changed'; name: string; from: string; to: string }
+  | { kind: 'remote-removed'; name: string }
 
 export async function checkGitRemotesConfigGuard(options: {
   tool: string
@@ -62,6 +65,9 @@ export function diffRemotes(
     if (prior === undefined) findings.push({ kind: 'remote-added', name, url })
     else if (prior !== url) findings.push({ kind: 'url-changed', name, from: prior, to: url })
   }
+  for (const name of Object.keys(before)) {
+    if (!(name in after)) findings.push({ kind: 'remote-removed', name })
+  }
   return findings
 }
 
@@ -75,11 +81,15 @@ function buildBlockReason(tool: string, findings: readonly GitRemotesFinding[]):
   // Names only: remote URLs can carry credentials, and this reason is returned
   // to the session as a tool error.
   const changes = findings.map((f) =>
-    f.kind === 'remote-added' ? `adds remote \`${f.name}\`` : `changes the URL of remote \`${f.name}\``,
+    f.kind === 'remote-added'
+      ? `adds remote \`${f.name}\``
+      : f.kind === 'remote-removed'
+        ? `removes remote \`${f.name}\``
+        : `changes the URL of remote \`${f.name}\``,
   )
   return [
     `Guard \`${GUARD_GIT_REMOTES_CONFIG}\` blocked ${tool} on typeclaw.json: ${changes.join('; ')}.`,
     'The next `typeclaw start` copies git.remotes into the agent repo, and the backup plugin pushes its history to `origin`, so this decides where the repository is sent.',
-    'Only a session holding `security.bypass.gitRemoteTainted` (owner by default, e.g. the TUI) may add or re-point a remote; the operator can also edit typeclaw.json on the host. Removing a remote is allowed.',
+    'Only a session holding `security.bypass.gitRemoteTainted` (owner by default, e.g. the TUI) may add, re-point, or remove a remote; the operator can also edit typeclaw.json on the host.',
   ].join(' ')
 }

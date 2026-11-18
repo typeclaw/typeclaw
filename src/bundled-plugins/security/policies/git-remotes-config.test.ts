@@ -51,10 +51,18 @@ describe('gitRemotesConfig guard', () => {
     expect(result?.reason).not.toContain('github.com/acme')
   })
 
-  test('allows removing a remote, keeping remotes as they are, and unrelated edits', async () => {
+  test('blocks removing a managed remote, which could cancel a pending retarget', async () => {
+    const agentDir = await agentWith({ git: { remotes: { origin: 'https://example.com/new.git' } } })
+
+    const result = await write(agentDir, { git: {} })
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('removes remote')
+  })
+
+  test('allows keeping remotes as they are and unrelated edits', async () => {
     const agentDir = await agentWith({ alias: ['atlas'], git: { remotes: { origin: ORIGIN, mirror: ORIGIN } } })
 
-    expect(await write(agentDir, { alias: ['atlas'], git: { remotes: { origin: ORIGIN } } })).toBeUndefined()
     expect(
       await write(agentDir, { alias: ['atlas', '아틀라스'], git: { remotes: { origin: ORIGIN, mirror: ORIGIN } } }),
     ).toBeUndefined()
