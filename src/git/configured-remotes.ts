@@ -11,7 +11,10 @@ import { runGit } from './run'
 // pushInsteadOf, or either from an included file) are kept, so each remote's
 // effective push destination, and the remote backups actually push to, are
 // checked afterwards and reported as warnings. Messages never include a URL,
-// since push URLs can carry credentials.
+// since push URLs can carry credentials. The check reads the agent repo's own
+// config only (global/system config and GIT_CONFIG_* overrides are off, as for
+// the write); Git overrides the operator puts in the container's environment
+// through .env are not visible here and can still redirect backups.
 export type GitRemotesSync = { failed?: string; warnings: string[] }
 
 export async function syncConfiguredGitRemotes(
