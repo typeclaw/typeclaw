@@ -6,7 +6,6 @@ import { basename, join } from 'node:path'
 import {
   _internal,
   editLocalConfigAtomically,
-  exportGitIdentityEnv,
   ensureGitIdentity,
   hasExplicitGitIdentity,
   isFallbackGitIdentity,
@@ -365,17 +364,24 @@ describe('resolveGitIdentity', () => {
     expect(env).toEqual(expected)
   })
 
-  test('exportGitIdentityEnv leaves names the operator declared in .env', () => {
-    const env: NodeJS.ProcessEnv = { GIT_AUTHOR_EMAIL: 'operator@example.com' }
+  test('removing git.user falls back to the GitHub account, then to the start seed', () => {
+    // given: git.user configured, then the GitHub adapter registers
+    const env: NodeJS.ProcessEnv = { GIT_AUTHOR_NAME: 'Typeey', GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local' }
+    let configured: { name: string; email: string } | undefined = { name: '현무', email: 'hyeonmu@typeclaw.local' }
+    const track = trackGithubGitIdentityEnv(new Set(), env, () => configured)
+    track({ login: 'typeey[bot]', id: 42 })
+    expect(env['GIT_AUTHOR_NAME']).toBe('현무')
 
-    exportGitIdentityEnv({ name: '현무', email: 'hyeonmu@typeclaw.local' }, new Set(['GIT_AUTHOR_EMAIL']), env)
+    // when: git.user is removed and the reload refreshes the env
+    configured = undefined
+    track.refresh()
 
-    expect(env).toEqual({
-      GIT_AUTHOR_NAME: '현무',
-      GIT_AUTHOR_EMAIL: 'operator@example.com',
-      GIT_COMMITTER_NAME: '현무',
-      GIT_COMMITTER_EMAIL: 'hyeonmu@typeclaw.local',
-    })
+    // then: the running adapter's account applies at once
+    expect(env['GIT_AUTHOR_NAME']).toBe('typeey[bot]')
+
+    // when / then: and once the adapter stops, the start-time seed comes back
+    track(null)
+    expect(env).toEqual({ GIT_AUTHOR_NAME: 'Typeey', GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local' })
   })
 
   test('scrubs Git controls case-insensitively for Windows environment semantics', () => {

@@ -72,19 +72,26 @@ const GIT_IDENTITY_ENV = [
   ['GIT_COMMITTER_EMAIL', 'email'],
 ] as const
 
-// Runtime commits (backup, dreaming, system files) inherit the runtime env, which
-// `typeclaw start` seeds with the repo identity. While the GitHub adapter runs,
-// its account replaces that seed; when it stops, the seed comes back. A
-// configured typeclaw.json#git.user outranks the GitHub account, so while one is
-// set it is applied instead. Names the operator declared in .env are left alone,
-// matching model bash.
+export type GitIdentityEnvTracker = ((self: { login: string; id: number } | null) => void) & {
+  // Re-applies the identity after typeclaw.json#git.user changes.
+  refresh(): void
+}
+
+// The single owner of the runtime's git identity env. Runtime commits (backup,
+// dreaming, system files) inherit it, and `typeclaw start` seeds it. The
+// identity is, in order: typeclaw.json#git.user, the running GitHub adapter's
+// account, then the start-time seed. It is re-applied when the adapter's
+// account changes and when git.user changes, so removing git.user falls back
+// right away. Names the operator declared in .env are left alone, matching
+// model bash.
 export function trackGithubGitIdentityEnv(
   operatorNames: ReadonlySet<string>,
   env: NodeJS.ProcessEnv = process.env,
   configured: () => GitIdentity | undefined = () => undefined,
-): (self: { login: string; id: number } | null) => void {
+): GitIdentityEnvTracker {
   const seed = Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]]))
-  return (self) => {
+  let self: { login: string; id: number } | null = null
+  const apply = () => {
     const identity = configured() ?? (self === null ? null : githubGitIdentity(self))
     for (const [name, field] of GIT_IDENTITY_ENV) {
       if (operatorNames.has(name)) continue
@@ -93,6 +100,11 @@ export function trackGithubGitIdentityEnv(
       else env[name] = value
     }
   }
+  const track = (next: { login: string; id: number } | null) => {
+    self = next
+    apply()
+  }
+  return Object.assign(track, { refresh: apply })
 }
 
 // Copies typeclaw.json#git.user into the agent repo so host-side Git agrees
@@ -154,19 +166,6 @@ export async function editLocalConfigAtomically(cwd: string, edits: readonly (re
     await lock.close().catch(() => {})
     if (!committed) await rm(lockPath, { force: true })
     if (scratch !== undefined) await rm(scratch, { recursive: true, force: true })
-  }
-}
-
-// Runtime-owned commits (backup, dreaming, system files) inherit the runtime's
-// environment, so a reloaded git.user reaches them by replacing it here. Names
-// the operator declared in .env keep their value, as at start.
-export function exportGitIdentityEnv(
-  identity: GitIdentity,
-  operatorNames: ReadonlySet<string>,
-  env: NodeJS.ProcessEnv = process.env,
-): void {
-  for (const [name, field] of GIT_IDENTITY_ENV) {
-    if (!operatorNames.has(name)) env[name] = identity[field]
   }
 }
 

@@ -283,11 +283,10 @@ async function startAgentRuntime(
   reconcileLeftoverConfigWindowsSync(cwd)
   markRuntimeOwnsConfigWindows()
   const { config: cwdConfig, pluginConfigs: pluginConfigsByName } = loadConfigBundleSync(cwd)
-  const githubTokenBridge = createGithubTokenBridge({
-    // Only names the operator declared in .env: the runtime-exported identity
-    // also counts as exposable to bash, and it is exactly what this replaces.
-    onSelfChange: trackGithubGitIdentityEnv(declaredEnvNames(cwd), process.env, () => getConfig().git.user),
-  })
+  // Only names the operator declared in .env: the runtime-exported identity
+  // also counts as exposable to bash, and it is exactly what this replaces.
+  const gitIdentityEnv = trackGithubGitIdentityEnv(declaredEnvNames(cwd), process.env, () => getConfig().git.user)
+  const githubTokenBridge = createGithubTokenBridge({ onSelfChange: gitIdentityEnv })
   const mcpOAuthStore = resolveContainerMcpOAuthStore(process.env, join(cwd, 'secrets.json'))
   const mcpManager =
     cwdConfig.mcpServers.length > 0
@@ -380,6 +379,7 @@ async function startAgentRuntime(
       permissions: pluginsLoaded.permissions,
       onRolesChanged: () => channelManager.router.tearDownAllLive(),
       skipMountValidation: containerName !== undefined,
+      onGitUserChanged: () => gitIdentityEnv.refresh(),
     }),
   )
   const pluginRegistry = pluginsLoaded.registry
