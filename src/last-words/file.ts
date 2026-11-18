@@ -5,11 +5,10 @@ import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
 import { z } from 'zod'
 
-// `.typeclaw/last-words.json`: what the agent was doing when its container
-// died. A SIGKILLed runtime cannot write anything, so the runtime keeps its
-// words current while alive, and the host stamps the cause of death after the
-// fact. The two never write concurrently: the host only seals an entry once
-// its container has stopped.
+// `.typeclaw/last-words/last-words.json`: what the agent was doing when its
+// container died. A SIGKILLed runtime cannot write anything, so the runtime
+// keeps its words current while alive, and the host stamps the cause of death
+// after the fact.
 //
 // Words describe shape, never content: origin keys, tool names, process kinds,
 // and sizes. Message text, tool arguments, URLs, and env values never land here.
@@ -86,8 +85,14 @@ export type ObservedExit = {
   log: string | null
 }
 
+// Everything last words touches lives in one runtime-private directory: the
+// file, its staging copy, and the lock. The sandbox masks the directory, which
+// stays put, so the file's inode can be replaced on every write without racing
+// mask setup, and a leftover staging file stays hidden.
+export const LAST_WORDS_RELATIVE_DIR = '.typeclaw/last-words'
+
 export function lastWordsPath(agentDir: string): string {
-  return join(agentDir, '.typeclaw', 'last-words.json')
+  return join(agentDir, LAST_WORDS_RELATIVE_DIR, 'last-words.json')
 }
 
 const EMPTY: LastWordsFile = { version: 1, entries: [] }

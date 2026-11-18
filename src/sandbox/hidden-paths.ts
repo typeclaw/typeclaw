@@ -13,7 +13,7 @@ import {
   RUNTIME_OWNED_SECRET_DIRS,
 } from './canonical-secrets'
 import { SandboxMaskTargetError } from './errors'
-import { CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
+import { CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS, CANONICAL_AGENT_RUNTIME_PRIVATE_FILES } from './runtime-private'
 
 export type HiddenPaths = {
   dirs: string[]
@@ -42,7 +42,7 @@ export function resolveHiddenPaths(
 ): HiddenPaths {
   const seesPrivate = canSeePrivateSurface(permissions, origin)
   const dirs = [
-    ...RUNTIME_OWNED_SECRET_DIRS.map((dir) => join(agentDir, dir)),
+    ...[...RUNTIME_OWNED_SECRET_DIRS, ...CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS].map((dir) => join(agentDir, dir)),
     ...(seesPrivate ? [] : [...OPERATOR_CLI_CREDENTIAL_DIRS, ...PRIVATE_DIRS].map((dir) => join(agentDir, dir))),
   ]
   const files = [...CANONICAL_AGENT_SECRET_FILES, ...CANONICAL_AGENT_RUNTIME_PRIVATE_FILES].map((f) =>

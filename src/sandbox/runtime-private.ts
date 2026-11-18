@@ -4,6 +4,10 @@
 export const CANONICAL_AGENT_RUNTIME_PRIVATE_FILES = [
   '.typeclaw/incidents.json',
   '.typeclaw/coding-agent-tasks.json',
-  '.typeclaw/last-words.json',
-  '.typeclaw/last-words.json.tmp',
 ] as const
+
+// Directories whose files are replaced by rename while the runtime runs. A file
+// mask needs a stable target, so these are masked as a whole. Mirrors
+// LAST_WORDS_RELATIVE_DIR in src/last-words/file.ts; kept as a literal so the
+// sandbox does not load that module.
+export const CANONICAL_AGENT_RUNTIME_PRIVATE_DIRS = ['.typeclaw/last-words'] as const
