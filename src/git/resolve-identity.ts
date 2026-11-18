@@ -86,6 +86,24 @@ export function trackGithubGitIdentityEnv(
   }
 }
 
+// Copies typeclaw.json#git.user into the agent repo so host-side Git and the
+// identity `typeclaw start` exports agree with it. Host stage only, and only
+// while the container is down: git commits config by renaming config.lock over
+// .git/config, which would detach the read-only bind of any sandbox still
+// running. Dropping the fallback marker makes the pair explicit.
+export async function syncConfiguredGitIdentity(cwd: string, user: GitIdentity | undefined): Promise<boolean> {
+  if (user === undefined) return true
+  const repo = resolveAgentGit(cwd)
+  if (repo === null) return true
+  const values = await readRepositoryIdentity(cwd, repo.gitArgs)
+  const current = { name: values.get('user.name')?.at(-1)?.trim(), email: values.get('user.email')?.at(-1)?.trim() }
+  const marked = values.has(FALLBACK_MARKER_KEY)
+  if (current.name === user.name && current.email === user.email && !marked) return true
+  if (!(await writeLocalConfig(cwd, repo.gitArgs, 'user.name', user.name, '--replace-all'))) return false
+  if (!(await writeLocalConfig(cwd, repo.gitArgs, 'user.email', user.email, '--replace-all'))) return false
+  return !marked || (await unsetLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY))
+}
+
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it
 // over an identity the operator sets while the container runs.
 export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity): Promise<boolean> {
@@ -108,9 +126,26 @@ function fallbackGitIdentity(cwd: string): GitIdentity {
   return { name: folder || 'agent', email: `${slug || 'agent'}@typeclaw.local` }
 }
 
-async function writeLocalConfig(cwd: string, gitArgs: readonly string[], key: string, value: string): Promise<boolean> {
+async function writeLocalConfig(
+  cwd: string,
+  gitArgs: readonly string[],
+  key: string,
+  value: string,
+  ...flags: string[]
+): Promise<boolean> {
   try {
-    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', key, value], {
+    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', ...flags, key, value], {
+      env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+    })
+    return result.exitCode === 0
+  } catch {
+    return false
+  }
+}
+
+async function unsetLocalConfig(cwd: string, gitArgs: readonly string[], key: string): Promise<boolean> {
+  try {
+    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', '--unset-all', key], {
       env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
     })
     return result.exitCode === 0

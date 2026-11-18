@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -9,6 +9,7 @@ import {
   isFallbackGitIdentity,
   resolveGitIdentity,
   trackGithubGitIdentityEnv,
+  syncConfiguredGitIdentity,
 } from './resolve-identity'
 
 const roots: string[] = []
@@ -146,6 +147,42 @@ describe('resolveGitIdentity', () => {
       false,
     )
     await expect(isFallbackGitIdentity(configured, kept!)).resolves.toBe(false)
+  })
+
+  test('syncConfiguredGitIdentity replaces the synthesized fallback with git.user', async () => {
+    const repo = await tempDir('typeclaw-git-identity-sync-')
+    await git(repo, ['init', '-q'])
+    await ensureGitIdentity(repo)
+
+    await expect(syncConfiguredGitIdentity(repo, { name: '현무', email: 'hyeonmu@typeclaw.local' })).resolves.toBe(true)
+
+    const identity = await resolveGitIdentity(repo)
+    expect(identity).toEqual({ name: '현무', email: 'hyeonmu@typeclaw.local' })
+    await expect(isFallbackGitIdentity(repo, identity!)).resolves.toBe(false)
+  })
+
+  test('syncConfiguredGitIdentity makes an exact fallback pair explicit', async () => {
+    const repo = await tempDir('typeclaw-git-identity-sync-same-')
+    await git(repo, ['init', '-q'])
+    const fallback = await ensureGitIdentity(repo)
+
+    await expect(syncConfiguredGitIdentity(repo, fallback!)).resolves.toBe(true)
+
+    await expect(isFallbackGitIdentity(repo, fallback!)).resolves.toBe(false)
+  })
+
+  test('syncConfiguredGitIdentity leaves config untouched when it already matches or git.user is unset', async () => {
+    const repo = await tempDir('typeclaw-git-identity-sync-noop-')
+    await git(repo, ['init', '-q'])
+    await git(repo, ['config', '--local', 'user.name', 'Agent'])
+    await git(repo, ['config', '--local', 'user.email', 'agent@example.com'])
+    const config = join(repo, '.git', 'config')
+    const before = await stat(config)
+
+    await expect(syncConfiguredGitIdentity(repo, { name: 'Agent', email: 'agent@example.com' })).resolves.toBe(true)
+    await expect(syncConfiguredGitIdentity(repo, undefined)).resolves.toBe(true)
+
+    expect((await stat(config)).ino).toBe(before.ino)
   })
 
   test('ensureGitIdentity leaves a non-repository untouched', async () => {

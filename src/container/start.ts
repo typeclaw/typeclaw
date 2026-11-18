@@ -8,7 +8,13 @@ import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } fro
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
-import { ensureGitIdentity, resolveGitIdentity, isFallbackGitIdentity, type GitIdentity } from '@/git/resolve-identity'
+import {
+  ensureGitIdentity,
+  resolveGitIdentity,
+  isFallbackGitIdentity,
+  syncConfiguredGitIdentity,
+  type GitIdentity,
+} from '@/git/resolve-identity'
 import { commitSystemFile as commitSystemFileShared } from '@/git/system-commit'
 import { send as sendToDaemon } from '@/hostd/client'
 import { ensureModels as ensureHostModels } from '@/hostd/models'
@@ -419,6 +425,14 @@ async function runStart({
     }
 
     const githubCliConfig = await loadTypeclawConfig(cwd)
+    // The container is confirmed down here, so no sandbox holds the read-only
+    // .git/config bind that git's rename-based config write would detach.
+    if (!(await syncConfiguredGitIdentity(cwd, githubCliConfig.git.user))) {
+      const warning =
+        'typeclaw: could not copy typeclaw.json#git.user into the agent repo; commits keep the previous git identity.'
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
     // Before anything else touches secrets.json, so the GitHub CLI refresh
     // below already writes to whichever store this start settles on.
     const typevaultReconcile = await reconcileTypevault(cwd, githubCliConfig.typevault.enabled)

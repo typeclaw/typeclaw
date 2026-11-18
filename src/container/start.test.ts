@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
-import { ensureGitIdentity } from '@/git/resolve-identity'
+import { ensureGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { startDaemon, type Daemon } from '@/hostd/daemon'
 import { buildDockerfile, BUN_BASE_IMAGE } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
@@ -2212,6 +2212,62 @@ describe('start (composition)', () => {
 
     expect(result.ok).toBe(true)
     expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(true)
+  })
+
+  test('copies typeclaw.json#git.user into the agent repo and exports it to the container', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { user: { name: '현무', email: 'hyeonmu@typeclaw.local' } } })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(result.ok).toBe(true)
+    expect(await resolveGitIdentity(root)).toEqual({ name: '현무', email: 'hyeonmu@typeclaw.local' })
+    const runCall = docker.calls.find((call) => call.args[0] === 'run')
+    expect(runCall?.args).toContain('GIT_AUTHOR_NAME=현무')
+    expect(runCall?.args).toContain('GIT_COMMITTER_EMAIL=hyeonmu@typeclaw.local')
+  })
+
+  test('leaves the agent repo identity alone while the container is already running', async () => {
+    // given: a running agent whose sandboxes hold the read-only .git/config bind
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { user: { name: 'New Name', email: 'new@example.com' } } })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: true, running: true } })
+
+    // when
+    await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(await resolveGitIdentity(root)).toEqual({ name: 'Test User', email: 'test@example.com' })
   })
 
   test('migrates legacy agent-messenger data before docker run and injects the canonical container path', async () => {
