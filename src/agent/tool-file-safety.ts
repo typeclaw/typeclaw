@@ -24,6 +24,7 @@ import {
   createPrivateSurfaceReadIdentityVerifier,
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
+import { withConfigFileLock } from '@/config/config-file-lock'
 import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
@@ -859,11 +860,12 @@ export type ManagedConfigCommitCheck = {
   check(content: string, destination: string): Promise<void>
 }
 
-// The queue serializes checked writes only. Writers outside it, namely privileged
-// model bash (roles that keep agent-root writes, which already bypass the
-// medium-tier config guards) and host-side typeclaw config commands, can still
-// land between a queued write's check and its write and then be overwritten.
-// Coordinating them needs a lock shared across processes; see #1718.
+// The queue serializes checked writes in this process, and each one holds the
+// cross-process config file lock (src/config/config-file-lock.ts) from its check
+// through its write, which host-side typeclaw config commands share. Writers
+// that take no lock, namely privileged model bash (roles that keep agent-root
+// writes, which already bypass the medium-tier config guards) and hand edits,
+// can still land between a check and its write and then be overwritten; see #1718.
 const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
 const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
 let checkedWrites: Promise<unknown> = Promise.resolve()
@@ -878,16 +880,18 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
   if (commit === undefined || destination === undefined) return writeOutputNoFollow(targetPath, content)
   const write = checkedWrites.then(async () => {
     commit.signal?.throwIfAborted()
-    // Guards decide on the managed path and read their baseline through it, so
-    // the pinned descriptor must still be that entry's inode, before the check
-    // and again before any byte is truncated.
-    await assertPinnedEntry(targetPath, destination)
-    await commit.check(content, destination)
-    await assertPinnedEntry(targetPath, destination)
-    // A call cancelled while queued, while its guards ran, or during the entry
-    // check above must not write; nothing is awaited between here and the write.
-    commit.signal?.throwIfAborted()
-    await writeOutputNoFollow(targetPath, content)
+    await withConfigFileLock(destination, async () => {
+      // Guards decide on the managed path and read their baseline through it, so
+      // the pinned descriptor must still be that entry's inode, before the check
+      // and again before any byte is truncated.
+      await assertPinnedEntry(targetPath, destination)
+      await commit.check(content, destination)
+      await assertPinnedEntry(targetPath, destination)
+      // A call cancelled while queued, while its guards ran, or during the entry
+      // check above must not write; nothing is awaited between here and the write.
+      commit.signal?.throwIfAborted()
+      await writeOutputNoFollow(targetPath, content)
+    })
   })
   checkedWrites = write.catch(() => {})
   return write
