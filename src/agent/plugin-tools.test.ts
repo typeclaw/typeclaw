@@ -7845,6 +7845,7 @@ describe('managed config commit check', () => {
       }
       const fresh = { id: 'fresh', schedule: '0 10 * * *', kind: 'prompt', prompt: 'y', scheduledByRole: 'owner' }
       await writeFile(cron, JSON.stringify({ jobs: [expired, fresh] }, null, 2))
+      const concurrent = JSON.stringify({ jobs: [fresh] }, null, 2)
       const hooks = createHookBus()
       hooks.registerAll('guard', agentDir, noopLogger, {})
       let preflightPassed = false
@@ -7852,7 +7853,7 @@ describe('managed config commit check', () => {
         'tool.before': async (event) => {
           if (preflightPassed || path.isAbsolute(String(event.args.path))) return undefined
           preflightPassed = true
-          await writeFile(cron, JSON.stringify({ jobs: [fresh] }, null, 2))
+          await writeFile(cron, concurrent)
           return undefined
         },
       })
@@ -7885,7 +7886,7 @@ describe('managed config commit check', () => {
         // then: preflight let it through, the commit check blocked it, nothing was written
         await expect(execution).rejects.toThrow(/managedConfig/)
         expect(preflightPassed).toBe(true)
-        expect(JSON.parse(await readFile(cron, 'utf8'))).toEqual({ jobs: [fresh] })
+        expect(await readFile(cron, 'utf8')).toBe(concurrent)
       } finally {
         await rm(agentDir, { recursive: true, force: true })
       }
