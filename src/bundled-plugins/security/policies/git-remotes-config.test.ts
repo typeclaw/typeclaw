@@ -77,6 +77,19 @@ describe('gitRemotesConfig guard', () => {
     }
   })
 
+  test('blocks an edit of typeclaw.json whose result it cannot preview', async () => {
+    const agentDir = await agentWith({ alias: ['atlas'] })
+
+    const result = await checkGitRemotesConfigGuard({
+      tool: 'edit',
+      args: { path: 'typeclaw.json', edits: [{ oldText: '"atlas" ', newText: '"atlas", "x"' }] },
+      agentDir,
+    })
+
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('write')
+  })
+
   test('ignores files other than typeclaw.json', async () => {
     const agentDir = await agentWith({})
 

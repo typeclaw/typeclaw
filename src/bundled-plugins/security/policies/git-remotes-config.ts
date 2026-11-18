@@ -34,8 +34,15 @@ export async function checkGitRemotesConfigGuard(options: {
   const editRefusal = refuseRiskyEdit(tool, args, targetPath, GUARD_GIT_REMOTES_CONFIG)
   if (editRefusal) return editRefusal
 
+  // Fail closed: the editor can apply an edit this preview cannot reproduce, so
+  // an edit of typeclaw.json the guard cannot evaluate is not let through.
   const newContent = await intendedContent(tool, args, targetPath)
-  if (newContent === undefined) return undefined
+  if (newContent === undefined) {
+    return {
+      block: true,
+      reason: `Guard \`${GUARD_GIT_REMOTES_CONFIG}\` cannot preview this ${tool} of typeclaw.json, so it cannot rule out a git.remotes change. Use \`write\` with the full file content instead.`,
+    }
+  }
   const after = parseRemotes(newContent)
   if (after === undefined) return undefined
 
