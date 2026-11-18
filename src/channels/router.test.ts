@@ -9309,6 +9309,46 @@ describe('ChannelRouter duplicate-send guard', () => {
     expect(duplicate.ok).toBe(false)
     expect(seen.map((message) => message.text)).toEqual(['live answer', 'old interrupted work'])
   })
+  test('a transport-only notice leaves an active turn at its destination untouched', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const seen: OutboundMessage[] = []
+    router.registerOutbound('discord-bot', async (message) => {
+      seen.push(message)
+      return { ok: true }
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    await router.send({ ...KEY, text: 'live answer' })
+    const before = router.__testing!.getRecoveryAccountingSnapshot(KEY)
+
+    const notice = await router.send(
+      { ...KEY, text: 'I stopped unexpectedly' },
+      { source: 'system', outputKind: 'meta', transportOnly: true },
+    )
+
+    expect(notice.ok).toBe(true)
+    expect(router.__testing!.getRecoveryAccountingSnapshot(KEY)).toEqual(before)
+    expect((await router.send({ ...KEY, text: 'live answer' })).ok).toBe(false)
+    expect(seen.map((message) => [message.text, message.sendOptions])).toEqual([
+      ['live answer', undefined],
+      ['I stopped unexpectedly', undefined],
+    ])
+  })
+  test('a transport-only send whose destination was revoked during review never reaches the adapter', async () => {
+    const dir = await tempDir()
+    const { router } = makeRouter(dir)
+    const seen: OutboundMessage[] = []
+    router.registerOutbound('discord-bot', async (message) => {
+      seen.push(message)
+      return { ok: true }
+    })
+
+    const result = await router.send({ ...KEY, text: 'notice' }, { transportOnly: true, deliverIf: () => false })
+
+    expect(result).toMatchObject({ ok: false, code: 'cancelled' })
+    expect(seen).toEqual([])
+  })
   test('recovery preserves held live promise, leaf, skip and reaction ownership', async () => {
     for (const mode of ['promise', 'skip']) {
       const dir = await tempDir()

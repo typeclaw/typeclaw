@@ -1453,6 +1453,14 @@ export type SendOptions = TransportSendOptions & {
   outputKind?: 'substantive' | 'status' | 'meta'
   // Runtime-owned provenance; never populated from model tool arguments.
   origin?: ChannelOutboundOrigin
+  // Delivery outside any turn (a notice about the previous run's death). Like
+  // recovery, it never reads or mutates the destination's live-turn accounting,
+  // so it cannot be mistaken for an active turn's reply.
+  transportOnly?: true
+  // Transport-only sends only: checked after outbound review, right before the
+  // adapter is invoked, so a caller can cancel a send whose destination was
+  // revoked while it was being prepared.
+  deliverIf?: () => boolean
 }
 
 export type EditMessageOptions = { origin?: ChannelOutboundOrigin }
@@ -7361,7 +7369,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
     // Recovery is a transport-only operation. Do not even look up the live
     // session: doing so would let a delayed notice alter a newer logical turn.
-    if (opts?.accounting === 'recovery') {
+    if (opts?.accounting === 'recovery' || opts?.transportOnly === true) {
       const reviewed = hasOutboundReviewer()
       if (reviewed) {
         const text = await reviewOutbound({
@@ -7377,8 +7385,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         })
         if (msg.text !== undefined) msg = { ...msg, text }
       }
+      if (opts.deliverIf?.() === false) return { ok: false, error: 'delivery cancelled', code: 'cancelled' }
       for (const callback of Array.from(callbacks)) {
-        const result = await callback({ ...msg, sendOptions: opts })
+        const result = await callback(opts.accounting === 'recovery' ? { ...msg, sendOptions: opts } : msg)
         if (result.ok) return reviewed && msg.text !== undefined ? { ...result, deliveredText: msg.text } : result
         return result
       }
