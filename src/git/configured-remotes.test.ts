@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, stat } from 'node:fs/promises'
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -52,18 +52,32 @@ describe('syncConfiguredGitRemotes', () => {
     expect(await git(repo, ['remote', 'get-url', 'upstream'])).toBe('https://example.com/upstream.git')
   })
 
-  test('keeps an operator pushurl but reports that pushes still go there', async () => {
+  test('keeps an operator pushurl and warns without printing any URL', async () => {
     const repo = await agentRepo()
     await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
-    await git(repo, ['config', 'remote.origin.pushurl', 'https://example.com/push.git'])
+    await git(repo, ['config', 'remote.origin.pushurl', 'https://alice:s3cr3t-token@example.com/push.git'])
 
     const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
-    expect(problems).toEqual([
-      'remote "origin" keeps its pushurl https://example.com/push.git, so pushes (including backups) go there instead of git.remotes.origin',
-    ])
-    expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/new.git')
-    expect(await git(repo, ['config', '--get', 'remote.origin.pushurl'])).toBe('https://example.com/push.git')
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('remote "origin"')
+    expect(problems.join('\n')).not.toContain('s3cr3t-token')
+    expect(problems.join('\n')).not.toContain('example.com')
+    expect(await git(repo, ['config', '--get', 'remote.origin.pushurl'])).toBe(
+      'https://alice:s3cr3t-token@example.com/push.git',
+    )
+  })
+
+  test('warns about a push override that comes from an included config file', async () => {
+    const repo = await agentRepo()
+    const included = join(repo, '.git', 'push-override.inc')
+    await writeFile(included, '[remote "origin"]\n\tpushurl = https://example.com/elsewhere.git\n')
+    await git(repo, ['config', 'include.path', included])
+
+    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('remote "origin"')
   })
 
   test('leaves config untouched when every remote already matches or none are configured', async () => {
