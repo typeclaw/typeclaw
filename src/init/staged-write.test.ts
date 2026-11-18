@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,10 +9,40 @@ import {
   credentialStagingDir,
   discardCredentialStaging,
   publishCredential,
+  replaceFile,
   stageCredential,
 } from './staged-write'
 
 const mode = (path: string) => statSync(path).mode & 0o777
+
+describe('replaceFile', () => {
+  test.skipIf(process.platform === 'win32')('replaces the target of a symlink and keeps the link', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
+    const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-staged-target-'))
+    const target = join(elsewhere, 'typeclaw.json')
+    await writeFile(target, '{}\n')
+    await symlink(target, join(cwd, 'typeclaw.json'))
+
+    replaceFile(join(cwd, 'typeclaw.json'), '{"alias":["atlas"]}\n')
+
+    expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(target, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    expect(readdirSync(elsewhere)).toEqual(['typeclaw.json'])
+    expect(readdirSync(cwd)).toEqual(['typeclaw.json'])
+  })
+
+  test.skipIf(process.platform === 'win32')('creates the file a dangling symlink names', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
+    const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-staged-target-'))
+    const target = join(elsewhere, 'typeclaw.json')
+    await symlink(target, join(cwd, 'typeclaw.json'))
+
+    replaceFile(join(cwd, 'typeclaw.json'), '{}\n')
+
+    expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
+    expect(readFileSync(target, 'utf8')).toBe('{}\n')
+  })
+})
 
 describe('credential staging', () => {
   test.skipIf(process.platform === 'win32')(

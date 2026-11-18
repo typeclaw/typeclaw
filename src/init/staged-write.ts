@@ -8,12 +8,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 
 // Where a credential file (.env) update is staged before it is written in
 // place: the full new content and a copy of the prior content, for recovery.
@@ -31,11 +33,19 @@ export function credentialStagingDir(agentDir: string): string {
 // Makes `dir` an owner-only (0700) directory: creates it 0700, or tightens an
 // existing one. Shared by credential staging and the sandbox mask setup so the
 // directory a credential is staged in is never readable by other local users.
-// Throws if `dir` is not a real directory or cannot be made 0700.
+// Throws if `dir` is not a real directory (a symlink is refused) or cannot be
+// made 0700.
 export function ensureOwnerOnlyDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const stats = lstatSync(dir)
   if (!stats.isDirectory()) throw new Error(`${dir} is not a directory; refusing to stage credentials in it`)
+  // Windows has no POSIX owner/group/other bits: chmod only toggles read-only,
+  // so the 0700 check could never pass. Its access control is ACLs, and the
+  // staging dir sits under the agent folder, which inherits the user profile's
+  // ACLs; the bwrap mask this dir pairs with is Linux-only. Checking ACLs would
+  // mean parsing localized `icacls` output, which is too fragile to gate token
+  // storage on, so only the directory and symlink checks above apply there.
+  if (process.platform === 'win32') return
   if ((stats.mode & 0o777) !== 0o700) chmodSync(dir, 0o700)
   if ((lstatSync(dir).mode & 0o777) !== 0o700) {
     throw new Error(`${dir} could not be made owner-only (0700); refusing to stage credentials in it`)
@@ -50,19 +60,23 @@ export type StagedReplacement = { temp: string; path: string }
 export function replaceFile(path: string, content: string | Buffer, rename: Rename = renameSync): void {
   const staged = stageReplacement(path, content)
   try {
-    rename(staged.temp, path)
+    rename(staged.temp, staged.path)
   } finally {
     rmSync(staged.temp, { force: true })
   }
 }
 
-// Writes the replacement for `path` in full beside it, with a gitignored suffix
-// and the destination's mode; the caller renames `temp` over `path`. A
-// read-only destination is refused, as an in-place write to it would be.
+// Writes the replacement for `path` in full, with a gitignored suffix and the
+// destination's mode; the caller renames `temp` over the returned `path`. If
+// `path` is a symlink, that is the link's target (staged beside it, so the
+// rename stays on one filesystem), so the link survives and keeps pointing at
+// the updated file, as an in-place write through it would. A read-only
+// destination is refused, as an in-place write to it would be.
 export function stageReplacement(path: string, content: string | Buffer): StagedReplacement {
-  const mode = modeOrUndefined(path)
-  if (mode !== undefined) accessSync(path, constants.W_OK)
-  const temp = join(dirname(path), `.${basename(path)}.${randomUUID()}.typeclaw-tmp`)
+  const target = linkTarget(path)
+  const mode = modeOrUndefined(target)
+  if (mode !== undefined) accessSync(target, constants.W_OK)
+  const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.typeclaw-tmp`)
   try {
     writeFileSync(temp, content, { flag: 'wx' })
     if (mode !== undefined) chmodSync(temp, mode)
@@ -70,7 +84,25 @@ export function stageReplacement(path: string, content: string | Buffer): Staged
     rmSync(temp, { force: true })
     throw error
   }
-  return { temp, path }
+  return { temp, path: target }
+}
+
+// The file a write to `path` lands in: its real path through any symlinks, or
+// for a dangling link, the file the link names (which an in-place write would
+// create).
+function linkTarget(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  try {
+    return resolve(dirname(path), readlinkSync(path))
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'EINVAL') return path
+    throw error
+  }
 }
 
 export type StagedCredential = {
@@ -176,14 +208,14 @@ export function publishConfigWithCredential(
   const rename = seams.rename ?? renameSync
   const credentialName = credential === undefined ? undefined : basename(credential.path)
   let staged: StagedCredential | undefined
-  let configTemp: string | undefined
+  let configStaged: StagedReplacement | undefined
   let keepPriorCopy = false
   try {
     if (credential !== undefined) staged = stageCredential(credential.path, credential.content, credential.stagingDir)
-    configTemp = stageReplacement(configPath, configBytes).temp
+    configStaged = stageReplacement(configPath, configBytes)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      rename(configTemp, configPath)
+      rename(configStaged.temp, configStaged.path)
     } catch (error) {
       if (staged === undefined) return { ok: false, reason: `${describe(error)}. typeclaw.json was not changed.` }
       try {
@@ -205,7 +237,7 @@ export function publishConfigWithCredential(
         : `Neither ${credentialName} nor typeclaw.json was changed`
     return { ok: false, reason: `${describe(error)}. ${unchanged}.` }
   } finally {
-    if (configTemp !== undefined) rmSync(configTemp, { force: true })
+    if (configStaged !== undefined) rmSync(configStaged.temp, { force: true })
     if (staged !== undefined) discardCredentialStaging(staged, keepPriorCopy)
   }
   return { ok: true }

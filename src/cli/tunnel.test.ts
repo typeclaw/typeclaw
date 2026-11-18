@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
-import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { existsSync, lstatSync, readdirSync, readlinkSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { AgentSession } from '@/agent'
 import { storeEnvKeyUnlessPresent } from '@/init'
@@ -1083,7 +1083,7 @@ describe('writeConfigAndToken', () => {
     expect(result.reason).toContain(`${env} could not be restored (injected in-place write failure 2)`)
     expect(result.reason).toContain(`its previous content is saved at ${priorCopy}`)
     expect(await readFile(priorCopy, 'utf8')).toBe('OTHER=1\n')
-    expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
+    if (process.platform !== 'win32') expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
     expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
   })
 
@@ -1130,6 +1130,67 @@ describe('writeConfigAndToken', () => {
     expect(statSync(join(cwd, '.env')).mode & 0o777).toBe(0o600)
     expect(leftoverTemps(cwd)).toEqual([])
   })
+
+  // typeclaw.json as a symlink to a file in another directory (the managed-config
+  // guard covers a link into the workspace).
+  async function linkConfigElsewhere(cwd: string): Promise<{ link: string; target: string }> {
+    const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-tunnel-config-target-'))
+    const link = join(cwd, 'typeclaw.json')
+    const target = join(elsewhere, 'typeclaw.json')
+    await writeFile(target, `${JSON.stringify({ tunnels: [] }, null, 2)}\n`)
+    await rm(link)
+    await symlink(target, link)
+    return { link, target }
+  }
+
+  test.skipIf(process.platform === 'win32')(
+    'a tunnel add through a symlinked typeclaw.json updates the target and keeps the link',
+    async () => {
+      // given: typeclaw.json links to a file in another directory
+      const cwd = await makeAgentDir({})
+      const { link, target } = await linkConfigElsewhere(cwd)
+
+      // when
+      const result = await tunnel.runTunnelAddFlow(
+        cwd,
+        { name: 'demo' },
+        { selectProvider: async () => 'cloudflare-quick', selectOwner: async () => 'manual', text: async () => '5173' },
+      )
+
+      // then: the target holds the tunnel and typeclaw.json is still the same link
+      expect(result.ok).toBe(true)
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(readlinkSync(link)).toBe(target)
+      expect((JSON.parse(await readFile(target, 'utf8')) as { tunnels: unknown[] }).tunnels).toEqual([
+        { name: 'demo', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 5173 },
+      ])
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'a failed publish through a symlinked typeclaw.json leaves the link, its target and .env unchanged',
+    async () => {
+      // given: typeclaw.json links elsewhere, and .env exists
+      const cwd = await makeAgentDir({})
+      const { link, target } = await linkConfigElsewhere(cwd)
+      const env = join(cwd, '.env')
+      await writeFile(env, 'OTHER=1\n')
+      const targetBefore = await readFile(target, 'utf8')
+
+      // when: publishing the config onto the target fails after .env was written
+      const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
+        rename: failConfigPublish,
+      })
+
+      // then: nothing changed, and the link still points at the untouched target
+      expect(result.ok).toBe(false)
+      expect(lstatSync(link).isSymbolicLink()).toBe(true)
+      expect(readlinkSync(link)).toBe(target)
+      expect(await readFile(target, 'utf8')).toBe(targetBefore)
+      expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+      expect(readdirSync(dirname(target))).toEqual(['typeclaw.json'])
+    },
+  )
 
   test('keeps a token another command stored before it when its rollback runs', async () => {
     // given: channel setup stored the default tunnel token under the lock
