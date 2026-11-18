@@ -7,7 +7,13 @@ import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
 import { z } from 'zod'
 
 import { BROWSER_ENGINE_IDS, BROWSER_EXTENSION_IDS } from '@/browser/registry'
-import { channelsSchema, SEEDED_GITHUB_EVENT_ALLOWLISTS } from '@/channels/schema'
+import {
+  ADAPTER_IDS,
+  ADAPTER_WRITE_CAPABILITIES,
+  type AdapterId,
+  channelsSchema,
+  SEEDED_GITHUB_EVENT_ALLOWLISTS,
+} from '@/channels/schema'
 import { evalConfigSchema } from '@/eval/config'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { parseMatchRule } from '@/permissions/match-rule'
@@ -347,6 +353,38 @@ const logsObjectSchema = z.object({
 export const logsSchema = logsObjectSchema.default(() => logsObjectSchema.parse({}))
 
 export type LogsConfig = z.infer<typeof logsSchema>
+
+// Opt-in: where to tell the operator that the agent died unexpectedly. A killed
+// runtime cannot send anything, so the next boot sends one notice for the run
+// right before it. `user` direct-messages a person on an adapter that can open a
+// DM from a user id; `workspace` + `chat` posts to an existing conversation,
+// including an existing DM on any adapter. Strict branches keep the generated
+// editor schema as strict as runtime parsing.
+const OPEN_DM_ADAPTER_IDS = ADAPTER_IDS.filter((id) => ADAPTER_WRITE_CAPABILITIES[id].includes('open-dm'))
+
+export const lastWordsNoticeSchema = z.union([
+  z
+    .object({
+      adapter: z.enum(OPEN_DM_ADAPTER_IDS as [AdapterId, ...AdapterId[]]),
+      user: z.string().min(1),
+      workspace: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      adapter: z.enum(ADAPTER_IDS),
+      workspace: z.string().min(1),
+      chat: z.string().min(1),
+      thread: z.string().min(1).optional(),
+    })
+    .strict(),
+])
+
+export type LastWordsNoticeTarget = z.infer<typeof lastWordsNoticeSchema>
+
+const lastWordsObjectSchema = z.object({ notice: lastWordsNoticeSchema.optional() })
+
+export const lastWordsSchema = lastWordsObjectSchema.default(() => lastWordsObjectSchema.parse({}))
 
 const IPV4_CIDR_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/
 
@@ -908,6 +946,7 @@ export const configSchema = z
     githubCli: githubCliSchema,
     typevault: typevaultSchema,
     logs: logsSchema,
+    lastWords: lastWordsSchema,
     roles: rolesConfigSchema.optional(),
     tunnels: tunnelsArraySchema,
     // When `true` (default), the system prompt tells the agent it runs on
@@ -1202,6 +1241,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   githubCli: 'restart-required',
   typevault: 'restart-required',
   logs: 'ignored',
+  lastWords: 'applied',
   // Split: `match` lists are reload-safe (typeclaw role claim, hand-edits
   // adding/removing match rules apply without a container restart);
   // `permissions` lists are restart-required (changing what a role can DO

@@ -42,26 +42,28 @@ export const ADAPTER_READ_CAPABILITIES: Record<AdapterId, readonly ReadCapabilit
   'webex-bot': ['history'],
 }
 
-export type WriteCapability = 'message-edit'
+export type WriteCapability = 'message-edit' | 'open-dm'
 
 // Mirror of ADAPTER_READ_CAPABILITIES for write-side capabilities that must
 // survive a failed start(). Only adapters whose underlying SDK exposes a
 // message-edit primitive appear here; the router uses this to answer
 // `adapter-unavailable` (configured but not running — re-auth may help) vs
-// `not-supported` (this adapter never edits) for a missing callback. The
-// schema.test.ts guard re-derives each entry from the adapter's
-// `.registerEditMessage(` call and fails if the table drifts.
+// `not-supported` (this adapter never edits) for a missing callback. `open-dm`
+// marks adapters that can open a direct message from a user id, so config can
+// reject a user-id target on an adapter that never could. The schema.test.ts
+// guard re-derives each entry from the adapter's `.registerEditMessage(` and
+// `.registerOpenDm(` calls and fails if the table drifts.
 export const ADAPTER_WRITE_CAPABILITIES: Record<AdapterId, readonly WriteCapability[]> = {
-  discord: ['message-edit'],
-  'discord-bot': ['message-edit'],
+  discord: ['message-edit', 'open-dm'],
+  'discord-bot': ['message-edit', 'open-dm'],
   github: [],
   instagram: [],
-  line: [],
+  line: ['open-dm'],
   kakaotalk: [],
-  slack: ['message-edit'],
-  'slack-bot': ['message-edit'],
+  slack: ['message-edit', 'open-dm'],
+  'slack-bot': ['message-edit', 'open-dm'],
   teams: ['message-edit'],
-  'telegram-bot': ['message-edit'],
+  'telegram-bot': ['message-edit', 'open-dm'],
   webex: ['message-edit'],
   'webex-bot': ['message-edit'],
 }

@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { normalizeContext, type Context, type Model, type ThinkingLevel } from '@earendil-works/pi-ai'
 import { streamSimple } from '@earendil-works/pi-ai/api/anthropic-messages'
 import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
+import { z } from 'zod'
 
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import { isWindows } from '@/shared'
@@ -20,6 +21,7 @@ import {
   expandMountPath,
   FIELD_EFFECTS,
   getSandboxWritablePathSpecs,
+  lastWordsNoticeSchema,
   loadConfigBundleSync,
   loadConfigSync,
   loadConfigSyncOrDefaults,
@@ -1295,6 +1297,53 @@ describe('logs schema', () => {
 
   test.each([0, -1, 1.5, '14', 3651])('rejects invalid retentionDays: %p', (retentionDays) => {
     expect(() => configSchema.parse({ models: { default: VALID_MODEL }, logs: { retentionDays } })).toThrow()
+  })
+})
+
+describe('lastWords schema', () => {
+  const parse = (lastWords: unknown) => configSchema.parse({ models: { default: VALID_MODEL }, lastWords }).lastWords
+  const valid: Record<string, string>[] = [
+    { adapter: 'slack-bot', user: 'U0OWNER' },
+    { adapter: 'discord-bot', workspace: 'G1', chat: 'C1', thread: 'T1' },
+    { adapter: 'teams', workspace: 'T0', chat: '19:dm-chat' },
+  ]
+  const invalid: Record<string, string>[] = [
+    { adapter: 'slack-bot' },
+    { adapter: 'slack-bot', user: 'U0', workspace: 'T0', chat: 'C0' },
+    { adapter: 'slack-bot', chat: 'C0' },
+    { adapter: 'slack-bot', user: 'U0', thread: '1.2' },
+    { adapter: 'teams', user: 'U0' },
+    { adapter: 'not-an-adapter', user: 'U0' },
+  ]
+
+  test('sends no notice unless a target is configured', () => {
+    expect(configSchema.parse({ models: { default: VALID_MODEL } }).lastWords).toEqual({})
+  })
+
+  test.each(valid)('accepts a DM or conversation target: %j', (notice) => {
+    expect(parse({ notice }) as unknown).toEqual({ notice })
+  })
+
+  test.each(invalid)('rejects an ambiguous, incomplete, or undeliverable target: %j', (notice) => {
+    expect(() => parse({ notice })).toThrow()
+  })
+
+  // The editor schema cannot run refinements, so the branches themselves must
+  // carry the rules. Each branch is a flat object: required keys, a closed key
+  // set, and an adapter enum.
+  test('the generated editor schema accepts and rejects the same targets', () => {
+    type Branch = { required: string[]; properties: Record<string, { enum?: string[] }> }
+    const generated = z.toJSONSchema(lastWordsNoticeSchema, { io: 'input', reused: 'inline' }) as { anyOf: Branch[] }
+    const accepts = (value: Record<string, string>) =>
+      generated.anyOf.some(
+        (branch) =>
+          branch.required.every((key) => key in value) &&
+          Object.keys(value).every((key) => key in branch.properties) &&
+          (branch.properties.adapter?.enum ?? []).includes(value.adapter ?? ''),
+      )
+
+    expect(valid.map(accepts)).toEqual(valid.map(() => true))
+    expect(invalid.map(accepts)).toEqual(invalid.map(() => false))
   })
 })
 

@@ -47,6 +47,8 @@ export type LastWordsRecorder = {
   dispose: () => void
   // Resolves once the write in flight, if any, has landed.
   settled: () => Promise<void>
+  // Resolves once this run's entry is on disk; never resolves if it never lands.
+  opened: Promise<void>
 }
 
 // Memory is sampled every tick so the trend is dense, but the file is only
@@ -64,6 +66,7 @@ export function startLastWordsRecorder(options: LastWordsRecorderOptions): LastW
   let opened = false
   let failing = false
   let inFlight: Promise<void> | null = null
+  const { promise: openedSignal, resolve: markOpened } = Promise.withResolvers<void>()
 
   // A recorder must never take the agent down, and a persistent failure
   // (read-only mount, full disk) must not log every two seconds.
@@ -105,6 +108,7 @@ export function startLastWordsRecorder(options: LastWordsRecorderOptions): LastW
     const wrote = await guarded((file) => recordWords(opened ? file : openRun(file, run, iso), run, words, iso))
     if (!wrote) return
     opened = true
+    markOpened()
     lastWriteAt = at.getTime()
   }
 
@@ -130,6 +134,7 @@ export function startLastWordsRecorder(options: LastWordsRecorderOptions): LastW
   return {
     dispose,
     settled,
+    opened: openedSignal,
     // Shutdown has a hard deadline shared with every other teardown step, so
     // the clean-stop mark gets a short lock budget and is skipped if the lock
     // stays busy: `typeclaw stop` seals the run as stopped either way. An

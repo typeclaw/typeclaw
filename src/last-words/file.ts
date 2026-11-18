@@ -60,6 +60,12 @@ const entrySchema = z.object({
   writtenAt: z.string(),
   words: wordsSchema.nullable(),
   death: deathSchema.optional(),
+  notice: z
+    .union([
+      z.object({ sentAt: z.string(), target: z.string() }),
+      z.object({ failedAt: z.string(), error: z.string() }),
+    ])
+    .optional(),
 })
 
 const fileSchema = z.object({ version: z.literal(1), entries: z.array(entrySchema) })
@@ -68,6 +74,7 @@ export type LastWordsTurn = z.infer<typeof turnSchema>
 export type LastWordsChild = z.infer<typeof childSchema>
 export type LastWords = z.infer<typeof wordsSchema>
 export type LastWordsDeath = z.infer<typeof deathSchema>
+export type LastWordsNotice = NonNullable<LastWordsEntry['notice']>
 export type LastWordsRun = z.infer<typeof runSchema>
 export type LastWordsEntry = z.infer<typeof entrySchema>
 export type LastWordsFile = z.infer<typeof fileSchema>
@@ -146,6 +153,20 @@ export function recordWords(file: LastWordsFile, run: LastWordsRun, words: LastW
   const index = findAlive(file, run)
   if (index === -1) return file
   return replaceEntry(file, index, { ...file.entries[index]!, words, writtenAt: now })
+}
+
+// Only the run right before this one: an operator enabling notices later must
+// not get a burst of old deaths, and a crash loop reports each death once.
+export function previousUnnoticedDeath(file: LastWordsFile, run: LastWordsRun): LastWordsEntry | null {
+  const index = findAlive(file, run)
+  const previous = index > 0 ? file.entries[index - 1] : undefined
+  return previous?.status === 'died' && previous.notice === undefined ? previous : null
+}
+
+export function recordNotice(file: LastWordsFile, died: LastWordsRun, notice: LastWordsNotice): LastWordsFile {
+  const index = file.entries.findIndex((entry) => entry.status === 'died' && sameRun(entry.run, died))
+  if (index === -1) return file
+  return replaceEntry(file, index, { ...file.entries[index]!, notice })
 }
 
 // A clean shutdown is not a death, so nothing about it is worth keeping.

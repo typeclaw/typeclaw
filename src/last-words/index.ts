@@ -7,4 +7,5 @@ export {
   type LastWordsFile,
   type ObservedExit,
 } from './file'
+export { sendLastWordsNotice } from './notice'
 export { startLastWordsRecorder, type LastWordsRecorder } from './recorder'

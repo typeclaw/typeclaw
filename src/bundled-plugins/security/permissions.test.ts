@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { HIGH_TIER_PER_GUARD_PERMISSIONS, SECURITY_PERMISSIONS, SEVERITY_PERMISSION } from './permissions'
 import { GUARD_CRON_PROMOTION_SEVERITY } from './policies/cron-promotion'
 import { GUARD_GIT_EXFIL_SEVERITY, GUARD_GIT_REMOTE_TAINTED_SEVERITY } from './policies/git-exfil'
+import { GUARD_NOTICE_TARGET_SEVERITY } from './policies/notice-target'
 import { GUARD_OUTBOUND_SECRET_SEVERITY } from './policies/outbound-secret-scan'
 import { GUARD_PLUGIN_ADDITION_SEVERITY } from './policies/plugin-addition'
 import { GUARD_ROLE_PROMOTION_SEVERITY } from './policies/role-promotion'
@@ -46,7 +47,7 @@ describe('per-guard severity classification', () => {
     expect(GUARD_GIT_REMOTE_TAINTED_SEVERITY).toBe('high')
   })
 
-  test('medium-tier guards (silent-attack + operator-reviewable-state axes): secretExfilBash, secretExfilRead, ssrf, sessionSearchSecrets, gitExfil, rolePromotion, cronPromotion, pluginAddition', () => {
+  test('medium-tier guards (silent-attack + operator-reviewable-state axes): secretExfilBash, secretExfilRead, ssrf, sessionSearchSecrets, gitExfil, rolePromotion, cronPromotion, pluginAddition, noticeTarget', () => {
     expect(GUARD_SECRET_EXFIL_BASH_SEVERITY).toBe('medium')
     expect(GUARD_SECRET_EXFIL_READ_SEVERITY).toBe('medium')
     expect(GUARD_SSRF_SEVERITY).toBe('medium')
@@ -55,6 +56,7 @@ describe('per-guard severity classification', () => {
     expect(GUARD_ROLE_PROMOTION_SEVERITY).toBe('medium')
     expect(GUARD_CRON_PROMOTION_SEVERITY).toBe('medium')
     expect(GUARD_PLUGIN_ADDITION_SEVERITY).toBe('medium')
+    expect(GUARD_NOTICE_TARGET_SEVERITY).toBe('medium')
   })
 
   test('no guards are classified low today (tier reserved for noisy, immediately-recoverable side effects)', () => {

@@ -384,6 +384,7 @@ export type SendErrorCode =
   | 'no-adapter'
   | 'callback-rejected'
   | 'skip-locked'
+  | 'cancelled'
 
 // `messageId` is an adapter-reported id of a posted message (e.g. Slack `ts`,
 // Discord snowflake, Telegram `message_id`, Webex/GitHub comment id). The
