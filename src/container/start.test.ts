@@ -2244,14 +2244,51 @@ describe('start (composition)', () => {
     expect(runCall?.args).toContain('GIT_COMMITTER_EMAIL=hyeonmu@typeclaw.local')
   })
 
-  test('leaves the agent repo identity alone while the container is already running', async () => {
+  test('copies typeclaw.json#git.remotes into the agent repo before launch', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/acme/agent.git' } } })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let originAtRun = ''
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') originAtRun = (await runGit(root, ['remote', 'get-url', 'origin'])).trim()
+      return docker.exec(args, options)
+    }
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(result.ok).toBe(true)
+    expect(originAtRun).toBe('https://example.com/acme/agent.git')
+  })
+
+  test('leaves the agent repo identity and remotes alone while the container is already running', async () => {
     // given: a running agent whose sandboxes hold the read-only .git/config bind
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
     await gitInit(root)
     await writeFile(
       join(root, 'typeclaw.json'),
-      `${JSON.stringify({ git: { user: { name: 'New Name', email: 'new@example.com' } } })}\n`,
+      `${JSON.stringify({
+        git: {
+          user: { name: 'New Name', email: 'new@example.com' },
+          remotes: { origin: 'https://example.com/new.git' },
+        },
+      })}\n`,
     )
     const docker = fakeDockerExec({ imageExists: true, container: { exists: true, running: true } })
 
@@ -2268,6 +2305,8 @@ describe('start (composition)', () => {
 
     // then
     expect(await resolveGitIdentity(root)).toEqual({ name: 'Test User', email: 'test@example.com' })
+    expect(existsSync(join(root, '.git', 'refs', 'remotes'))).toBe(false)
+    await expect(runGit(root, ['remote'])).resolves.toBe('')
   })
 
   test('migrates legacy agent-messenger data before docker run and injects the canonical container path', async () => {

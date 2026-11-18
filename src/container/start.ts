@@ -7,6 +7,7 @@ import { isAbsolute, join, posix, relative, resolve } from 'node:path'
 import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } from '@/agent-messenger/config-dir'
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
+import { syncConfiguredGitRemotes } from '@/git/configured-remotes'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
 import {
   ensureGitIdentity,
@@ -426,10 +427,15 @@ async function runStart({
 
     const githubCliConfig = await loadTypeclawConfig(cwd)
     // The container is confirmed down here, so no sandbox holds the read-only
-    // .git/config bind that git's rename-based config write would detach.
+    // .git/config bind that git's rename-based config writes below would detach.
     if (!(await syncConfiguredGitIdentity(cwd, githubCliConfig.git.user))) {
       const warning =
         'typeclaw: could not copy typeclaw.json#git.user into the agent repo; commits keep the previous git identity.'
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
+    if (!(await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes))) {
+      const warning = 'typeclaw: could not copy every typeclaw.json#git.remotes entry into the agent repo.'
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)
     }
