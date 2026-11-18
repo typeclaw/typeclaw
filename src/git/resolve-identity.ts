@@ -74,15 +74,18 @@ const GIT_IDENTITY_ENV = [
 
 // Runtime commits (backup, dreaming, system files) inherit the runtime env, which
 // `typeclaw start` seeds with the repo identity. While the GitHub adapter runs,
-// its account replaces that seed; when it stops, the seed comes back. Names the
-// operator declared in .env are left alone, matching model bash.
+// its account replaces that seed; when it stops, the seed comes back. A
+// configured typeclaw.json#git.user outranks the GitHub account, so while one is
+// set it is applied instead. Names the operator declared in .env are left alone,
+// matching model bash.
 export function trackGithubGitIdentityEnv(
   operatorNames: ReadonlySet<string>,
   env: NodeJS.ProcessEnv = process.env,
+  configured: () => GitIdentity | undefined = () => undefined,
 ): (self: { login: string; id: number } | null) => void {
   const seed = Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]]))
   return (self) => {
-    const identity = self === null ? null : githubGitIdentity(self)
+    const identity = configured() ?? (self === null ? null : githubGitIdentity(self))
     for (const [name, field] of GIT_IDENTITY_ENV) {
       if (operatorNames.has(name)) continue
       const value = identity === null ? seed[name] : identity[field]
@@ -155,12 +158,16 @@ export async function editLocalConfigAtomically(cwd: string, edits: readonly (re
 }
 
 // Runtime-owned commits (backup, dreaming, system files) inherit the runtime's
-// environment, so a reloaded git.user reaches them by replacing it here.
-export function exportGitIdentityEnv(identity: GitIdentity, env: NodeJS.ProcessEnv = process.env): void {
-  env['GIT_AUTHOR_NAME'] = identity.name
-  env['GIT_AUTHOR_EMAIL'] = identity.email
-  env['GIT_COMMITTER_NAME'] = identity.name
-  env['GIT_COMMITTER_EMAIL'] = identity.email
+// environment, so a reloaded git.user reaches them by replacing it here. Names
+// the operator declared in .env keep their value, as at start.
+export function exportGitIdentityEnv(
+  identity: GitIdentity,
+  operatorNames: ReadonlySet<string>,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  for (const [name, field] of GIT_IDENTITY_ENV) {
+    if (!operatorNames.has(name)) env[name] = identity[field]
+  }
 }
 
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it

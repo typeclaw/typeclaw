@@ -1,4 +1,5 @@
 import { exportGitIdentityEnv } from '@/git/resolve-identity'
+import { declaredEnvNames } from '@/init/env-file'
 import type { PermissionService } from '@/permissions'
 import type { Reloadable, ReloadResult } from '@/reload'
 
@@ -74,7 +75,9 @@ async function doReload(
   // Removing git.user keeps the exported identity until restart, when start
   // re-exports whatever the agent repo then holds.
   const gitUser = getConfig().git.user
-  if (gitUser !== undefined && diff.applied.some((c) => c.path === 'git.user')) exportGitIdentityEnv(gitUser)
+  if (gitUser !== undefined && diff.applied.some((c) => c.path === 'git.user')) {
+    exportGitIdentityEnv(gitUser, declaredEnvNames(cwd))
+  }
 
   return {
     scope: 'config',

@@ -6,6 +6,7 @@ import { basename, join } from 'node:path'
 import {
   _internal,
   editLocalConfigAtomically,
+  exportGitIdentityEnv,
   ensureGitIdentity,
   hasExplicitGitIdentity,
   isFallbackGitIdentity,
@@ -340,6 +341,40 @@ describe('resolveGitIdentity', () => {
       GIT_AUTHOR_NAME: 'Typeey',
       GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local',
       GIT_COMMITTER_NAME: 'Operator',
+    })
+  })
+
+  test('runtime env keeps a configured git.user over the GitHub account, before and after it stops', () => {
+    // given: git.user configured and an operator .env name
+    const env: NodeJS.ProcessEnv = { GIT_AUTHOR_NAME: 'Typeey', GIT_COMMITTER_NAME: 'Operator' }
+    const configured = { name: '현무', email: 'hyeonmu@typeclaw.local' }
+    const track = trackGithubGitIdentityEnv(new Set(['GIT_COMMITTER_NAME']), env, () => configured)
+    const expected = {
+      GIT_AUTHOR_NAME: '현무',
+      GIT_AUTHOR_EMAIL: 'hyeonmu@typeclaw.local',
+      GIT_COMMITTER_NAME: 'Operator',
+      GIT_COMMITTER_EMAIL: 'hyeonmu@typeclaw.local',
+    }
+
+    // when / then: the adapter registering does not replace git.user
+    track({ login: 'typeey[bot]', id: 42 })
+    expect(env).toEqual(expected)
+
+    // when / then: nor does it stopping restore the start-time seed over it
+    track(null)
+    expect(env).toEqual(expected)
+  })
+
+  test('exportGitIdentityEnv leaves names the operator declared in .env', () => {
+    const env: NodeJS.ProcessEnv = { GIT_AUTHOR_EMAIL: 'operator@example.com' }
+
+    exportGitIdentityEnv({ name: '현무', email: 'hyeonmu@typeclaw.local' }, new Set(['GIT_AUTHOR_EMAIL']), env)
+
+    expect(env).toEqual({
+      GIT_AUTHOR_NAME: '현무',
+      GIT_AUTHOR_EMAIL: 'operator@example.com',
+      GIT_COMMITTER_NAME: '현무',
+      GIT_COMMITTER_EMAIL: 'hyeonmu@typeclaw.local',
     })
   })
 

@@ -69,7 +69,7 @@ import {
 import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
 import { trackGithubGitIdentityEnv } from '@/git/resolve-identity'
 import { CLI_VERSION } from '@/init/cli-version'
-import { readEnvFile } from '@/init/env-file'
+import { declaredEnvNames } from '@/init/env-file'
 import { sendLastWordsNotice, startLastWordsRecorder } from '@/last-words'
 import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
@@ -286,9 +286,7 @@ async function startAgentRuntime(
   const githubTokenBridge = createGithubTokenBridge({
     // Only names the operator declared in .env: the runtime-exported identity
     // also counts as exposable to bash, and it is exactly what this replaces.
-    onSelfChange: trackGithubGitIdentityEnv(
-      new Set([...readEnvFile(cwd)].filter(([, value]) => value.length > 0).map(([name]) => name)),
-    ),
+    onSelfChange: trackGithubGitIdentityEnv(declaredEnvNames(cwd), process.env, () => getConfig().git.user),
   })
   const mcpOAuthStore = resolveContainerMcpOAuthStore(process.env, join(cwd, 'secrets.json'))
   const mcpManager =
