@@ -2,7 +2,7 @@ import { DEFAULT_LOG_RETENTION_DAYS, loadConfigSync } from '@/config'
 import { isDaemonReachable, send as sendToDaemon } from '@/hostd/client'
 
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
-import { inspectContainerExit } from './exit-reason'
+import { inspectContainerExit, sealObservedExit } from './exit-reason'
 import { archiveContainerLogs, dockerLogsUnavailableWarning, type DockerLogArchiver } from './log-archive'
 import {
   classifyRmStderr,
@@ -104,6 +104,12 @@ async function runStop({
       onWarning?.(dockerLogsUnavailableWarning(containerId))
     }
     if (staleExit?.kind === 'stopped' && staleExit.reason !== null) onWarning?.(staleExit.reason)
+    // A container this stop shut down ended on the operator's request; a corpse
+    // that was already stopped died on its own before anyone asked.
+    const sealedExit = running ? await inspectContainerExit(exec, containerId) : staleExit
+    if (sealedExit?.kind === 'stopped') {
+      await sealObservedExit(cwd, sealedExit, archive.ok ? archive.path : null, 'stop', { operatorStop: running })
+    }
 
     // Containers run without `--rm`, so `docker stop` only stops them. Remove
     // the inspected ID without force after archival. If that same ID resumed,

@@ -17,6 +17,7 @@ export async function inspectContainerExit(
   | {
       kind: 'stopped'
       containerId: string
+      startedAt: string
       finishedAt: string
       exitCode: number
       oomKilled: boolean
@@ -28,11 +29,11 @@ export async function inspectContainerExit(
     const result = await exec([
       'inspect',
       '--format',
-      '{{.Id}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.State.ExitCode}}|{{.HostConfig.Memory}}|{{.State.FinishedAt}}',
+      '{{.Id}}|{{.State.Running}}|{{.State.OOMKilled}}|{{.State.ExitCode}}|{{.HostConfig.Memory}}|{{.State.FinishedAt}}|{{.State.StartedAt}}',
       name,
     ])
     if (result.exitCode !== 0) return null
-    const match = /^([0-9a-f]{64})\|(true|false)\|(true|false)\|(\d+)\|(\d+)\|(\S+)$/.exec(result.stdout.trim())
+    const match = /^([0-9a-f]{64})\|(true|false)\|(true|false)\|(\d+)\|(\d+)\|(\S+)\|(\S+)$/.exec(result.stdout.trim())
     if (!match) return null
     const containerId = match[1]!
     if (match[2] === 'true') return { kind: 'running', containerId }
@@ -50,7 +51,15 @@ export async function inspectContainerExit(
         : exitCode === 137
           ? 'agent runtime exited with SIGKILL (137); Docker did not report an OOM kill.'
           : null
-    return { kind: 'stopped', containerId, finishedAt: match[6]!, exitCode, oomKilled: match[3] === 'true', reason }
+    return {
+      kind: 'stopped',
+      containerId,
+      startedAt: match[7]!,
+      finishedAt: match[6]!,
+      exitCode,
+      oomKilled: match[3] === 'true',
+      reason,
+    }
   } catch {
     return null
   }
@@ -62,10 +71,12 @@ export function sealObservedExit(
   archivedLog: string | null,
   observedBy: LastWordsDeath['observedBy'],
   options: { operatorStop?: boolean } = {},
-): void {
-  sealExitForAgent(
+): Promise<void> {
+  return sealExitForAgent(
     agentDir,
     {
+      containerId: exit.containerId,
+      startedAt: exit.startedAt,
       finishedAt: exit.finishedAt,
       exitCode: exit.exitCode,
       oomKilled: exit.oomKilled,

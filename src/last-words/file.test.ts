@@ -11,6 +11,7 @@ import {
   readLastWords,
   recordWords,
   sealExit,
+  DEFAULT_SEAL_IO,
   sealExitForAgent,
   writeLastWords,
   type LastWords,
@@ -36,6 +37,8 @@ const words: LastWords = {
 }
 
 const oomExit: ObservedExit = {
+  containerId: `abc123${'0'.repeat(58)}`,
+  startedAt: '2026-11-16T14:25:58.9Z',
   finishedAt: '2026-11-18T05:18:30.123456789Z',
   exitCode: 137,
   oomKilled: true,
@@ -85,7 +88,8 @@ describe('sealExit', () => {
   test('an unexpected exit records the death and keeps the last words', () => {
     const file = sealExit(aliveWithWords(), oomExit, 'hostd')
 
-    expect(file.entries[0]).toMatchObject({ status: 'died', words, death: { ...oomExit, observedBy: 'hostd' } })
+    const { containerId: _id, startedAt: _started, ...death } = oomExit
+    expect(file.entries[0]).toMatchObject({ status: 'died', words, death: { ...death, observedBy: 'hostd' } })
   })
 
   test('an operator stop is a clean stop even after a SIGKILL', () => {
@@ -111,6 +115,21 @@ describe('sealExit', () => {
     expect(sealExit(file, { ...oomExit, finishedAt: '2026-11-01T00:00:00Z' }, 'hostd')).toBe(file)
   })
 
+  test('an unobserved crash is not paired with a later boot of the same container that died before recording', () => {
+    // given: run A recorded words, crashed unobserved, and Docker restarted the
+    // same container, whose boot B failed before opening its own entry
+    const file = aliveWithWords()
+    const bootB = { ...oomExit, startedAt: '2026-11-18T06:00:00Z', finishedAt: '2026-11-18T06:00:05Z', log: 'b.log' }
+
+    expect(sealExit(file, bootB, 'hostd')).toBe(file)
+  })
+
+  test('an exit of a different container is not this run', () => {
+    const file = aliveWithWords()
+
+    expect(sealExit(file, { ...oomExit, containerId: 'f'.repeat(64) }, 'hostd')).toBe(file)
+  })
+
   test('already-closed runs are left alone', () => {
     const file = closeRun(aliveWithWords(), RUN, '2026-11-18T06:00:00.000Z')
 
@@ -120,22 +139,47 @@ describe('sealExit', () => {
 })
 
 describe('file io', () => {
-  test('round-trips through disk and seals for an agent dir', () => {
+  test('round-trips through disk and seals for an agent dir', async () => {
     const agentDir = mkdtempSync(join(tmpdir(), 'last-words-'))
     writeLastWords(agentDir, aliveWithWords())
 
-    sealExitForAgent(agentDir, oomExit, 'start')
+    await sealExitForAgent(agentDir, oomExit, 'start')
 
     expect(readLastWords(agentDir).entries[0]?.status).toBe('died')
   })
 
-  test('a missing or malformed file reads as empty and sealing does not create one', () => {
+  test('a missing or malformed file reads as empty and sealing does not create one', async () => {
     const agentDir = mkdtempSync(join(tmpdir(), 'last-words-'))
-    sealExitForAgent(agentDir, oomExit, 'hostd')
+    await sealExitForAgent(agentDir, oomExit, 'hostd')
     expect(readLastWords(agentDir)).toEqual(EMPTY)
 
     mkdirSync(join(agentDir, '.typeclaw'), { recursive: true })
     writeFileSync(lastWordsPath(agentDir), '{"version":2}')
     expect(readLastWords(agentDir)).toEqual(EMPTY)
+  })
+
+  test('a stale logless seal does not erase a log-bearing seal of the same exit', async () => {
+    // given: hostd reads the alive run and stalls before writing, while start
+    // seals the same exit with its archived log
+    const agentDir = mkdtempSync(join(tmpdir(), 'last-words-'))
+    writeLastWords(agentDir, aliveWithWords())
+    let resumeHostd!: () => void
+    const hostdStalled = new Promise<void>((resolve) => (resumeHostd = resolve))
+    let hostdRead!: () => void
+    const hostdHasRead = new Promise<void>((resolve) => (hostdRead = resolve))
+    const stallingRead = async (dir: string) => {
+      const file = readLastWords(dir)
+      hostdRead()
+      await hostdStalled
+      return file
+    }
+
+    const hostd = sealExitForAgent(agentDir, oomExit, 'hostd', {}, { ...DEFAULT_SEAL_IO, read: stallingRead })
+    await hostdHasRead
+    const start = sealExitForAgent(agentDir, { ...oomExit, log: '.typeclaw/logs/a.log' }, 'start')
+    resumeHostd()
+    await Promise.all([hostd, start])
+
+    expect(readLastWords(agentDir).entries[0]?.death?.log).toBe('.typeclaw/logs/a.log')
   })
 })

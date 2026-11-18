@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import lockfile from 'proper-lockfile'
 import { z } from 'zod'
 
 // `.typeclaw/last-words.json`: what the agent was doing when its container
@@ -71,7 +73,12 @@ export type LastWordsRun = z.infer<typeof runSchema>
 export type LastWordsEntry = z.infer<typeof entrySchema>
 export type LastWordsFile = z.infer<typeof fileSchema>
 
+// `containerId` is the full Docker ID and `startedAt` the container's own start
+// time: together they identify one execution of a container, which keeps its ID
+// across restarts.
 export type ObservedExit = {
+  containerId: string
+  startedAt: string
   finishedAt: string
   exitCode: number
   oomKilled: boolean
@@ -152,9 +159,11 @@ function parseInstant(value: string): number {
 }
 
 // Host: the newest entry still alive belongs to the container that just
-// stopped, because only one runtime owns an agent directory at a time. An entry
-// that started after the exit belongs to a newer run and is left alone. An
-// operator stop (`typeclaw stop` ran `docker stop` itself) is a clean stop even
+// stopped, because only one runtime owns an agent directory at a time, but only
+// when it was recorded by that execution: same container, and booted between the
+// container's start and its exit. A run from an earlier execution of the same
+// container whose own exit went unobserved is not paired with a later boot that
+// died before recording anything. An operator stop (`typeclaw stop` ran `docker stop` itself) is a clean stop even
 // when Docker had to SIGKILL a slow shutdown. A later observer of the same exit
 // may fill in the archived log path an earlier one did not have.
 export function sealExit(
@@ -170,26 +179,68 @@ export function sealExit(
     if (entry.death.log !== null || exit.log === null) return file
     return replaceEntry(file, index, { ...entry, death: { ...entry.death, log: exit.log } })
   }
-  if (entry.status !== 'alive') return file
-  if (parseInstant(entry.run.startedAt) > parseInstant(exit.finishedAt)) return file
+  if (entry.status !== 'alive' || !recordedBy(entry.run, exit)) return file
   if (options.operatorStop === true) {
     return replaceEntry(file, index, { ...entry, status: 'stopped', words: null })
   }
-  return replaceEntry(file, index, { ...entry, status: 'died', death: { ...exit, observedBy } })
+  const { finishedAt, exitCode, oomKilled, reason, log } = exit
+  return replaceEntry(file, index, {
+    ...entry,
+    status: 'died',
+    death: { finishedAt, exitCode, oomKilled, reason, log, observedBy },
+  })
+}
+
+function recordedBy(run: LastWordsRun, exit: ObservedExit): boolean {
+  const bootedAt = parseInstant(run.startedAt)
+  return (
+    (run.containerId === null || exit.containerId.startsWith(run.containerId)) &&
+    bootedAt >= parseInstant(exit.startedAt) &&
+    bootedAt <= parseInstant(exit.finishedAt)
+  )
+}
+
+export type SealIo = {
+  read: (agentDir: string) => Promise<LastWordsFile>
+  write: (agentDir: string, file: LastWordsFile) => void
+  serialize: (agentDir: string, operation: () => Promise<void>) => Promise<void>
+}
+
+const LOCK_RETRIES = { retries: 600, factor: 1, minTimeout: 10, maxTimeout: 10, randomize: false } as const
+
+// hostd's probe and a standalone `start` or `stop` can observe the same exit
+// from different processes. Each seal rereads under the agent's lock, so a
+// logless seal that started first cannot overwrite a seal that added the log.
+export const DEFAULT_SEAL_IO: SealIo = {
+  read: async (agentDir) => readLastWords(agentDir),
+  write: writeLastWords,
+  serialize: async (agentDir, operation) => {
+    const path = lastWordsPath(agentDir)
+    await mkdir(dirname(path), { recursive: true })
+    const release = await lockfile.lock(path, { realpath: false, stale: 10_000, update: 2_000, retries: LOCK_RETRIES })
+    try {
+      await operation()
+    } finally {
+      await release().catch(() => undefined)
+    }
+  },
 }
 
 // Host lifecycle steps call this best-effort: a failure to record last words
 // must never block start, stop, or the daemon's probe loop.
-export function sealExitForAgent(
+export async function sealExitForAgent(
   agentDir: string,
   exit: ObservedExit,
   observedBy: LastWordsDeath['observedBy'],
   options: { operatorStop?: boolean } = {},
-): void {
+  io: SealIo = DEFAULT_SEAL_IO,
+): Promise<void> {
   try {
-    const before = readLastWords(agentDir)
-    const after = sealExit(before, exit, observedBy, options)
-    if (after !== before) writeLastWords(agentDir, after)
+    await io.serialize(agentDir, async () => {
+      const before = await io.read(agentDir)
+      const after = sealExit(before, exit, observedBy, options)
+      if (after !== before) io.write(agentDir, after)
+    })
   } catch (error) {
     console.warn(`[last-words] could not seal exit: ${error instanceof Error ? error.message : String(error)}`)
   }

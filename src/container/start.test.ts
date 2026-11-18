@@ -4995,7 +4995,7 @@ describe('start (composition)', () => {
       if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
         return {
           exitCode: 0,
-          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
           stderr: '',
         }
       }
@@ -5037,7 +5037,7 @@ describe('start (composition)', () => {
       if (args[0] === 'inspect' && args.some((arg) => arg.includes('{{.State.OOMKilled}}'))) {
         return {
           exitCode: 0,
-          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z\n`,
+          stdout: `${'a'.repeat(64)}|false|true|137|6442450944|2026-09-29T04:58:43Z|2026-09-29T04:00:00Z\n`,
           stderr: '',
         }
       }
