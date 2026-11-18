@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
+import { configFileLockPath } from '@/config/config-file-lock'
 import type { PermissionService, RolesConfig } from '@/permissions'
 
 import { createClaimController, type ClaimResultEvent } from './controller'
@@ -191,6 +195,46 @@ describe('ClaimController', () => {
     expect(events).toHaveLength(1)
     expect(events[0]).toEqual({ kind: 'error', code: 'claim-AAAA-BBBB', reason: 'disk full' })
   })
+
+  test('a claim completed while another process holds the config lock fails with the recovery step', async () => {
+    // given: a pending claim, and another process's lock on typeclaw.json
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-claim-lock-'))
+    const config = join(cwd, 'typeclaw.json')
+    await writeFile(config, '{}\n')
+    await writeFile(configFileLockPath(config), '')
+    const events: ClaimResultEvent[] = []
+    const { service } = makePermissions()
+    const controller = createClaimController({
+      cwd,
+      permissions: service,
+      rolesProvider: () => ({}),
+      now: () => 1_000_000,
+    })
+    controller.onResult((e) => events.push(e))
+    controller.startClaim({ code: 'claim-AAAA-BBBB', role: 'owner', ttlMs: 600_000 })
+
+    try {
+      // when: the claim code arrives through the real grant
+      const outcome = await controller.claimHandler({
+        adapter: 'slack-bot',
+        workspace: 'T0123',
+        chat: 'D0',
+        isDm: true,
+        authorId: 'U_ME',
+        text: 'claim-AAAA-BBBB',
+      })
+
+      // then: the claim fails through its error path with the manual recovery,
+      // and the role was not written
+      expect(outcome.kind).toBe('fail')
+      if (outcome.kind === 'fail') expect(outcome.reply).toContain(`rm "${configFileLockPath(config)}"`)
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({ kind: 'error', code: 'claim-AAAA-BBBB' })
+      expect(await readFile(config, 'utf8')).toBe('{}\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  }, 15_000)
 
   test('rejects unknown role names at startClaim', () => {
     const { service } = makePermissions()

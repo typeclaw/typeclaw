@@ -34,7 +34,7 @@ export type GrantPermissionOptions = {
 }
 
 export function grantRole(opts: GrantOptions): GrantResult {
-  return withConfigFileLockSync(join(opts.cwd, CONFIG_FILE), () => {
+  const result = underConfigLock(opts.cwd, () => {
     const validation = parseMatchRule(opts.matchRule)
     if (!validation.ok) {
       return { ok: false, reason: `invalid match rule '${opts.matchRule}': ${validation.error}` }
@@ -57,16 +57,16 @@ export function grantRole(opts: GrantOptions): GrantResult {
     roles[opts.roleName] = role
     obj.roles = roles
 
-    const written = writeConfigObject(opts.cwd, obj)
-    if (!written.ok) return written
-
-    // Best-effort commit so a claimed role survives a fresh clone/rebuild — a
-    // failing commit leaves the on-disk grant intact (history, not correctness).
-    // Subject stays neutral: every grantRole caller hits this, not just claim.
-    commitSystemFileSync(opts.cwd, CONFIG_FILE, `${CONFIG_FILE}: grant ${opts.roleName} role`)
-
-    return written
+    return writeConfigObject(opts.cwd, obj)
   })
+
+  // Best-effort commit so a claimed role survives a fresh clone/rebuild — a
+  // failing commit leaves the on-disk grant intact (history, not correctness).
+  // Subject stays neutral: every grantRole caller hits this, not just claim.
+  if (result.ok && result.added) {
+    commitSystemFileSync(opts.cwd, CONFIG_FILE, `${CONFIG_FILE}: grant ${opts.roleName} role`)
+  }
+  return result
 }
 
 // Appends `permission` to `typeclaw.json#roles.<name>.permissions`. For a
@@ -82,7 +82,7 @@ export function grantRole(opts: GrantOptions): GrantResult {
 // lands on disk but does not take effect until the next container restart.
 // Callers must surface that to the operator.
 export function grantRolePermission(opts: GrantPermissionOptions): GrantResult {
-  return withConfigFileLockSync(join(opts.cwd, CONFIG_FILE), () => {
+  return underConfigLock(opts.cwd, () => {
     const loaded = loadConfigObject(opts.cwd, opts.roleName)
     if (!loaded.ok) return loaded
 
@@ -99,6 +99,16 @@ export function grantRolePermission(opts: GrantPermissionOptions): GrantResult {
 
     return writeConfigObject(opts.cwd, obj)
   })
+}
+
+// A busy config lock is a grant failure like any other, so role claim and
+// grant_role reply with it instead of throwing past their error paths.
+function underConfigLock(cwd: string, grant: () => GrantResult): GrantResult {
+  try {
+    return withConfigFileLockSync(join(cwd, CONFIG_FILE), grant)
+  } catch (error) {
+    return { ok: false, reason: describeError(error) }
+  }
 }
 
 function effectivePermissions(roleName: string, role: Record<string, unknown>): string[] {

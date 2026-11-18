@@ -4,6 +4,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { withConfigFileLock } from '@/config/config-file-lock'
+
 import { BUILTIN_ROLES } from './builtins'
 import { grantRole, grantRolePermission } from './grant'
 
@@ -106,6 +108,36 @@ describe('grantRole', () => {
     expect(config.channels).toEqual({ 'slack-bot': {} })
     expect(config.roles.owner?.match).toEqual(['tui', 'slack:T0123 author:U_ME'])
     expect(config.roles.member?.match).toEqual(['slack:T0123'])
+  })
+})
+
+describe('grant under a held config lock', () => {
+  test('returns a failure result instead of throwing, and leaves typeclaw.json unchanged', async () => {
+    // given: another writer in this process holds the typeclaw.json lock
+    const dir = freshAgentDir({ roles: {} })
+    let release: () => void = () => {}
+    const holder = withConfigFileLock(
+      join(dir, 'typeclaw.json'),
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve
+        }),
+    )
+    try {
+      // when: both grant kinds run while it is held
+      const match = grantRole({ cwd: dir, roleName: 'owner', matchRule: 'slack:T0123 author:U_ME' })
+      const permission = grantRolePermission({ cwd: dir, roleName: 'member', permission: 'tool.bash' })
+
+      // then: each reports the busy lock as an ordinary grant failure
+      for (const result of [match, permission]) {
+        expect(result.ok).toBe(false)
+        if (!result.ok) expect(result.reason).toContain('typeclaw.json.lock')
+      }
+      expect(readConfig(dir)).toEqual({ roles: {} })
+    } finally {
+      release()
+      await holder
+    }
   })
 })
 
