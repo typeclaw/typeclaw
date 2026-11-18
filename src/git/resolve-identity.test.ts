@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { _internal, ensureGitIdentity, isFallbackGitIdentity, resolveGitIdentity } from './resolve-identity'
+import {
+  _internal,
+  ensureGitIdentity,
+  isFallbackGitIdentity,
+  resolveGitIdentity,
+  trackGithubGitIdentityEnv,
+} from './resolve-identity'
 
 const roots: string[] = []
 
@@ -177,6 +183,37 @@ describe('resolveGitIdentity', () => {
         else process.env[name] = value
       }
     }
+  })
+
+  test('runtime env follows the GitHub account and restores the start seed when it stops', () => {
+    // given
+    const env: NodeJS.ProcessEnv = {
+      GIT_AUTHOR_NAME: 'Typeey',
+      GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local',
+      GIT_COMMITTER_NAME: 'Operator',
+    }
+    const track = trackGithubGitIdentityEnv(new Set(['GIT_COMMITTER_NAME']), env)
+
+    // when
+    track({ login: 'typeey[bot]', id: 42 })
+
+    // then
+    expect(env).toEqual({
+      GIT_AUTHOR_NAME: 'typeey[bot]',
+      GIT_AUTHOR_EMAIL: '42+typeey[bot]@users.noreply.github.com',
+      GIT_COMMITTER_NAME: 'Operator',
+      GIT_COMMITTER_EMAIL: '42+typeey[bot]@users.noreply.github.com',
+    })
+
+    // when
+    track(null)
+
+    // then
+    expect(env).toEqual({
+      GIT_AUTHOR_NAME: 'Typeey',
+      GIT_AUTHOR_EMAIL: 'typeey@typeclaw.local',
+      GIT_COMMITTER_NAME: 'Operator',
+    })
   })
 
   test('scrubs Git controls case-insensitively for Windows environment semantics', () => {

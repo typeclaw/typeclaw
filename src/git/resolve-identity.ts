@@ -59,6 +59,33 @@ export function githubGitIdentity(self: { login: string; id: number }): GitIdent
   return { name: self.login, email: `${self.id}+${self.login}@users.noreply.github.com` }
 }
 
+const GIT_IDENTITY_ENV = [
+  ['GIT_AUTHOR_NAME', 'name'],
+  ['GIT_AUTHOR_EMAIL', 'email'],
+  ['GIT_COMMITTER_NAME', 'name'],
+  ['GIT_COMMITTER_EMAIL', 'email'],
+] as const
+
+// Runtime commits (backup, dreaming, system files) inherit the runtime env, which
+// `typeclaw start` seeds with the repo identity. While the GitHub adapter runs,
+// its account replaces that seed; when it stops, the seed comes back. Names the
+// operator declared in .env are left alone, matching model bash.
+export function trackGithubGitIdentityEnv(
+  operatorNames: ReadonlySet<string>,
+  env: NodeJS.ProcessEnv = process.env,
+): (self: { login: string; id: number } | null) => void {
+  const seed = Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]]))
+  return (self) => {
+    const identity = self === null ? null : githubGitIdentity(self)
+    for (const [name, field] of GIT_IDENTITY_ENV) {
+      if (operatorNames.has(name)) continue
+      const value = identity === null ? seed[name] : identity[field]
+      if (value === undefined) delete env[name]
+      else env[name] = value
+    }
+  }
+}
+
 // GIT_* env overrides repo config, so forwarding the fallback would freeze it
 // over an identity the operator sets while the container runs.
 export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity): Promise<boolean> {
