@@ -6,6 +6,7 @@ import { join } from 'node:path'
 
 import { writeConfigAndToken } from '@/cli/tunnel'
 import { storeEnvKeyUnlessPresent } from '@/init/env-file'
+import { failingConfigPublish } from '@/test-helpers/config-publish-seams'
 
 import { buildSandboxedCommand } from './build'
 
@@ -96,13 +97,7 @@ describe('a credential update under a running sandbox', () => {
           { tunnels: [] },
           { env: 'CLOUDFLARE_TUNNEL_TOKEN', value: 'first-attempt-token' },
           'typeclaw tunnel add',
-          {
-            rename: (from, to) => {
-              if (!to.endsWith('typeclaw.json')) return renameSync(from, to)
-              sandbox = startMaskedSandboxSync(agentDir)
-              throw new Error('injected config publish failure')
-            },
-          },
+          failingConfigPublish({ onConfigPublish: () => (sandbox = startMaskedSandboxSync(agentDir)) }),
         )
         expect(failed.ok).toBe(false)
 

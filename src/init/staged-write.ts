@@ -10,7 +10,6 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -23,15 +22,12 @@ import { basename, dirname, join, resolve } from 'node:path'
 // leaf module so the sandbox can import it without loading the init domain.
 export const CREDENTIAL_STAGING_RELATIVE_DIR = '.typeclaw/credential-staging'
 
-export type Rename = (from: string, to: string) => void
 export type WriteInPlace = (path: string, content: string | Buffer) => void
-// Test seams for a config (+ credential) publication: fail or observe a step
-// after writing has begun, or take the Windows path on any platform.
+// Test seams for a config (+ credential) publication: fail or observe an
+// in-place write after writing has begun, or take the Windows .env path (no
+// staged copies) on any platform.
 export type PublishSeams = {
-  rename?: Rename
   writeInPlace?: WriteInPlace
-  // Writes the bytes into the staged (already created, 0600) config copy.
-  writeStaged?: WriteInPlace
   platform?: NodeJS.Platform
 }
 
@@ -61,93 +57,52 @@ export function ensureOwnerOnlyDir(dir: string): void {
   }
 }
 
-export type StagedReplacement = {
-  // The file to update: `path` itself, or through a symlink, its target.
+// typeclaw.json is always written in place on its existing inode, never
+// replaced by rename. A new inode would take the directory's default group and
+// ACLs (a setgid directory, inherited default ACLs, an ACL mask) instead of the
+// file's own access policy, which can broaden access to a config that holds
+// inline credentials (e.g. an MCP server's env); on Windows it would take the
+// directory's ACL. The prior bytes are kept in memory, and a failed write puts
+// them back in place.
+export type ConfigWrite = {
+  // The file to update: `path` itself, or through a symlink, its target, so the
+  // link survives and keeps pointing at the updated file.
   path: string
   content: Buffer
-  // The fully written copy renamed over `path`; none on Windows (see below).
-  temp: string | undefined
-  // The bytes `path` held, to put back if an in-place write fails.
   prior: Buffer | undefined
 }
 
 // A failed in-place config write whose prior content could not be put back.
 export class ConfigRestoreError extends Error {}
 
-// Replaces a file no sandbox masks (typeclaw.json) without ever leaving it
-// partly written: a masked credential goes through `publishCredential`.
-export function replaceFile(
-  path: string,
-  content: string | Buffer,
-  rename: Rename = renameSync,
-  platform: NodeJS.Platform = process.platform,
-): void {
-  const staged = stageReplacement(path, content, platform)
-  try {
-    publishReplacement(staged, rename)
-  } finally {
-    if (staged.temp !== undefined) rmSync(staged.temp, { force: true })
-  }
+export function writeConfigInPlace(path: string, content: string | Buffer, writeInPlace?: WriteInPlace): void {
+  publishConfigWrite(prepareConfigWrite(path, content), writeInPlace)
 }
 
-// Prepares the replacement for `path`. If `path` is a symlink, the file updated
-// is the link's target, so the link survives and keeps pointing at the updated
-// file, as an in-place write through it would. A read-only destination is
-// refused, as an in-place write to it would be. Elsewhere the content is
-// written in full to a gitignored copy beside the target for
-// `publishReplacement` to rename over it. The copy is created 0600 before any
-// byte is written (config can hold inline credentials, e.g. an MCP server's
-// env) and given the target's mode, or a new file's default, only once complete. On Windows no copy is made: a new
-// file object would take the directory's ACL in place of the file's own (a
-// config with a stricter explicit ACL would lose it), so the file is written
-// in place instead, with its prior bytes kept in memory for a failed write.
-export function stageReplacement(
-  path: string,
-  content: string | Buffer,
-  platform: NodeJS.Platform = process.platform,
-  writeStaged: WriteInPlace = writeExistingInPlace,
-): StagedReplacement {
+// Resolves the file to write and reads its prior bytes. A read-only
+// destination is refused, as the in-place write would be.
+export function prepareConfigWrite(path: string, content: string | Buffer): ConfigWrite {
   const target = linkTarget(path)
-  const mode = modeOrUndefined(target)
-  if (mode !== undefined) accessSync(target, constants.W_OK)
-  const bytes = Buffer.from(content)
-  if (platform === 'win32') return { path: target, content: bytes, temp: undefined, prior: readFileOrUndefined(target) }
-  const temp = join(dirname(target), `.${basename(target)}.${randomUUID()}.typeclaw-tmp`)
-  try {
-    closeSync(openSync(temp, 'wx', 0o600))
-    writeStaged(temp, bytes)
-    chmodSync(temp, mode ?? 0o666 & ~process.umask())
-  } catch (error) {
-    rmSync(temp, { force: true })
-    throw error
-  }
-  return { path: target, content: bytes, temp, prior: undefined }
+  if (modeOrUndefined(target) !== undefined) accessSync(target, constants.W_OK)
+  return { path: target, content: Buffer.from(content), prior: readFileOrUndefined(target) }
 }
 
-// Renames the staged copy over the target, or on Windows writes the target in
-// place (creating it if it did not exist), putting the prior bytes back if the
-// write fails; a failed restore throws `ConfigRestoreError`.
-export function publishReplacement(
-  staged: StagedReplacement,
-  rename: Rename = renameSync,
-  writeInPlace: WriteInPlace = writeExistingInPlace,
-): void {
-  if (staged.temp !== undefined) {
-    rename(staged.temp, staged.path)
-    return
-  }
-  if (staged.prior === undefined) {
-    writeFileSync(staged.path, staged.content, { flag: 'wx' })
+// Writes the target in place (O_WRONLY|O_TRUNC), or creates it if it did not
+// exist, putting the prior bytes back if the write fails; a failed restore
+// throws `ConfigRestoreError`.
+export function publishConfigWrite(write: ConfigWrite, writeInPlace: WriteInPlace = writeExistingInPlace): void {
+  if (write.prior === undefined) {
+    writeFileSync(write.path, write.content, { flag: 'wx' })
     return
   }
   try {
-    writeInPlace(staged.path, staged.content)
+    writeInPlace(write.path, write.content)
   } catch (error) {
     try {
-      writeInPlace(staged.path, staged.prior)
+      writeInPlace(write.path, write.prior)
     } catch (restoreError) {
       throw new ConfigRestoreError(
-        `${staged.path} could not be restored (${describe(restoreError)}) after a failed write (${describe(error)}); restore it with \`git checkout -- ${basename(staged.path)}\` in the agent folder`,
+        `${write.path} could not be restored (${describe(restoreError)}) after a failed write (${describe(error)}); restore it with \`git checkout -- ${basename(write.path)}\` in the agent folder`,
       )
     }
     throw error
@@ -275,32 +230,30 @@ export function restoreCredential(
 export type CredentialUpdate = { path: string; content: string; stagingDir: string }
 
 // Publishes typeclaw.json together with an optional credential (.env) update,
-// all or nothing, for callers holding the config lock. Both are staged first;
+// all or nothing, for callers holding the config lock. Both are prepared first;
 // then the credential is written in place (`publishCredential`) and
-// typeclaw.json published (`publishReplacement`: renamed into place, or on
-// Windows written in place), and the credential is put back if typeclaw.json
-// cannot be. A failure never leaves either file partly written; a .env this
-// created is left empty rather than removed. `seams` let tests fail a step
-// after writing has begun and take the Windows path on any platform.
+// typeclaw.json written in place (`publishConfigWrite`), and the credential is
+// put back if typeclaw.json cannot be. A failure never leaves either file
+// partly written; a .env this created is left empty rather than removed.
+// `seams` let tests fail a step after writing has begun and take the Windows
+// .env path on any platform.
 export function publishConfigWithCredential(
   configPath: string,
   configBytes: string,
   credential: CredentialUpdate | undefined,
   seams: PublishSeams = {},
 ): { ok: true } | { ok: false; reason: string } {
-  const rename = seams.rename ?? renameSync
   const credentialName = credential === undefined ? undefined : basename(credential.path)
   let staged: StagedCredential | undefined
-  let configStaged: StagedReplacement | undefined
   let keepPriorCopy = false
   try {
     if (credential !== undefined) {
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
-    configStaged = stageReplacement(configPath, configBytes, seams.platform, seams.writeStaged)
+    const configWrite = prepareConfigWrite(configPath, configBytes)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      publishReplacement(configStaged, rename, seams.writeInPlace)
+      publishConfigWrite(configWrite, seams.writeInPlace)
     } catch (error) {
       const configState = error instanceof ConfigRestoreError ? error.message : 'typeclaw.json was not changed'
       const cause = error instanceof ConfigRestoreError ? '' : `${describe(error)}. `
@@ -327,7 +280,6 @@ export function publishConfigWithCredential(
           : `Neither ${credentialName} nor typeclaw.json was changed`
     return { ok: false, reason: `${describe(error)}. ${unchanged}.` }
   } finally {
-    if (configStaged?.temp !== undefined) rmSync(configStaged.temp, { force: true })
     if (staged !== undefined) discardCredentialStaging(staged, keepPriorCopy)
   }
   return { ok: true }

@@ -9,7 +9,12 @@ import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import { credentialStagingDir, publishConfigWithCredential, type PublishSeams, replaceFile } from '@/init/staged-write'
+import {
+  credentialStagingDir,
+  publishConfigWithCredential,
+  type PublishSeams,
+  writeConfigInPlace,
+} from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -989,7 +994,7 @@ function readRawConfig(cwd: string): Record<string, unknown> {
 }
 
 function writeRawConfig(cwd: string, config: Record<string, unknown>): void {
-  replaceFile(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
+  writeConfigInPlace(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

@@ -4,11 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import {
-  CONFIG_PUBLISH_PATHS,
-  failingConfigPublish,
-  INJECTED_CONFIG_PUBLISH_FAILURE,
-} from '@/test-helpers/config-publish-seams'
+import { failingConfigPublish, INJECTED_CONFIG_PUBLISH_FAILURE } from '@/test-helpers/config-publish-seams'
 
 import { type AddChannelStepEvent, readConfiguredChannels, runAddChannel, scaffold, writeSecrets } from './index'
 import { runKakaotalkBootstrap } from './kakaotalk-auth'
@@ -693,37 +689,35 @@ describe('runAddChannel', () => {
     expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
   })
 
-  for (const { name, platform } of CONFIG_PUBLISH_PATHS) {
-    test(`keeps typeclaw.json and .env byte-identical when the github config fails to publish (${name})`, async () => {
-      // given: an existing .env and the scaffolded typeclaw.json
-      const config = join(root, 'typeclaw.json')
-      const env = join(root, '.env')
-      await writeFile(env, 'OTHER=1\n')
-      const configBefore = await readFile(config, 'utf8')
+  test('keeps typeclaw.json and .env byte-identical when the github config fails to publish', async () => {
+    // given: an existing .env and the scaffolded typeclaw.json
+    const config = join(root, 'typeclaw.json')
+    const env = join(root, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    const configBefore = await readFile(config, 'utf8')
 
-      // when/then: the token is written to .env, then publishing typeclaw.json
-      // fails on this path, and the add reports it
-      await expect(
-        runAddChannel({
-          cwd: root,
-          channel: 'github',
-          auth: { type: 'pat', pat: 'ghp_test' },
-          webhookSecret: 'wh-secret',
-          tunnelProvider: 'cloudflare-named',
-          hostname: 'https://agent.example.com',
-          tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
-          tokenValue: 'prompted-token',
-          webhookPort: 8975,
-          repos: ['acme/widgets'],
-          configPublishSeams: failingConfigPublish(platform),
-        }),
-      ).rejects.toThrow(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed; .env was restored.`)
+    // when/then: the token is written to .env, then publishing typeclaw.json
+    // fails on this path, and the add reports it
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-named',
+        hostname: 'https://agent.example.com',
+        tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+        tokenValue: 'prompted-token',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+        configPublishSeams: failingConfigPublish(),
+      }),
+    ).rejects.toThrow(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed; .env was restored.`)
 
-      // then: both files keep their original bytes
-      expect(await readFile(config, 'utf8')).toBe(configBefore)
-      expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
-    })
-  }
+    // then: both files keep their original bytes
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+  })
 
   test('stores the prompted named-tunnel token with the github config', async () => {
     await runAddChannel({

@@ -1,8 +1,20 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, lstatSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chownSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { failingConfigPublish, INJECTED_CONFIG_PUBLISH_FAILURE } from '@/test-helpers/config-publish-seams'
 
 import {
   CredentialRestoreError,
@@ -10,21 +22,41 @@ import {
   discardCredentialStaging,
   publishConfigWithCredential,
   publishCredential,
-  replaceFile,
   stageCredential,
+  writeConfigInPlace,
 } from './staged-write'
 
 const mode = (path: string) => statSync(path).mode & 0o777
 
-describe('replaceFile', () => {
-  test.skipIf(process.platform === 'win32')('replaces the target of a symlink and keeps the link', async () => {
+// What a file's access policy hangs off: the same file object (so its ACLs and
+// group stay with it), owner, group and mode.
+const identity = (path: string) => {
+  const stats = statSync(path)
+  return { ino: stats.ino, uid: stats.uid, gid: stats.gid, mode: stats.mode & 0o7777 }
+}
+
+// A group the test user belongs to other than the one a new file in a fresh
+// temp dir gets, so a config can be given a group its directory does not have.
+const otherGroup = (() => {
+  if (process.platform === 'win32' || typeof process.getgroups !== 'function') return undefined
+  const dir = mkdtempSync(join(tmpdir(), 'typeclaw-staged-groups-'))
+  try {
+    const dirGroup = statSync(dir).gid
+    return process.getgroups().find((gid) => gid !== dirGroup)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})()
+
+describe('writeConfigInPlace', () => {
+  test.skipIf(process.platform === 'win32')('writes the target of a symlink and keeps the link', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
     const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-staged-target-'))
     const target = join(elsewhere, 'typeclaw.json')
     await writeFile(target, '{}\n')
     await symlink(target, join(cwd, 'typeclaw.json'))
 
-    replaceFile(join(cwd, 'typeclaw.json'), '{"alias":["atlas"]}\n')
+    writeConfigInPlace(join(cwd, 'typeclaw.json'), '{"alias":["atlas"]}\n')
 
     expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
     expect(readFileSync(target, 'utf8')).toBe('{"alias":["atlas"]}\n')
@@ -38,65 +70,81 @@ describe('replaceFile', () => {
     const target = join(elsewhere, 'typeclaw.json')
     await symlink(target, join(cwd, 'typeclaw.json'))
 
-    replaceFile(join(cwd, 'typeclaw.json'), '{}\n')
+    writeConfigInPlace(join(cwd, 'typeclaw.json'), '{}\n')
 
     expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
     expect(readFileSync(target, 'utf8')).toBe('{}\n')
   })
 })
 
-describe('config staging', () => {
-  // Publishes `bytes` as typeclaw.json under umask 022 (a broad default), and
-  // returns the staged copy's mode while its bytes were written, and the
-  // published file's mode.
-  async function publishUnderBroadUmask(cwd: string, bytes: string) {
+describe('config publication keeps the file object', () => {
+  // A new inode would take its directory's default group and ACLs; writing in
+  // place keeps the config's own (it can hold inline credentials).
+  async function agentWithConfig() {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
     const config = join(cwd, 'typeclaw.json')
-    let stagedModeWhileWriting: number | undefined
-    const previous = process.umask(0o022)
-    try {
-      const result = publishConfigWithCredential(config, bytes, undefined, {
-        writeStaged: (path, content) => {
-          stagedModeWhileWriting = mode(path)
-          writeFileSync(path, content, { flag: 'w' })
-        },
-      })
-      expect(result).toEqual({ ok: true })
-    } finally {
-      process.umask(previous)
-    }
-    return { stagedModeWhileWriting, published: mode(config) }
+    const env = join(cwd, '.env')
+    await writeFile(config, '{}\n')
+    await chmod(config, 0o640)
+    await writeFile(env, 'OLD=1\n')
+    return { cwd, config, env }
   }
 
-  test.skipIf(process.platform === 'win32')(
-    'stages a 0600 config owner-only from creation, and publishes it 0600',
+  test("keeps typeclaw.json's inode, owner, group and mode when it publishes", async () => {
+    const { config } = await agentWithConfig()
+    const before = identity(config)
+
+    const result = publishConfigWithCredential(config, '{"mcpServers":{}}\n', undefined)
+
+    expect(result).toEqual({ ok: true })
+    expect(identity(config)).toEqual(before)
+    expect(readFileSync(config, 'utf8')).toBe('{"mcpServers":{}}\n')
+  })
+
+  test("keeps both files' identity and bytes when a publish is rolled back", async () => {
+    // given: a config and .env, and a config publication that fails part-way
+    const { cwd, config, env } = await agentWithConfig()
+    const before = { config: identity(config), env: identity(env) }
+
+    // when
+    const result = publishConfigWithCredential(
+      config,
+      '{"mcpServers":{}}\n',
+      { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: credentialStagingDir(cwd) },
+      failingConfigPublish(),
+    )
+
+    // then: it failed there, and both are the same file objects with the same bytes
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed`)
+    expect({ config: identity(config), env: identity(env) }).toEqual(before)
+    expect(readFileSync(config, 'utf8')).toBe('{}\n')
+    expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+  })
+
+  test.skipIf(otherGroup === undefined)(
+    'keeps a config group its directory does not have, on publish and on rollback',
     async () => {
-      // given: a 0600 typeclaw.json (it can hold inline credentials)
-      const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
-      await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
-      await chmod(join(cwd, 'typeclaw.json'), 0o600)
+      // given: typeclaw.json owned by a group other than its directory's
+      const { cwd, config, env } = await agentWithConfig()
+      chownSync(config, process.getuid!(), otherGroup!)
+      expect(statSync(cwd).gid).not.toBe(otherGroup)
 
-      // when
-      const modes = await publishUnderBroadUmask(cwd, '{"mcpServers":{}}\n')
+      // when: one publish succeeds and one is rolled back
+      expect(publishConfigWithCredential(config, '{"alias":["atlas"]}\n', undefined)).toEqual({ ok: true })
+      const failed = publishConfigWithCredential(
+        config,
+        '{}\n',
+        { path: env, content: 'OLD=1\nTOKEN=new\n', stagingDir: credentialStagingDir(cwd) },
+        failingConfigPublish(),
+      )
 
-      // then: the copy was never readable by others, and the file keeps 0600
-      expect(modes).toEqual({ stagedModeWhileWriting: 0o600, published: 0o600 })
-      expect(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')).toBe('{"mcpServers":{}}\n')
+      // then: the config keeps that group throughout
+      expect(failed.ok).toBe(false)
+      expect(statSync(config).gid).toBe(otherGroup!)
+      expect(readFileSync(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
     },
   )
-
-  test.skipIf(process.platform === 'win32')('publishes a 0644 config as 0644', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
-    await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
-    await chmod(join(cwd, 'typeclaw.json'), 0o644)
-
-    expect(await publishUnderBroadUmask(cwd, '{}\n')).toEqual({ stagedModeWhileWriting: 0o600, published: 0o644 })
-  })
-
-  test.skipIf(process.platform === 'win32')('publishes a new config with the default mode', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
-
-    expect(await publishUnderBroadUmask(cwd, '{}\n')).toEqual({ stagedModeWhileWriting: 0o600, published: 0o644 })
-  })
 })
 
 describe('credential staging', () => {
@@ -227,9 +275,9 @@ describe('credential staging', () => {
   })
 
   describe('on Windows', () => {
-    // Exercised on every platform through the platform seam. No credential byte
-    // is written to the staging dir, and typeclaw.json is written in place, so
-    // neither file is replaced by a new file object carrying the folder's ACL.
+    // Exercised on every platform through the platform seam: no credential byte
+    // is written to the staging dir, whose files would carry the folder's ACL
+    // rather than .env's (typeclaw.json is written in place on every platform).
     async function agentWithEnv() {
       const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-win32-'))
       await writeFile(join(cwd, '.env'), 'OLD=1\n')
