@@ -855,7 +855,8 @@ export async function writeFileAnchored(options: {
 // no other one lands between a check and its write.
 export type ManagedConfigCommitCheck = {
   agentDir: string
-  check(content: string): Promise<void>
+  signal?: AbortSignal
+  check(content: string, destination: string): Promise<void>
 }
 
 const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
@@ -868,24 +869,26 @@ export function runWithManagedConfigCommitCheck<T>(check: ManagedConfigCommitChe
 
 export async function writeToolOutputNoFollow(targetPath: string, content: string): Promise<void> {
   const commit = managedConfigCommitCheck.getStore()
-  if (commit === undefined || !(await isManagedConfigDestination(commit.agentDir, targetPath))) {
-    return writeOutputNoFollow(targetPath, content)
-  }
+  const destination = commit === undefined ? undefined : await managedConfigDestination(commit.agentDir, targetPath)
+  if (commit === undefined || destination === undefined) return writeOutputNoFollow(targetPath, content)
   const write = checkedWrites.then(async () => {
-    await commit.check(content)
+    commit.signal?.throwIfAborted()
+    await commit.check(content, destination)
+    // A call cancelled while queued or while its guards ran must not write.
+    commit.signal?.throwIfAborted()
     await writeOutputNoFollow(targetPath, content)
   })
   checkedWrites = write.catch(() => {})
   return write
 }
 
-async function isManagedConfigDestination(agentDir: string, targetPath: string): Promise<boolean> {
+async function managedConfigDestination(agentDir: string, targetPath: string): Promise<string | undefined> {
   const destination = await realpath(targetPath).catch(() => path.resolve(targetPath))
   for (const file of MANAGED_CONFIG_FILES) {
     const managed = path.join(path.resolve(agentDir), file)
-    if (destination === managed || destination === (await realpath(managed).catch(() => managed))) return true
+    if (destination === managed || destination === (await realpath(managed).catch(() => managed))) return managed
   }
-  return false
+  return undefined
 }
 
 async function writeOutputNoFollow(targetPath: string, content: string): Promise<void> {

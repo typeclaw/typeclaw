@@ -1,6 +1,7 @@
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
+import { normalizeFileReference } from '@/agent/file-reference'
 import { parseConfigJson } from '@/config'
 import { validateCronEdit } from '@/cron'
 import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
@@ -24,7 +25,12 @@ export async function checkManagedConfigGuard(options: {
   const rawPath = args.path
   if (typeof rawPath !== 'string') return undefined
 
-  const targetPath = path.resolve(agentDir, rawPath)
+  let targetPath: string
+  try {
+    targetPath = path.resolve(agentDir, normalizeFileReference(rawPath))
+  } catch {
+    return undefined
+  }
   const managed = await resolveManagedTarget(agentDir, targetPath)
   if (!managed) return undefined
 

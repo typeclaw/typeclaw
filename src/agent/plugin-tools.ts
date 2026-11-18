@@ -720,13 +720,14 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               ? await runWithManagedConfigCommitCheck(
                   {
                     agentDir: opts.agentDir,
-                    check: async (content) => {
+                    ...(signal !== undefined ? { signal } : {}),
+                    check: async (content, destination) => {
                       const block = await opts.hooks.runToolBefore(
                         {
                           tool: 'write',
                           sessionId: opts.sessionId,
                           callId: toolCallId,
-                          args: { path: originalArgs.path, content },
+                          args: { path: destination, content },
                           toolProvenance: 'first-party',
                           ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
                         },
