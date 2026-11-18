@@ -1,4 +1,5 @@
-import { basename } from 'node:path'
+import { open, readFile, rename, rm } from 'node:fs/promises'
+import { basename, join, resolve } from 'node:path'
 
 import { resolveAgentGit } from './resolve-agent-git'
 import { runGit } from './run'
@@ -90,22 +91,58 @@ export function trackGithubGitIdentityEnv(
   }
 }
 
-// Copies typeclaw.json#git.user into the agent repo so host-side Git and the
-// identity `typeclaw start` exports agree with it. Host stage only, and only
-// while the container is down: git commits config by renaming config.lock over
-// .git/config, which would detach the read-only bind of any sandbox still
-// running. Dropping the fallback marker makes the pair explicit.
+// Copies typeclaw.json#git.user into the agent repo so host-side Git agrees
+// with it. Host stage only, and only while the container is down, because the
+// commit renames config.lock over .git/config and would detach the read-only
+// bind of any sandbox still running. Both keys and the fallback marker change in
+// one transaction. Returns false, without writing, when a config.worktree
+// identity would shadow the copy, and false when the copy failed.
 export async function syncConfiguredGitIdentity(cwd: string, user: GitIdentity | undefined): Promise<boolean> {
   if (user === undefined) return true
   const repo = resolveAgentGit(cwd)
   if (repo === null) return true
   const values = await readRepositoryIdentity(cwd, repo.gitArgs)
-  const current = { name: values.get('user.name')?.at(-1)?.trim(), email: values.get('user.email')?.at(-1)?.trim() }
+  const matches = (identity: GitIdentity | null) => identity?.name === user.name && identity?.email === user.email
   const marked = values.has(FALLBACK_MARKER_KEY)
-  if (current.name === user.name && current.email === user.email && !marked) return true
-  if (!(await writeLocalConfig(cwd, repo.gitArgs, 'user.name', user.name, '--replace-all'))) return false
-  if (!(await writeLocalConfig(cwd, repo.gitArgs, 'user.email', user.email, '--replace-all'))) return false
-  return !marked || (await unsetLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY))
+  if (matches(await resolveGitIdentity(cwd)) && !marked) return true
+  if (await hasWorktreeIdentity(cwd, repo.gitArgs)) return false
+  const committed = await editLocalConfigAtomically(cwd, [
+    ['--replace-all', 'user.name', user.name],
+    ['--replace-all', 'user.email', user.email],
+    ...(marked ? [['--unset-all', FALLBACK_MARKER_KEY]] : []),
+  ])
+  return committed && matches(await resolveGitIdentity(cwd))
+}
+
+// Applies `git config --file` edits to a copy held as git's own config.lock,
+// then renames it over the agent repo's config, so every edit lands or none
+// does. Callers must run while no sandbox holds the read-only config bind.
+export async function editLocalConfigAtomically(cwd: string, edits: readonly (readonly string[])[]): Promise<boolean> {
+  const repo = resolveAgentGit(cwd)
+  if (repo === null) return false
+  const configPath = await localConfigPath(cwd, repo.gitArgs)
+  if (configPath === null) return false
+  const lockPath = `${configPath}.lock`
+  const lock = await open(lockPath, 'wx').catch(() => null)
+  if (lock === null) return false
+  let committed = false
+  try {
+    await lock.writeFile(await readFile(configPath))
+    await lock.close()
+    for (const edit of edits) {
+      const result = await runGit(Bun, cwd, ['config', '--file', lockPath, ...edit], { env: localGitConfigEnv() })
+      // `--unset-all` exits 5 when the key is already absent, the desired end state.
+      if (result.exitCode !== 0 && !(edit[0] === '--unset-all' && result.exitCode === 5)) return false
+    }
+    await rename(lockPath, configPath)
+    committed = true
+    return true
+  } catch {
+    return false
+  } finally {
+    await lock.close().catch(() => {})
+    if (!committed) await rm(lockPath, { force: true })
+  }
 }
 
 // Runtime-owned commits (backup, dreaming, system files) inherit the runtime's
@@ -144,15 +181,9 @@ function fallbackGitIdentity(cwd: string): GitIdentity {
   return { name: folder || 'agent', email: `${slug || 'agent'}@typeclaw.local` }
 }
 
-async function writeLocalConfig(
-  cwd: string,
-  gitArgs: readonly string[],
-  key: string,
-  value: string,
-  ...flags: string[]
-): Promise<boolean> {
+async function writeLocalConfig(cwd: string, gitArgs: readonly string[], key: string, value: string): Promise<boolean> {
   try {
-    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', ...flags, key, value], {
+    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', key, value], {
       env: localGitConfigEnv(),
     })
     return result.exitCode === 0
@@ -161,14 +192,29 @@ async function writeLocalConfig(
   }
 }
 
-async function unsetLocalConfig(cwd: string, gitArgs: readonly string[], key: string): Promise<boolean> {
+async function hasWorktreeIdentity(cwd: string, gitArgs: readonly string[]): Promise<boolean> {
   try {
-    const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', '--unset-all', key], {
-      env: localGitConfigEnv(),
-    })
-    return result.exitCode === 0
+    const result = await runGit(
+      Bun,
+      cwd,
+      [...gitArgs, 'config', '--show-scope', '--get-regexp', '^user\\.(name|email)$'],
+      {
+        env: localGitConfigEnv(),
+      },
+    )
+    return result.exitCode === 0 && result.stdout.split('\n').some((line) => line.startsWith('worktree\t'))
   } catch {
     return false
+  }
+}
+
+async function localConfigPath(cwd: string, gitArgs: readonly string[]): Promise<string | null> {
+  try {
+    const result = await runGit(Bun, cwd, [...gitArgs, 'rev-parse', '--git-common-dir'], { env: localGitConfigEnv() })
+    if (result.exitCode !== 0) return null
+    return join(resolve(cwd, result.stdout.trim()), 'config')
+  } catch {
+    return null
   }
 }
 

@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 
 import {
   _internal,
+  editLocalConfigAtomically,
   ensureGitIdentity,
   hasExplicitGitIdentity,
   isFallbackGitIdentity,
@@ -170,6 +171,50 @@ describe('resolveGitIdentity', () => {
     await expect(syncConfiguredGitIdentity(repo, fallback!)).resolves.toBe(true)
 
     await expect(isFallbackGitIdentity(repo, fallback!)).resolves.toBe(false)
+  })
+
+  test('syncConfiguredGitIdentity refuses, without writing, when a config.worktree identity would shadow git.user', async () => {
+    const repo = await tempDir('typeclaw-git-identity-sync-shadow-')
+    await git(repo, ['init', '-q'])
+    await git(repo, ['config', 'extensions.worktreeConfig', 'true'])
+    await git(repo, ['config', '--worktree', 'user.name', 'Worktree Override'])
+    const config = join(repo, '.git', 'config')
+    const original = await readFile(config, 'utf8')
+
+    await expect(syncConfiguredGitIdentity(repo, { name: 'Agent', email: 'agent@example.com' })).resolves.toBe(false)
+
+    expect(await readFile(config, 'utf8')).toBe(original)
+  })
+
+  test('editLocalConfigAtomically applies no edit when a later one fails', async () => {
+    const repo = await tempDir('typeclaw-git-identity-txn-')
+    await git(repo, ['init', '-q'])
+    await git(repo, ['config', '--local', 'user.name', 'Before'])
+    const config = join(repo, '.git', 'config')
+    const original = await readFile(config, 'utf8')
+
+    await expect(
+      editLocalConfigAtomically(repo, [
+        ['--replace-all', 'user.name', 'After'],
+        ['--replace-all', 'not a valid key', 'value'],
+      ]),
+    ).resolves.toBe(false)
+
+    expect(await readFile(config, 'utf8')).toBe(original)
+    expect(await Bun.file(`${config}.lock`).exists()).toBe(false)
+  })
+
+  test('editLocalConfigAtomically leaves config to a git writer that holds the lock', async () => {
+    const repo = await tempDir('typeclaw-git-identity-txn-locked-')
+    await git(repo, ['init', '-q'])
+    const config = join(repo, '.git', 'config')
+    const original = await readFile(config, 'utf8')
+    await writeFile(`${config}.lock`, '')
+
+    await expect(editLocalConfigAtomically(repo, [['--replace-all', 'user.name', 'After']])).resolves.toBe(false)
+
+    expect(await readFile(config, 'utf8')).toBe(original)
+    expect(await Bun.file(`${config}.lock`).exists()).toBe(true)
   })
 
   test('syncConfiguredGitIdentity leaves config untouched when it already matches or git.user is unset', async () => {
