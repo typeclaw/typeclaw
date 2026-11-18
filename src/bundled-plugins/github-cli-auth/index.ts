@@ -638,7 +638,10 @@ export default definePlugin({
       const credentials: GitRepoCredential[] = []
       for (const repoSlug of destinationRepos) {
         const result = await resolveTokenForRepo(repoSlug)
-        if (result.kind === 'unavailable') return { block: true, reason: result.reason }
+        if (result.kind === 'unavailable') {
+          if (decision.credentialOptional === true) return
+          return { block: true, reason: result.reason }
+        }
         credentials.push({ repoSlug, token: result.token })
       }
 

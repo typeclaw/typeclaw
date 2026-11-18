@@ -36,6 +36,8 @@ export type GitCommandDecision =
       access: GitRemoteAccess
       pushProvenance?: GitPushProvenance
       rewrittenCommand?: string
+      // A refused mint runs the command without a credential instead of blocking it.
+      credentialOptional?: true
     }
 
 export type GitRemoteResolver = (cwd: string, remote: string, forPush: boolean) => Promise<string | null>
@@ -225,7 +227,10 @@ export async function analyzeGitCommand(
     if (invocation !== null) {
       const decision = await decideStandalone(invocation, options.resolvers)
       if (invocation.dashCCount > 0) {
-        return decision.kind === 'inject' ? { kind: 'block', reason: COMPOSITION_REASON } : decision
+        if (decision.kind !== 'inject') return decision
+        return decision.credentialOptional === true
+          ? { kind: 'pass-through' }
+          : { kind: 'block', reason: COMPOSITION_REASON }
       }
       if (decision.kind !== 'inject') return decision
       return {
@@ -265,7 +270,19 @@ async function decideStandalone(invocation: MintableInvocation, resolvers: GitRe
     repoSlug: [...repos][0] as string,
     access: remoteAccess(invocation.subcommand),
     ...(evidence.pushProvenance === undefined ? {} : { pushProvenance: evidence.pushProvenance }),
+    ...(isNamedRemoteLsRemote(invocation) ? { credentialOptional: true } : {}),
   }
+}
+
+// `ls-remote <remote>` was never brokered, so a public GitHub remote outside
+// channels.github.repos[] read anonymously. Brokering it must not turn that
+// working read into a refusal block.
+function isNamedRemoteLsRemote(invocation: MintableInvocation): boolean {
+  return (
+    invocation.subcommand === 'ls-remote' &&
+    invocation.target.kind === 'single' &&
+    !looksLikeUrl(invocation.target.value)
+  )
 }
 
 function remoteAccess(subcommand: RemoteSubcommand): GitRemoteAccess {
@@ -297,9 +314,8 @@ function parseMintableGitInvocation(command: string, baseCwd: string): MintableI
 function parseMintableTarget(subcommand: RemoteSubcommand, args: readonly string[]): TargetSpec | null {
   if (subcommand === 'push') return parseMintablePush(args)
   if (subcommand === 'fetch') return parseMintableFetch(args)
-  if (subcommand === 'pull') return parseSimpleRemote(args, false)
   if (subcommand === 'clone') return parseCloneTarget(args)
-  return parseExplicitUrl(args, Number.POSITIVE_INFINITY)
+  return parseSimpleRemote(args, false)
 }
 
 // Value-less clone flags that cannot redirect the fetch to another repo/host, run a
@@ -415,12 +431,6 @@ function parseMintableFetch(args: readonly string[]): TargetSpec | null {
 function parseSimpleRemote(args: readonly string[], forPush: boolean): TargetSpec | null {
   if (args.length === 0 || args.some((arg) => !isOptionValue(arg))) return null
   return { kind: 'single', value: args[0] as string, forPush }
-}
-
-function parseExplicitUrl(args: readonly string[], maxPositionals: number): TargetSpec | null {
-  if (args.length === 0 || args.length > maxPositionals || args.some((arg) => !isOptionValue(arg))) return null
-  const url = args[0] as string
-  return looksLikeUrl(url) ? { kind: 'single', value: url, forPush: false } : null
 }
 
 function tokenizeStandalone(command: string): string[] | null {

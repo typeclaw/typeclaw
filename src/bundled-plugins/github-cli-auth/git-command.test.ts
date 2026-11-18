@@ -254,6 +254,25 @@ describe('analyzeGitCommand — inject (remote resolution)', () => {
       access: 'read',
     })
   })
+  test('ls-remote origin HEAD', async () => {
+    expect(await analyze('git ls-remote origin HEAD', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'read',
+      credentialOptional: true,
+    })
+  })
+  test.each([
+    'git ls-remote --upload-pack=/bin/sh origin',
+    'git ls-remote -u /bin/sh origin',
+    'git ls-remote --heads origin',
+  ])('ls-remote with a flag is not mintable: %s', async (command) => {
+    expect(await analyze(command, ghRemote)).toEqual({ kind: 'pass-through' })
+  })
+  test('ls-remote of a non-github remote', async () => {
+    const glRemote = resolvers({ resolveRemoteUrl: async () => 'https://gitlab.com/acme/widgets.git' })
+    expect(await analyze('git ls-remote origin', glRemote)).toEqual({ kind: 'pass-through' })
+  })
   test('push origin main', async () => {
     expect(await analyze('git push origin main', ghRemote)).toEqual({
       kind: 'inject',
@@ -353,6 +372,10 @@ describe('analyzeGitCommand — cd rewrite', () => {
   })
   test('cd dir && git -C other blocks (would stack two -C and change cwd)', async () => {
     expect((await analyze('cd workspace/repo && git -C other push origin main', ghRemote)).kind).toBe('block')
+  })
+  test('cd dir && git -C other ls-remote <remote> stays a tokenless pass-through', async () => {
+    expect(await analyze('cd /tmp && git -C clone ls-remote origin HEAD', ghRemote)).toEqual({ kind: 'pass-through' })
+    expect((await analyze('cd /tmp && git -C clone fetch origin', ghRemote)).kind).toBe('block')
   })
   test('redirection-prefixed git evidence resolves remotes from the cd directory', async () => {
     const seen: string[] = []
