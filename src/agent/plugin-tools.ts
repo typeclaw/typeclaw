@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { mkdir } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { access, mkdir, readFile } from 'node:fs/promises'
 import { relative, sep } from 'node:path'
 
 import {
@@ -225,7 +226,15 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
       })
     }
     case 'edit':
-      return piCreateEditToolDefinition(cwd)
+      // Same writer as `write`, so an edit of typeclaw.json or cron.json gets the
+      // commit-time guard check too.
+      return piCreateEditToolDefinition(cwd, {
+        operations: {
+          readFile: (absolutePath) => readFile(absolutePath),
+          writeFile: writeToolOutputNoFollow,
+          access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
+        },
+      })
     case 'write':
       return piCreateWriteToolDefinition(cwd, {
         operations: {

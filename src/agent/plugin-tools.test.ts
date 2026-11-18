@@ -7550,8 +7550,14 @@ describe('managed config commit check', () => {
     let checks = 0
     hooks.registerAll('alias-lock', agentDir, noopLogger, {
       'tool.before': async (event) => {
-        if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
         if (!String(event.args.path).endsWith('typeclaw.json')) return undefined
+        if (event.tool === 'edit') {
+          // An edit's pre-check cannot see its final bytes; the commit check can.
+          checks += 1
+          if (checks === 1) await onPreCheck?.()
+          return undefined
+        }
+        if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
         checks += 1
         const current = JSON.parse(await readFile(path.join(agentDir, 'typeclaw.json'), 'utf8')) as { alias?: string[] }
         const intended = JSON.parse(event.args.content) as { alias?: string[] }
@@ -7562,6 +7568,65 @@ describe('managed config commit check', () => {
     })
     return { hooks, checks: () => checks }
   }
+
+  function builtin(name: string, agentDir: string, hooks: ReturnType<typeof createHookBus>) {
+    const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check' }
+    const tool = buildBuiltinPiToolOverrides({
+      agentDir,
+      sessionId: 'commit-check',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+    }).find((candidate) => candidate.name === name)
+    if (tool === undefined) throw new Error(`missing ${name} builtin`)
+    return tool
+  }
+
+  test.skipIf(lacksInodeAnchoring)('checks the bytes an edit produces at commit', async () => {
+    // given: the edit's pre-check cannot see its result, so it passes
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-edit-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    await writeFile(config, `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    const { hooks, checks } = aliasLockedHooks(agentDir)
+    try {
+      // when: the edit changes the locked alias
+      const execution = builtin('edit', agentDir, hooks).execute(
+        'c',
+        { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"renamed"' }] } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      // then: the commit check sees the produced bytes and nothing is written
+      await expect(execution).rejects.toThrow(/alias may not change/)
+      expect(checks()).toBe(2)
+      expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['atlas'] })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(lacksInodeAnchoring)('writes nothing when the call is cancelled after its guard check', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-abort-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    await writeFile(config, `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    const controller = new AbortController()
+    const { hooks } = aliasLockedHooks(agentDir, async () => controller.abort())
+    try {
+      const execution = builtin('write', agentDir, hooks).execute(
+        'c',
+        { path: 'typeclaw.json', content: `${JSON.stringify({ alias: ['atlas'], branding: false })}\n` } as never,
+        controller.signal,
+        undefined,
+        {} as never,
+      )
+      await expect(execution).rejects.toThrow()
+      expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['atlas'] })
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
 
   function writeTool(agentDir: string, hooks: ReturnType<typeof createHookBus>) {
     const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check' }
