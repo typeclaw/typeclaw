@@ -873,15 +873,26 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
   if (commit === undefined || destination === undefined) return writeOutputNoFollow(targetPath, content)
   const write = checkedWrites.then(async () => {
     commit.signal?.throwIfAborted()
-    // The pinned descriptor path makes the guards read their baseline from the
-    // very inode this write lands on; a new file has no pinned baseline.
-    await commit.check(content, /^\/proc\/self\/fd\/\d+$/.test(targetPath) ? targetPath : destination)
+    // Guards decide on the managed path and read their baseline through it, so
+    // the pinned descriptor must still be that entry's inode, before the check
+    // and again before any byte is truncated.
+    await assertPinnedEntry(targetPath, destination)
+    await commit.check(content, destination)
     // A call cancelled while queued or while its guards ran must not write.
     commit.signal?.throwIfAborted()
+    await assertPinnedEntry(targetPath, destination)
     await writeOutputNoFollow(targetPath, content)
   })
   checkedWrites = write.catch(() => {})
   return write
+}
+
+async function assertPinnedEntry(targetPath: string, destination: string): Promise<void> {
+  if (!/^\/proc\/self\/fd\/\d+$/.test(targetPath)) return
+  const [pinned, entry] = await Promise.all([stat(targetPath), stat(destination).catch(() => undefined)])
+  if (entry === undefined || pinned.dev !== entry.dev || pinned.ino !== entry.ino) {
+    throw new Error(`${destination} was replaced after it was opened; refusing to write the stale file`)
+  }
 }
 
 async function managedConfigDestination(agentDir: string, targetPath: string): Promise<string | undefined> {

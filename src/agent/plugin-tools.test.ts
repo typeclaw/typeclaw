@@ -13,6 +13,7 @@ import {
   symlink,
   truncate,
   writeFile,
+  rename,
 } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -7727,6 +7728,104 @@ describe('managed config commit check', () => {
       await rm(agentDir, { recursive: true, force: true })
     }
   })
+
+  function guardedBuiltin(name: string, agentDir: string) {
+    const hooks = createHookBus()
+    hooks.registerAll('guard', agentDir, noopLogger, {})
+    const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check-real' }
+    const tool = buildBuiltinPiToolOverrides({
+      agentDir,
+      sessionId: 'commit-check-real',
+      hooks,
+      guards: buildInternalGuards(agentDir),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+    }).find((candidate) => candidate.name === name)
+    if (tool === undefined) throw new Error(`missing ${name} builtin`)
+    return tool
+  }
+
+  test.skipIf(lacksInodeAnchoring)(
+    'lets a valid typeclaw.json write through the real guards without an acknowledgement',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-real-ok-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, '{}\n')
+      try {
+        for (const [name, args] of [
+          ['write', { path: 'typeclaw.json', content: '{"alias":["atlas"]}\n' }],
+          ['edit', { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"atlas","아틀라스"' }] }],
+        ] as const) {
+          await guardedBuiltin(name, agentDir).execute('c', args as never, undefined, undefined, {} as never)
+        }
+        expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['atlas', '아틀라스'] })
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)(
+    'rejects invalid typeclaw.json through the real guards by path and file: URI',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-real-bad-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, '{}\n')
+      try {
+        for (const ref of ['typeclaw.json', pathToFileURL(config).href]) {
+          await expect(
+            guardedBuiltin('write', agentDir).execute(
+              'c',
+              { path: ref, content: '{ not json' } as never,
+              undefined,
+              undefined,
+              {} as never,
+            ),
+          ).rejects.toThrow(/managedConfig/)
+        }
+        expect(await readFile(config, 'utf8')).toBe('{}\n')
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)(
+    'refuses to write when the entry was replaced after the file was pinned',
+    async () => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-replaced-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      // Replace the entry during the commit-time check, after the writer pinned
+      // the original file (only that check carries an absolute destination).
+      const hooks = createHookBus()
+      let replaced = false
+      hooks.registerAll('replace', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          if (replaced || event.tool !== 'write' || !path.isAbsolute(String(event.args.path))) return undefined
+          replaced = true
+          await writeFile(path.join(agentDir, 'replacement.json'), '{"alias":["atlas"],"owner":true}\n')
+          await rename(path.join(agentDir, 'replacement.json'), config)
+          return undefined
+        },
+      })
+      try {
+        await expect(
+          writeTool(agentDir, hooks).execute(
+            'c',
+            { path: 'typeclaw.json', content: '{"alias":["atlas"]}\n' } as never,
+            undefined,
+            undefined,
+            {} as never,
+          ),
+        ).rejects.toThrow(/replaced after it was opened/)
+        expect(replaced).toBe(true)
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"],"owner":true}\n')
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
 
   function writeTool(agentDir: string, hooks: ReturnType<typeof createHookBus>) {
     const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check' }
