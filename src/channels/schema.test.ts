@@ -172,6 +172,7 @@ describe('ADAPTER_WRITE_CAPABILITIES', () => {
 
   const capabilityCall: Record<WriteCapability, RegExp> = {
     'message-edit': /\.registerEditMessage\(/,
+    'open-dm': /\.registerOpenDm\(/,
   }
 
   for (const id of ADAPTER_IDS) {
