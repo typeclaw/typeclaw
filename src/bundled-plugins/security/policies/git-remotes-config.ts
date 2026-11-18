@@ -72,10 +72,10 @@ function parseRemotes(content: string): Record<string, string> | undefined {
 }
 
 function buildBlockReason(tool: string, findings: readonly GitRemotesFinding[]): string {
+  // Names only: remote URLs can carry credentials, and this reason is returned
+  // to the session as a tool error.
   const changes = findings.map((f) =>
-    f.kind === 'remote-added'
-      ? `new remote \`${f.name}\` -> ${JSON.stringify(f.url)}`
-      : `remote \`${f.name}\` changes ${JSON.stringify(f.from)} -> ${JSON.stringify(f.to)}`,
+    f.kind === 'remote-added' ? `adds remote \`${f.name}\`` : `changes the URL of remote \`${f.name}\``,
   )
   return [
     `Guard \`${GUARD_GIT_REMOTES_CONFIG}\` blocked ${tool} on typeclaw.json: ${changes.join('; ')}.`,

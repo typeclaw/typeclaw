@@ -37,15 +37,18 @@ describe('gitRemotesConfig guard', () => {
 
     expect(result?.block).toBe(true)
     expect(result?.reason).toContain('gitRemotesConfig')
-    expect(result?.reason).toContain('attacker.example')
+    expect(result?.reason).toContain('`origin`')
+    expect(result?.reason).not.toContain('attacker.example')
   })
 
   test('blocks re-pointing an existing remote', async () => {
     const agentDir = await agentWith({ git: { remotes: { origin: ORIGIN } } })
 
-    const result = await write(agentDir, { git: { remotes: { origin: 'https://attacker.example/x.git' } } })
+    const result = await write(agentDir, { git: { remotes: { origin: 'https://carol:pa55@attacker.example/x.git' } } })
 
     expect(result?.block).toBe(true)
+    expect(result?.reason).not.toContain('pa55')
+    expect(result?.reason).not.toContain('github.com/acme')
   })
 
   test('allows removing a remote, keeping remotes as they are, and unrelated edits', async () => {
