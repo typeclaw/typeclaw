@@ -11,6 +11,7 @@ import {
   type Config,
   type CustomModelMeta,
 } from '@/config'
+import { isGithubChannelTunnel } from '@/config/channels-mutation'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1593,9 +1594,21 @@ function mergeGithubTunnelConfig(
     }
   }
 
-  const existingTunnels = Array.isArray(parsed.tunnels) ? parsed.tunnels : []
+  const existingTunnels: unknown[] = Array.isArray(parsed.tunnels) ? parsed.tunnels : []
   const tunnel = buildGithubTunnelEntry(options)
-  parsed.tunnels = [...existingTunnels, tunnel]
+  // Callers run this on the config as read under the lock. A tunnel already
+  // using the name is replaced only when the GitHub channel owns it (an init
+  // retry); a standalone one is the operator's, so nothing is written.
+  const sameName = existingTunnels.find((entry) => isObjectRecord(entry) && entry.name === tunnel.name)
+  if (sameName !== undefined && !isGithubChannelTunnel(sameName)) {
+    throw new Error(
+      `A tunnel named "${String(tunnel.name)}" already exists in ${CONFIG_FILE} and is not owned by the GitHub channel; nothing was written. Remove or rename it (\`typeclaw tunnel remove ${String(tunnel.name)}\`), then rerun.`,
+    )
+  }
+  parsed.tunnels =
+    sameName === undefined
+      ? [...existingTunnels, tunnel]
+      : existingTunnels.map((entry) => (entry === sameName ? tunnel : entry))
 
   if (options.tunnelProvider === 'cloudflare-quick' || options.tunnelProvider === 'cloudflare-named') {
     const docker = isObjectRecord(parsed.docker) ? { ...parsed.docker } : {}

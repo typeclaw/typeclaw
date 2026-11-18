@@ -646,6 +646,83 @@ describe('runAddChannel', () => {
     ])
   })
 
+  test('refuses github when a standalone tunnel already owns the github-webhook name, writing nothing', async () => {
+    // given: an operator-added tunnel that happens to use the GitHub tunnel's name
+    const config = join(root, 'typeclaw.json')
+    const scaffolded = JSON.parse(await readFile(config, 'utf8')) as Record<string, unknown>
+    await writeFile(
+      config,
+      `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    )
+    const before = await readFile(config, 'utf8')
+
+    // when/then: the add fails with the conflict and typeclaw.json is untouched
+    await expect(
+      runAddChannel({
+        cwd: root,
+        channel: 'github',
+        auth: { type: 'pat', pat: 'ghp_test' },
+        webhookSecret: 'wh-secret',
+        tunnelProvider: 'cloudflare-quick',
+        webhookPort: 8975,
+        repos: ['acme/widgets'],
+      }),
+    ).rejects.toThrow('already exists in typeclaw.json and is not owned by the GitHub channel')
+    expect(await readFile(config, 'utf8')).toBe(before)
+  })
+
+  test('replaces a github-webhook tunnel the GitHub channel already owns instead of duplicating it', async () => {
+    // given: a GitHub-owned tunnel left from an earlier attempt
+    const config = join(root, 'typeclaw.json')
+    const scaffolded = JSON.parse(await readFile(config, 'utf8')) as Record<string, unknown>
+    await writeFile(
+      config,
+      `${JSON.stringify(
+        {
+          ...scaffolded,
+          tunnels: [
+            { name: 'other', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+            {
+              name: 'github-webhook',
+              provider: 'external',
+              externalUrl: 'https://old.example.com/gh',
+              for: { kind: 'channel', name: 'github' },
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+    )
+
+    // when
+    await runAddChannel({
+      cwd: root,
+      channel: 'github',
+      auth: { type: 'pat', pat: 'ghp_test' },
+      webhookSecret: 'wh-secret',
+      tunnelProvider: 'cloudflare-quick',
+      webhookPort: 8975,
+      repos: ['acme/widgets'],
+    })
+
+    // then: the GitHub tunnel is replaced in place and the other tunnel is kept
+    const cfg = (await readConfig()) as { tunnels?: unknown[] }
+    expect(cfg.tunnels).toEqual([
+      { name: 'other', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 },
+      { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } },
+    ])
+  })
+
   test('adds github channel with a cloudflare-named tunnel and cloudflared Dockerfile toggle', async () => {
     await runAddChannel({
       cwd: root,

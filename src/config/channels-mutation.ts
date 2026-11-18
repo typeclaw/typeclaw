@@ -156,7 +156,7 @@ function removeGithubTunnels(config: Record<string, unknown>): number {
   return before - (config.tunnels as unknown[]).length
 }
 
-function isGithubChannelTunnel(entry: unknown): boolean {
+export function isGithubChannelTunnel(entry: unknown): boolean {
   if (!isObjectRecord(entry)) return false
   const target = entry.for
   if (!isObjectRecord(target)) return false
