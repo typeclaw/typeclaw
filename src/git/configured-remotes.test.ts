@@ -109,15 +109,22 @@ describe('syncConfiguredGitRemotes', () => {
     expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/old.git')
   })
 
-  test.each([
-    ['branch.main.pushRemote', 'mirror'],
-    ['remote.pushDefault', 'mirror'],
-    ['branch.main.remote', 'mirror'],
-  ])('warns when %s routes backups away from origin', async (key, value) => {
-    const repo = await agentRepo()
+  // A tracked branch: the backup runner pushes it with a bare `git push`.
+  async function trackedMain(repo: string, upstream: string): Promise<void> {
     await git(repo, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+    await git(repo, ['config', 'branch.main.remote', upstream])
+    await git(repo, ['config', 'branch.main.merge', 'refs/heads/main'])
+  }
+
+  test.each([
+    ['branch.main.pushRemote', 'origin'],
+    ['remote.pushDefault', 'origin'],
+    ['branch.main.remote', 'mirror'],
+  ])('warns when %s routes a tracked branch away from origin', async (key, upstream) => {
+    const repo = await agentRepo()
     await git(repo, ['remote', 'add', 'mirror', 'https://example.com/mirror.git'])
-    await git(repo, ['config', key, value])
+    await trackedMain(repo, upstream)
+    if (key !== 'branch.main.remote') await git(repo, ['config', key, 'mirror'])
 
     const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
@@ -126,9 +133,23 @@ describe('syncConfiguredGitRemotes', () => {
     ])
   })
 
-  test('names only the routing key when a push routing value is a URL, never the URL itself', async () => {
+  test('does not warn for a branch with no upstream, which backup pushes to origin', async () => {
+    // given: routing keys point elsewhere, but main has no upstream yet
     const repo = await agentRepo()
     await git(repo, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+    await git(repo, ['remote', 'add', 'mirror', 'https://example.com/mirror.git'])
+    await git(repo, ['config', 'remote.pushDefault', 'mirror'])
+    await git(repo, ['config', 'branch.main.pushRemote', 'mirror'])
+
+    const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    // then: the first backup push goes to origin by name
+    expect(warnings).toEqual([])
+  })
+
+  test('names only the routing key when a push routing value is a URL, never the URL itself', async () => {
+    const repo = await agentRepo()
+    await trackedMain(repo, 'origin')
     await git(repo, ['config', 'remote.pushDefault', 'https://alice:s3cr3t-token@example.com/elsewhere.git'])
 
     const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
