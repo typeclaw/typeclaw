@@ -61,12 +61,13 @@ export function diffRemotes(
 ): GitRemotesFinding[] {
   const findings: GitRemotesFinding[] = []
   for (const [name, url] of Object.entries(after)) {
-    const prior = before[name]
+    // Own properties only: a remote may be named like an Object.prototype member.
+    const prior = Object.hasOwn(before, name) ? before[name] : undefined
     if (prior === undefined) findings.push({ kind: 'remote-added', name, url })
     else if (prior !== url) findings.push({ kind: 'url-changed', name, from: prior, to: url })
   }
   for (const name of Object.keys(before)) {
-    if (!(name in after)) findings.push({ kind: 'remote-removed', name })
+    if (!Object.hasOwn(after, name)) findings.push({ kind: 'remote-removed', name })
   }
   return findings
 }

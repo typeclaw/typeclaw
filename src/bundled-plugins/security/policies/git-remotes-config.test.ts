@@ -60,6 +60,21 @@ describe('gitRemotesConfig guard', () => {
     expect(result?.reason).toContain('removes remote')
   })
 
+  test.each(['constructor', 'toString'])(
+    'blocks adding or removing a remote named %s like an inherited property',
+    async (name) => {
+      const agentDir = await agentWith({ git: { remotes: { [name]: ORIGIN } } })
+
+      const removed = await write(agentDir, { git: {} })
+      expect(removed?.block).toBe(true)
+      expect(removed?.reason).toContain('removes remote')
+
+      const fresh = await agentWith({})
+      const added = await write(fresh, { git: { remotes: { [name]: ORIGIN } } })
+      expect(added?.reason).toContain('adds remote')
+    },
+  )
+
   test('allows keeping remotes as they are and unrelated edits', async () => {
     const agentDir = await agentWith({ alias: ['atlas'], git: { remotes: { origin: ORIGIN, mirror: ORIGIN } } })
 
