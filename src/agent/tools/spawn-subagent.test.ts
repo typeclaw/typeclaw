@@ -484,6 +484,51 @@ describe('createSpawnSubagentTool — sync mode', () => {
     expect(liveRegistry.get('bg_test1')?.status).toBe('completed')
   })
 
+  test('a finished subagent entry no longer reaches the child session', async () => {
+    // given
+    const session = stubSession()
+    const { tool, liveRegistry } = fixedSpawn({ createSession: async () => session })
+
+    // when
+    await tool.execute(
+      'call_1',
+      { subagent_type: 'explorer', prompt: 'q', run_in_foreground: true },
+      undefined,
+      undefined,
+      ctx,
+    )
+    await liveRegistry.get('bg_test1')?.abort()
+
+    // then
+    expect(liveRegistry.get('bg_test1')?.status).toBe('completed')
+    expect(session.abortCount.n).toBe(0)
+  })
+
+  test('a subagent settled by its spawn timeout no longer reaches the child session', async () => {
+    // given: the child's prompt never settles, so the timeout settles it before teardown
+    let releasePrompt = (): void => {}
+    const session = stubSession()
+    session.prompt = () => new Promise<void>((resolve) => (releasePrompt = resolve))
+    const registry = makeRegistry({ explorer: { systemPrompt: 'You explore.', visibility: 'public', timeoutMs: 10 } })
+    const { tool, liveRegistry } = fixedSpawn({ createSession: async () => session, registry })
+
+    // when
+    await tool.execute(
+      'call_1',
+      { subagent_type: 'explorer', prompt: 'q', run_in_foreground: true },
+      undefined,
+      undefined,
+      ctx,
+    )
+    const abortsAfterTimeout = session.abortCount.n
+    await liveRegistry.get('bg_test1')?.abort()
+
+    // then
+    expect(liveRegistry.get('bg_test1')?.status).toBe('failed')
+    expect(session.abortCount.n).toBe(abortsAfterTimeout)
+    releasePrompt()
+  })
+
   test('returns mode=sync with synthesized text when no final message was captured', async () => {
     const session = stubSession()
     const { tool } = fixedSpawn({ createSession: async () => session })

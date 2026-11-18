@@ -448,6 +448,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         // broadcast so exactly one canonical completed-event is emitted (the
         // winner's).
         const won = liveRegistry.recordCompletionIfRunning(taskId, completionToFinalShape(c, durationMs))
+        liveRegistry.release(taskId)
         if (reviewIdentity !== undefined) {
           // Classify only once an in-flight abort's result is known: aborting
           // can resolve the completion before the abort itself settles.

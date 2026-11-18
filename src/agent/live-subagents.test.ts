@@ -524,3 +524,49 @@ describe('newestRunningBackgroundChildStartedAt', () => {
     expect(newestRunningBackgroundChildStartedAt(children)).toBe(1_000)
   })
 })
+
+describe('LiveSubagentRegistry.release', () => {
+  // Registers an entry whose handles close over a stand-in for the child
+  // session, without leaving a stack reference that would keep it alive.
+  function registerHoldingSession(registry: LiveSubagentRegistry, taskId: string): WeakRef<object> {
+    const session = { transcript: 'x'.repeat(1_000_000) }
+    registry.register(
+      makeLive({
+        taskId,
+        abort: async () => {
+          session.transcript = ''
+        },
+        releaseCoalesceKey: () => {
+          session.transcript = ''
+        },
+      }),
+    )
+    return new WeakRef(session)
+  }
+
+  test('a released entry stops keeping the child session alive but stays readable', () => {
+    // given
+    const registry = new LiveSubagentRegistry()
+    const session = registerHoldingSession(registry, 'bg_t1')
+    registry.recordCompletionIfRunning('bg_t1', { ok: true, finalMessage: 'done', durationMs: 5 })
+
+    // when
+    registry.release('bg_t1')
+    Bun.gc(true)
+
+    // then
+    expect(session.deref()).toBeUndefined()
+    expect(registry.snapshot('bg_t1')?.status).toBe('completed')
+    expect(registry.get('bg_t1')?.completion?.finalMessage).toBe('done')
+  })
+
+  test('an unreleased entry keeps the child session alive', () => {
+    const registry = new LiveSubagentRegistry()
+    const session = registerHoldingSession(registry, 'bg_t1')
+    registry.recordCompletionIfRunning('bg_t1', { ok: true, durationMs: 5 })
+
+    Bun.gc(true)
+
+    expect(session.deref()).toBeDefined()
+  })
+})
