@@ -4,4 +4,6 @@
 export const CANONICAL_AGENT_RUNTIME_PRIVATE_FILES = [
   '.typeclaw/incidents.json',
   '.typeclaw/coding-agent-tasks.json',
+  '.typeclaw/last-words.json',
+  '.typeclaw/last-words.json.tmp',
 ] as const

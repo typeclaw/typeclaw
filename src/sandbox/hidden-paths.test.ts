@@ -48,6 +48,8 @@ const secretFiles = (agentDir: string) => [
   join(agentDir, 'auth.json'),
   join(agentDir, '.typeclaw', 'incidents.json'),
   join(agentDir, '.typeclaw', 'coding-agent-tasks.json'),
+  join(agentDir, '.typeclaw', 'last-words.json'),
+  join(agentDir, '.typeclaw', 'last-words.json.tmp'),
 ]
 
 function parseRoles(raw: unknown): RolesConfig {
@@ -69,6 +71,8 @@ describe('resolveHiddenPaths — builtin tiers', () => {
     expect(CANONICAL_AGENT_RUNTIME_PRIVATE_FILES).toEqual([
       '.typeclaw/incidents.json',
       '.typeclaw/coding-agent-tasks.json',
+      '.typeclaw/last-words.json',
+      '.typeclaw/last-words.json.tmp',
     ])
     expect(CANONICAL_AGENT_SECRET_FILES).not.toContain('.typeclaw/incidents.json')
     const resolved = resolveHiddenPaths(createPermissionService(), tui, AGENT)

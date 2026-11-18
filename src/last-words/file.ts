@@ -98,13 +98,16 @@ export function readLastWords(agentDir: string): LastWordsFile {
 
 // Synchronous temp-file + rename so a reader (or the host after a kill) only
 // ever sees a complete file, and so the graceful-stop write cannot interleave
-// with an in-flight tick.
+// with an in-flight tick. The staging name is fixed so the sandbox masks it like
+// the file itself: a kill between write and rename leaves it behind. Writers
+// never stage concurrently: the runtime writes only while its container lives,
+// and host seals serialize on the agent's lock.
 export function writeLastWords(agentDir: string, file: LastWordsFile): void {
   const path = lastWordsPath(agentDir)
   mkdirSync(dirname(path), { recursive: true })
-  const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 })
-  renameSync(tmp, path)
+  const staging = `${path}.tmp`
+  writeFileSync(staging, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 })
+  renameSync(staging, path)
 }
 
 function sameRun(a: LastWordsRun, b: LastWordsRun): boolean {
