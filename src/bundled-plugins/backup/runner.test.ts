@@ -128,7 +128,7 @@ describe('runBackup', () => {
     }
   })
 
-  test('never commits a config write lock held while it runs', async () => {
+  test('never commits a config write lock or staged replacement left while it runs', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'autobackup-config-lock-'))
     const gitSpawn = makeDefaultGitSpawn()
     const git = async (...args: string[]) => {
@@ -143,7 +143,14 @@ describe('runBackup', () => {
       await writeFile(join(cwd, '.gitignore'), buildGitignore())
       await git('add', '.gitignore')
       await git('commit', '-qm', 'initial')
-      for (const name of ['typeclaw.json', 'typeclaw.json.lock', 'cron.json', 'cron.json.lock']) {
+      for (const name of [
+        'typeclaw.json',
+        'typeclaw.json.lock',
+        'cron.json',
+        'cron.json.lock',
+        '..env.0123.typeclaw-tmp',
+        '.typeclaw.json.0123.typeclaw-tmp',
+      ]) {
         await writeFile(join(cwd, name), '{}\n')
       }
 
