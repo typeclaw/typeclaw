@@ -729,7 +729,17 @@ export async function scaffold(root: string, options: ScaffoldOptions = {}): Pro
   // `owner` (runOwnerClaim, post-hatch) and explicitly grants others. GitHub is
   // wired separately and seeds per-repo `member.match` entries scoped to the
   // opted-in repos. See runOwnerClaim for the mute-until-claimed warning.
-  await writeFile(join(root, CONFIG_FILE), `${JSON.stringify(config, null, 2)}\n`)
+  // A first init creates the file exclusively, so it never clobbers one another
+  // writer created meanwhile; an init retry replaces the existing file under the
+  // config lock, so it never lands between another writer's read and write.
+  const configPath = join(root, CONFIG_FILE)
+  const configBytes = `${JSON.stringify(config, null, 2)}\n`
+  try {
+    await writeFile(configPath, configBytes, { flag: 'wx' })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    await withConfigFileLock(configPath, () => writeFile(configPath, configBytes))
+  }
 
   const cron = {
     $schema: './node_modules/typeclaw/cron.schema.json',

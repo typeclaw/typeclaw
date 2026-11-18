@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import * as z from 'zod'
 
 import { configSchema, dockerfileSchema } from '@/config/config'
+import { configFileLockPath } from '@/config/config-file-lock'
 import type { DockerExec } from '@/container'
 
 import { buildDockerfile, BUN_BASE_IMAGE } from './dockerfile'
@@ -951,6 +952,32 @@ describe('scaffold', () => {
 
     expect(await readFile(join(root, 'cron.json'), 'utf8')).toBe(original)
   })
+
+  test('an init retry replaces an existing typeclaw.json', async () => {
+    await writeFile(join(root, 'typeclaw.json'), '{"alias":["stale"]}\n')
+
+    await scaffold(root, { model: 'zai/glm-4.6' })
+
+    const config = JSON.parse(await readFile(join(root, 'typeclaw.json'), 'utf8')) as {
+      alias?: unknown
+      models: unknown
+    }
+    expect(config.alias).toBeUndefined()
+    expect(config.models).toEqual({ default: 'zai/glm-4.6' })
+    expect(existsSync(configFileLockPath(join(root, 'typeclaw.json')))).toBe(false)
+  })
+
+  test('an init retry does not replace typeclaw.json while another process holds its lock', async () => {
+    // given: an existing typeclaw.json whose lock another process holds
+    const config = join(root, 'typeclaw.json')
+    await writeFile(config, '{"alias":["mine"]}\n')
+    await writeFile(configFileLockPath(config), '')
+
+    // when/then: the retry waits for the lock, times out with the recovery
+    // step, and leaves the other writer's file untouched
+    await expect(scaffold(root)).rejects.toThrow(`rm "${configFileLockPath(config)}"`)
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["mine"]}\n')
+  }, 15_000)
 
   test('writes typeclaw.json that passes configSchema validation', async () => {
     await scaffold(root)
