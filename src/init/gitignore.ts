@@ -18,6 +18,8 @@ export const TRULY_IGNORED_PATTERNS = [
   'mounts/',
   'Dockerfile',
   '.DS_Store',
+  'typeclaw.json.lock',
+  'cron.json.lock',
 ] as const
 
 // Gitignored but force-committed by TypeClaw (auto-backup, dreaming, channels).
@@ -47,6 +49,9 @@ export function buildGitignore(config: GitignoreConfig = { append: [] }): string
 # resume). Upgraded agents may also retain legacy .typeclaw/home/ credentials;
 # the runtime no longer uses or migrates them, but they must remain ignored.
 # Local-only; never commit.
+#
+# typeclaw.json.lock and cron.json.lock exist only while a writer holds the
+# cross-process config lock; a backup that runs meanwhile must not commit them.
 ${TRULY_IGNORED_PATTERNS.join('\n')}
 
 # System-managed: gitignored by default so the agent never stages them by hand,

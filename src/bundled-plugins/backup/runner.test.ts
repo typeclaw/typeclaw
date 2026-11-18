@@ -128,6 +128,34 @@ describe('runBackup', () => {
     }
   })
 
+  test('never commits a config write lock held while it runs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-config-lock-'))
+    const gitSpawn = makeDefaultGitSpawn()
+    const git = async (...args: string[]) => {
+      const result = await gitSpawn(args, { cwd, timeoutMs: 30_000 })
+      expect(result.exitCode).toBe(0)
+      return result.stdout
+    }
+    try {
+      await git('init', '-q', '-b', 'main')
+      await git('config', 'user.name', 'Test')
+      await git('config', 'user.email', 'test@example.com')
+      await writeFile(join(cwd, '.gitignore'), buildGitignore())
+      await git('add', '.gitignore')
+      await git('commit', '-qm', 'initial')
+      for (const name of ['typeclaw.json', 'typeclaw.json.lock', 'cron.json', 'cron.json.lock']) {
+        await writeFile(join(cwd, name), '{}\n')
+      }
+
+      expect(
+        await runBackup({ cwd, pushToOrigin: false }, { gitSpawn, pickCommitMessage: async () => 'backup config' }),
+      ).toEqual({ ok: true, kind: 'committed' })
+      expect(await git('show', '--format=', '--name-only', 'HEAD')).toBe('cron.json\ntypeclaw.json\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('default runner commits without executing a planted hook', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'autobackup-hookless-'))
     try {
