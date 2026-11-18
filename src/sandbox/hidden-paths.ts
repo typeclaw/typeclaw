@@ -1,3 +1,4 @@
+import type { Stats } from 'node:fs'
 import { lstat, mkdir, opendir, writeFile } from 'node:fs/promises'
 import { join, sep } from 'node:path'
 
@@ -153,7 +154,11 @@ async function rejectHardlinksUnderCanonicalDir(root: string): Promise<void> {
   await rejectHardlinkAliases(root, MAX_CANONICAL_SECRET_SCAN_ENTRIES)
 }
 
-export async function rejectHardlinkAliases(root: string, maxEntries = Number.POSITIVE_INFINITY): Promise<void> {
+export async function rejectHardlinkAliases(
+  root: string,
+  maxEntries = Number.POSITIVE_INFINITY,
+  lstatEntry: (path: string) => Promise<Stats> = lstat,
+): Promise<void> {
   const pending = [root]
   let visited = 0
   while (pending.length > 0) {
@@ -168,8 +173,14 @@ export async function rejectHardlinkAliases(root: string, maxEntries = Number.PO
           throw new SandboxMaskTargetError(root, 'canonical secret directory exceeds bounded hardlink scan')
         }
         const child = join(current, entry.name)
-        const stats = await lstat(child)
-        if (stats.isSymbolicLink()) continue
+        // A child removed between enumeration and lstat (a staged credential
+        // copy cleaned up mid-scan) can no longer alias anything; skip it. The
+        // root and every other error stay fail-closed.
+        const stats = await lstatEntry(child).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined
+          throw error
+        })
+        if (stats === undefined || stats.isSymbolicLink()) continue
         if (stats.isDirectory()) pending.push(child)
         if (stats.isFile() && stats.nlink !== 1) {
           throw new SandboxMaskTargetError(root, `file under canonical secret directory has hardlink aliases: ${child}`)

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import type { Stats } from 'node:fs'
 import { chmod, link, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -379,6 +380,32 @@ describe('ensureHiddenMaskTargets', () => {
     await link(cookies, join(dir, 'public-alias'))
     // when / then
     await expect(rejectHardlinkAliases(profile)).rejects.toThrow(/hardlink aliases/)
+  })
+
+  test('skips a child removed between enumeration and lstat', async () => {
+    // given: a staged file that normal cleanup removes after the scan listed it
+    const staging = join(dir, '.typeclaw', 'credential-staging')
+    await mkdir(staging, { recursive: true })
+    const staged = join(staging, '..env.0123.new.typeclaw-tmp')
+    await writeFile(staged, 'TOKEN=x\n')
+    const removeThenLstat = async (path: string) => {
+      if (path === staged) await rm(staged)
+      return lstat(path)
+    }
+
+    // when/then: the scan completes
+    await expect(rejectHardlinkAliases(staging, Number.POSITIVE_INFINITY, removeThenLstat)).resolves.toBeUndefined()
+  })
+
+  test('still fails closed on any other error inspecting a child', async () => {
+    const staging = join(dir, '.typeclaw', 'credential-staging')
+    await mkdir(staging, { recursive: true })
+    await writeFile(join(staging, '..env.0123.new.typeclaw-tmp'), 'TOKEN=x\n')
+    const denied = async (): Promise<Stats> => {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' })
+    }
+
+    await expect(rejectHardlinkAliases(staging, Number.POSITIVE_INFINITY, denied)).rejects.toThrow('permission denied')
   })
 
   test('fails closed when an absent canonical mask target cannot be materialized', async () => {
