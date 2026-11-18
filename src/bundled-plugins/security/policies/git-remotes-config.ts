@@ -1,10 +1,9 @@
 import { readFile } from 'node:fs/promises'
-import path from 'node:path'
 
 import { parseConfigJson } from '@/config'
 
 import type { SecurityBlock } from '../policy'
-import { intendedContent, pathIsTypeclawJson, refuseRiskyEdit } from './plugin-addition'
+import { intendedContent, pathIsTypeclawJson, refuseRiskyEdit, resolveToolTarget } from './plugin-addition'
 
 export const GUARD_GIT_REMOTES_CONFIG = 'gitRemotesConfig'
 // typeclaw.json#git.remotes is copied into the agent repo by the next
@@ -29,8 +28,8 @@ export async function checkGitRemotesConfigGuard(options: {
   const rawPath = args.path
   if (typeof rawPath !== 'string') return undefined
 
-  const targetPath = path.resolve(agentDir, rawPath)
-  if (!(await pathIsTypeclawJson(agentDir, targetPath))) return undefined
+  const targetPath = resolveToolTarget(agentDir, rawPath)
+  if (targetPath === undefined || !(await pathIsTypeclawJson(agentDir, targetPath))) return undefined
 
   const editRefusal = refuseRiskyEdit(tool, args, targetPath, GUARD_GIT_REMOTES_CONFIG)
   if (editRefusal) return editRefusal

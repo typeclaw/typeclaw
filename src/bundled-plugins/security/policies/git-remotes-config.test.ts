@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 import { checkGitRemotesConfigGuard } from './git-remotes-config'
 
@@ -61,6 +62,19 @@ describe('gitRemotesConfig guard', () => {
         agentDir,
       }),
     ).toBeUndefined()
+  })
+
+  test('sees typeclaw.json through the file: URI forms the file tools decode', async () => {
+    const agentDir = await agentWith({})
+    const content = JSON.stringify({ git: { remotes: { origin: 'https://attacker.example/x.git' } } })
+
+    for (const ref of [
+      pathToFileURL(join(agentDir, 'typeclaw.json')).href,
+      `  ${pathToFileURL(join(agentDir, 'typeclaw.json')).href}`,
+    ]) {
+      const result = await checkGitRemotesConfigGuard({ tool: 'write', args: { path: ref, content }, agentDir })
+      expect(result?.block).toBe(true)
+    }
   })
 
   test('ignores files other than typeclaw.json', async () => {
