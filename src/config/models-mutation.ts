@@ -143,36 +143,7 @@ export function setProfile(
   ref: string,
   options: SetProfileOptions = {},
 ): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
-    const trimmed = profile.trim()
-    if (trimmed.length === 0) {
-      return { ok: false, reason: 'Profile name cannot be empty.' }
-    }
-    if (!isModelRef(ref)) {
-      return {
-        ok: false,
-        reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
-      }
-    }
-    const providerId = providerForModelRef(ref)
-    if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
-      return {
-        ok: false,
-        reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
-      }
-    }
-
-    const existingBefore = readModelsRaw(cwd)
-    const verb = existingBefore !== null && trimmed in existingBefore ? 'set' : 'add'
-    const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
-    // An explicit `thinkingLevel` key (even `undefined`) overrides the existing
-    // level; an omitted key preserves it. Pass the override as a single-element
-    // tuple so `writeProfile` can tell "clear to undefined" from "don't touch".
-    const thinkingOverride: [ThinkingLevel | undefined] | undefined = Object.hasOwn(options, 'thinkingLevel')
-      ? [options.thinkingLevel]
-      : undefined
-    return writeProfile(cwd, trimmed, ref, `model: ${verb} ${trimmed} → ${ref}`, customModel, thinkingOverride)
-  })
+  return underConfigLock(cwd, () => setProfileInLock(cwd, profile, ref, options))
 }
 
 // `add` is just `set` with a uniqueness guard; users who want "update" should
@@ -184,7 +155,7 @@ export function addProfile(
   ref: string,
   options: SetProfileOptions = {},
 ): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const existing = readModelsRaw(cwd)
     if (existing !== null && profile in existing) {
       return {
@@ -192,8 +163,39 @@ export function addProfile(
         reason: `Profile "${profile}" already exists. Use \`typeclaw model set ${profile} ${ref}\` to update it.`,
       }
     }
-    return setProfile(cwd, profile, ref, options)
+    return setProfileInLock(cwd, profile, ref, options)
   })
+}
+
+function setProfileInLock(cwd: string, profile: string, ref: string, options: SetProfileOptions): ConfigWrite {
+  const trimmed = profile.trim()
+  if (trimmed.length === 0) {
+    return { ok: false, reason: 'Profile name cannot be empty.' }
+  }
+  if (!isModelRef(ref)) {
+    return {
+      ok: false,
+      reason: `Unknown model "${ref}". Run \`typeclaw model list --available\` to see valid options.`,
+    }
+  }
+  const providerId = providerForModelRef(ref)
+  if (options.force !== true && !hasUsableCredential(cwd, providerId, options.env ?? process.env)) {
+    return {
+      ok: false,
+      reason: `Provider "${providerId}" has no credentials. Run \`typeclaw provider add ${providerId}\` first, or pass --force to write anyway.`,
+    }
+  }
+
+  const existingBefore = readModelsRaw(cwd)
+  const verb = existingBefore !== null && trimmed in existingBefore ? 'set' : 'add'
+  const customModel = !isKnownModelRef(ref) && options.meta !== undefined ? { ref, meta: options.meta } : undefined
+  // An explicit `thinkingLevel` key (even `undefined`) overrides the existing
+  // level; an omitted key preserves it. Pass the override as a single-element
+  // tuple so `writeProfile` can tell "clear to undefined" from "don't touch".
+  const thinkingOverride: [ThinkingLevel | undefined] | undefined = Object.hasOwn(options, 'thinkingLevel')
+    ? [options.thinkingLevel]
+    : undefined
+  return writeProfile(cwd, trimmed, ref, `model: ${verb} ${trimmed} → ${ref}`, customModel, thinkingOverride)
 }
 
 // `default` is required by the schema (`modelsSchema.refine`). Removing it
@@ -201,7 +203,7 @@ export function addProfile(
 // letting the next `validateConfig` failure confuse the user. To change the
 // default model, the user runs `typeclaw model set default <ref>`.
 export function removeProfile(cwd: string, profile: string): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     if (profile === 'default') {
       return {
         ok: false,
@@ -232,7 +234,7 @@ export function setProfileThinkingLevel(
   profile: string,
   level: ThinkingLevel | undefined,
 ): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const trimmed = profile.trim()
     if (trimmed.length === 0) {
       return { ok: false, reason: 'Profile name cannot be empty.' }
@@ -271,7 +273,7 @@ function writeProfile(
   // the existing level. The tuple is what lets an explicit clear win over a
   // pre-existing level instead of being swallowed by `??`.
   thinkingOverride?: [ThinkingLevel | undefined],
-): ModelMutationResult {
+): ConfigWrite {
   const existing = readModelsRaw(cwd)
   // Setting refs keeps a bare ref bare; it only becomes a rich object once a
   // thinkingLevel is present. An override replaces the level (including a clear
@@ -290,7 +292,7 @@ function writeModels(
   models: RawModels,
   commitMessage: string,
   customModel?: { ref: ModelRef; meta: CustomModelMeta },
-): ModelMutationResult {
+): ConfigWrite {
   return writeConfig(
     cwd,
     (parsed) => {
@@ -306,7 +308,7 @@ function writeConfig(
   mutate: (parsed: Record<string, unknown>) => void,
   commitMessage: string,
   customModel?: { ref: ModelRef; meta: CustomModelMeta },
-): ModelMutationResult {
+): ConfigWrite {
   const path = join(cwd, CONFIG_FILE)
   let parsed: Record<string, unknown>
   try {
@@ -347,6 +349,18 @@ function writeConfig(
       reason: `Failed to write ${CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
+  return { ok: true, commitMessage }
+}
+
+// A mutation that ran under the config lock; `commitMessage` is set when it wrote.
+type ConfigWrite = { ok: true; commitMessage?: string } | { ok: false; reason: string }
+
+// Runs a read-modify-write under the config lock, then validates and commits
+// after releasing it, so the lock is never held across a git subprocess.
+function underConfigLock(cwd: string, mutate: () => ConfigWrite): ModelMutationResult {
+  const write = withConfigFileLockSync(join(cwd, CONFIG_FILE), mutate)
+  if (!write.ok) return write
+  if (write.commitMessage === undefined) return { ok: true }
   // Final schema-pass for parity with every other host-side mutation that runs
   // through validateConfig. Mount checks etc. should never fail here because
   // we only touched `models`, but if the file was already in a bad state we
@@ -360,7 +374,7 @@ function writeConfig(
   // config mutation. Same pattern as `persistMigratedConfig` and cron
   // migrations: `commitSystemFileSync` no-ops on non-git folders, missing
   // Bun, and clean files, so callers outside a git repo pay zero cost.
-  commitSystemFileSync(cwd, CONFIG_FILE, commitMessage)
+  commitSystemFileSync(cwd, CONFIG_FILE, write.commitMessage)
   return { ok: true }
 }
 
@@ -396,7 +410,7 @@ export function setOverrideProfile(
   ref: string,
   options: SetOverrideProfileOptions = {},
 ): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const trimmed = profile.trim()
     if (trimmed.length === 0) return { ok: false, reason: 'Profile name cannot be empty.' }
     if (!isModelRef(ref)) {
@@ -440,7 +454,7 @@ export function setOverrideProfile(
 // Removing an override's last profile removes the override itself, since an
 // entry with no profiles would be schema-invalid and has nothing to apply.
 export function removeOverrideProfile(cwd: string, name: string, profile: string): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const existing = readOverridesRaw(cwd)[name]
     if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
     if (!(profile in existing.models)) {
@@ -448,13 +462,13 @@ export function removeOverrideProfile(cwd: string, name: string, profile: string
     }
     const models = { ...existing.models }
     delete models[profile]
-    if (Object.keys(models).length === 0) return removeOverride(cwd, name)
+    if (Object.keys(models).length === 0) return removeOverrideInLock(cwd, name)
     return writeOverride(cwd, name, { ...existing, models }, `model: remove ${profile} from override ${name}`)
   })
 }
 
 export function addOverrideMatch(cwd: string, name: string, rule: string): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const ruleError = modelOverrideRuleError(rule)
     if (ruleError !== undefined) return { ok: false, reason: `Invalid match rule "${rule}": ${ruleError}` }
     const existing = readOverridesRaw(cwd)[name]
@@ -475,7 +489,7 @@ export function addOverrideMatch(cwd: string, name: string, rule: string): Model
 }
 
 export function removeOverrideMatch(cwd: string, name: string, rule: string): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  return underConfigLock(cwd, () => {
     const existing = readOverridesRaw(cwd)[name]
     if (existing === undefined) return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
     if (!existing.match.includes(rule)) return { ok: false, reason: `Rule "${rule}" not found in override "${name}".` }
@@ -491,20 +505,22 @@ export function removeOverrideMatch(cwd: string, name: string, rule: string): Mo
 }
 
 export function removeOverride(cwd: string, name: string): ModelMutationResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
-    if (readOverridesRaw(cwd)[name] === undefined) {
-      return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
-    }
-    return writeConfig(
-      cwd,
-      (parsed) => {
-        const overrides = { ...(isObjectRecord(parsed.modelOverrides) ? parsed.modelOverrides : {}) }
-        delete overrides[name]
-        parsed.modelOverrides = overrides
-      },
-      `model: remove override ${name}`,
-    )
-  })
+  return underConfigLock(cwd, () => removeOverrideInLock(cwd, name))
+}
+
+function removeOverrideInLock(cwd: string, name: string): ConfigWrite {
+  if (readOverridesRaw(cwd)[name] === undefined) {
+    return { ok: false, reason: `Override "${name}" not found in ${CONFIG_FILE}.` }
+  }
+  return writeConfig(
+    cwd,
+    (parsed) => {
+      const overrides = { ...(isObjectRecord(parsed.modelOverrides) ? parsed.modelOverrides : {}) }
+      delete overrides[name]
+      parsed.modelOverrides = overrides
+    },
+    `model: remove override ${name}`,
+  )
 }
 
 type RawOverride = { match: string[]; models: RawModels }
@@ -515,7 +531,7 @@ function writeOverride(
   override: RawOverride,
   commitMessage: string,
   customModel?: { ref: ModelRef; meta: CustomModelMeta },
-): ModelMutationResult {
+): ConfigWrite {
   return writeConfig(
     cwd,
     (parsed) => {

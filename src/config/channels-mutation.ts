@@ -74,7 +74,7 @@ export function listChannels(cwd: string): ChannelListEntry[] {
 }
 
 export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  const removed = withConfigFileLockSync(join(cwd, CONFIG_FILE), (): ConfigRemoval | { ok: false; reason: string } => {
     const config = readConfigRecord(cwd)
     if (!config.ok) return config
 
@@ -110,19 +110,29 @@ export function removeChannel(cwd: string, kind: ChannelKind): RemoveChannelResu
 
     const githubCleanup = kind === 'github' ? cleanGithubConfig(config.value, githubRepos) : undefined
 
-    const write = writeConfig(cwd, config.value, `channel: remove ${kind}`)
+    const write = writeConfig(cwd, config.value)
     if (!write.ok) return write
-
-    const secretsRemoved = new SecretsBackend(join(cwd, SECRETS_FILE)).removeChannelSync(kind)
-
-    return {
-      ok: true,
-      configRemoved: inConfig,
-      secretsRemoved,
-      ...(githubCleanup !== undefined ? { githubCleanup } : {}),
-      hadRemoteWebhooks,
-    }
+    return { ok: true, inConfig, githubCleanup, hadRemoteWebhooks }
   })
+  if (!removed.ok) return removed
+  commitSystemFileSync(cwd, CONFIG_FILE, `channel: remove ${kind}`)
+
+  const secretsRemoved = new SecretsBackend(join(cwd, SECRETS_FILE)).removeChannelSync(kind)
+
+  return {
+    ok: true,
+    configRemoved: removed.inConfig,
+    secretsRemoved,
+    ...(removed.githubCleanup !== undefined ? { githubCleanup: removed.githubCleanup } : {}),
+    hadRemoteWebhooks: removed.hadRemoteWebhooks,
+  }
+}
+
+type ConfigRemoval = {
+  ok: true
+  inConfig: boolean
+  githubCleanup: GithubConfigCleanup | undefined
+  hadRemoteWebhooks: boolean
 }
 
 // GitHub `add` writes three config artifacts beyond `channels.github`: a
@@ -255,17 +265,12 @@ function channelSecretsOrEmpty(read: ChannelSecretsRead): Record<string, unknown
   return read.kind === 'ok' ? read.channels : {}
 }
 
-function writeConfig(
-  cwd: string,
-  record: Record<string, unknown>,
-  commitMessage: string,
-): { ok: true } | { ok: false; reason: string } {
+function writeConfig(cwd: string, record: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {
   try {
     writeFileSync(join(cwd, CONFIG_FILE), `${JSON.stringify(record, null, 2)}\n`)
   } catch (error) {
     return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
   }
-  commitSystemFileSync(cwd, CONFIG_FILE, commitMessage)
   return { ok: true }
 }
 

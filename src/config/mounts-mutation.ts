@@ -37,7 +37,7 @@ export function listMounts(cwd: string): MountListEntry[] {
 }
 
 export function addMount(cwd: string, name: string, path: string, options: AddMountOptions = {}): AddMountResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  const added = withConfigFileLockSync(join(cwd, CONFIG_FILE), (): MountWrite => {
     const mount = buildMount(name, path, options)
     if (!mount.ok) return mount
 
@@ -57,14 +57,17 @@ export function addMount(cwd: string, name: string, path: string, options: AddMo
     }
 
     const next = { ...parsed.value, mounts: [...current.value, mount.value] }
-    const write = writeMounts(cwd, next, `mount: add ${mount.value.name}`)
+    const write = writeMounts(cwd, next)
     if (!write.ok) return write
-    return { ok: true, entry: toListEntry(mount.value, cwd) }
+    return { ok: true, mount: mount.value }
   })
+  if (!added.ok) return added
+  commitSystemFileSync(cwd, CONFIG_FILE, `mount: add ${added.mount.name}`)
+  return { ok: true, entry: toListEntry(added.mount, cwd) }
 }
 
 export function removeMount(cwd: string, name: string): RemoveMountResult {
-  return withConfigFileLockSync(join(cwd, CONFIG_FILE), () => {
+  const removed = withConfigFileLockSync(join(cwd, CONFIG_FILE), (): MountWrite => {
     const trimmed = name.trim()
     if (trimmed.length === 0) return { ok: false, reason: 'Mount name cannot be empty.' }
 
@@ -78,11 +81,16 @@ export function removeMount(cwd: string, name: string): RemoveMountResult {
     if (removed === undefined) return { ok: false, reason: `Mount "${trimmed}" not found in ${CONFIG_FILE}.` }
 
     const next = { ...parsed.value, mounts: current.value.filter((m) => m.name !== trimmed) }
-    const write = writeMounts(cwd, next, `mount: remove ${trimmed}`)
+    const write = writeMounts(cwd, next)
     if (!write.ok) return write
-    return { ok: true, removed: toListEntry(removed, cwd) }
+    return { ok: true, mount: removed }
   })
+  if (!removed.ok) return removed
+  commitSystemFileSync(cwd, CONFIG_FILE, `mount: remove ${removed.mount.name}`)
+  return { ok: true, removed: toListEntry(removed.mount, cwd) }
 }
+
+type MountWrite = { ok: true; mount: Mount } | { ok: false; reason: string }
 
 function buildMount(
   name: string,
@@ -127,11 +135,7 @@ function readMounts(record: Record<string, unknown>): { ok: true; value: Mount[]
   return { ok: true, value: parsed.data.mounts }
 }
 
-function writeMounts(
-  cwd: string,
-  record: Record<string, unknown>,
-  commitMessage: string,
-): { ok: true } | { ok: false; reason: string } {
+function writeMounts(cwd: string, record: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {
   const parsed = configSchema.safeParse(record)
   if (!parsed.success) {
     return { ok: false, reason: `mounts block would be invalid: ${parsed.error.issues.map(formatIssue).join('; ')}` }
@@ -142,8 +146,6 @@ function writeMounts(
   } catch (error) {
     return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
   }
-
-  commitSystemFileSync(cwd, CONFIG_FILE, commitMessage)
   return { ok: true }
 }
 
