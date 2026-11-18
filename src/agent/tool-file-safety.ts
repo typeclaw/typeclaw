@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 
 import {
   checkPrivateSurfaceReadGuard,
@@ -28,6 +28,7 @@ import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
 import type { HiddenPaths } from '@/sandbox/hidden-paths'
 
+import { normalizeFileReference } from './file-reference'
 import { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS } from './tools-without-local-file-operands'
 
 export { TOOLS_WITHOUT_LOCAL_FILE_OPERANDS }
@@ -1324,16 +1325,6 @@ function isDeniedSnapshotPath(
       hidden: options.hidden ?? { dirs: [], files: [] },
     }) !== undefined
   )
-}
-
-function normalizeFileReference(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed.toLocaleLowerCase().startsWith('file:')) return value
-  try {
-    return fileURLToPath(trimmed)
-  } catch {
-    throw new Error(`invalid file URI: ${value}`)
-  }
 }
 
 function inputTooLarge(original: string, size: number, maxBytes: number): Error {
