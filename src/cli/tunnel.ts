@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
@@ -358,10 +358,9 @@ export async function runTunnelAddFlow(
     if (provider === 'cloudflare-quick' || provider === 'cloudflare-named') {
       raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
     }
-    writeRawConfig(cwd, raw)
-    // Only an add that won its write stores its token, so a rejected one never
-    // replaces the credential of the tunnel that won.
-    if (tokenEnv !== undefined && tokenValue !== undefined) appendOrReplaceEnvKey(cwd, tokenEnv, tokenValue)
+    const token = tokenEnv !== undefined && tokenValue !== undefined ? { env: tokenEnv, value: tokenValue } : undefined
+    const written = writeConfigAndToken(cwd, raw, token, 'typeclaw tunnel add')
+    if (!written.ok) return written
     return { ok: true, value: tunnel }
   })
   if (added.ok) loadConfigSync(cwd)
@@ -567,10 +566,10 @@ export async function runTunnelSetFlow(
     // in an invalid state.
     const check = parseConfigJson(JSON.stringify(raw))
     if (!check.ok) return check
-    writeRawConfig(cwd, raw)
-    // Only a set that won its write stores its token, so a rejected one never
-    // replaces the credential of the edit that won.
-    if (next.tokenEnv !== undefined && tokenValue !== undefined) appendOrReplaceEnvKey(cwd, next.tokenEnv, tokenValue)
+    const token =
+      next.tokenEnv !== undefined && tokenValue !== undefined ? { env: next.tokenEnv, value: tokenValue } : undefined
+    const written = writeConfigAndToken(cwd, raw, token, `typeclaw tunnel set ${existing.name}`)
+    if (!written.ok) return written
     return { ok: true, value: next }
   })
   if (updated.ok) loadConfigSync(cwd)
@@ -923,6 +922,53 @@ function ensureAgentDir(): string {
     process.exit(1)
   }
   return cwd
+}
+
+// Called under the config lock once a flow has won its typeclaw.json write.
+// The prompted token is stored only if no other command stored that key since
+// the prompt, and the token and config land together or not at all: .env is
+// written first and put back byte-for-byte if the config write then fails.
+function writeConfigAndToken(
+  cwd: string,
+  raw: Record<string, unknown>,
+  token: { env: string; value: string } | undefined,
+  rerun: string,
+): LiveResult<void> {
+  if (token === undefined) {
+    writeRawConfig(cwd, raw)
+    return { ok: true, value: undefined }
+  }
+  if (hasEnvKey(cwd, token.env)) {
+    return {
+      ok: false,
+      reason: `${token.env} was stored in .env by another typeclaw command while this one was in progress; nothing was written. Rerun \`${rerun}\` to use the stored token.`,
+    }
+  }
+  const envPath = join(cwd, '.env')
+  const priorEnv = readFileOrUndefined(envPath)
+  let envWritten = false
+  try {
+    appendOrReplaceEnvKey(cwd, token.env, token.value)
+    envWritten = true
+    writeRawConfig(cwd, raw)
+  } catch (error) {
+    if (envWritten && priorEnv === undefined) rmSync(envPath, { force: true })
+    else if (envWritten && priorEnv !== undefined) writeFileSync(envPath, priorEnv)
+    return {
+      ok: false,
+      reason: `failed to store the tunnel: ${error instanceof Error ? error.message : String(error)}. Neither .env nor typeclaw.json was changed.`,
+    }
+  }
+  return { ok: true, value: undefined }
+}
+
+function readFileOrUndefined(path: string): Buffer | undefined {
+  try {
+    return readFileSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
 }
 
 // Tunnels as typeclaw.json holds them now. Parsed without persisting a

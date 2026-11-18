@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -278,6 +278,106 @@ describe('tunnel add/remove config flows', () => {
     expect(await readFile(config, 'utf8')).toBe(winnerConfig)
     expect(await readFile(env, 'utf8')).toBe(winnerEnv)
   })
+
+  test('add fails with a conflict when another command stores the same token key while it prompts', async () => {
+    // given: while this add waits on its token prompt, another command stores
+    // the same token key in .env
+    const cwd = await makeAgentDir({})
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    const configBefore = await readFile(config, 'utf8')
+    let otherEnv = ''
+
+    // when: this add reaches its write
+    const result = await tunnel.runTunnelAddFlow(
+      cwd,
+      { name: 'demo', forChannel: 'github' },
+      {
+        ...namedTunnelPrompts,
+        password: async () => {
+          await writeFile(env, 'CLOUDFLARE_TUNNEL_TOKEN=other-token\n')
+          otherEnv = await readFile(env, 'utf8')
+          return 'this-token'
+        },
+      },
+    )
+
+    // then: it reports the conflict and writes neither file
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('CLOUDFLARE_TUNNEL_TOKEN was stored in .env by another typeclaw command')
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(await readFile(env, 'utf8')).toBe(otherEnv)
+  })
+
+  test.skipIf(isRoot || process.platform === 'win32')(
+    'add changes neither file when its token cannot be stored in .env',
+    async () => {
+      // given: .env becomes read-only while this add waits on its token prompt
+      const cwd = await makeAgentDir({})
+      const config = join(cwd, 'typeclaw.json')
+      const env = join(cwd, '.env')
+      await writeFile(env, 'OTHER=1\n')
+      const configBefore = await readFile(config, 'utf8')
+      try {
+        // when: this add reaches its write
+        const result = await tunnel.runTunnelAddFlow(
+          cwd,
+          { name: 'demo', forChannel: 'github' },
+          {
+            ...namedTunnelPrompts,
+            password: async () => {
+              await chmod(env, 0o444)
+              return 'this-token'
+            },
+          },
+        )
+
+        // then: it fails without publishing the tunnel
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain('Neither .env nor typeclaw.json was changed')
+        expect(await readFile(config, 'utf8')).toBe(configBefore)
+        expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+      } finally {
+        await chmod(env, 0o644)
+      }
+    },
+  )
+
+  test.skipIf(isRoot || process.platform === 'win32')(
+    'add removes the .env it created when typeclaw.json cannot be written',
+    async () => {
+      // given: no .env yet, and typeclaw.json becomes read-only while this add
+      // waits on its token prompt
+      const cwd = await makeAgentDir({})
+      const config = join(cwd, 'typeclaw.json')
+      const configBefore = await readFile(config, 'utf8')
+      try {
+        // when: this add reaches its write
+        const result = await tunnel.runTunnelAddFlow(
+          cwd,
+          { name: 'demo', forChannel: 'github' },
+          {
+            ...namedTunnelPrompts,
+            password: async () => {
+              await chmod(config, 0o444)
+              return 'this-token'
+            },
+          },
+        )
+
+        // then: it fails and takes back the token it stored
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain('Neither .env nor typeclaw.json was changed')
+        expect(await readFile(config, 'utf8')).toBe(configBefore)
+        expect(existsSync(join(cwd, '.env'))).toBe(false)
+      } finally {
+        await chmod(config, 0o644)
+      }
+    },
+  )
 
   test('non-interactive add rejects a name that violates the schema regex', async () => {
     const cwd = await makeAgentDir({})
@@ -643,6 +743,45 @@ describe('tunnel set config flow', () => {
     expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
   })
 
+  test.skipIf(isRoot || process.platform === 'win32')(
+    'set restores .env byte-for-byte when typeclaw.json cannot be written',
+    async () => {
+      // given: an existing .env, and typeclaw.json becomes read-only while this
+      // set (switching to a named tunnel) waits on its token prompt
+      const cwd = await makeAgentDir({
+        tunnels: [{ name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } }],
+      })
+      const config = join(cwd, 'typeclaw.json')
+      const env = join(cwd, '.env')
+      await writeFile(env, '# operator notes\nOTHER=1')
+      const configBefore = await readFile(config, 'utf8')
+      try {
+        // when: this set reaches its write
+        const result = await tunnel.runTunnelSetFlow(
+          cwd,
+          { name: 'github-webhook' },
+          {
+            ...namedTunnelPrompts,
+            selectSetField: async () => 'provider',
+            password: async () => {
+              await chmod(config, 0o444)
+              return 'this-token'
+            },
+          },
+        )
+
+        // then: it fails and puts .env back exactly as it was
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain('Neither .env nor typeclaw.json was changed')
+        expect(await readFile(config, 'utf8')).toBe(configBefore)
+        expect(await readFile(env, 'utf8')).toBe('# operator notes\nOTHER=1')
+      } finally {
+        await chmod(config, 0o644)
+      }
+    },
+  )
+
   test('interactive set with no name auto-picks the only configured tunnel', async () => {
     const cwd = await makeAgentDir({
       tunnels: [
@@ -891,6 +1030,16 @@ describe('resolveInContainerWsUrl', () => {
     )
   })
 })
+
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
+
+// Interactive answers for a named-tunnel add or provider switch; tests override
+// `password` to act as a concurrent command while the flow waits on the token.
+const namedTunnelPrompts = {
+  selectProvider: async () => 'cloudflare-named' as const,
+  selectOwner: async () => 'channel' as const,
+  text: async () => 'https://agent.example.com',
+}
 
 async function makeAgentDir(config: Record<string, unknown>): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'typeclaw-tunnel-cli-'))
