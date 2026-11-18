@@ -37,6 +37,8 @@ export async function resolveGitIdentity(cwd: string): Promise<GitIdentity | nul
 // Commits by the runtime (backup, dreaming, system files) need an identity, and
 // repository-local config is lost on clone or by hand edits. Fill only the
 // missing keys from the agent folder name; an identity the user set is kept.
+// Only a pair synthesized in full is marked as fallback: a half the operator set
+// is explicit even when its value happens to equal the folder-derived one.
 export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null> {
   const repo = resolveAgentGit(cwd)
   if (repo === null) return null
@@ -50,7 +52,9 @@ export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null
   const identity = { name: name ?? fallback.name, email: email ?? fallback.email }
   if (name === null && !(await writeLocalConfig(cwd, repo.gitArgs, 'user.name', identity.name))) return null
   if (email === null && !(await writeLocalConfig(cwd, repo.gitArgs, 'user.email', identity.email))) return null
-  await writeLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY, formatIdentity(identity))
+  if (name === null && email === null) {
+    await writeLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY, formatIdentity(identity))
+  }
   return identity
 }
 
@@ -120,6 +124,11 @@ export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity):
   if (repo === null) return false
   const marker = (await readRepositoryIdentity(cwd, repo.gitArgs)).get(FALLBACK_MARKER_KEY)?.at(-1)
   return marker === formatIdentity(identity)
+}
+
+export async function hasExplicitGitIdentity(cwd: string): Promise<boolean> {
+  const identity = await resolveGitIdentity(cwd)
+  return identity !== null && !(await isFallbackGitIdentity(cwd, identity))
 }
 
 function formatIdentity(identity: GitIdentity): string {

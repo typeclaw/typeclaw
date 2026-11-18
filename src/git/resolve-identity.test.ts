@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 
 import {
   _internal,
   ensureGitIdentity,
+  hasExplicitGitIdentity,
   isFallbackGitIdentity,
   resolveGitIdentity,
   trackGithubGitIdentityEnv,
@@ -183,6 +184,37 @@ describe('resolveGitIdentity', () => {
     await expect(syncConfiguredGitIdentity(repo, undefined)).resolves.toBe(true)
 
     expect((await stat(config)).ino).toBe(before.ino)
+  })
+
+  test('hasExplicitGitIdentity is false only while the identity is missing or wholly synthesized', async () => {
+    const missing = await tempDir('typeclaw-git-identity-explicit-missing-')
+    await git(missing, ['init', '-q'])
+    const synthesized = await tempDir('typeclaw-git-identity-explicit-fallback-')
+    await git(synthesized, ['init', '-q'])
+    await ensureGitIdentity(synthesized)
+    const configured = await tempDir('typeclaw-git-identity-explicit-configured-')
+    await git(configured, ['init', '-q'])
+    await git(configured, ['config', '--local', 'user.name', 'Operator Pick'])
+    await git(configured, ['config', '--local', 'user.email', 'pick@example.com'])
+
+    await expect(hasExplicitGitIdentity(missing)).resolves.toBe(false)
+    await expect(hasExplicitGitIdentity(synthesized)).resolves.toBe(false)
+    await expect(hasExplicitGitIdentity(configured)).resolves.toBe(true)
+
+    // ensureGitIdentity fills only the missing key; the operator's half stays
+    // explicit, including when its value equals the folder-derived one
+    for (const pick of [
+      () => ['user.name', 'Operator Name'],
+      () => ['user.email', 'operator@example.com'],
+      (dir: string) => ['user.name', basename(dir)],
+      (dir: string) => ['user.email', `${basename(dir).toLowerCase()}@typeclaw.local`],
+    ]) {
+      const partial = await tempDir('typeclaw-git-identity-explicit-partial-')
+      await git(partial, ['init', '-q'])
+      await git(partial, ['config', '--local', ...pick(partial)])
+      await ensureGitIdentity(partial)
+      await expect(hasExplicitGitIdentity(partial)).resolves.toBe(true)
+    }
   })
 
   test('ensureGitIdentity leaves a non-repository untouched', async () => {
