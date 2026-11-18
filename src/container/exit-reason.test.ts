@@ -27,7 +27,15 @@ describe('inspectContainerExit', () => {
     [`${id}|false|false|1|6442450944|${finishedAt}`, null],
   ])('classifies a stopped container from Docker state: %s', async (stdout, reason) => {
     const exec: DockerExec = async () => ({ exitCode: 0, stdout, stderr: '' })
-    expect(await inspectContainerExit(exec, 'agent')).toEqual({ kind: 'stopped', containerId: id, finishedAt, reason })
+    const [, , oomKilled, exitCode] = stdout.split('|')
+    expect(await inspectContainerExit(exec, 'agent')).toEqual({
+      kind: 'stopped',
+      containerId: id,
+      finishedAt,
+      exitCode: Number(exitCode),
+      oomKilled: oomKilled === 'true',
+      reason,
+    })
   })
 
   test('running container yields no exit reason even with stale OOM flag', async () => {
