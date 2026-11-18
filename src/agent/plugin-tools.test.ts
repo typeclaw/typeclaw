@@ -7541,3 +7541,112 @@ describe('loop guard integration', () => {
     expect(calls.length).toBe(10)
   })
 })
+
+describe('managed config commit check', () => {
+  // A stand-in for the typeclaw.json guards: this session may not change
+  // `alias` from what the file holds when the guard runs.
+  function aliasLockedHooks(agentDir: string, onPreCheck?: () => Promise<void>) {
+    const hooks = createHookBus()
+    let checks = 0
+    hooks.registerAll('alias-lock', agentDir, noopLogger, {
+      'tool.before': async (event) => {
+        if (event.tool !== 'write' || typeof event.args.content !== 'string') return undefined
+        if (!String(event.args.path).endsWith('typeclaw.json')) return undefined
+        checks += 1
+        const current = JSON.parse(await readFile(path.join(agentDir, 'typeclaw.json'), 'utf8')) as { alias?: string[] }
+        const intended = JSON.parse(event.args.content) as { alias?: string[] }
+        const blocked = JSON.stringify(intended.alias) !== JSON.stringify(current.alias)
+        if (checks === 1) await onPreCheck?.()
+        return blocked ? { block: true, reason: 'alias may not change' } : undefined
+      },
+    })
+    return { hooks, checks: () => checks }
+  }
+
+  function writeTool(agentDir: string, hooks: ReturnType<typeof createHookBus>) {
+    const tui: SessionOrigin = { kind: 'tui', sessionId: 'commit-check' }
+    const write = buildBuiltinPiToolOverrides({
+      agentDir,
+      sessionId: 'commit-check',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+    }).find((tool) => tool.name === 'write')
+    if (write === undefined) throw new Error('missing write builtin')
+    return write
+  }
+
+  test.skipIf(lacksInodeAnchoring)(
+    'rejects a stale write when the file changed between its guard check and its write',
+    async () => {
+      // given: a write whose pre-check passes, then a privileged change lands
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-stale-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, `${JSON.stringify({ alias: ['atlas'] })}\n`)
+      const { hooks, checks } = aliasLockedHooks(agentDir, async () => {
+        await writeFile(config, `${JSON.stringify({ alias: ['renamed'] })}\n`)
+      })
+      try {
+        // when: the stale write, still carrying the old alias, reaches its commit
+        const execution = writeTool(agentDir, hooks).execute(
+          'c',
+          { path: 'typeclaw.json', content: `${JSON.stringify({ alias: ['atlas'] })}\n` } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: the commit-time check sees the change and nothing is overwritten
+        await expect(execution).rejects.toThrow(/alias may not change/)
+        expect(checks()).toBe(2)
+        expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['renamed'] })
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)('lets a write through when nothing changed since its guard check', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-ok-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    await writeFile(config, `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    const { hooks, checks } = aliasLockedHooks(agentDir)
+    try {
+      const content = `${JSON.stringify({ alias: ['atlas'], branding: false })}\n`
+
+      await writeTool(agentDir, hooks).execute(
+        'c',
+        { path: 'typeclaw.json', content } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(checks()).toBe(2)
+      expect(await readFile(config, 'utf8')).toBe(content)
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test.skipIf(lacksInodeAnchoring)('does not re-check writes to other files', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-other-'))
+    await mkdir(path.join(agentDir, 'workspace'))
+    await writeFile(path.join(agentDir, 'typeclaw.json'), '{}\n')
+    const { hooks, checks } = aliasLockedHooks(agentDir)
+    try {
+      await writeTool(agentDir, hooks).execute(
+        'c',
+        { path: 'workspace/notes.md', content: 'hello' } as never,
+        undefined,
+        undefined,
+        {} as never,
+      )
+
+      expect(checks()).toBe(0)
+      expect(await readFile(path.join(agentDir, 'workspace', 'notes.md'), 'utf8')).toBe('hello')
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+})

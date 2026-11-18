@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { constants, createWriteStream, lstatSync, type Stats } from 'node:fs'
 import {
   chmod,
@@ -845,7 +846,48 @@ export async function writeFileAnchored(options: {
   if (cleanupError !== undefined) throw cleanupError
 }
 
+// The typeclaw.json and cron.json guards authorize a write/edit in tool.before,
+// against the file as it was then, but the bytes land later. A stale write
+// that passed that check could restore a value a privileged session has since
+// changed. So a write to one of these files re-runs its guards on the exact
+// bytes, against the file as it is now, and checked writes are serialized so
+// no other one lands between a check and its write.
+export type ManagedConfigCommitCheck = {
+  agentDir: string
+  check(content: string): Promise<void>
+}
+
+const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
+const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
+let checkedWrites: Promise<unknown> = Promise.resolve()
+
+export function runWithManagedConfigCommitCheck<T>(check: ManagedConfigCommitCheck, fn: () => Promise<T>): Promise<T> {
+  return managedConfigCommitCheck.run(check, fn)
+}
+
 export async function writeToolOutputNoFollow(targetPath: string, content: string): Promise<void> {
+  const commit = managedConfigCommitCheck.getStore()
+  if (commit === undefined || !(await isManagedConfigDestination(commit.agentDir, targetPath))) {
+    return writeOutputNoFollow(targetPath, content)
+  }
+  const write = checkedWrites.then(async () => {
+    await commit.check(content)
+    await writeOutputNoFollow(targetPath, content)
+  })
+  checkedWrites = write.catch(() => {})
+  return write
+}
+
+async function isManagedConfigDestination(agentDir: string, targetPath: string): Promise<boolean> {
+  const destination = await realpath(targetPath).catch(() => path.resolve(targetPath))
+  for (const file of MANAGED_CONFIG_FILES) {
+    const managed = path.join(path.resolve(agentDir), file)
+    if (destination === managed || destination === (await realpath(managed).catch(() => managed))) return true
+  }
+  return false
+}
+
+async function writeOutputNoFollow(targetPath: string, content: string): Promise<void> {
   const trustedDescriptorPath = /^\/proc\/self\/fd\/\d+$/.test(targetPath)
   const flags = trustedDescriptorPath
     ? constants.O_WRONLY | constants.O_TRUNC

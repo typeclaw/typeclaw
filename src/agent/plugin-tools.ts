@@ -75,7 +75,7 @@ import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-
 import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-bash-policy'
 import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
-import { enforceAndPinToolFiles, writeToolOutputNoFollow } from './tool-file-safety'
+import { enforceAndPinToolFiles, runWithManagedConfigCommitCheck, writeToolOutputNoFollow } from './tool-file-safety'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
 import { webFetchTool } from './tools/webfetch'
 import { webSearchTool } from './tools/websearch'
@@ -709,9 +709,36 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               : tool.name === 'bash'
                 ? {}
                 : undefined
-          const executed = await bashEnvStore.run(spawnEnvContext, () =>
-            tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
-          )
+          const run = () =>
+            bashEnvStore.run(spawnEnvContext, () =>
+              tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
+            )
+          // A write/edit of typeclaw.json or cron.json re-runs this session's
+          // guards on the exact bytes at commit (see writeToolOutputNoFollow).
+          const executed =
+            tool.name === 'write' || tool.name === 'edit'
+              ? await runWithManagedConfigCommitCheck(
+                  {
+                    agentDir: opts.agentDir,
+                    check: async (content) => {
+                      const block = await opts.hooks.runToolBefore(
+                        {
+                          tool: 'write',
+                          sessionId: opts.sessionId,
+                          callId: toolCallId,
+                          args: { path: originalArgs.path, content },
+                          toolProvenance: 'first-party',
+                          ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+                        },
+                        opts.guards,
+                        envelope.acknowledgements,
+                      )
+                      if (block !== undefined) throw new Error(`blocked: ${block.reason}`)
+                    },
+                  },
+                  run,
+                )
+              : await run()
           // Pi 0.99 bash returns a nonzero exit as an `isError` result whose text
           // is the message 0.87 threw (tools/bash.js). This wrapper returns only
           // content/details, so rethrow to keep the failure on the error path
