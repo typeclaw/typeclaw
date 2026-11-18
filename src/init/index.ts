@@ -53,7 +53,7 @@ export { formatEagerGithubWebhookInstallResult, installGithubWebhooksEagerly } f
 
 export { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
 
-export { appendOrReplaceEnvKey, hasEnvKey, readEnvFile } from './env-file'
+export { appendOrReplaceEnvKey, hasEnvKey, readEnvFile, withEnvKey } from './env-file'
 
 export { CONFIG_FILE, findAgentDir, isInitialized }
 

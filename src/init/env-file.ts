@@ -69,6 +69,12 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
   } catch (err) {
     if (!(err instanceof Error) || !('code' in err) || err.code !== 'ENOENT') throw err
   }
+  writeFileSync(path, withEnvKey(raw, key, value), 'utf8')
+}
+
+// The `.env` content `appendOrReplaceEnvKey` writes, for callers that write it
+// themselves.
+export function withEnvKey(raw: string, key: string, value: string): string {
   const lines = raw.length === 0 ? [] : raw.split(/\r?\n/)
   // `"foo\n".split(/\r?\n/)` returns `["foo", ""]` — strip that phantom
   // trailing empty element so the rebuilt output ends in exactly one newline
@@ -85,6 +91,5 @@ export function appendOrReplaceEnvKey(cwd: string, key: string, value: string): 
     return `${bom}${key}=${value}`
   })
   if (!replaced) next.push(`${key}=${value}`)
-  const out = `${next.join('\n')}\n`
-  writeFileSync(path, out, 'utf8')
+  return `${next.join('\n')}\n`
 }

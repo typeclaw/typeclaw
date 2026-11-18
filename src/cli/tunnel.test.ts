@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +10,8 @@ import { waitFor } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
 
 const tunnel = await import('./tunnel')
+
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
 
 let server: ReturnType<ReturnType<typeof createServer>['start']> | null = null
 let prevNoColor: string | undefined
@@ -346,7 +348,7 @@ describe('tunnel add/remove config flows', () => {
   )
 
   test.skipIf(isRoot || process.platform === 'win32')(
-    'add removes the .env it created when typeclaw.json cannot be written',
+    'add creates no .env when typeclaw.json is read-only',
     async () => {
       // given: no .env yet, and typeclaw.json becomes read-only while this add
       // waits on its token prompt
@@ -367,7 +369,7 @@ describe('tunnel add/remove config flows', () => {
           },
         )
 
-        // then: it fails and takes back the token it stored
+        // then: it fails before publishing either file
         expect(result.ok).toBe(false)
         if (result.ok) throw new Error('unreachable')
         expect(result.reason).toContain('Neither .env nor typeclaw.json was changed')
@@ -744,7 +746,7 @@ describe('tunnel set config flow', () => {
   })
 
   test.skipIf(isRoot || process.platform === 'win32')(
-    'set restores .env byte-for-byte when typeclaw.json cannot be written',
+    'set changes neither file when typeclaw.json is read-only',
     async () => {
       // given: an existing .env, and typeclaw.json becomes read-only while this
       // set (switching to a named tunnel) waits on its token prompt
@@ -770,7 +772,7 @@ describe('tunnel set config flow', () => {
           },
         )
 
-        // then: it fails and puts .env back exactly as it was
+        // then: it fails before publishing either file
         expect(result.ok).toBe(false)
         if (result.ok) throw new Error('unreachable')
         expect(result.reason).toContain('Neither .env nor typeclaw.json was changed')
@@ -932,6 +934,96 @@ describe('tunnel set config flow', () => {
   })
 })
 
+describe('writeConfigAndToken', () => {
+  const token = { env: 'CLOUDFLARE_TUNNEL_TOKEN', value: 'new-token' }
+  const nextConfig = { tunnels: [{ name: 'demo', provider: 'cloudflare-named' }] }
+
+  // Fails the typeclaw.json publish after .env was published, and optionally
+  // every later .env publish (the rollback).
+  function failConfigPublish(failRollback: boolean) {
+    let envPublishes = 0
+    return (from: string, to: string) => {
+      if (to.endsWith('typeclaw.json')) throw new Error('injected config publish failure')
+      if (to.endsWith('.env') && ++envPublishes > 1 && failRollback) throw new Error('injected rollback failure')
+      renameSync(from, to)
+    }
+  }
+
+  function leftoverTemps(cwd: string): string[] {
+    return readdirSync(cwd).filter((name) => name.endsWith('.typeclaw-tmp'))
+  }
+
+  test('restores .env byte-for-byte when typeclaw.json fails to publish after .env did', async () => {
+    // given: an existing .env and typeclaw.json
+    const cwd = await makeAgentDir({ tunnels: [] })
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    await writeFile(env, '# operator notes\nOTHER=1')
+    const configBefore = await readFile(config, 'utf8')
+
+    // when: the config publish fails after .env was renamed into place
+    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', failConfigPublish(false))
+
+    // then: both files are exactly as before and no staged file is left
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('typeclaw.json was not changed; .env was restored.')
+    expect(await readFile(env, 'utf8')).toBe('# operator notes\nOTHER=1')
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
+    expect(leftoverTemps(cwd)).toEqual([])
+  })
+
+  test('removes the .env it published when there was none and typeclaw.json fails to publish', async () => {
+    const cwd = await makeAgentDir({ tunnels: [] })
+    const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+
+    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', failConfigPublish(false))
+
+    expect(result.ok).toBe(false)
+    expect(existsSync(join(cwd, '.env'))).toBe(false)
+    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
+    expect(leftoverTemps(cwd)).toEqual([])
+  })
+
+  test('names .env and the fix when restoring it fails too', async () => {
+    // given: an existing .env and typeclaw.json
+    const cwd = await makeAgentDir({ tunnels: [] })
+    const env = join(cwd, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+
+    // when: both the config publish and the .env rollback fail
+    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', failConfigPublish(true))
+
+    // then: the failure says .env still holds the token and how to fix it
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain(`.env could not be restored (injected rollback failure)`)
+    expect(result.reason).toContain(`remove the CLOUDFLARE_TUNNEL_TOKEN line from ${env} by hand`)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\nCLOUDFLARE_TUNNEL_TOKEN=new-token\n')
+    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
+    expect(leftoverTemps(cwd)).toEqual([])
+  })
+
+  test.skipIf(process.platform === 'win32')('keeps each file mode when it publishes both', async () => {
+    const cwd = await makeAgentDir({ tunnels: [] })
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    await chmod(env, 0o600)
+    await chmod(config, 0o640)
+
+    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add')
+
+    expect(result.ok).toBe(true)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\nCLOUDFLARE_TUNNEL_TOKEN=new-token\n')
+    expect(JSON.parse(await readFile(config, 'utf8'))).toEqual(nextConfig)
+    expect(statSync(env).mode & 0o777).toBe(0o600)
+    expect(statSync(config).mode & 0o777).toBe(0o640)
+    expect(leftoverTemps(cwd)).toEqual([])
+  })
+})
+
 describe('tunnel live commands', () => {
   test('list against a websocket server prints expected rows', async () => {
     const built = createServer({
@@ -1030,8 +1122,6 @@ describe('resolveInContainerWsUrl', () => {
     )
   })
 })
-
-const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
 
 // Interactive answers for a named-tunnel add or provider switch; tests override
 // `password` to act as a concurrent command while the flow waits on the token.

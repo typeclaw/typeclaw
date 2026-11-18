@@ -1,5 +1,6 @@
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { accessSync, chmodSync, constants, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
@@ -8,7 +9,7 @@ import { defineCommand } from 'citty'
 import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
-import { appendOrReplaceEnvKey, findAgentDir, hasEnvKey, isInitialized } from '@/init'
+import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -926,16 +927,21 @@ function ensureAgentDir(): string {
 
 // Called under the config lock once a flow has won its typeclaw.json write.
 // The prompted token is stored only if no other command stored that key since
-// the prompt, and the token and config land together or not at all: .env is
-// written first and put back byte-for-byte if the config write then fails.
-function writeConfigAndToken(
+// the prompt, and the token and config land together or not at all: both
+// replacements are staged beside their files, .env is renamed into place and
+// then typeclaw.json, and .env is put back if typeclaw.json cannot be.
+// `rename` is a seam for tests that fail a publish after writing has begun.
+export function writeConfigAndToken(
   cwd: string,
   raw: Record<string, unknown>,
   token: { env: string; value: string } | undefined,
   rerun: string,
+  rename: (from: string, to: string) => void = renameSync,
 ): LiveResult<void> {
+  const configPath = join(cwd, 'typeclaw.json')
+  const configBytes = `${JSON.stringify(raw, null, 2)}\n`
   if (token === undefined) {
-    writeRawConfig(cwd, raw)
+    replaceFile(configPath, configBytes, rename)
     return { ok: true, value: undefined }
   }
   if (hasEnvKey(cwd, token.env)) {
@@ -946,20 +952,94 @@ function writeConfigAndToken(
   }
   const envPath = join(cwd, '.env')
   const priorEnv = readFileOrUndefined(envPath)
-  let envWritten = false
+  const staged: string[] = []
   try {
-    appendOrReplaceEnvKey(cwd, token.env, token.value)
-    envWritten = true
-    writeRawConfig(cwd, raw)
+    const envTemp = stageReplacement(envPath, withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value))
+    staged.push(envTemp)
+    const configTemp = stageReplacement(configPath, configBytes)
+    staged.push(configTemp)
+    rename(envTemp, envPath)
+    try {
+      rename(configTemp, configPath)
+    } catch (error) {
+      const rollbackError = restoreFile(envPath, priorEnv, rename)
+      const envState =
+        rollbackError === undefined
+          ? '.env was restored.'
+          : `.env could not be restored (${describeError(rollbackError)}) and still sets ${token.env}, which no tunnel in typeclaw.json uses; remove the ${token.env} line from ${envPath} by hand.`
+      return {
+        ok: false,
+        reason: `failed to store the tunnel: ${describeError(error)}. typeclaw.json was not changed; ${envState}`,
+      }
+    }
   } catch (error) {
-    if (envWritten && priorEnv === undefined) rmSync(envPath, { force: true })
-    else if (envWritten && priorEnv !== undefined) writeFileSync(envPath, priorEnv)
     return {
       ok: false,
-      reason: `failed to store the tunnel: ${error instanceof Error ? error.message : String(error)}. Neither .env nor typeclaw.json was changed.`,
+      reason: `failed to store the tunnel: ${describeError(error)}. Neither .env nor typeclaw.json was changed.`,
     }
+  } finally {
+    for (const temp of staged) rmSync(temp, { force: true })
   }
   return { ok: true, value: undefined }
+}
+
+// Replaces `path` with `content` by renaming a fully written sibling over it,
+// so a failure part-way through never leaves a truncated file.
+function replaceFile(
+  path: string,
+  content: string | Buffer,
+  rename: (from: string, to: string) => void = renameSync,
+): void {
+  const temp = stageReplacement(path, content)
+  try {
+    rename(temp, path)
+  } finally {
+    rmSync(temp, { force: true })
+  }
+}
+
+// Writes the replacement for `path` beside it with the same mode. A read-only
+// destination is refused, as an in-place write to it would be. The suffix is
+// gitignored, so a temp a crash leaves behind is never committed.
+function stageReplacement(path: string, content: string | Buffer): string {
+  const mode = modeOrUndefined(path)
+  if (mode !== undefined) accessSync(path, constants.W_OK)
+  const temp = join(dirname(path), `.${basename(path)}.${randomUUID()}.typeclaw-tmp`)
+  try {
+    writeFileSync(temp, content, { flag: 'wx' })
+    if (mode !== undefined) chmodSync(temp, mode)
+  } catch (error) {
+    rmSync(temp, { force: true })
+    throw error
+  }
+  return temp
+}
+
+function restoreFile(
+  path: string,
+  prior: Buffer | undefined,
+  rename: (from: string, to: string) => void,
+): unknown | undefined {
+  try {
+    if (prior === undefined) rmSync(path, { force: true })
+    else replaceFile(path, prior, rename)
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+
+function modeOrUndefined(path: string): number | undefined {
+  try {
+    return statSync(path).mode & 0o7777
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function readFileOrUndefined(path: string): Buffer | undefined {
@@ -989,7 +1069,7 @@ function readRawConfig(cwd: string): Record<string, unknown> {
 }
 
 function writeRawConfig(cwd: string, config: Record<string, unknown>): void {
-  writeFileSync(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`, 'utf8')
+  replaceFile(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
