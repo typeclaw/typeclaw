@@ -36,6 +36,7 @@ import {
   stop,
 } from '@/container'
 import { hooklessGitArgs } from '@/git/hookless'
+import { hasExplicitGitIdentity } from '@/git/resolve-identity'
 import { commitSystemFile } from '@/git/system-commit'
 import { type Channels, type Secret, SecretsBackend } from '@/secrets'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
@@ -582,7 +583,10 @@ export async function defaultRunHatching({
     const typeclawJsonContent = await readTypeclawJsonRaw(cwd)
     const tui = tuiFactory({
       url: buildTuiUrl(hostPort, launch.tuiToken),
-      initialPrompt: buildHatchingPrompt(typeclawJsonContent !== undefined ? { typeclawJsonContent } : undefined),
+      initialPrompt: buildHatchingPrompt({
+        ...(typeclawJsonContent !== undefined ? { typeclawJsonContent } : {}),
+        setGitIdentity: !(await hasExplicitGitIdentity(cwd)),
+      }),
     })
     await tui.run()
     return { ok: true }

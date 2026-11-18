@@ -29,4 +29,10 @@ describe('buildHatchingPrompt', () => {
     expect(end).toBeGreaterThan(start)
     expect(prompt.slice(start, end)).toContain(json)
   })
+
+  test('asks the agent to set its git identity only when told the identity is not explicit', () => {
+    expect(buildHatchingPrompt({ setGitIdentity: true })).toContain('git.user')
+    expect(buildHatchingPrompt({ setGitIdentity: false })).not.toContain('git.user')
+    expect(buildHatchingPrompt()).not.toContain('git.user')
+  })
 })
