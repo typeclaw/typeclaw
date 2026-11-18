@@ -309,6 +309,7 @@ export async function runTunnelAddFlow(
   }
   let hostname: string | undefined
   let tokenEnv: string | undefined
+  let tokenValue: string | undefined
   if (provider === 'cloudflare-named') {
     hostname =
       args.hostname ??
@@ -328,6 +329,7 @@ export async function runTunnelAddFlow(
     if (args.provider === undefined) {
       const tokenPromptResult = await maybePromptTunnelTokenValue(cwd, tokenEnv, prompts)
       if (!tokenPromptResult.ok) return tokenPromptResult
+      tokenValue = tokenPromptResult.value
     }
   }
 
@@ -357,6 +359,9 @@ export async function runTunnelAddFlow(
       raw.docker = { ...asRecord(raw.docker), file: { ...asRecord(asRecord(raw.docker).file), cloudflared: true } }
     }
     writeRawConfig(cwd, raw)
+    // Only an add that won its write stores its token, so a rejected one never
+    // replaces the credential of the tunnel that won.
+    if (tokenEnv !== undefined && tokenValue !== undefined) appendOrReplaceEnvKey(cwd, tokenEnv, tokenValue)
     return { ok: true, value: tunnel }
   })
   if (added.ok) loadConfigSync(cwd)
@@ -530,9 +535,11 @@ export async function runTunnelSetFlow(
     ...(nextTokenEnv !== undefined ? { tokenEnv: nextTokenEnv } : {}),
   }
 
+  let tokenValue: string | undefined
   if (interactive && next.provider === 'cloudflare-named' && next.tokenEnv !== undefined) {
     const tokenPromptResult = await maybePromptTunnelTokenValue(cwd, next.tokenEnv, prompts)
     if (!tokenPromptResult.ok) return tokenPromptResult
+    tokenValue = tokenPromptResult.value
   }
 
   // The prompts above can take a while, so another writer may have changed or
@@ -561,6 +568,9 @@ export async function runTunnelSetFlow(
     const check = parseConfigJson(JSON.stringify(raw))
     if (!check.ok) return check
     writeRawConfig(cwd, raw)
+    // Only a set that won its write stores its token, so a rejected one never
+    // replaces the credential of the edit that won.
+    if (next.tokenEnv !== undefined && tokenValue !== undefined) appendOrReplaceEnvKey(cwd, next.tokenEnv, tokenValue)
     return { ok: true, value: next }
   })
   if (updated.ok) loadConfigSync(cwd)
@@ -802,11 +812,13 @@ async function resolveExistingTunnelName(
   return { ok: true, value: choice }
 }
 
+// Prompts for the token value; the caller stores it in .env only once its
+// typeclaw.json write has won.
 async function maybePromptTunnelTokenValue(
   cwd: string,
   tokenEnv: string,
   prompts: TunnelPrompts,
-): Promise<LiveResult<void>> {
+): Promise<LiveResult<string | undefined>> {
   if (hasEnvKey(cwd, tokenEnv)) return { ok: true, value: undefined }
   if (prompts.password === undefined) return { ok: true, value: undefined }
   const value = await prompts.password(`Cloudflare tunnel token (will be written to .env as ${tokenEnv})`, (v) =>
@@ -816,8 +828,7 @@ async function maybePromptTunnelTokenValue(
     cancel('Aborted.')
     process.exit(0)
   }
-  appendOrReplaceEnvKey(cwd, tokenEnv, value)
-  return { ok: true, value: undefined }
+  return { ok: true, value }
 }
 
 async function resolveProvider(input: string | undefined, prompts: TunnelPrompts): Promise<TunnelProvider> {

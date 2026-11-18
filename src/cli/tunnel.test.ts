@@ -237,32 +237,46 @@ describe('tunnel add/remove config flows', () => {
     expect(result.reason).toMatch(/already exists/)
   })
 
-  test('add fails with a conflict when another writer claims the name while it prompts', async () => {
-    // given: while this add waits on its prompt, another writer adds a tunnel
-    // with the same name
+  test('add fails with a conflict when another writer claims the name while it prompts, leaving its token', async () => {
+    // given: while this add waits on its token prompt, another writer adds a
+    // named tunnel with the same name and stores that tunnel's token
     const cwd = await makeAgentDir({})
-    let firstAddBytes = ''
-    const prompts = {
-      selectProvider: async () => 'cloudflare-quick' as const,
-      selectOwner: async () => 'manual' as const,
-      text: async () => {
-        await writeFile(
-          join(cwd, 'typeclaw.json'),
-          `${JSON.stringify({ tunnels: [{ name: 'demo', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 }] }, null, 2)}\n`,
-        )
-        firstAddBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
-        return '5173'
-      },
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    const winner = {
+      name: 'demo',
+      provider: 'cloudflare-named',
+      for: { kind: 'channel', name: 'github' },
+      hostname: 'https://winner.example.com',
+      tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
     }
+    let winnerConfig = ''
+    let winnerEnv = ''
 
     // when: this add reaches its write
-    const result = await tunnel.runTunnelAddFlow(cwd, { name: 'demo' }, prompts)
+    const result = await tunnel.runTunnelAddFlow(
+      cwd,
+      { name: 'demo', forChannel: 'github' },
+      {
+        selectProvider: async () => 'cloudflare-named',
+        selectOwner: async () => 'channel',
+        text: async () => 'https://loser.example.com',
+        password: async () => {
+          await writeFile(config, `${JSON.stringify({ tunnels: [winner] }, null, 2)}\n`)
+          await writeFile(env, 'CLOUDFLARE_TUNNEL_TOKEN=winner-token\n')
+          winnerConfig = await readFile(config, 'utf8')
+          winnerEnv = await readFile(env, 'utf8')
+          return 'loser-token'
+        },
+      },
+    )
 
-    // then: it reports the conflict and leaves the first add's config intact
+    // then: it reports the conflict and leaves the winner's config and token intact
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('unreachable')
     expect(result.reason).toContain('was added by another typeclaw.json writer')
-    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(firstAddBytes)
+    expect(await readFile(config, 'utf8')).toBe(winnerConfig)
+    expect(await readFile(env, 'utf8')).toBe(winnerEnv)
   })
 
   test('non-interactive add rejects a name that violates the schema regex', async () => {
@@ -550,72 +564,73 @@ describe('tunnel set config flow', () => {
     expect(result.value.externalUrl).toBe('https://new.example.com')
   })
 
-  test('set fails with a conflict when another writer edits the tunnel while it prompts', async () => {
-    // given: while this set waits on its prompt, another writer changes the
-    // same tunnel's upstream port
-    const original = {
-      name: 'manual-demo',
-      provider: 'external',
-      for: { kind: 'manual' },
-      upstreamPort: 5173,
-      externalUrl: 'https://old.example.com',
-    }
+  test('set fails with a conflict when another writer edits the tunnel while it prompts, leaving its token', async () => {
+    // given: while this set (switching to a named tunnel) waits on its token
+    // prompt, another writer edits the same tunnel and stores its own token
+    const original = { name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } }
     const cwd = await makeAgentDir({ tunnels: [original] })
-    let concurrentBytes = ''
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    let winnerConfig = ''
+    let winnerEnv = ''
 
     // when: this set reaches its write
     const result = await tunnel.runTunnelSetFlow(
       cwd,
-      { name: 'manual-demo' },
+      { name: 'github-webhook' },
       {
-        selectProvider: async () => 'external',
-        selectOwner: async () => 'manual',
-        selectSetField: async () => 'externalUrl',
-        text: async () => {
-          await writeFile(
-            join(cwd, 'typeclaw.json'),
-            `${JSON.stringify({ tunnels: [{ ...original, upstreamPort: 6000 }] }, null, 2)}\n`,
-          )
-          concurrentBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
-          return 'https://new.example.com'
+        selectProvider: async () => 'cloudflare-named',
+        selectOwner: async () => 'channel',
+        selectSetField: async () => 'provider',
+        text: async () => 'https://loser.example.com',
+        password: async () => {
+          const edited = {
+            ...original,
+            provider: 'cloudflare-named',
+            hostname: 'https://winner.example.com',
+            tokenEnv: 'CLOUDFLARE_TUNNEL_TOKEN',
+          }
+          await writeFile(config, `${JSON.stringify({ tunnels: [edited] }, null, 2)}\n`)
+          await writeFile(env, 'CLOUDFLARE_TUNNEL_TOKEN=winner-token\n')
+          winnerConfig = await readFile(config, 'utf8')
+          winnerEnv = await readFile(env, 'utf8')
+          return 'loser-token'
         },
       },
     )
 
-    // then: it reports the conflict instead of overwriting the other edit
+    // then: it reports the conflict instead of overwriting the other edit or its token
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('unreachable')
     expect(result.reason).toContain('was changed by another typeclaw.json writer')
-    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(concurrentBytes)
+    expect(await readFile(config, 'utf8')).toBe(winnerConfig)
+    expect(await readFile(env, 'utf8')).toBe(winnerEnv)
   })
 
-  test('set fails with a conflict when another writer removes the tunnel while it prompts', async () => {
-    // given: while this set waits on its prompt, another writer removes the tunnel
+  test('set fails with a conflict when another writer removes the tunnel while it prompts, leaving .env alone', async () => {
+    // given: while this set (switching to a named tunnel) waits on its token
+    // prompt, another writer removes the tunnel
     const cwd = await makeAgentDir({
-      tunnels: [
-        {
-          name: 'manual-demo',
-          provider: 'external',
-          for: { kind: 'manual' },
-          upstreamPort: 5173,
-          externalUrl: 'https://old.example.com',
-        },
-      ],
+      tunnels: [{ name: 'github-webhook', provider: 'cloudflare-quick', for: { kind: 'channel', name: 'github' } }],
     })
-    let concurrentBytes = ''
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    await writeFile(env, 'OTHER=1\n')
+    let winnerConfig = ''
 
     // when: this set reaches its write
     const result = await tunnel.runTunnelSetFlow(
       cwd,
-      { name: 'manual-demo' },
+      { name: 'github-webhook' },
       {
-        selectProvider: async () => 'external',
-        selectOwner: async () => 'manual',
-        selectSetField: async () => 'externalUrl',
-        text: async () => {
-          await writeFile(join(cwd, 'typeclaw.json'), '{ "tunnels": [] }\n')
-          concurrentBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
-          return 'https://new.example.com'
+        selectProvider: async () => 'cloudflare-named',
+        selectOwner: async () => 'channel',
+        selectSetField: async () => 'provider',
+        text: async () => 'https://loser.example.com',
+        password: async () => {
+          await writeFile(config, '{ "tunnels": [] }\n')
+          winnerConfig = await readFile(config, 'utf8')
+          return 'loser-token'
         },
       },
     )
@@ -624,7 +639,8 @@ describe('tunnel set config flow', () => {
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('unreachable')
     expect(result.reason).toContain('was removed by another typeclaw.json writer')
-    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(concurrentBytes)
+    expect(await readFile(config, 'utf8')).toBe(winnerConfig)
+    expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
   })
 
   test('interactive set with no name auto-picks the only configured tunnel', async () => {
