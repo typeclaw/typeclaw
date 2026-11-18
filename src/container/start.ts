@@ -430,7 +430,7 @@ async function runStart({
     // .git/config bind that git's rename-based config writes below would detach.
     if (!(await syncConfiguredGitIdentity(cwd, githubCliConfig.git.user))) {
       const warning =
-        'typeclaw: could not copy typeclaw.json#git.user into the agent repo; commits keep the previous git identity.'
+        'typeclaw: could not copy typeclaw.json#git.user into the agent repo, or a repo-level override such as config.worktree still shadows it; the container still uses git.user.'
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)
     }
@@ -1207,8 +1207,15 @@ export async function planStart({
   if (existsSync(join(cwd, ENV_FILE))) {
     runArgs.push('--env-file', join(cwd, ENV_FILE))
   }
-  const resolvedGitIdentity = gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity
-  if (resolvedGitIdentity !== null && !(await isFallbackGitIdentity(cwd, resolvedGitIdentity))) {
+  // typeclaw.json#git.user is exported as-is, so a repo-level override such as
+  // config.worktree cannot pair its name with the configured email.
+  const configuredGitIdentity = gitIdentity === undefined ? cfg.git.user : undefined
+  const resolvedGitIdentity =
+    configuredGitIdentity ?? (gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity)
+  if (
+    resolvedGitIdentity !== null &&
+    (configuredGitIdentity !== undefined || !(await isFallbackGitIdentity(cwd, resolvedGitIdentity)))
+  ) {
     // A name the operator declared in .env wins, so it is not exported over it.
     const declared = readEnvFile(cwd)
     for (const [name, field] of [

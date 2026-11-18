@@ -286,6 +286,30 @@ describe('planStart', () => {
     }
   })
 
+  test('exports typeclaw.json#git.user even when a worktree override shadows the repo identity', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await runGit(root, ['config', 'extensions.worktreeConfig', 'true'])
+    await runGit(root, ['config', '--worktree', 'user.name', 'Worktree Override'])
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { user: { name: 'Configured', email: 'configured@example.com' } } })}\n`,
+    )
+
+    // when
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    // then
+    expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([
+      'GIT_AUTHOR_NAME=Configured',
+      'GIT_AUTHOR_EMAIL=configured@example.com',
+      'GIT_COMMITTER_NAME=Configured',
+      'GIT_COMMITTER_EMAIL=configured@example.com',
+    ])
+  })
+
   test('omits Git identity variables when the agent repository has no complete identity', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
