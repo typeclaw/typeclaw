@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { AgentSession } from '@/agent'
+import { storeEnvKeyUnlessPresent } from '@/init'
 import { createServer } from '@/server'
 import { waitFor } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
@@ -279,6 +280,38 @@ describe('tunnel add/remove config flows', () => {
     expect(result.reason).toContain('was added by another typeclaw.json writer')
     expect(await readFile(config, 'utf8')).toBe(winnerConfig)
     expect(await readFile(env, 'utf8')).toBe(winnerEnv)
+  })
+
+  test('add fails with a conflict when channel setup stores the same token while it prompts', async () => {
+    // given: while this add waits on its token prompt, `typeclaw channel add
+    // github` (or the init wizard) stores the default tunnel token
+    const cwd = await makeAgentDir({})
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    const configBefore = await readFile(config, 'utf8')
+    let channelEnv = ''
+
+    // when: this add reaches its write
+    const result = await tunnel.runTunnelAddFlow(
+      cwd,
+      { name: 'demo', forChannel: 'github' },
+      {
+        ...namedTunnelPrompts,
+        password: async () => {
+          expect(storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'channel-token')).toEqual({ ok: true })
+          channelEnv = await readFile(env, 'utf8')
+          return 'tunnel-token'
+        },
+      },
+    )
+
+    // then: the tunnel's publish is rejected and the channel's token survives
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('CLOUDFLARE_TUNNEL_TOKEN was stored in .env by another typeclaw command')
+    expect(await readFile(env, 'utf8')).toBe(channelEnv)
+    expect(channelEnv).toBe('CLOUDFLARE_TUNNEL_TOKEN=channel-token\n')
+    expect(await readFile(config, 'utf8')).toBe(configBefore)
   })
 
   test('add fails with a conflict when another command stores the same token key while it prompts', async () => {
@@ -950,7 +983,10 @@ describe('writeConfigAndToken', () => {
   }
 
   function leftoverTemps(cwd: string): string[] {
-    return readdirSync(cwd).filter((name) => name.endsWith('.typeclaw-tmp'))
+    const staging = join(cwd, '.typeclaw', 'credential-staging')
+    return [...readdirSync(cwd), ...(existsSync(staging) ? readdirSync(staging) : [])].filter((name) =>
+      name.endsWith('.typeclaw-tmp'),
+    )
   }
 
   test('restores .env byte-for-byte when typeclaw.json fails to publish after .env did', async () => {
@@ -1003,6 +1039,46 @@ describe('writeConfigAndToken', () => {
     expect(await readFile(env, 'utf8')).toBe('OTHER=1\nCLOUDFLARE_TUNNEL_TOKEN=new-token\n')
     expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
     expect(leftoverTemps(cwd)).toEqual([])
+  })
+
+  test.skipIf(process.platform === 'win32')(
+    'stages the new .env owner-only in the masked staging dir, never beside .env',
+    async () => {
+      const cwd = await makeAgentDir({ tunnels: [] })
+      const staged: { dir: string; mode: number }[] = []
+
+      const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', (from, to) => {
+        if (to.endsWith('.env')) staged.push({ dir: dirname(from), mode: statSync(from).mode & 0o777 })
+        renameSync(from, to)
+      })
+
+      expect(result.ok).toBe(true)
+      expect(staged).toEqual([{ dir: join(cwd, '.typeclaw', 'credential-staging'), mode: 0o600 }])
+      expect(statSync(join(cwd, '.env')).mode & 0o777).toBe(0o600)
+    },
+  )
+
+  test('keeps a token another command stored before it when its rollback runs', async () => {
+    // given: channel setup stored the default tunnel token under the lock
+    // before this tunnel's transaction, which stores a different key
+    const cwd = await makeAgentDir({ tunnels: [] })
+    const env = join(cwd, '.env')
+    expect(storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'channel-token')).toEqual({ ok: true })
+    const envBefore = await readFile(env, 'utf8')
+
+    // when: the tunnel's config publish fails after its .env was published
+    const result = tunnel.writeConfigAndToken(
+      cwd,
+      nextConfig,
+      { env: 'TUNNEL_B_TOKEN', value: 'tunnel-token' },
+      'typeclaw tunnel add',
+      failConfigPublish(false),
+    )
+
+    // then: the rollback restores .env with the channel's token intact
+    expect(result.ok).toBe(false)
+    expect(await readFile(env, 'utf8')).toBe(envBefore)
+    expect(envBefore).toBe('CLOUDFLARE_TUNNEL_TOKEN=channel-token\n')
   })
 
   test.skipIf(process.platform === 'win32')('keeps each file mode when it publishes both', async () => {

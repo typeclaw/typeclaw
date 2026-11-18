@@ -1,6 +1,5 @@
-import { randomUUID } from 'node:crypto'
-import { accessSync, chmodSync, constants, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { readFileSync, renameSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 
 import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
@@ -10,6 +9,7 @@ import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
+import { credentialStagingDir, type Rename, replaceFile, stageReplacement } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -928,20 +928,21 @@ function ensureAgentDir(): string {
 // Called under the config lock once a flow has won its typeclaw.json write.
 // The prompted token is stored only if no other command stored that key since
 // the prompt, and the token and config land together or not at all: both
-// replacements are staged beside their files, .env is renamed into place and
-// then typeclaw.json, and .env is put back if typeclaw.json cannot be.
+// replacements are staged in full (.env in the masked credential staging dir),
+// .env is renamed into place and then typeclaw.json, and .env is put back if
+// typeclaw.json cannot be.
 // `rename` is a seam for tests that fail a publish after writing has begun.
 export function writeConfigAndToken(
   cwd: string,
   raw: Record<string, unknown>,
   token: { env: string; value: string } | undefined,
   rerun: string,
-  rename: (from: string, to: string) => void = renameSync,
+  rename: Rename = renameSync,
 ): LiveResult<void> {
   const configPath = join(cwd, 'typeclaw.json')
   const configBytes = `${JSON.stringify(raw, null, 2)}\n`
   if (token === undefined) {
-    replaceFile(configPath, configBytes, rename)
+    replaceFile(configPath, configBytes, { rename })
     return { ok: true, value: undefined }
   }
   if (hasEnvKey(cwd, token.env)) {
@@ -951,10 +952,15 @@ export function writeConfigAndToken(
     }
   }
   const envPath = join(cwd, '.env')
+  const stagingDir = credentialStagingDir(cwd)
   const priorEnv = readFileOrUndefined(envPath)
   const staged: string[] = []
   try {
-    const envTemp = stageReplacement(envPath, withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value))
+    const envTemp = stageReplacement(
+      envPath,
+      withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value),
+      stagingDir,
+    )
     staged.push(envTemp)
     const configTemp = stageReplacement(configPath, configBytes)
     staged.push(configTemp)
@@ -962,7 +968,7 @@ export function writeConfigAndToken(
     try {
       rename(configTemp, configPath)
     } catch (error) {
-      const rollbackError = restoreFile(envPath, priorEnv, rename)
+      const rollbackError = restoreFile(envPath, priorEnv, rename, stagingDir)
       const envState =
         rollbackError === undefined
           ? '.env was restored.'
@@ -983,58 +989,13 @@ export function writeConfigAndToken(
   return { ok: true, value: undefined }
 }
 
-// Replaces `path` with `content` by renaming a fully written sibling over it,
-// so a failure part-way through never leaves a truncated file.
-function replaceFile(
-  path: string,
-  content: string | Buffer,
-  rename: (from: string, to: string) => void = renameSync,
-): void {
-  const temp = stageReplacement(path, content)
-  try {
-    rename(temp, path)
-  } finally {
-    rmSync(temp, { force: true })
-  }
-}
-
-// Writes the replacement for `path` beside it with the same mode. A read-only
-// destination is refused, as an in-place write to it would be. The suffix is
-// gitignored, so a temp a crash leaves behind is never committed.
-function stageReplacement(path: string, content: string | Buffer): string {
-  const mode = modeOrUndefined(path)
-  if (mode !== undefined) accessSync(path, constants.W_OK)
-  const temp = join(dirname(path), `.${basename(path)}.${randomUUID()}.typeclaw-tmp`)
-  try {
-    writeFileSync(temp, content, { flag: 'wx' })
-    if (mode !== undefined) chmodSync(temp, mode)
-  } catch (error) {
-    rmSync(temp, { force: true })
-    throw error
-  }
-  return temp
-}
-
-function restoreFile(
-  path: string,
-  prior: Buffer | undefined,
-  rename: (from: string, to: string) => void,
-): unknown | undefined {
+function restoreFile(path: string, prior: Buffer | undefined, rename: Rename, stagingDir: string): unknown {
   try {
     if (prior === undefined) rmSync(path, { force: true })
-    else replaceFile(path, prior, rename)
+    else replaceFile(path, prior, { rename, credentialStagingDir: stagingDir })
     return undefined
   } catch (error) {
     return error
-  }
-}
-
-function modeOrUndefined(path: string): number | undefined {
-  try {
-    return statSync(path).mode & 0o7777
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-    throw error
   }
 }
 
