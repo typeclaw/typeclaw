@@ -434,7 +434,14 @@ async function runStart({
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)
     }
-    for (const problem of await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes)) {
+    const remotesSync = await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes)
+    if (remotesSync.failed !== undefined) {
+      return {
+        ok: false,
+        reason: `${remotesSync.failed}, so start stopped rather than let backups push to the previous destination. If no git process is running, remove a stale .git/config.lock in the agent folder, then run typeclaw start again.`,
+      }
+    }
+    for (const problem of remotesSync.warnings) {
       const warning = `typeclaw: ${problem}.`
       if (streamOutput) process.stderr.write(`${warning}\n`)
       else onWarning?.(warning)

@@ -35,7 +35,9 @@ describe('syncConfiguredGitRemotes', () => {
   test('adds a missing remote with its default fetch refspec', async () => {
     const repo = await agentRepo()
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual([])
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual({
+      warnings: [],
+    })
 
     expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/acme/agent.git')
     expect(await git(repo, ['config', '--get', 'remote.origin.fetch'])).toBe('+refs/heads/*:refs/remotes/origin/*')
@@ -46,7 +48,9 @@ describe('syncConfiguredGitRemotes', () => {
     await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
     await git(repo, ['remote', 'add', 'upstream', 'https://example.com/upstream.git'])
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })).resolves.toEqual([])
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })).resolves.toEqual({
+      warnings: [],
+    })
 
     expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/new.git')
     expect(await git(repo, ['remote', 'get-url', 'upstream'])).toBe('https://example.com/upstream.git')
@@ -57,7 +61,7 @@ describe('syncConfiguredGitRemotes', () => {
     await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
     await git(repo, ['config', 'remote.origin.pushurl', 'https://alice:s3cr3t-token@example.com/push.git'])
 
-    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+    const { warnings: problems } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
     expect(problems).toHaveLength(1)
     expect(problems[0]).toContain('remote "origin"')
@@ -74,7 +78,7 @@ describe('syncConfiguredGitRemotes', () => {
     await git(repo, ['config', '--add', 'remote.origin.pushurl', 'https://example.com/new.git'])
     await git(repo, ['config', '--add', 'remote.origin.pushurl', 'https://bob:t0ken@example.com/second.git'])
 
-    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+    const { warnings: problems } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
     expect(problems).toHaveLength(1)
     expect(problems[0]).toContain('remote "origin"')
@@ -87,10 +91,39 @@ describe('syncConfiguredGitRemotes', () => {
     await writeFile(included, '[remote "origin"]\n\tpushurl = https://example.com/elsewhere.git\n')
     await git(repo, ['config', 'include.path', included])
 
-    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+    const { warnings: problems } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
     expect(problems).toHaveLength(1)
     expect(problems[0]).toContain('remote "origin"')
+  })
+
+  test('reports a failed retarget so start can stop, and leaves config unchanged', async () => {
+    const repo = await agentRepo()
+    await git(repo, ['remote', 'add', 'origin', 'https://example.com/old.git'])
+    const lock = join(repo, '.git', 'config.lock')
+    await writeFile(lock, '')
+
+    const result = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(result.failed).toBeDefined()
+    expect(await git(repo, ['remote', 'get-url', 'origin'])).toBe('https://example.com/old.git')
+  })
+
+  test.each([
+    ['branch.main.pushRemote', 'mirror'],
+    ['remote.pushDefault', 'mirror'],
+    ['branch.main.remote', 'mirror'],
+  ])('warns when %s routes backups away from origin', async (key, value) => {
+    const repo = await agentRepo()
+    await git(repo, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+    await git(repo, ['remote', 'add', 'mirror', 'https://example.com/mirror.git'])
+    await git(repo, ['config', key, value])
+
+    const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(warnings).toEqual([
+      'backups on branch "main" push to remote "mirror" (set by its upstream, pushRemote, or remote.pushDefault), not to git.remotes.origin',
+    ])
   })
 
   test('leaves config untouched when every remote already matches or none are configured', async () => {
@@ -99,8 +132,10 @@ describe('syncConfiguredGitRemotes', () => {
     const config = join(repo, '.git', 'config')
     const before = await stat(config)
 
-    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual([])
-    await expect(syncConfiguredGitRemotes(repo, undefined)).resolves.toEqual([])
+    await expect(syncConfiguredGitRemotes(repo, { origin: 'https://example.com/acme/agent.git' })).resolves.toEqual({
+      warnings: [],
+    })
+    await expect(syncConfiguredGitRemotes(repo, undefined)).resolves.toEqual({ warnings: [] })
 
     expect((await stat(config)).ino).toBe(before.ino)
   })

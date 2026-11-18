@@ -2300,6 +2300,36 @@ describe('start (composition)', () => {
     expect(originAtRun).toBe('https://example.com/acme/agent.git')
   })
 
+  test('refuses to launch when a git.remotes retarget cannot be applied', async () => {
+    // given: origin must move, but another git writer holds the config lock
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await runGit(root, ['remote', 'add', 'origin', 'https://example.com/old.git'])
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/new.git' } } })}\n`,
+    )
+    await writeFile(join(root, '.git', 'config.lock'), '')
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: nothing launches with the stale destination
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('config.lock')
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(false)
+  })
+
   test('leaves the agent repo identity and remotes alone while the container is already running', async () => {
     // given: a running agent whose sandboxes hold the read-only .git/config bind
     await writeDockerfile(root)
