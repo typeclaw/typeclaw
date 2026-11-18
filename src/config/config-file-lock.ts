@@ -7,11 +7,11 @@ import { basename, resolve } from 'node:path'
 // file is shared by host CLI processes and the container runtime. Every writer
 // holds it from its read (or guard check) through its write, so no other
 // writer's bytes can land in between and be clobbered by a stale result.
+// Holders keep git and other subprocesses outside the lock. A lock left by a
+// crashed holder is never reclaimed automatically: a stalled holder cannot be
+// told apart from a dead one, so the timeout error names the manual recovery.
 
 const ACQUIRE_TIMEOUT_MS = 5_000
-// A holder finishes in milliseconds; a lock this old was left by a crashed
-// process and would otherwise wedge config writes until removed by hand.
-const STALE_LOCK_MS = 10_000
 const RETRY_MS = 20
 
 export type ConfigFileLockOptions = { timeoutMs?: number }
@@ -19,8 +19,7 @@ export type ConfigFileLockOptions = { timeoutMs?: number }
 type Held = { lock: string; ino: number }
 
 // Locks held by the current call chain, so a writer that reaches another
-// locked writer (a mutation validating config, which may persist a migration)
-// re-enters instead of waiting on itself.
+// locked writer re-enters instead of waiting on itself.
 const heldLocks = new AsyncLocalStorage<ReadonlySet<string>>()
 // Locks this process holds from an async holder. A sync acquirer outside that
 // holder's call chain cannot wait for it: the event loop the holder needs to
@@ -89,45 +88,34 @@ function tryAcquire(lock: string): Held | undefined {
       closeSync(fd)
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return undefined
+    throw error
   }
-  reclaimIfStale(lock)
-  return undefined
-}
-
-function reclaimIfStale(lock: string): void {
-  const stale = statOrUndefined(lock)
-  if (stale === undefined || Date.now() - stale.mtimeMs < STALE_LOCK_MS) return
-  // Re-stat so a lock another waiter just reclaimed and re-created is left alone.
-  const current = statOrUndefined(lock)
-  if (current?.ino !== stale.ino || current.mtimeMs !== stale.mtimeMs) return
-  unlinkIfPresent(lock)
 }
 
 function release(held: Held): void {
-  // Leave the lock alone if it was reclaimed as stale and now belongs to someone else.
-  if (statOrUndefined(held.lock)?.ino === held.ino) unlinkIfPresent(held.lock)
+  // Leave the lock alone if an operator removed it by hand and another writer
+  // has taken it since.
+  if (inodeOf(held.lock) !== held.ino) return
+  try {
+    unlinkSync(held.lock)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
 }
 
-function statOrUndefined(lock: string): { ino: number; mtimeMs: number } | undefined {
+function inodeOf(lock: string): number | undefined {
   try {
-    return statSync(lock)
+    return statSync(lock).ino
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw error
   }
 }
 
-function unlinkIfPresent(lock: string): void {
-  try {
-    unlinkSync(lock)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-}
-
 function lockTimeoutError(file: string, lock: string): Error {
+  const name = basename(file)
   return new Error(
-    `Timed out waiting for the ${basename(file)} write lock (${lock}). Another typeclaw process is writing ${basename(file)}; retry once it finishes. If no typeclaw process is writing it, remove the stale lock with \`rm "${lock}"\`.`,
+    `Timed out waiting for the ${name} write lock (${lock}). Another typeclaw process may be writing ${name}; if none is (stop the agent container and any typeclaw CLI), remove the lock with \`rm "${lock}"\`.`,
   )
 }

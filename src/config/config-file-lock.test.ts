@@ -76,17 +76,11 @@ describe('withConfigFileLock', () => {
     expect(events).toEqual(['first:start', 'first:end', 'second'])
   })
 
-  test('reclaims a stale lock left by a crashed holder', async () => {
+  test('never reclaims an old lock, and times out naming the manual recovery', async () => {
+    // given: a lock long past any write's duration, as a stalled holder leaves it
     writeFileSync(lock, '')
-    const past = new Date(Date.now() - 60_000)
+    const past = new Date(Date.now() - 60 * 60_000)
     utimesSync(lock, past, past)
-
-    expect(await withConfigFileLock(file, async () => 'ran')).toBe('ran')
-    expect(existsSync(lock)).toBe(false)
-  })
-
-  test('times out with an error naming the lock and how to recover', async () => {
-    writeFileSync(lock, '')
     let ran = false
 
     const acquirer = withConfigFileLock(
@@ -97,7 +91,9 @@ describe('withConfigFileLock', () => {
       { timeoutMs: 50 },
     )
 
-    await expect(acquirer).rejects.toThrow(`rm "${lock}"`)
+    await expect(acquirer).rejects.toThrow(
+      `Another typeclaw process may be writing typeclaw.json; if none is (stop the agent container and any typeclaw CLI), remove the lock with \`rm "${lock}"\`.`,
+    )
     expect(ran).toBe(false)
     expect(existsSync(lock)).toBe(true)
   })
@@ -147,17 +143,10 @@ describe('withConfigFileLockSync', () => {
     expect(existsSync(lock)).toBe(false)
   })
 
-  test('reclaims a stale lock left by a crashed holder', () => {
+  test('never reclaims an old lock, and times out naming the manual recovery', () => {
     writeFileSync(lock, '')
-    const past = new Date(Date.now() - 60_000)
+    const past = new Date(Date.now() - 60 * 60_000)
     utimesSync(lock, past, past)
-
-    expect(withConfigFileLockSync(file, () => 'ran')).toBe('ran')
-    expect(existsSync(lock)).toBe(false)
-  })
-
-  test('times out with an error naming the lock and how to recover', () => {
-    writeFileSync(lock, '')
     let ran = false
 
     expect(() =>
@@ -168,7 +157,7 @@ describe('withConfigFileLockSync', () => {
         },
         { timeoutMs: 50 },
       ),
-    ).toThrow(`rm "${lock}"`)
+    ).toThrow(`if none is (stop the agent container and any typeclaw CLI), remove the lock with \`rm "${lock}"\`.`)
     expect(ran).toBe(false)
     expect(existsSync(lock)).toBe(true)
   })
