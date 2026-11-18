@@ -45,6 +45,60 @@ describe('replaceFile', () => {
   })
 })
 
+describe('config staging', () => {
+  // Publishes `bytes` as typeclaw.json under umask 022 (a broad default), and
+  // returns the staged copy's mode while its bytes were written, and the
+  // published file's mode.
+  async function publishUnderBroadUmask(cwd: string, bytes: string) {
+    const config = join(cwd, 'typeclaw.json')
+    let stagedModeWhileWriting: number | undefined
+    const previous = process.umask(0o022)
+    try {
+      const result = publishConfigWithCredential(config, bytes, undefined, {
+        writeStaged: (path, content) => {
+          stagedModeWhileWriting = mode(path)
+          writeFileSync(path, content, { flag: 'w' })
+        },
+      })
+      expect(result).toEqual({ ok: true })
+    } finally {
+      process.umask(previous)
+    }
+    return { stagedModeWhileWriting, published: mode(config) }
+  }
+
+  test.skipIf(process.platform === 'win32')(
+    'stages a 0600 config owner-only from creation, and publishes it 0600',
+    async () => {
+      // given: a 0600 typeclaw.json (it can hold inline credentials)
+      const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
+      await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
+      await chmod(join(cwd, 'typeclaw.json'), 0o600)
+
+      // when
+      const modes = await publishUnderBroadUmask(cwd, '{"mcpServers":{}}\n')
+
+      // then: the copy was never readable by others, and the file keeps 0600
+      expect(modes).toEqual({ stagedModeWhileWriting: 0o600, published: 0o600 })
+      expect(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')).toBe('{"mcpServers":{}}\n')
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')('publishes a 0644 config as 0644', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
+    await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
+    await chmod(join(cwd, 'typeclaw.json'), 0o644)
+
+    expect(await publishUnderBroadUmask(cwd, '{}\n')).toEqual({ stagedModeWhileWriting: 0o600, published: 0o644 })
+  })
+
+  test.skipIf(process.platform === 'win32')('publishes a new config with the default mode', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-config-'))
+
+    expect(await publishUnderBroadUmask(cwd, '{}\n')).toEqual({ stagedModeWhileWriting: 0o600, published: 0o644 })
+  })
+})
+
 describe('credential staging', () => {
   test.skipIf(process.platform === 'win32')(
     'stages the new and prior content 0600 in a tightened owner-only dir, never beside .env',
@@ -133,6 +187,43 @@ describe('credential staging', () => {
       expect(readFileSync(staged.priorCopy!, 'utf8')).toBe('OLD=1\n')
       expect(existsSync(staged.newCopy!)).toBe(false)
     }
+  })
+
+  test('reports a rollback failure, not an empty .env, when emptying a created .env fails', async () => {
+    // given: no .env yet; the write into the new .env stops after part of the
+    // token, and emptying it again fails too
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
+    const env = join(cwd, '.env')
+    await writeFile(join(cwd, 'typeclaw.json'), '{}\n')
+    let calls = 0
+    const writeInPlace = (path: string, _content: string | Buffer) => {
+      calls += 1
+      if (calls === 1) {
+        writeFileSync(path, 'TOKEN=par', { flag: 'w' })
+        throw new Error('disk full')
+      }
+      throw new Error('read-only filesystem')
+    }
+
+    // when
+    const result = publishConfigWithCredential(
+      join(cwd, 'typeclaw.json'),
+      '{}\n',
+      { path: env, content: 'TOKEN=partial-then-lost\n', stagingDir: credentialStagingDir(cwd) },
+      { writeInPlace },
+    )
+
+    // then: the failure names .env and says to empty it in place, never that it
+    // was left empty; the partial bytes are still there
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain(
+      `${env} could not be restored (read-only filesystem) after a failed write (disk full)`,
+    )
+    expect(result.reason).toContain(`Empty ${env} in place before retrying; do not delete it`)
+    expect(result.reason).not.toContain('left empty')
+    expect(readFileSync(env, 'utf8')).toBe('TOKEN=par')
+    expect(readFileSync(join(cwd, 'typeclaw.json'), 'utf8')).toBe('{}\n')
   })
 
   describe('on Windows', () => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, lstatSync, readdirSync, readlinkSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readlinkSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -8,6 +8,11 @@ import type { AgentSession } from '@/agent'
 import { storeEnvKeyUnlessPresent } from '@/init'
 import { ensureHiddenMaskTargets } from '@/sandbox/hidden-paths'
 import { createServer } from '@/server'
+import {
+  CONFIG_PUBLISH_PATHS,
+  failingConfigPublish,
+  INJECTED_CONFIG_PUBLISH_FAILURE,
+} from '@/test-helpers/config-publish-seams'
 import { waitFor } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
 
@@ -972,11 +977,6 @@ describe('writeConfigAndToken', () => {
   const token = { env: 'CLOUDFLARE_TUNNEL_TOKEN', value: 'new-token' }
   const nextConfig = { tunnels: [{ name: 'demo', provider: 'cloudflare-named' }] }
 
-  const failConfigPublish = (from: string, to: string) => {
-    if (to.endsWith('typeclaw.json')) throw new Error('injected config publish failure')
-    renameSync(from, to)
-  }
-
   // Writes .env in place (same inode), failing on the listed calls (1-based);
   // a failing call truncates first, like a write that dies part-way.
   function inPlaceWriter(failCalls: number[] = [], onWrite?: () => void) {
@@ -1001,55 +1001,6 @@ describe('writeConfigAndToken', () => {
     )
   }
 
-  test('restores .env in place when typeclaw.json fails to publish after .env was written', async () => {
-    // given: an existing .env and typeclaw.json
-    const cwd = await makeAgentDir({ tunnels: [] })
-    const config = join(cwd, 'typeclaw.json')
-    const env = join(cwd, '.env')
-    await writeFile(env, '# operator notes\nOTHER=1')
-    const inode = statSync(env).ino
-    const configBefore = await readFile(config, 'utf8')
-
-    // when: the config publish fails after .env was written
-    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
-      rename: failConfigPublish,
-    })
-
-    // then: both files are exactly as before, .env on the same inode, nothing staged left
-    expect(result.ok).toBe(false)
-    if (result.ok) throw new Error('unreachable')
-    expect(result.reason).toContain('typeclaw.json was not changed; .env was restored.')
-    expect(await readFile(env, 'utf8')).toBe('# operator notes\nOTHER=1')
-    expect(statSync(env).ino).toBe(inode)
-    expect(await readFile(config, 'utf8')).toBe(configBefore)
-    expect(leftoverTemps(cwd)).toEqual([])
-  })
-
-  test('empties, never removes, the .env it created when typeclaw.json fails to publish', async () => {
-    // given: no .env yet; record the inode the publish creates it with
-    const cwd = await makeAgentDir({ tunnels: [] })
-    const env = join(cwd, '.env')
-    const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
-    let createdInode: number | undefined
-
-    // when: the config publish fails after .env was created
-    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
-      rename: (from, to) => {
-        if (to.endsWith('typeclaw.json')) createdInode = statSync(env).ino
-        failConfigPublish(from, to)
-      },
-    })
-
-    // then: .env is kept on that inode (a sandbox may have masked it) but empty
-    expect(result.ok).toBe(false)
-    if (result.ok) throw new Error('unreachable')
-    expect(result.reason).toContain('typeclaw.json was not changed; .env was left empty.')
-    expect(await readFile(env, 'utf8')).toBe('')
-    expect(statSync(env).ino).toBe(createdInode!)
-    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
-    expect(leftoverTemps(cwd)).toEqual([])
-  })
-
   test('restores .env when its in-place write fails part-way, and changes neither file', async () => {
     // given: an existing .env and typeclaw.json
     const cwd = await makeAgentDir({ tunnels: [] })
@@ -1069,39 +1020,6 @@ describe('writeConfigAndToken', () => {
     expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
     expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
     expect(leftoverTemps(cwd)).toEqual([])
-  })
-
-  test('names .env and the saved prior copy when restoring it fails too', async () => {
-    // given: an existing .env and typeclaw.json
-    const cwd = await makeAgentDir({ tunnels: [] })
-    const env = join(cwd, '.env')
-    await writeFile(env, 'OTHER=1\n')
-    const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
-
-    // when: the config publish fails and so does the in-place restore of .env
-    const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
-      rename: failConfigPublish,
-      writeInPlace: inPlaceWriter([2]),
-    })
-
-    // then: the failure names .env and how to recover: from the kept staged
-    // copy of its prior content, or on Windows (which keeps no copy on disk)
-    // by re-entering the token
-    expect(result.ok).toBe(false)
-    if (result.ok) throw new Error('unreachable')
-    expect(result.reason).toContain(`${env} could not be restored (injected in-place write failure 2)`)
-    if (process.platform === 'win32') {
-      expect(result.reason).toContain(`must be re-entered in ${env}`)
-      expect(existsSync(stagingDir(cwd))).toBe(false)
-    } else {
-      const kept = readdirSync(stagingDir(cwd))
-      expect(kept).toHaveLength(1)
-      const priorCopy = join(stagingDir(cwd), kept[0]!)
-      expect(result.reason).toContain(`its previous content is saved at ${priorCopy}`)
-      expect(await readFile(priorCopy, 'utf8')).toBe('OTHER=1\n')
-      expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
-    }
-    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
   })
 
   test.skipIf(process.platform === 'win32')(
@@ -1184,53 +1102,162 @@ describe('writeConfigAndToken', () => {
     },
   )
 
-  test.skipIf(process.platform === 'win32')(
-    'a failed publish through a symlinked typeclaw.json leaves the link, its target and .env unchanged',
-    async () => {
-      // given: typeclaw.json links elsewhere, and .env exists
-      const cwd = await makeAgentDir({})
-      const { link, target } = await linkConfigElsewhere(cwd)
-      const env = join(cwd, '.env')
-      await writeFile(env, 'OTHER=1\n')
-      const targetBefore = await readFile(target, 'utf8')
+  for (const { name, platform } of CONFIG_PUBLISH_PATHS) {
+    describe(`when typeclaw.json is ${name}`, () => {
+      test('restores .env in place when typeclaw.json fails to publish after .env was written', async () => {
+        // given: an existing .env and typeclaw.json
+        const cwd = await makeAgentDir({ tunnels: [] })
+        const config = join(cwd, 'typeclaw.json')
+        const env = join(cwd, '.env')
+        await writeFile(env, '# operator notes\nOTHER=1')
+        const inode = statSync(env).ino
+        const configBefore = await readFile(config, 'utf8')
 
-      // when: publishing the config onto the target fails after .env was written
-      const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', {
-        rename: failConfigPublish,
+        // when: the config publication fails after .env was written
+        const result = tunnel.writeConfigAndToken(
+          cwd,
+          nextConfig,
+          token,
+          'typeclaw tunnel add',
+          failingConfigPublish(platform),
+        )
+
+        // then: it failed there, and both files are exactly as before, .env on
+        // the same inode, nothing staged left
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain(
+          `${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed; .env was restored.`,
+        )
+        expect(await readFile(env, 'utf8')).toBe('# operator notes\nOTHER=1')
+        expect(statSync(env).ino).toBe(inode)
+        expect(await readFile(config, 'utf8')).toBe(configBefore)
+        expect(leftoverTemps(cwd)).toEqual([])
       })
 
-      // then: nothing changed, and the link still points at the untouched target
-      expect(result.ok).toBe(false)
-      expect(lstatSync(link).isSymbolicLink()).toBe(true)
-      expect(readlinkSync(link)).toBe(target)
-      expect(await readFile(target, 'utf8')).toBe(targetBefore)
-      expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
-      expect(readdirSync(dirname(target))).toEqual(['typeclaw.json'])
-    },
-  )
+      test('empties, never removes, the .env it created when typeclaw.json fails to publish', async () => {
+        // given: no .env yet; record the inode the publish creates it with
+        const cwd = await makeAgentDir({ tunnels: [] })
+        const env = join(cwd, '.env')
+        const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+        let createdInode: number | undefined
 
-  test('keeps a token another command stored before it when its rollback runs', async () => {
-    // given: channel setup stored the default tunnel token under the lock
-    // before this tunnel's transaction, which stores a different key
-    const cwd = await makeAgentDir({ tunnels: [] })
-    const env = join(cwd, '.env')
-    expect(storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'channel-token')).toEqual({ ok: true })
-    const envBefore = await readFile(env, 'utf8')
+        // when: the config publication fails after .env was created
+        const result = tunnel.writeConfigAndToken(
+          cwd,
+          nextConfig,
+          token,
+          'typeclaw tunnel add',
+          failingConfigPublish(platform, { onConfigPublish: () => (createdInode = statSync(env).ino) }),
+        )
 
-    // when: the tunnel's config publish fails after its .env was written
-    const result = tunnel.writeConfigAndToken(
-      cwd,
-      nextConfig,
-      { env: 'TUNNEL_B_TOKEN', value: 'tunnel-token' },
-      'typeclaw tunnel add',
-      { rename: failConfigPublish },
-    )
+        // then: .env is kept on that inode (a sandbox may have masked it) but empty
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain(
+          `${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed; .env was left empty.`,
+        )
+        expect(await readFile(env, 'utf8')).toBe('')
+        expect(statSync(env).ino).toBe(createdInode!)
+        expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
+        expect(leftoverTemps(cwd)).toEqual([])
+      })
 
-    // then: the rollback restores .env with the channel's token intact
-    expect(result.ok).toBe(false)
-    expect(await readFile(env, 'utf8')).toBe(envBefore)
-    expect(envBefore).toBe('CLOUDFLARE_TUNNEL_TOKEN=channel-token\n')
-  })
+      test('names .env and how to recover it when restoring it fails too', async () => {
+        // given: an existing .env and typeclaw.json
+        const cwd = await makeAgentDir({ tunnels: [] })
+        const env = join(cwd, '.env')
+        await writeFile(env, 'OTHER=1\n')
+        const configBefore = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+
+        // when: the config publication fails, and so does the in-place restore of .env
+        const result = tunnel.writeConfigAndToken(
+          cwd,
+          nextConfig,
+          token,
+          'typeclaw tunnel add',
+          failingConfigPublish(platform, { envFailCalls: [2] }),
+        )
+
+        // then: the failure names .env and how to recover: from the kept staged
+        // copy of its prior content, or on Windows (which keeps no copy on disk)
+        // by re-entering the token
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain(INJECTED_CONFIG_PUBLISH_FAILURE)
+        expect(result.reason).toContain(`${env} could not be restored (injected in-place write failure 2)`)
+        if (platform === 'win32') {
+          expect(result.reason).toContain(`must be re-entered in ${env}`)
+          expect(existsSync(stagingDir(cwd))).toBe(false)
+        } else {
+          const kept = readdirSync(stagingDir(cwd))
+          expect(kept).toHaveLength(1)
+          const priorCopy = join(stagingDir(cwd), kept[0]!)
+          expect(result.reason).toContain(`its previous content is saved at ${priorCopy}`)
+          expect(await readFile(priorCopy, 'utf8')).toBe('OTHER=1\n')
+          if (process.platform !== 'win32') expect(statSync(priorCopy).mode & 0o777).toBe(0o600)
+        }
+        expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(configBefore)
+      })
+
+      test('keeps a token another command stored before it when its rollback runs', async () => {
+        // given: channel setup stored the default tunnel token under the lock
+        // before this tunnel's transaction, which stores a different key
+        const cwd = await makeAgentDir({ tunnels: [] })
+        const env = join(cwd, '.env')
+        expect(storeEnvKeyUnlessPresent(cwd, 'CLOUDFLARE_TUNNEL_TOKEN', 'channel-token')).toEqual({ ok: true })
+        const envBefore = await readFile(env, 'utf8')
+
+        // when: the tunnel's config publication fails after its .env was written
+        const result = tunnel.writeConfigAndToken(
+          cwd,
+          nextConfig,
+          { env: 'TUNNEL_B_TOKEN', value: 'tunnel-token' },
+          'typeclaw tunnel add',
+          failingConfigPublish(platform),
+        )
+
+        // then: the rollback restores .env with the channel's token intact
+        expect(result.ok).toBe(false)
+        if (result.ok) throw new Error('unreachable')
+        expect(result.reason).toContain(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed`)
+        expect(await readFile(env, 'utf8')).toBe(envBefore)
+        expect(envBefore).toBe('CLOUDFLARE_TUNNEL_TOKEN=channel-token\n')
+      })
+
+      test.skipIf(process.platform === 'win32')(
+        'a failed publish through a symlinked typeclaw.json leaves the link, its target and .env unchanged',
+        async () => {
+          // given: typeclaw.json links elsewhere, and .env exists
+          const cwd = await makeAgentDir({})
+          const { link, target } = await linkConfigElsewhere(cwd)
+          const env = join(cwd, '.env')
+          await writeFile(env, 'OTHER=1\n')
+          const targetBefore = await readFile(target, 'utf8')
+
+          // when: publishing the config onto the target fails after .env was written
+          const result = tunnel.writeConfigAndToken(
+            cwd,
+            nextConfig,
+            token,
+            'typeclaw tunnel add',
+            failingConfigPublish(platform),
+          )
+
+          // then: it failed there, nothing changed, and the link still points at
+          // the untouched target
+          expect(result.ok).toBe(false)
+          if (result.ok) throw new Error('unreachable')
+          expect(result.reason).toContain(`${INJECTED_CONFIG_PUBLISH_FAILURE}. typeclaw.json was not changed`)
+          expect(lstatSync(link).isSymbolicLink()).toBe(true)
+          expect(readlinkSync(link)).toBe(target)
+          expect(await readFile(target, 'utf8')).toBe(targetBefore)
+          expect(await readFile(env, 'utf8')).toBe('OTHER=1\n')
+          expect(readdirSync(dirname(target))).toEqual(['typeclaw.json'])
+        },
+      )
+    })
+  }
 
   test.skipIf(process.platform === 'win32')('keeps each file mode when it publishes both', async () => {
     const cwd = await makeAgentDir({ tunnels: [] })
