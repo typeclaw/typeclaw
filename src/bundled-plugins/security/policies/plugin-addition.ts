@@ -129,7 +129,7 @@ async function readExistingPlugins(targetPath: string): Promise<readonly string[
 
 // See the parallel rationale block in role-promotion.ts — Oracle PR #305
 // findings #5 and #6 (symlinked managed file + case-insensitive FS).
-async function pathIsTypeclawJson(agentDir: string, targetPath: string): Promise<boolean> {
+export async function pathIsTypeclawJson(agentDir: string, targetPath: string): Promise<boolean> {
   const resolvedAgentDir = path.resolve(agentDir)
   const canonicalManagedPath = path.join(resolvedAgentDir, 'typeclaw.json')
   const resolvedTarget = path.resolve(targetPath)
@@ -143,7 +143,12 @@ async function pathIsTypeclawJson(agentDir: string, targetPath: string): Promise
 // finding #4: simulator-vs-real divergence on multi-edit, plus non-unique
 // oldText ambiguity. Conservative refusal keeps the guard honest without
 // re-implementing the edit-diff semantics inside the security plugin.
-function refuseRiskyEdit(tool: string, args: Record<string, unknown>, targetPath: string): SecurityBlock | undefined {
+export function refuseRiskyEdit(
+  tool: string,
+  args: Record<string, unknown>,
+  targetPath: string,
+  guard: string = GUARD_PLUGIN_ADDITION,
+): SecurityBlock | undefined {
   if (tool !== 'edit') return undefined
   const edits = args.edits
   if (!Array.isArray(edits)) return undefined
@@ -151,7 +156,7 @@ function refuseRiskyEdit(tool: string, args: Record<string, unknown>, targetPath
     return {
       block: true,
       reason: [
-        `Guard \`${GUARD_PLUGIN_ADDITION}\` refuses multi-edit on ${targetPath}: the security guard's edit simulator cannot match the pi-coding-agent edit tool's original-content semantics for multi-edit calls.`,
+        `Guard \`${guard}\` refuses multi-edit on ${targetPath}: the security guard's edit simulator cannot match the pi-coding-agent edit tool's original-content semantics for multi-edit calls.`,
         'Use `write` with the full file content instead — this is the canonical workflow for managed config files.',
       ].join(' '),
     }
@@ -159,7 +164,7 @@ function refuseRiskyEdit(tool: string, args: Record<string, unknown>, targetPath
   return undefined
 }
 
-async function intendedContent(
+export async function intendedContent(
   tool: string,
   args: Record<string, unknown>,
   targetPath: string,
