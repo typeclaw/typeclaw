@@ -12,6 +12,7 @@ export const SECURITY_PERMISSIONS = {
   bypassRolePromotion: 'security.bypass.rolePromotion',
   bypassCronPromotion: 'security.bypass.cronPromotion',
   bypassPluginAddition: 'security.bypass.pluginAddition',
+  bypassNoticeTarget: 'security.bypass.noticeTarget',
   // Severity-tier bypasses. Tiers classify guards on a two-axis policy:
   //   high   — bypass sends data to a third-party audience outside the
   //            operator's control loop (channel readers, remote git host).

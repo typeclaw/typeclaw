@@ -15,6 +15,7 @@ import {
   isPushOnlyGitExfilMatch,
   recordGitRemoteTaintIfAny,
 } from './policies/git-exfil'
+import { GUARD_NOTICE_TARGET_SEVERITY, checkNoticeTargetGuard } from './policies/notice-target'
 import { GUARD_OUTBOUND_SECRET_SEVERITY, checkOutboundSecretGuard } from './policies/outbound-secret-scan'
 import { GUARD_PLUGIN_ADDITION_SEVERITY, checkPluginAdditionGuard } from './policies/plugin-addition'
 import { checkPrivateSurfaceReadGuard } from './policies/private-surface-read'
@@ -75,6 +76,8 @@ const BYPASS_ROLE_HINT = {
     'owner and trusted have it by default (medium tier); member and guest do not. Same shape as rolePromotion but deferred: a new cron job (or a changed scheduledByRole) fires at schedule-time as the stamped role. The operator-review window between write and execution is the trusted-tier defense.',
   [SECURITY_PERMISSIONS.bypassPluginAddition]:
     'owner and trusted have it by default (medium tier); member and guest do not. Same shape as cronPromotion but for host-side install: a new (or version-bumped) plugins[] entry is materialized into package.json and installed by the next host `typeclaw start`, running npm lifecycle scripts as the operator. The operator-review window between the typeclaw.json write and the next start is the trusted-tier defense.',
+  [SECURITY_PERMISSIONS.bypassNoticeTarget]:
+    "owner and trusted have it by default (medium tier); member and guest do not. `lastWords.notice` routes the operator's unexpected-death alert, so enabling, retargeting, or disabling it from a lower-trust session is blocked. Every typeclaw.json change is force-committed by auto-backup for operator review.",
 } as const satisfies Record<PerGuardSecurityPermission, string>
 
 function withPermissionHint(
@@ -233,6 +236,15 @@ export default definePlugin({
                 GUARD_PLUGIN_ADDITION_SEVERITY,
               )
           if (pluginAdditionResult) return pluginAdditionResult
+
+          const noticeTargetResult = canBypass(GUARD_NOTICE_TARGET_SEVERITY, SECURITY_PERMISSIONS.bypassNoticeTarget)
+            ? undefined
+            : withPermissionHint(
+                await checkNoticeTargetGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
+                SECURITY_PERMISSIONS.bypassNoticeTarget,
+                GUARD_NOTICE_TARGET_SEVERITY,
+              )
+          if (noticeTargetResult) return noticeTargetResult
 
           // Taint-recording runs FIRST, independently of the gitExfil guard.
           // The gitRemoteTainted defense depends on it. We pass through
