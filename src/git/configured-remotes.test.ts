@@ -68,6 +68,19 @@ describe('syncConfiguredGitRemotes', () => {
     )
   })
 
+  test('warns when a later push URL differs even though the first matches', async () => {
+    const repo = await agentRepo()
+    await git(repo, ['remote', 'add', 'origin', 'https://example.com/new.git'])
+    await git(repo, ['config', '--add', 'remote.origin.pushurl', 'https://example.com/new.git'])
+    await git(repo, ['config', '--add', 'remote.origin.pushurl', 'https://bob:t0ken@example.com/second.git'])
+
+    const problems = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    expect(problems).toHaveLength(1)
+    expect(problems[0]).toContain('remote "origin"')
+    expect(problems.join('\n')).not.toContain('t0ken')
+  })
+
   test('warns about a push override that comes from an included config file', async () => {
     const repo = await agentRepo()
     const included = join(repo, '.git', 'push-override.inc')

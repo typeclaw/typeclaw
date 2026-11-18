@@ -34,7 +34,7 @@ export async function syncConfiguredGitRemotes(
 
   const problems: string[] = []
   for (const [name, url] of Object.entries(remotes)) {
-    const push = await git(['remote', 'get-url', '--push', name])
+    const push = await git(['remote', 'get-url', '--push', '--all', name])
     if (push.exitCode === 0 && lines(push.stdout).every((pushUrl) => pushUrl === url)) continue
     problems.push(
       `remote "${name}" pushes somewhere other than git.remotes.${name} because a pushurl or URL rewrite overrides it, so pushes (including backups) do not go to the configured URL`,
