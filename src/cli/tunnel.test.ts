@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 
 import type { AgentSession } from '@/agent'
 import { storeEnvKeyUnlessPresent } from '@/init'
+import { ensureHiddenMaskTargets } from '@/sandbox/hidden-paths'
 import { createServer } from '@/server'
 import { waitFor } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
@@ -1055,6 +1056,33 @@ describe('writeConfigAndToken', () => {
       expect(result.ok).toBe(true)
       expect(staged).toEqual([{ dir: join(cwd, '.typeclaw', 'credential-staging'), mode: 0o600 }])
       expect(statSync(join(cwd, '.env')).mode & 0o777).toBe(0o600)
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')(
+    'keeps a token staged in a mask-created dir unreadable by others until it is published',
+    async () => {
+      // given: the sandbox mask setup created the staging dir, and .env is 0644
+      const cwd = await makeAgentDir({ tunnels: [] })
+      const env = join(cwd, '.env')
+      await writeFile(env, 'OTHER=1\n')
+      await chmod(env, 0o644)
+      await ensureHiddenMaskTargets({ dirs: [join(cwd, '.typeclaw', 'credential-staging')], files: [] })
+      let beforePublish: { dir: number; file: number } | undefined
+
+      // when: the token and config are published
+      const result = tunnel.writeConfigAndToken(cwd, nextConfig, token, 'typeclaw tunnel add', (from, to) => {
+        if (to.endsWith('.env'))
+          beforePublish = { dir: statSync(dirname(from)).mode & 0o777, file: statSync(from).mode & 0o777 }
+        renameSync(from, to)
+      })
+
+      // then: the staged copy was owner-only in an owner-only dir, and the
+      // published .env keeps its mode
+      expect(result.ok).toBe(true)
+      expect(beforePublish).toEqual({ dir: 0o700, file: 0o600 })
+      expect(await readFile(env, 'utf8')).toBe('OTHER=1\nCLOUDFLARE_TUNNEL_TOKEN=new-token\n')
+      expect(statSync(env).mode & 0o777).toBe(0o644)
     },
   )
 

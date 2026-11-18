@@ -9,7 +9,7 @@ import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import { credentialStagingDir, type Rename, replaceFile, stageReplacement } from '@/init/staged-write'
+import { applyPublishMode, credentialStagingDir, type Rename, replaceFile, stageReplacement } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -956,17 +956,18 @@ export function writeConfigAndToken(
   const priorEnv = readFileOrUndefined(envPath)
   const staged: string[] = []
   try {
-    const envTemp = stageReplacement(
+    const envStaged = stageReplacement(
       envPath,
       withEnvKey(priorEnv?.toString('utf8') ?? '', token.env, token.value),
       stagingDir,
     )
-    staged.push(envTemp)
-    const configTemp = stageReplacement(configPath, configBytes)
-    staged.push(configTemp)
-    rename(envTemp, envPath)
+    staged.push(envStaged.temp)
+    const configStaged = stageReplacement(configPath, configBytes)
+    staged.push(configStaged.temp)
+    rename(envStaged.temp, envPath)
     try {
-      rename(configTemp, configPath)
+      applyPublishMode(envStaged)
+      rename(configStaged.temp, configPath)
     } catch (error) {
       const rollbackError = restoreFile(envPath, priorEnv, rename, stagingDir)
       const envState =
