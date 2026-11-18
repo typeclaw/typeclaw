@@ -69,7 +69,7 @@ import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDep
 import { trackGithubGitIdentityEnv } from '@/git/resolve-identity'
 import { CLI_VERSION } from '@/init/cli-version'
 import { readEnvFile } from '@/init/env-file'
-import { startLastWordsRecorder } from '@/last-words'
+import { sendLastWordsNotice, startLastWordsRecorder } from '@/last-words'
 import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
 import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistry, summarizeLoaded } from '@/plugin'
@@ -350,13 +350,11 @@ async function startAgentRuntime(
   registerBootCleanup(() => stopResourceSampler())
   // Only a container has a host that seals the run when it dies; an ad-hoc run
   // outside Docker would leave a run marked alive forever.
-  const lastWords =
+  const lastWordsRun =
     containerName !== undefined
-      ? startLastWordsRecorder({
-          agentDir: cwd,
-          run: { containerId: hostname(), startedAt: new Date().toISOString(), typeclawVersion: CLI_VERSION },
-        })
+      ? { containerId: hostname(), startedAt: new Date().toISOString(), typeclawVersion: CLI_VERSION }
       : null
+  const lastWords = lastWordsRun !== null ? startLastWordsRecorder({ agentDir: cwd, run: lastWordsRun }) : null
   registerBootCleanup(() => lastWords?.dispose())
   const vectorStartupPromise = runVectorStartup(cwd)
   let pluginsLoaded: LoadPluginsResult
@@ -980,6 +978,15 @@ async function startAgentRuntime(
     startAdapters: () => channelManager.start(),
     onError: (error) => console.warn(`[run] channel restart-resume failed: ${error}`),
   })
+  if (lastWords !== null && lastWordsRun !== null && getConfig().lastWords.notice !== undefined) {
+    void sendLastWordsNotice({
+      agentDir: cwd,
+      run: lastWordsRun,
+      target: () => getConfig().lastWords.notice,
+      router: channelManager.router,
+      ready: lastWords.opened,
+    })
+  }
   await recoveryDispatcher.wake()
 
   // Captured separately from setSpawnSubagent so both the plugin context and
