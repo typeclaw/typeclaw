@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -235,6 +235,34 @@ describe('tunnel add/remove config flows', () => {
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error('unreachable')
     expect(result.reason).toMatch(/already exists/)
+  })
+
+  test('add fails with a conflict when another writer claims the name while it prompts', async () => {
+    // given: while this add waits on its prompt, another writer adds a tunnel
+    // with the same name
+    const cwd = await makeAgentDir({})
+    let firstAddBytes = ''
+    const prompts = {
+      selectProvider: async () => 'cloudflare-quick' as const,
+      selectOwner: async () => 'manual' as const,
+      text: async () => {
+        await writeFile(
+          join(cwd, 'typeclaw.json'),
+          `${JSON.stringify({ tunnels: [{ name: 'demo', provider: 'cloudflare-quick', for: { kind: 'manual' }, upstreamPort: 3000 }] }, null, 2)}\n`,
+        )
+        firstAddBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+        return '5173'
+      },
+    }
+
+    // when: this add reaches its write
+    const result = await tunnel.runTunnelAddFlow(cwd, { name: 'demo' }, prompts)
+
+    // then: it reports the conflict and leaves the first add's config intact
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('was added by another typeclaw.json writer')
+    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(firstAddBytes)
   })
 
   test('non-interactive add rejects a name that violates the schema regex', async () => {
@@ -520,6 +548,83 @@ describe('tunnel set config flow', () => {
     expect(result.ok).toBe(true)
     if (!result.ok) throw new Error(result.reason)
     expect(result.value.externalUrl).toBe('https://new.example.com')
+  })
+
+  test('set fails with a conflict when another writer edits the tunnel while it prompts', async () => {
+    // given: while this set waits on its prompt, another writer changes the
+    // same tunnel's upstream port
+    const original = {
+      name: 'manual-demo',
+      provider: 'external',
+      for: { kind: 'manual' },
+      upstreamPort: 5173,
+      externalUrl: 'https://old.example.com',
+    }
+    const cwd = await makeAgentDir({ tunnels: [original] })
+    let concurrentBytes = ''
+
+    // when: this set reaches its write
+    const result = await tunnel.runTunnelSetFlow(
+      cwd,
+      { name: 'manual-demo' },
+      {
+        selectProvider: async () => 'external',
+        selectOwner: async () => 'manual',
+        selectSetField: async () => 'externalUrl',
+        text: async () => {
+          await writeFile(
+            join(cwd, 'typeclaw.json'),
+            `${JSON.stringify({ tunnels: [{ ...original, upstreamPort: 6000 }] }, null, 2)}\n`,
+          )
+          concurrentBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+          return 'https://new.example.com'
+        },
+      },
+    )
+
+    // then: it reports the conflict instead of overwriting the other edit
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('was changed by another typeclaw.json writer')
+    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(concurrentBytes)
+  })
+
+  test('set fails with a conflict when another writer removes the tunnel while it prompts', async () => {
+    // given: while this set waits on its prompt, another writer removes the tunnel
+    const cwd = await makeAgentDir({
+      tunnels: [
+        {
+          name: 'manual-demo',
+          provider: 'external',
+          for: { kind: 'manual' },
+          upstreamPort: 5173,
+          externalUrl: 'https://old.example.com',
+        },
+      ],
+    })
+    let concurrentBytes = ''
+
+    // when: this set reaches its write
+    const result = await tunnel.runTunnelSetFlow(
+      cwd,
+      { name: 'manual-demo' },
+      {
+        selectProvider: async () => 'external',
+        selectOwner: async () => 'manual',
+        selectSetField: async () => 'externalUrl',
+        text: async () => {
+          await writeFile(join(cwd, 'typeclaw.json'), '{ "tunnels": [] }\n')
+          concurrentBytes = await readFile(join(cwd, 'typeclaw.json'), 'utf8')
+          return 'https://new.example.com'
+        },
+      },
+    )
+
+    // then: it reports the conflict rather than succeeding, and writes nothing
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('unreachable')
+    expect(result.reason).toContain('was removed by another typeclaw.json writer')
+    expect(await readFile(join(cwd, 'typeclaw.json'), 'utf8')).toBe(concurrentBytes)
   })
 
   test('interactive set with no name auto-picks the only configured tunnel', async () => {
