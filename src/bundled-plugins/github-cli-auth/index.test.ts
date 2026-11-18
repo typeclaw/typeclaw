@@ -2221,6 +2221,51 @@ describe('github-cli-auth plugin — git in the sandbox /tmp bind', () => {
     expect(env.GIT_ASKPASS).toBe(askpassPath)
   })
 
+  test('ls-remote of a named remote mints for an allowlisted repo', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+    const event: ToolBeforeEvent = {
+      tool: 'bash',
+      sessionId,
+      callId: 'c',
+      args: { command: 'git -C /tmp/clone ls-remote origin HEAD' },
+    }
+
+    const result = await hook(event, hookCtx)
+
+    expect(result).toBeUndefined()
+    expect(((event.args[TYPECLAW_INTERNAL_BASH_ENV] ?? {}) as Record<string, string>).TYPECLAW_GIT_TOKEN).toBe(
+      'ghs_minted',
+    )
+  })
+
+  // A public remote outside repos[] read anonymously before ls-remote was brokered;
+  // the refused mint must leave that read working, while other refused reads still block.
+  test('ls-remote of a named remote runs without a credential when the mint is refused', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    const hook = await hookFor(unavailableResolver)
+    const lsRemote: ToolBeforeEvent = {
+      tool: 'bash',
+      sessionId,
+      callId: 'c',
+      args: { command: 'git -C /tmp/clone ls-remote origin HEAD' },
+    }
+    const fetch: ToolBeforeEvent = {
+      tool: 'bash',
+      sessionId,
+      callId: 'c2',
+      args: { command: 'git -C /tmp/clone fetch origin' },
+    }
+
+    const lsRemoteResult = await hook(lsRemote, hookCtx)
+    const fetchResult = await hook(fetch, hookCtx)
+
+    expect(lsRemoteResult).toBeUndefined()
+    expect(lsRemote.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+    expect(lsRemote.args.command).toBe('git -C /tmp/clone ls-remote origin HEAD')
+    expect(fetchResult).toMatchObject({ block: true })
+  })
+
   test('a /tmp path with no repo behind it still passes through', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     const hook = await hookFor(tokenResolver('ghs_minted'))
