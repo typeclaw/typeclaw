@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
 import { SLACK_SLASH_COMMAND_NAMES } from '@/channels/adapters/slack-bot'
+import type { DiscordBotIntentCheck } from '@/init/discord-bot-intents'
 import { WORDMARK_LINES } from '@/shared/wordmark'
 
 import {
   c,
+  confirmDiscordBotIntents,
   cornflower,
   done,
   errorLine,
@@ -641,5 +643,64 @@ describe('printDiscordInviteHint', () => {
   test('writes nothing when the token is not a parseable Discord bot token', () => {
     const { output } = captureStdout(() => withNoColor(() => printDiscordInviteHint('not-a-token')))
     expect(output).toBe('')
+  })
+})
+
+describe('confirmDiscordBotIntents', () => {
+  async function run(
+    results: DiscordBotIntentCheck[],
+    choices: ('recheck' | 'continue' | 'cancel')[] = [],
+  ): Promise<{ outcome: 'continue' | 'cancel'; checks: number; prompts: number }> {
+    let checks = 0
+    let prompts = 0
+    const original = process.stdout.write.bind(process.stdout)
+    process.stdout.write = (() => true) as typeof process.stdout.write
+    try {
+      const outcome = await confirmDiscordBotIntents('token', {
+        check: async () => results[checks++]!,
+        choose: async () => choices[prompts++]!,
+      })
+      return { outcome, checks, prompts }
+    } finally {
+      process.stdout.write = original
+    }
+  }
+
+  const messageContentOff: DiscordBotIntentCheck = { status: 'missing', intents: ['MESSAGE CONTENT'] }
+
+  test('continues without prompting when the intents are enabled', async () => {
+    expect(await run([{ status: 'ok' }])).toEqual({ outcome: 'continue', checks: 1, prompts: 0 })
+  })
+
+  test('continues without prompting when only Server Members is off', async () => {
+    expect(await run([{ status: 'missing', intents: ['SERVER MEMBERS'] }])).toEqual({
+      outcome: 'continue',
+      checks: 1,
+      prompts: 0,
+    })
+  })
+
+  test('continues without prompting when the check could not run', async () => {
+    expect(await run([{ status: 'unchecked', reason: 'offline' }])).toEqual({
+      outcome: 'continue',
+      checks: 1,
+      prompts: 0,
+    })
+  })
+
+  test('check again reads fresh settings and continues once Message Content is on', async () => {
+    expect(await run([messageContentOff, messageContentOff, { status: 'ok' }], ['recheck', 'recheck'])).toEqual({
+      outcome: 'continue',
+      checks: 3,
+      prompts: 2,
+    })
+  })
+
+  test('continue anyway proceeds while Message Content is still off', async () => {
+    expect(await run([messageContentOff], ['continue'])).toEqual({ outcome: 'continue', checks: 1, prompts: 1 })
+  })
+
+  test('escape on the prompt cancels', async () => {
+    expect(await run([messageContentOff], ['cancel'])).toEqual({ outcome: 'cancel', checks: 1, prompts: 1 })
   })
 })

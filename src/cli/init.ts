@@ -87,6 +87,7 @@ import { promptGithubAppAuth } from './github-app-auth'
 import { buildOAuthCallbacks } from './oauth-callbacks'
 import {
   c,
+  confirmDiscordBotIntents,
   cornflower,
   done,
   errorLine,
@@ -1590,6 +1591,7 @@ async function runDiscordFlow(): Promise<StepResult<CollectedInputs['channelSecr
     validate: (v) => (v && v.length > 0 ? undefined : 'Token is required'),
   })
   if (isCancel(token)) return back()
+  if ((await confirmDiscordBotIntents(token)) === 'cancel') return back()
   printDiscordInviteHint(token)
   return value({ discordBotToken: token })
 }
