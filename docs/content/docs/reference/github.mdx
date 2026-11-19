@@ -86,6 +86,103 @@ Set these under **Settings → Developer settings → GitHub Apps → your app �
 
 After changing permissions on an installed App, the install owner must accept the updated permissions on the install page before they take effect. At start, the adapter checks the installation against your `eventAllowlist` and logs a warning naming any missing permission; that preflight does not separately validate the **Contents** read access private-repo reviews need, so a reviewer missing it only fails at review time.
 
+#### Create the App from a manifest
+
+Instead of clicking through every permission above, you can register the App from a [manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest) that already has them set. GitHub still asks you to confirm once in the browser; it has no API that creates an App without that click.
+
+The manifest sets no App webhook, because TypeClaw installs its own repository webhooks. Its `redirect_url` points at an unused port on `127.0.0.1`, so no public callback server is needed: the browser shows a connection error, and the one-time code you need is in the address bar. Pick a port nothing on your machine listens on, because a local service there would receive the code. Share the code only with GitHub's conversion endpoint in step 3.
+
+Run all steps in the same shell, with `curl` and [`jq`](https://jqlang.org/) installed. They keep their files in a private temporary directory that only your user can read.
+
+**1. Pick a name and check it is free.** App names are unique across all of GitHub. Use lowercase letters, digits, and hyphens here so the name is also the App's URL slug; you can change the display name on GitHub's confirmation page.
+
+```sh
+APP_NAME="my-agent"
+if [[ "$APP_NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+  curl -s -o /dev/null -w '%{http_code}\n' "https://api.github.com/apps/$APP_NAME"
+else
+  echo "Use lowercase letters, digits, and hyphens"
+fi
+```
+
+`200` means the name is taken; pick another. `404` means no public App uses it, but another owner's private App can still hold it. If so, GitHub rejects the name on the confirmation page and lets you edit it there.
+
+**2. Open the registration page.** The App is private, so it can only be installed on the account that owns it. Set `OWNER` to the organization that owns the repositories the agent should watch, or leave it empty if they are under your personal account. One agent holds one App credential, so repositories under several accounts need either a separate agent per account, each with its own private App, or a single public App (`"public": true`) installed on each account if their policies allow it.
+
+If you don't use discussion events, drop the `discussions` line and also remove `discussion.created` and `discussion_comment.created` from `channels.github.eventAllowlist`; otherwise the adapter warns about the missing permission at start.
+
+```sh
+OWNER=""
+PORT=47821
+if DIR=$(mktemp -d) && [ -d "$DIR" ]; then
+ACTION="https://github.com/settings/apps/new"
+[ -n "$OWNER" ] && ACTION="https://github.com/organizations/$OWNER/settings/apps/new"
+cat > "$DIR/register.html" <<EOF
+<form id="f" action="$ACTION" method="post">
+  <input type="hidden" name="manifest" value='{
+    "name": "$APP_NAME",
+    "url": "https://typeclaw.dev",
+    "redirect_url": "http://127.0.0.1:$PORT/",
+    "public": false,
+    "default_permissions": {
+      "actions": "write",
+      "checks": "write",
+      "contents": "read",
+      "discussions": "write",
+      "issues": "write",
+      "metadata": "read",
+      "pull_requests": "write",
+      "repository_hooks": "write"
+    }
+  }'>
+</form>
+<script>document.getElementById('f').submit()</script>
+EOF
+open "$DIR/register.html"  # Linux: xdg-open
+else
+  echo "Could not create a private temporary directory"
+fi
+```
+
+Review the permissions and click **Create GitHub App**. The browser lands on `http://127.0.0.1:47821/?code=…`. Copy the `code` value; it expires after one hour and works once.
+
+**3. Exchange the code for the App's credentials.** This endpoint needs no authentication, so anyone holding an unused code can redeem it. The command reads the code without echoing it, keeps it out of shell history and process arguments, and stops unless GitHub returns a real App ID, slug, and private key.
+
+```sh
+if ! command -v jq > /dev/null; then
+  echo "Install jq first; the code works only once"
+elif [ -n "${DIR:-}" ] && [ -d "$DIR" ]; then
+  printf 'Paste the code: '; read -rs CODE; echo
+  if [[ "$CODE" =~ ^[A-Za-z0-9]+$ ]]; then
+    (
+      umask 077
+      printf 'url = "https://api.github.com/app-manifests/%s/conversions"\n' "$CODE" |
+        curl --disable --config - --fail --silent --show-error -X POST \
+          -H 'Accept: application/vnd.github+json' -o "$DIR/app.json" &&
+      jq -e '(.id | type == "number" and . > 0) and (.slug | type == "string" and length > 0)
+        and (.pem | type == "string" and startswith("-----BEGIN"))' "$DIR/app.json" > /dev/null &&
+      jq -r .pem "$DIR/app.json" > "$DIR/app.pem" &&
+      jq --arg key "$DIR/app.pem" '{appId: .id, slug, privateKeyPath: $key}' "$DIR/app.json"
+    ) || echo "Code exchange failed"
+  else
+    echo "That doesn't look like a manifest code"
+  fi
+  unset CODE
+else
+  echo "Run step 2 in this shell first"
+fi
+```
+
+If the exchange fails because the code expired or was already used, the App may exist anyway. Check **Settings → Developer settings → GitHub Apps**: either delete it and repeat from step 2, or keep it and generate a private key from its settings page.
+
+**4. Install the App** on the repositories the agent should watch at `https://github.com/apps/<slug>/installations/new`, using the `slug` from step 3.
+
+**5. Add the channel.** Run `typeclaw channel add github`, choose GitHub App auth, and enter the `appId` and `privateKeyPath` printed in step 3. Then delete the directory; `app.json` also holds the App's client secret.
+
+```sh
+[ -n "${DIR:-}" ] && [ -d "$DIR" ] && rm -rf "$DIR"
+```
+
 Installations are resolved per repository, and validated model-driven `gh` commands receive a short-lived installation token minted for that exact `owner/repo`. App credentials are never seeded into the ambient process `GH_TOKEN`; validated `gh` calls and runtime-owned consumers mint through the repository-scoped token bridge instead. An operator-authored `GH_TOKEN` remains untouched.
 
 App-backed GraphQL requires an explicit repository mint hint (`gh api graphql -R owner/repo ...`); TypeClaw consumes `-R`, mints that repository's installation token, and removes the unsupported flag before invoking `gh api`. Review-producing mutations are rejected from the shell-normalized query before minting so they cannot bypass the formal-review coordinator.
