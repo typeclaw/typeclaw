@@ -86,6 +86,8 @@ type Window = {
   // open on it get the file read-only.
   coordinated: boolean
   uncoordinatedReason?: string
+  // Set when a rollback could not advance the epoch: the record outlives the window.
+  keepRecord?: boolean
 }
 
 let configReadHook: ((stage: 'after-window' | 'after-live') => void) | undefined
@@ -289,12 +291,36 @@ export async function closeConfigWindow(file: string, call: symbol): Promise<voi
 // Bumped when a window opens, closes, or rolls a change back, and kept when the
 // window is gone, so a cross-process read can tell that a whole window came and
 // went between its samples.
-export function bumpConfigEpochSync(file: string): void {
+function bumpConfigEpochSync(file: string): { ok: true } | { ok: false; reason: string } {
   try {
+    if (failEpochWrites) throw new Error('epoch writes are failing (test)')
     writeStateFileSync(epochPath(file), { epoch: readConfigEpochSync(file) + 1 })
+    return { ok: true }
   } catch (error) {
-    console.warn(`[typeclaw] could not advance the ${basename(file)} window epoch (${errorText(error)})`)
+    return {
+      ok: false,
+      reason: `the ${basename(file)} window epoch could not be advanced at ${epochPath(file)}: ${errorText(error)}`,
+    }
   }
+}
+
+let failEpochWrites = false
+
+// Test seam: makes epoch advances fail while every other state write succeeds.
+export function __failConfigEpochWritesForTests(fail: boolean): void {
+  failEpochWrites = fail
+}
+
+// A rollback advances the epoch; if it cannot, the window's record is kept past
+// its close, so host readers keep using the trusted bytes until a restart.
+export function noteConfigRollbackSync(file: string): void {
+  const bumped = bumpConfigEpochSync(file)
+  if (bumped.ok) return
+  const window = windows.get(resolve(file))
+  if (window !== undefined) window.keepRecord = true
+  console.warn(
+    `[typeclaw] ${bumped.reason}; the agent's open ${basename(file)} state stays published until it restarts`,
+  )
 }
 
 function readConfigEpochSync(file: string): number {
@@ -575,10 +601,19 @@ function captureWindow(file: string, uncoordinatedReason?: string): void {
   }
   windows.set(key, window)
   if (window.coordinated) {
-    bumpConfigEpochSync(file)
-    publishWindow(file, window)
-  } else
-    console.warn(`[typeclaw] a bash command could not coordinate with host typeclaw commands (${uncoordinatedReason})`)
+    // A window that cannot advance the epoch is invisible to a host read that
+    // samples around it, so it is not coordinated.
+    const bumped = bumpConfigEpochSync(file)
+    if (bumped.ok) publishWindow(file, window)
+    else {
+      window.coordinated = false
+      window.uncoordinatedReason = bumped.reason
+    }
+  }
+  if (!window.coordinated)
+    console.warn(
+      `[typeclaw] a bash command could not coordinate with host typeclaw commands (${window.uncoordinatedReason})`,
+    )
 }
 
 function settleWindow(file: string, window: Window): void {
@@ -587,7 +622,17 @@ function settleWindow(file: string, window: Window): void {
     return
   }
   windows.delete(resolve(file))
-  bumpConfigEpochSync(file)
+  const bumped = bumpConfigEpochSync(file)
+  if (!bumped.ok || window.keepRecord === true) {
+    // Without an epoch advance a host read could miss this window entirely, so
+    // its record stays and host readers keep using the trusted bytes.
+    if (window.coordinated) {
+      console.warn(
+        `[typeclaw] ${bumped.ok ? `the ${basename(file)} window epoch could not be advanced during a rollback` : bumped.reason}; the agent's open ${basename(file)} state stays published until it restarts`,
+      )
+      return
+    }
+  }
   try {
     rmSync(windowPath(file), { force: true })
   } catch (error) {

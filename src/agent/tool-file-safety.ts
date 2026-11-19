@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { constants, createWriteStream, lstatSync, realpathSync, statSync, type Stats } from 'node:fs'
+import { constants, createWriteStream, lstatSync, statSync, type Stats } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -25,12 +25,12 @@ import {
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
 import {
-  bumpConfigEpochSync,
   closeConfigWindow,
   concurrentCallGuards,
   contentOf,
   identityOf,
   MANAGED_CONFIG_FILES,
+  noteConfigRollbackSync,
   noteConfigWriteSync,
   openConfigWindow,
   readConfigEntrySync,
@@ -970,7 +970,7 @@ export async function snapshotManagedConfigFiles(
   // read-only, so it cannot leave a change no host writer or restart can see.
   const makeReadOnly = (destination: string, reason: string): void => {
     reasons.push(reason)
-    const target = readOnlyTarget(agentDir, destination)
+    const target = readOnlyTarget(destination)
     if ('path' in target) readOnlyFiles.push(target.path)
     else refusals.push(target.refuse)
   }
@@ -1002,10 +1002,10 @@ export async function snapshotManagedConfigFiles(
   return { call, guard, files, ...(reasons.length > 0 ? { readOnly: { files: readOnlyFiles, reasons } } : {}) }
 }
 
-// The path a read-only bind must cover for a managed file: the file itself, or
-// for a symlink the regular file it resolves to inside the agent folder (a bind
-// on that file is what makes a write through the link fail).
-function readOnlyTarget(agentDir: string, destination: string): { path: string } | { refuse: string } {
+// Only a regular file at its fixed agent-root path can be held read-only: a
+// read-only bind cannot stop a missing path from being created, or a symlink's
+// directory entry from being replaced.
+function readOnlyTarget(destination: string): { path: string } | { refuse: string } {
   const name = path.basename(destination)
   let entry: Stats
   try {
@@ -1014,20 +1014,8 @@ function readOnlyTarget(agentDir: string, destination: string): { path: string }
     return { refuse: `${name} does not exist, so it cannot be made read-only for it` }
   }
   if (entry.isFile()) return { path: destination }
-  if (!entry.isSymbolicLink()) return { refuse: `${name} is not a regular file, so it cannot be made read-only for it` }
-  let resolved: string
-  try {
-    resolved = realpathSync(destination)
-  } catch {
-    return { refuse: `${name} is a symlink to nothing, so it cannot be made read-only for it` }
-  }
-  const root = realpathSync(path.resolve(agentDir))
-  if (!resolved.startsWith(`${root}${path.sep}`)) {
-    return { refuse: `${name} links outside the agent folder, so it cannot be made read-only for it` }
-  }
-  return isRegularFile(resolved)
-    ? { path: resolved }
-    : { refuse: `${name} links to something that is not a regular file, so it cannot be made read-only for it` }
+  if (entry.isSymbolicLink()) return { refuse: `${name} is a symlink, so it cannot be made read-only for it` }
+  return { refuse: `${name} is not a regular file, so it cannot be made read-only for it` }
 }
 
 // Prepended to the result of a call that ran with the config files read-only.
@@ -1037,14 +1025,6 @@ export function readOnlyConfigNotice(snapshot: ManagedConfigSnapshot): string | 
     `[TypeClaw config guard] typeclaw.json and cron.json were read-only for this command: the agent could not coordinate it with host typeclaw commands (${snapshot.readOnly.reasons.join('; ')}).`,
     'Any change this command tried to make to them failed. Retry it once that is cleared, or make the change with the write or edit tool.',
   ].join('\n')
-}
-
-function isRegularFile(destination: string): boolean {
-  try {
-    return lstatSync(destination).isFile()
-  } catch {
-    return false
-  }
 }
 
 // Model bash for roles that keep agent-root writes can rewrite typeclaw.json and
@@ -1195,7 +1175,7 @@ function revert(
   try {
     restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
   } catch (error) {
-    bumpConfigEpochSync(destination)
+    noteConfigRollbackSync(destination)
     setConfigRecovery(destination, true)
     return [
       `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
@@ -1203,7 +1183,7 @@ function revert(
       `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content; the agent keeps using the last authorized ${name} until it is fixed. Restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
     ].join('\n')
   }
-  bumpConfigEpochSync(destination)
+  noteConfigRollbackSync(destination)
   return [
     `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
     `blocked: ${reason}`,

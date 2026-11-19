@@ -52,6 +52,7 @@ import {
 import type { SandboxPolicy } from '@/sandbox'
 import { resolveExposableEnvNames } from '@/sandbox/env-exposure'
 
+import { prepareBashSandbox } from './bash-sandbox'
 import type { InternalGuard } from './guard-types'
 import { buildInternalGuards } from './guards'
 import { URL_FETCH_MAX_BYTES } from './multimodal/looker'
@@ -8717,7 +8718,7 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
   }
 
   test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
-    'under coordination failure a write through a symlinked typeclaw.json fails, and the command still runs',
+    'under coordination failure a symlinked typeclaw.json refuses that one call and nothing runs',
     async () => {
       await withAgentDir(async (agentDir, config) => {
         // given: typeclaw.json links into workspace and its window cannot be published
@@ -8725,20 +8726,20 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
         await mkdir(path.dirname(real), { recursive: true })
         await writeFile(real, '{"alias":["atlas"]}\n')
         await symlink(real, config)
+        await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
         await mkdir(path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json', 'occupied'), {
           recursive: true,
         })
         const { run, argv } = bwrapBash(agentDir)
 
-        // when: the command writes through the link
-        const text = await run(`printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; echo still-ran`)
+        // when: a command runs
+        const text = await run('touch ran-marker')
 
-        // then: the link's target was bound read-only, so the write failed and the rest ran
-        const target = await realpath(real)
-        expect(argv.at(-1)?.join(' ')).toContain(`--ro-bind ${target} ${target}`)
-        expect(text.startsWith('[TypeClaw config guard] typeclaw.json and cron.json were read-only')).toBe(true)
-        expect(text).toMatch(/Read-only file system/i)
-        expect(text).toContain('still-ran')
+        // then: it was refused with the cause, no sandbox was built, and nothing ran
+        expect(text).toContain('This command was not run: the agent could not coordinate config writes')
+        expect(text).toContain('typeclaw.json is a symlink, so it cannot be made read-only')
+        expect(argv).toEqual([])
+        expect(await Bun.file(path.join(agentDir, 'ran-marker')).exists()).toBe(false)
         expect(await readFile(real, 'utf8')).toBe('{"alias":["atlas"]}\n')
       })
     },
@@ -8777,7 +8778,7 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
     async () => {
       await withAgentDir(async (agentDir, config) => {
         await writeFile(config, '{"alias":["atlas"]}\n')
-        const { run } = bwrapBash(agentDir)
+        const { run, argv } = bwrapBash(agentDir)
 
         // given: window state cannot be published, so this call is uncoordinated
         const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
@@ -8788,6 +8789,30 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
 
         // then: the write fails in the sandbox, the call still runs, and it is told why
         expect(readOnly.startsWith('[TypeClaw config guard] typeclaw.json and cron.json were read-only')).toBe(true)
+        // the read-only bind of typeclaw.json comes after the masks, and no later
+        // bind lands on or inside a masked path
+        const args = argv.at(-1) ?? []
+        const masked: string[] = []
+        let lastMask = -1
+        // Role and credential masks all sit inside the agent folder; the jail's
+        // own `--tmpfs /tmp` scaffolding is not one (and this test's folder is under /tmp).
+        for (let i = 0; i < args.length; i++) {
+          const dest = args[i] === '--tmpfs' ? args[i + 1] : args[i] === '--ro-bind-data' ? args[i + 2] : undefined
+          if (dest !== undefined && dest.startsWith(`${agentDir}/`)) {
+            masked.push(dest)
+            lastMask = i
+          }
+        }
+        expect(masked.length).toBeGreaterThan(0)
+        const configBind = args.findIndex((arg, i) => arg === '--ro-bind' && args[i + 2] === config)
+        expect(configBind).toBeGreaterThan(lastMask)
+        for (let i = lastMask + 1; i < args.length; i++) {
+          if (args[i] !== '--bind' && args[i] !== '--ro-bind') continue
+          const dest = args[i + 2] ?? ''
+          for (const hidden of masked) {
+            expect(dest === hidden || dest.startsWith(`${hidden}/`)).toBe(false)
+          }
+        }
         expect(readOnly).toContain('still-ran')
         expect(readOnly).toMatch(/Read-only file system/i)
         expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
@@ -8800,6 +8825,41 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
       })
     },
   )
+
+  test('a read-only fallback bind on or inside a hidden path refuses the call and emits no bind', async () => {
+    await withAgentDir(async (agentDir) => {
+      // given: a fixture file inside a directory every role's sandbox masks
+      const hidden = path.join(agentDir, '.typeclaw', 'logs', 'fixture.json')
+      await mkdir(path.dirname(hidden), { recursive: true })
+      await writeFile(hidden, '{}\n')
+      const built: unknown[] = []
+
+      // when: the sandbox is asked to bind it read-only
+      const prepared = prepareBashSandbox({
+        command: 'true',
+        permissions: createPermissionService(),
+        origin: tui,
+        agentDir,
+        sessionId: 'bash-recheck-masked',
+        readOnlyFiles: [hidden],
+        boundary: {
+          ensureAvailable: async () => {},
+          resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+          resolveRuntime: async () => ({ env: {}, mounts: [] }),
+          buildCommand: (command, options) => {
+            built.push(options)
+            return { ...buildSandboxedCommand(command, options ?? {}), commandString: command }
+          },
+        },
+      })
+
+      // then: the call is refused before any command (or bind) is built
+      await expect(prepared).rejects.toThrow(
+        /This command was not run: .*fixture\.json would have to be bound read-only inside a path hidden/,
+      )
+      expect(built).toEqual([])
+    })
+  })
 
   test("the guard check sees the call's bytes on disk; the live file is never flipped to run it", async () => {
     await withAgentDir(async (agentDir, config) => {

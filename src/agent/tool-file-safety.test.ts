@@ -1,10 +1,11 @@
 import { expect, test } from 'bun:test'
 import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import {
+  __failConfigEpochWritesForTests,
   __setConfigReadHookForTests,
   readValidatedConfigFileSync,
   recordConfigCommitSync,
@@ -347,7 +348,7 @@ test('a fresh start refuses invalid leftover window state', async () => {
   }
 })
 
-test('under coordination failure a symlinked config binds its target read-only and a missing one refuses the call', async () => {
+test('under coordination failure a symlinked or missing config refuses the call', async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-readonly-targets-'))
   const config = path.join(agentDir, 'typeclaw.json')
   const real = path.join(agentDir, 'workspace', 'tc.json')
@@ -360,18 +361,19 @@ test('under coordination failure a symlinked config binds its target read-only a
     await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
     await mkdir(path.join(staging, 'typeclaw.json.window.json', 'occupied'), { recursive: true })
 
-    // when / then: the link's target is what gets bound read-only
-    const linked = await snapshotManagedConfigFiles(agentDir, async () => undefined)
-    await recheckManagedConfigAfterBash(linked)
-    expect(linked.readOnly?.files).toEqual([await realpath(real)])
+    // when / then: the link cannot be held read-only, so the call is refused
+    await expect(snapshotManagedConfigFiles(agentDir, async () => undefined)).rejects.toThrow(
+      /This command was not run: the agent could not coordinate config writes[\s\S]*typeclaw\.json is a symlink, so it cannot be made read-only/,
+    )
 
-    // given: cron.json is missing and its window cannot be published either
+    // given: typeclaw.json is a regular file again, but cron.json is missing and uncoordinated
+    await rm(config)
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    await rm(path.join(staging, 'typeclaw.json.window.json'), { recursive: true })
     await rm(path.join(agentDir, 'cron.json'))
     await mkdir(path.join(staging, 'cron.json.window.json', 'occupied'), { recursive: true })
 
-    // when / then: the call is refused with the cause, not run unprotected
-    const refused = snapshotManagedConfigFiles(agentDir, async () => undefined)
-    await expect(refused).rejects.toThrow(/This command was not run: the agent could not coordinate config writes/)
+    // when / then: the call is refused with the cause
     await expect(snapshotManagedConfigFiles(agentDir, async () => undefined)).rejects.toThrow(
       /cron\.json does not exist, so it cannot be made read-only/,
     )
@@ -379,6 +381,54 @@ test('under coordination failure a symlinked config binds its target read-only a
       /cron\.json\.window\.json/,
     )
   } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a window whose epoch cannot advance on open is a coordination failure', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-open-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const cron = path.join(agentDir, 'cron.json')
+  try {
+    // given: both config files exist and epoch writes fail while other state writes succeed
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    await writeFile(cron, '{"jobs":[]}\n')
+    __failConfigEpochWritesForTests(true)
+
+    // when: a call opens its windows
+    const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await recheckManagedConfigAfterBash(snapshot)
+
+    // then: it takes the read-only fallback, naming the epoch problem
+    expect(snapshot.readOnly?.files).toEqual([config, cron])
+    expect(readOnlyConfigNotice(snapshot)).toContain('window epoch could not be advanced')
+  } finally {
+    __failConfigEpochWritesForTests(false)
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a close whose epoch cannot advance keeps the window record, so host reads stay on trusted bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-close-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const window = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+  const trusted = '{"alias":["atlas"]}\n'
+  try {
+    // given: a coordinated window, then epoch writes start failing before it closes
+    await writeFile(config, trusted)
+    const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    expect(snapshot.readOnly).toBeUndefined()
+    __failConfigEpochWritesForTests(true)
+
+    // when: the call closes
+    await recheckManagedConfigAfterBash(snapshot)
+
+    // then: the record stays, and a host read uses its trusted bytes over unchecked ones on disk
+    expect(existsSync(window)).toBe(true)
+    await writeFile(config, '{"alias":["unchecked"]}\n')
+    expect(readValidatedConfigFileSync(config)).toBe(trusted)
+  } finally {
+    __failConfigEpochWritesForTests(false)
     await rm(agentDir, { recursive: true, force: true })
   }
 })
