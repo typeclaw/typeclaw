@@ -218,7 +218,22 @@ async function connectCdp(url: string): Promise<CdpClient & { closed: Promise<vo
 async function setup(now: () => number = Date.now) {
   const chrome = await startFakeChrome()
   const sessions = createBrowserSessions(chrome.socket, now)
-  const relay = await startCdpRelay({ token: MASTER_TOKEN, upstreamSocket: chrome.socket, sessions: sessions.relay })
+  // The relay records a disconnect on its own socket's close, which can land
+  // after the client sees its side close (it does on Windows); tests that move
+  // the clock past a disconnect wait for this instead.
+  const dropWaiters = new Map<string, () => void>()
+  const relay = await startCdpRelay({
+    token: MASTER_TOKEN,
+    upstreamSocket: chrome.socket,
+    sessions: {
+      ...sessions.relay,
+      onConnection: (owner, open) => {
+        sessions.relay.onConnection(owner, open)
+        if (!open) dropWaiters.get(owner)?.()
+      },
+    },
+  })
+  const dropped = (owner: string) => new Promise<void>((resolve) => dropWaiters.set(owner, resolve))
   cleanups.push(() => relay.close())
   const connectAs = (sessionId: string) => connectCdp(cdpWebSocketUrl(relay.port, sessions.tokenFor(sessionId)))
   const startObserver = () => {
@@ -227,7 +242,7 @@ async function setup(now: () => number = Date.now) {
     return observer
   }
   const observe = () => startObserver().ready
-  return { chrome, sessions, relay, connectAs, observe, startObserver }
+  return { chrome, sessions, relay, connectAs, observe, startObserver, dropped }
 }
 
 async function openTab(client: CdpClient): Promise<string> {
@@ -659,14 +674,15 @@ describe('idle and over-cap tab reaping', () => {
 
   test('reaps an idle tab through the relay once its script disconnects, and forgets tabs a page closed itself', async () => {
     let clock = 0
-    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    const { chrome, sessions, relay, connectAs, observe, dropped } = await setup(() => clock)
     await observe()
     const client = await connectAs('session-a')
     const kept = await openTab(client)
     chrome.closeFromPage(await openTab(client))
 
+    const gone = dropped('session-a')
     relay.disconnect('session-a')
-    await client.closed
+    await gone
     clock = TAB_IDLE_MS
 
     expect(await sessions.reap()).toEqual({ closed: 1, failed: 0 })
@@ -692,11 +708,12 @@ describe('idle and over-cap tab reaping', () => {
 
   test('does not sweep while the observer is behind, and sweeps once it catches up', async () => {
     let clock = 0
-    const { chrome, sessions, relay, connectAs, startObserver } = await setup(() => clock)
+    const { chrome, sessions, relay, connectAs, startObserver, dropped } = await setup(() => clock)
     const client = await connectAs('session-a')
     const tab = await openTab(client)
+    const gone = dropped('session-a')
     relay.disconnect('session-a')
-    await client.closed
+    await gone
     const unreachable = sessions.observe('ws://127.0.0.1:9/devtools/browser/unreachable')
     cleanups.push(() => unreachable.stop())
     clock = TAB_IDLE_MS
@@ -709,12 +726,13 @@ describe('idle and over-cap tab reaping', () => {
 
   test('retries a tab whose close failed on the next sweep', async () => {
     let clock = 0
-    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    const { chrome, sessions, relay, connectAs, observe, dropped } = await setup(() => clock)
     await observe()
     const client = await connectAs('session-a')
     const tab = await openTab(client)
+    const gone = dropped('session-a')
     relay.disconnect('session-a')
-    await client.closed
+    await gone
     clock = TAB_IDLE_MS
 
     chrome.failNextClose()
@@ -725,12 +743,13 @@ describe('idle and over-cap tab reaping', () => {
 
   test('lets a reconnecting owner through once the bounded wait ends, even if Chrome never answers the close', async () => {
     let clock = 0
-    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    const { chrome, sessions, relay, connectAs, observe, dropped } = await setup(() => clock)
     await observe()
     const client = await connectAs('session-a')
     await openTab(client)
+    const gone = dropped('session-a')
     relay.disconnect('session-a')
-    await client.closed
+    await gone
     clock = TAB_IDLE_MS
 
     const hold = chrome.holdClose()
@@ -744,12 +763,13 @@ describe('idle and over-cap tab reaping', () => {
 
   test('holds a reconnecting owner until the sweep closing its tabs has finished', async () => {
     let clock = 0
-    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    const { chrome, sessions, relay, connectAs, observe, dropped } = await setup(() => clock)
     await observe()
     const client = await connectAs('session-a')
     await openTab(client)
+    const gone = dropped('session-a')
     relay.disconnect('session-a')
-    await client.closed
+    await gone
     clock = TAB_IDLE_MS
     const upgradesBefore = chrome.upgrades()
 
