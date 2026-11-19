@@ -20,7 +20,7 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
-import { readValidatedConfigFileSync, tryRecordConfigCommitSync } from './config-commits'
+import { readConfigForWriteSync, readValidatedConfigFileSync, tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1381,8 +1381,11 @@ export function loadConfigSync(cwd: string): Config {
   let raw: string
   try {
     raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
-  } catch {
-    return configSchema.parse({})
+  } catch (error) {
+    // Only a missing file means defaults; one that cannot be read as a regular
+    // file must not replace the live config with them on reload.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return configSchema.parse({})
+    throw error
   }
 
   let json: unknown
@@ -1561,7 +1564,7 @@ function persistMigratedConfig(cwd: string): void {
     // Migrate the file as it is under the lock, not the caller's earlier read,
     // so a write that landed in between is not rolled back.
     applied = withConfigFileLockSync(file, () => {
-      const migrated = migrateLegacyConfigShape(JSON.parse(readValidatedConfigFileSync(file)))
+      const migrated = migrateLegacyConfigShape(JSON.parse(readConfigForWriteSync(file)))
       if (migrated.changed) {
         const bytes = `${JSON.stringify(migrated.json, null, 2)}\n`
         writeFileSync(file, bytes)
@@ -1620,8 +1623,12 @@ export function validateConfig(cwd: string, options: ValidateConfigOptions = {})
   let raw: string
   try {
     raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
-  } catch {
-    return { ok: true }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true }
+    return {
+      ok: false,
+      reason: `${CONFIG_FILE} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    }
   }
 
   const parsed = parseConfigJson(raw, { migrate: true, persistTarget: cwd })

@@ -4,6 +4,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { readValidatedConfigFileSync, recordConfigCommitSync } from '@/config/config-commits'
+
 import {
   enforceAndPinToolFiles,
   enforceCanonicalSecretDenial,
@@ -96,7 +98,7 @@ test('a blocked bash change whose restore fails partway is reported with its rec
   try {
     // given: a blocked bash change, and a restore write that fails after writing half
     await writeFile(config, '{"alias":["atlas"]}\n')
-    const snapshot = snapshotManagedConfigFiles(agentDir)
+    const snapshot = snapshotManagedConfigFiles(agentDir, async () => 'Guard `aliasLock` blocked write')
     await writeFile(config, '{"alias":["blocked-change"]}\n')
     const failingWrite = (target: string, bytes: Buffer) => {
       const fd = openSync(target, 'r+')
@@ -109,16 +111,28 @@ test('a blocked bash change whose restore fails partway is reported with its rec
     }
 
     // when: the post-call check blocks it
-    const notices = await recheckManagedConfigAfterBash(snapshot, async () => 'Guard `aliasLock` blocked write', {
-      writeInPlace: failingWrite,
-    })
+    const notices = await recheckManagedConfigAfterBash(snapshot, { writeInPlace: failingWrite })
 
     // then: the notice names the file, the block, the failure, and the recovery
     expect(notices).toHaveLength(1)
     expect(notices[0]).toContain('blocked: Guard `aliasLock` blocked write')
     expect(notices[0]).toContain('typeclaw.json could not be restored to its state before this command (disk full)')
     expect(notices[0]).toContain('`git checkout -- typeclaw.json`')
-    expect(await readFile(config, 'utf8')).not.toBe('')
+    const damaged = await readFile(config, 'utf8')
+    expect(damaged).not.toBe('')
+    expect(damaged).not.toBe('{"alias":["atlas"]}\n')
+
+    // and: with the call closed, runtime readers still get the last authorized bytes
+    expect(readValidatedConfigFileSync(config)).toBe('{"alias":["atlas"]}\n')
+
+    // when: an authorized commit puts the file back in a consistent state
+    await writeFile(config, '{"alias":["fixed"]}\n')
+    recordConfigCommitSync(config, '{"alias":["fixed"]}\n')
+
+    // then: the recovery state is cleared and readers follow the file again
+    expect(readValidatedConfigFileSync(config)).toBe('{"alias":["fixed"]}\n')
+    await writeFile(config, '{"alias":["hand-edit"]}\n')
+    expect(readValidatedConfigFileSync(config)).toBe('{"alias":["hand-edit"]}\n')
   } finally {
     await rm(agentDir, { recursive: true, force: true })
   }

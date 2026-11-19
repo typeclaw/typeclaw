@@ -11,7 +11,7 @@ import {
   type CustomModelMeta,
   type ThinkingLevel,
 } from './config'
-import { tryRecordConfigCommitSync } from './config-commits'
+import { readConfigForWriteSync, tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   KNOWN_PROVIDERS,
@@ -313,7 +313,7 @@ function writeConfig(
   const path = join(cwd, CONFIG_FILE)
   let parsed: Record<string, unknown>
   try {
-    const raw = readFileSync(path, 'utf8')
+    const raw = readConfigForWriteSync(path)
     parsed = JSON.parse(raw) as Record<string, unknown>
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {

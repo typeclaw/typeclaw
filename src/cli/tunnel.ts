@@ -6,7 +6,7 @@ import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
 import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
-import { tryRecordConfigCommitSync } from '@/config/config-commits'
+import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
@@ -977,14 +977,14 @@ function readFileOrUndefined(path: string): Buffer | undefined {
 // Tunnels as typeclaw.json holds them now. Parsed without persisting a
 // migration, so nothing under the config lock commits to git.
 function readTunnelsInLock(cwd: string): LiveResult<TunnelConfig[]> {
-  const parsed = parseConfigJson(readFileSync(join(cwd, 'typeclaw.json'), 'utf8'))
+  const parsed = parseConfigJson(readConfigForWriteSync(join(cwd, 'typeclaw.json')))
   return parsed.ok ? { ok: true, value: parsed.config.tunnels } : parsed
 }
 
 function readRawConfig(cwd: string): Record<string, unknown> {
   const file = join(cwd, 'typeclaw.json')
   try {
-    return JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+    return JSON.parse(readConfigForWriteSync(file)) as Record<string, unknown>
   } catch (err) {
     if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return {}
     throw err

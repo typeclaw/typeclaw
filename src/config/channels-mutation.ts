@@ -1,10 +1,10 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { commitSystemFileSync } from '@/git/system-commit'
 import { SecretsBackend } from '@/secrets'
 
-import { tryRecordConfigCommitSync } from './config-commits'
+import { readConfigForWriteSync, tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -230,7 +230,7 @@ function readEnabled(channelConfig: unknown): boolean {
 
 function readConfigRecord(cwd: string): { ok: true; value: Record<string, unknown> } | { ok: false; reason: string } {
   try {
-    const raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    const raw = readConfigForWriteSync(join(cwd, CONFIG_FILE))
     const parsed = JSON.parse(raw) as unknown
     if (!isObjectRecord(parsed)) return { ok: false, reason: `${CONFIG_FILE} must contain a JSON object.` }
     return { ok: true, value: parsed }

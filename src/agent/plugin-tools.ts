@@ -768,13 +768,13 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             // Bash writes these files directly, so its changes are checked after
             // the call. Bash takes no acknowledgements, so a guard that asks for
             // one blocks here; the notice points the model at write/edit.
-            const managedConfigBefore = snapshotManagedConfigFiles(opts.agentDir)
+            const managedConfigBefore = snapshotManagedConfigFiles(opts.agentDir, (content, destination) =>
+              managedConfigBlock(content, destination, undefined),
+            )
             try {
               executed = await run()
             } finally {
-              managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore, (content, destination) =>
-                managedConfigBlock(content, destination, undefined),
-              )
+              managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore)
             }
             if (managedConfigNotices.length > 0) {
               executed = {

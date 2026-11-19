@@ -399,3 +399,21 @@ describe('createCronReloadable', () => {
 function job(id: string): CronJob {
   return { id, schedule: '* * * * *', kind: 'prompt', prompt: 'x', enabled: true }
 }
+
+test('a FIFO at cron.json fails the reload promptly and keeps the live schedule', async () => {
+  // given: a live schedule, then cron.json replaced by a FIFO nobody writes to
+  const scheduler = recordingScheduler()
+  await writeFile(join(agentDir, 'cron.json'), JSON.stringify({ jobs: [] }))
+  const reloadable = createCronReloadable({ cwd: agentDir, scheduler })
+  expect((await reloadable.reload()).ok).toBe(true)
+  const applied = scheduler.replacements.length
+  await rm(join(agentDir, 'cron.json'))
+  expect(await Bun.spawn(['mkfifo', join(agentDir, 'cron.json')]).exited).toBe(0)
+
+  // when: cron reloads (a blocking open would hang here until the test times out)
+  const result = await reloadable.reload()
+
+  // then: the reload fails and the schedule is not replaced
+  expect(result.ok).toBe(false)
+  expect(scheduler.replacements.length).toBe(applied)
+})

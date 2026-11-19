@@ -12,7 +12,7 @@ import {
   type CustomModelMeta,
 } from '@/config'
 import { isGithubChannelTunnel } from '@/config/channels-mutation'
-import { tryRecordConfigCommitSync } from '@/config/config-commits'
+import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1541,7 +1541,7 @@ async function mergeChannelIntoConfig(cwd: string, options: AddChannelOptions): 
     const path = join(cwd, CONFIG_FILE)
     let parsed: Record<string, unknown>
     try {
-      const raw = await readFile(path, 'utf8')
+      const raw = readConfigForWriteSync(path)
       parsed = JSON.parse(raw) as Record<string, unknown>
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -1708,7 +1708,7 @@ function buildGithubTunnelEntry(options: Extract<AddChannelOptions, { channel: '
 async function writeGithubChannelForInit(cwd: string, credentials: GithubInitCredentials): Promise<void> {
   const configPath = join(cwd, CONFIG_FILE)
   await withConfigFileLock(configPath, async () => {
-    const parsed = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>
+    const parsed = JSON.parse(readConfigForWriteSync(configPath)) as Record<string, unknown>
     const existingChannels = isObjectRecord(parsed.channels) ? { ...parsed.channels } : {}
     existingChannels.github = {
       ...(credentials.webhookUrl !== undefined ? { webhookUrl: credentials.webhookUrl } : {}),
@@ -1775,7 +1775,7 @@ async function appendGithubSecrets(
 async function appendGithubMatchRules(cwd: string, repos: readonly string[]): Promise<void> {
   await withConfigFileLock(join(cwd, CONFIG_FILE), async () => {
     const path = join(cwd, CONFIG_FILE)
-    const parsed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+    const parsed = JSON.parse(readConfigForWriteSync(path)) as Record<string, unknown>
     const roles = isObjectRecord(parsed.roles) ? { ...parsed.roles } : {}
     const member = isObjectRecord(roles.member) ? { ...roles.member } : {}
     const existing = Array.isArray(member.match) ? member.match.filter((v): v is string => typeof v === 'string') : []

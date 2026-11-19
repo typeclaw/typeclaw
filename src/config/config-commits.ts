@@ -8,8 +8,10 @@ import {
   openSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   realpathSync,
   renameSync,
+  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -26,12 +28,16 @@ import { CREDENTIAL_STAGING_RELATIVE_DIR, ensureOwnerOnlyDir } from '@/init/stag
 // that makes that after-the-fact check safe:
 //
 // - The last AUTHORIZED commit of each file: bytes written under the config file
-//   lock by a checked write/edit, a host CLI command, or a passed post-bash
-//   check. It lives in the credential staging dir, which is owner-only and masked
-//   from every model tool and every bash role, so bash cannot forge it.
-// - While any bash call is in flight, the VALIDATED state of each file in this
-//   process. Runtime readers (config/cron reload, the guards' own baselines) use
-//   it instead of bytes no check has passed yet.
+//   lock by a checked write/edit, a host CLI command, a config migration, or a
+//   passed post-bash check. It lives in the credential staging dir, which is
+//   owner-only and masked from every model tool and every bash role, so bash
+//   cannot forge it.
+// - While any bash call is in flight (or a failed rollback is unrecovered), the
+//   TRUSTED state of each file: the newest authorized state. Runtime readers
+//   (config/cron reload, the guards' own baselines) and guard-free
+//   read-modify-write writers use it instead of bytes no check has passed yet.
+//   It is also published to the staging dir, so host CLI writers in another
+//   process build on it too.
 
 export const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
 
@@ -54,12 +60,25 @@ export type ConfigFileEntry =
     }
   | { kind: 'other'; id: ConfigFileIdentity }
 
-export type ConfigCommit = { generation: number; bytes: Buffer | undefined }
+export type ConfigCommit = { generation: number; bytes: Buffer | undefined; superseded: boolean }
 
-type Window = { count: number; validated: ConfigFileEntry; generation: number | undefined }
+// A bash call's guard check: the denial reason, or undefined when content may land.
+export type ConfigCallGuard = (content: string, destination: string) => Promise<string | undefined>
+
+type Window = {
+  calls: Map<symbol, ConfigCallGuard>
+  trusted: ConfigFileEntry
+  generation: number | undefined
+  // A blocked change whose rollback failed: the trusted view stays in force,
+  // even with no call in flight, until the file is back to an authorized state.
+  recovery: boolean
+}
 
 const windows = new Map<string, Window>()
 const baselineOverride = new AsyncLocalStorage<{ file: string; bytes: Buffer | undefined }>()
+// Set by a guard-free writer's baseline read when the file held a bash candidate
+// that its write replaces; consumed by the commit it records under the same lock.
+const supersededCandidates = new Set<string>()
 
 export function readConfigEntrySync(file: string): ConfigFileEntry {
   const link = lstatOrUndefined(file)
@@ -106,46 +125,36 @@ export function equalBytes(a: Buffer | undefined, b: Buffer | undefined): boolea
 }
 
 export function readConfigCommitSync(file: string): ConfigCommit | undefined {
-  let raw: string
+  let parsed: Record<string, unknown> | undefined
   try {
-    raw = readFileSync(commitPath(file), 'utf8')
+    parsed = readStateFileSync(commitPath(file))
   } catch {
     return undefined
   }
-  try {
-    const parsed = JSON.parse(raw) as { generation?: unknown; content?: unknown }
-    if (typeof parsed.generation !== 'number') return undefined
-    const bytes = typeof parsed.content === 'string' ? Buffer.from(parsed.content, 'base64') : undefined
-    return { generation: parsed.generation, bytes }
-  } catch {
-    return undefined
-  }
+  if (parsed === undefined || typeof parsed.generation !== 'number') return undefined
+  const bytes = typeof parsed.content === 'string' ? Buffer.from(parsed.content, 'base64') : undefined
+  return { generation: parsed.generation, bytes, superseded: parsed.superseded === true }
 }
 
 // Records `content` as the last authorized commit of `file`. Callers hold the
 // config file lock and have just written exactly these bytes.
 export function recordConfigCommitSync(file: string, content: string | Buffer | undefined): number {
+  const key = resolve(file)
   const bytes = content === undefined ? undefined : Buffer.from(content)
   const generation = (readConfigCommitSync(file)?.generation ?? 0) + 1
-  const destination = commitPath(file)
-  ensureOwnerOnlyDir(dirname(destination))
-  const temporary = `${destination}.${process.pid}.${generation}.tmp`
-  writeFileSync(
-    temporary,
-    JSON.stringify({ generation, content: bytes === undefined ? null : bytes.toString('base64') }),
-    { mode: 0o600, flag: 'wx' },
-  )
-  try {
-    renameSync(temporary, destination)
-  } catch (error) {
-    unlinkSync(temporary)
-    throw error
-  }
-  const window = windows.get(resolve(file))
+  const superseded = supersededCandidates.delete(key)
+  writeStateFileSync(commitPath(file), {
+    generation,
+    content: bytes === undefined ? null : bytes.toString('base64'),
+    superseded,
+  })
+  const window = windows.get(key)
   if (window !== undefined) {
     const live = readConfigEntrySync(file)
-    window.validated = equalBytes(contentOf(live), bytes) ? live : withContent(window.validated, bytes)
+    window.trusted = equalBytes(contentOf(live), bytes) ? live : withContent(window.trusted, bytes)
     window.generation = generation
+    window.recovery = false
+    settleWindow(file, window)
   }
   return generation
 }
@@ -157,53 +166,103 @@ export function tryRecordConfigCommitSync(file: string, content: string | Buffer
     recordConfigCommitSync(file, content)
   } catch (error) {
     console.warn(
-      `[typeclaw] could not record the ${basename(file)} commit (${error instanceof Error ? error.message : String(error)}); a bash command running in the agent now may revert this change`,
+      `[typeclaw] could not record the ${basename(file)} commit (${errorText(error)}); a bash command running in the agent now may revert this change`,
     )
   }
 }
 
-// Opened by each bash call before it runs and closed after its post-call check.
-// The first open captures the file as validated: no unchecked bash bytes can be
-// on disk while no bash call is in flight.
-export function openConfigWindowSync(file: string): void {
+// The baseline for a writer that changes typeclaw.json/cron.json without the
+// guards (role grants, host CLI config commands, migrations), under the config
+// lock. While a bash call is in flight the file may hold that call's unchecked
+// candidate, so the writer builds on the trusted state instead: its write then
+// replaces the candidate, and the bash call's check finds an authorized commit.
+// With no bash call in flight it reads the file. Throws ENOENT when missing.
+export function readConfigForWriteSync(file: string): string {
   const key = resolve(file)
-  const window = windows.get(key)
-  if (window !== undefined) {
-    window.count += 1
-    return
+  supersededCandidates.delete(key)
+  const trusted = windows.has(key) ? trustedConfigState(file).entry : publishedTrustedEntry(file)
+  if (trusted === undefined) return textOf(file, readConfigEntrySync(file))
+  if (!sameConfigContent(readConfigEntrySync(file), trusted)) supersededCandidates.add(key)
+  return textOf(file, trusted)
+}
+
+// A checked write/edit lands `bytes`: if the file held a bash candidate that
+// these bytes replace, the bash call is told its change was discarded.
+export function noteConfigWriteSync(file: string, bytes: string | Buffer): void {
+  const key = resolve(file)
+  supersededCandidates.delete(key)
+  if (!windows.has(key)) return
+  const live = readConfigEntrySync(file)
+  const trusted = trustedConfigState(file).entry
+  if (!sameConfigContent(live, trusted) && !equalBytes(contentOf(live), Buffer.from(bytes))) {
+    supersededCandidates.add(key)
   }
-  windows.set(key, {
-    count: 1,
-    validated: readConfigEntrySync(file),
-    generation: readConfigCommitSync(file)?.generation,
-  })
 }
 
-export function closeConfigWindow(file: string): void {
+// Opened by each bash call before it runs and closed after its post-call check.
+// The first open captures the file as trusted: no unchecked bash bytes can be
+// on disk while no bash call is in flight and no rollback is unrecovered.
+export function openConfigWindowSync(file: string, call: symbol, guard: ConfigCallGuard): number | undefined {
   const key = resolve(file)
-  const window = windows.get(key)
-  if (window === undefined) return
-  window.count -= 1
-  if (window.count === 0) windows.delete(key)
+  let window = windows.get(key)
+  if (window === undefined) {
+    window = {
+      calls: new Map(),
+      trusted: readConfigEntrySync(file),
+      generation: readConfigCommitSync(file)?.generation,
+      recovery: false,
+    }
+    windows.set(key, window)
+    publishWindow(file, window)
+  }
+  window.calls.set(call, guard)
+  return trustedConfigState(file).generation
 }
 
-export function validatedConfigState(file: string): { entry: ConfigFileEntry; generation: number | undefined } {
+export function closeConfigWindow(file: string, call: symbol): void {
+  const window = windows.get(resolve(file))
+  if (window === undefined) return
+  window.calls.delete(call)
+  settleWindow(file, window)
+}
+
+// The newest authorized state: the trusted state, advanced to any commit an
+// authorized writer in another process recorded since.
+export function trustedConfigState(file: string): {
+  entry: ConfigFileEntry
+  generation: number | undefined
+  commit: ConfigCommit | undefined
+} {
   const window = windows.get(resolve(file))
   if (window === undefined) throw new Error(`${basename(file)} has no open bash config window`)
-  return { entry: window.validated, generation: window.generation }
-}
-
-export function setValidatedConfigEntry(file: string, entry: ConfigFileEntry): void {
-  const window = windows.get(resolve(file))
-  if (window !== undefined) window.validated = entry
-}
-
-// The commit that supersedes the validated state: one an authorized writer in
-// another process made after the validated state was captured.
-export function newerConfigCommit(file: string, generation: number | undefined): ConfigCommit | undefined {
   const commit = readConfigCommitSync(file)
-  if (commit === undefined) return undefined
-  return generation === undefined || commit.generation > generation ? commit : undefined
+  if (commit !== undefined && (window.generation === undefined || commit.generation > window.generation)) {
+    const live = readConfigEntrySync(file)
+    window.trusted = equalBytes(contentOf(live), commit.bytes) ? live : withContent(window.trusted, commit.bytes)
+    window.generation = commit.generation
+    publishWindow(file, window)
+  }
+  return { entry: window.trusted, generation: window.generation, commit }
+}
+
+// The guards of the other bash calls in flight on this file, whose sessions may
+// hold fewer permissions than the call being checked.
+export function concurrentCallGuards(file: string, call: symbol): ConfigCallGuard[] {
+  const window = windows.get(resolve(file))
+  if (window === undefined) return []
+  return [...window.calls].filter(([other]) => other !== call).map(([, guard]) => guard)
+}
+
+export function setTrustedConfigEntry(file: string, entry: ConfigFileEntry): void {
+  const window = windows.get(resolve(file))
+  if (window === undefined) return
+  window.trusted = entry
+  publishWindow(file, window)
+}
+
+export function setConfigRecovery(file: string, recovery: boolean): void {
+  const window = windows.get(resolve(file))
+  if (window !== undefined) window.recovery = recovery
 }
 
 export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): ConfigFileEntry {
@@ -212,27 +271,26 @@ export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): 
   return { kind: 'file', bytes, mode: 0o644, id: zeroIdentity() }
 }
 
-// What runtime readers load. With no bash call in flight this is the file. While
-// one is, bytes that differ from the validated state and from any newer
-// authorized commit have not passed a check yet, so the validated (or newer
-// committed) bytes are returned instead. Throws ENOENT for a missing file, like
-// readFileSync.
+// What runtime readers load. With no bash call in flight this is the file, read
+// only if it is one regular file (a link is followed to one). While one is (or
+// a failed rollback is unrecovered), bytes that differ from the trusted state
+// have not passed a check yet, so the trusted bytes are returned instead.
+// Throws ENOENT for a missing file, like readFileSync.
 export function readValidatedConfigFileSync(file: string): string {
   const window = windows.get(resolve(file))
-  if (window === undefined) return readFileSync(file, 'utf8')
+  if (window === undefined) return textOf(file, readConfigEntrySync(file))
   const live = readConfigEntrySync(file)
-  if (sameConfigContent(live, window.validated)) return textOf(file, live)
-  const commit = newerConfigCommit(file, window.generation)
-  if (commit !== undefined) {
-    return equalBytes(contentOf(live), commit.bytes)
-      ? textOf(file, live)
-      : textOf(file, withContent(live, commit.bytes))
+  const { entry: trusted } = trustedConfigState(file)
+  if (!sameConfigContent(live, trusted)) return textOf(file, trusted)
+  if (window.recovery) {
+    window.recovery = false
+    settleWindow(file, window)
   }
-  return textOf(file, window.validated)
+  return textOf(file, live)
 }
 
 // The baseline a typeclaw.json/cron.json guard compares a proposed change to.
-// The post-bash check passes the validated bytes explicitly, so the guards never
+// The post-bash check passes the trusted bytes explicitly, so the guards never
 // need the live file rewritten to see them.
 export function runWithConfigBaseline<T>(file: string, bytes: Buffer | undefined, fn: () => Promise<T>): Promise<T> {
   return baselineOverride.run({ file: resolve(file), bytes }, fn)
@@ -245,6 +303,19 @@ export async function readConfigBaseline(file: string): Promise<string> {
     return override.bytes.toString('utf8')
   }
   return readValidatedConfigFileSync(file)
+}
+
+// A runtime that stopped with a window open left its published state behind;
+// the next runtime starts with no bash call in flight.
+export function clearPublishedConfigWindowsSync(agentDir: string): void {
+  const dir = join(resolve(agentDir), CREDENTIAL_STAGING_RELATIVE_DIR)
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const name of names) if (name.endsWith('.window.json')) rmSync(join(dir, name), { force: true })
 }
 
 // Puts `to` back at `file`, given what is on disk now. A regular file is
@@ -350,8 +421,9 @@ function zeroIdentity(): ConfigFileIdentity {
 
 function textOf(file: string, entry: ConfigFileEntry): string {
   if (entry.kind === 'missing') throw notFound(file)
-  // Not one regular file (a directory or FIFO): read it as loaders always have.
-  if (entry.kind === 'other') return readFileSync(file, 'utf8')
+  if (entry.kind === 'other') {
+    throw Object.assign(new Error(`${file} is not a regular file; refusing to read it`), { code: 'EINVAL' })
+  }
   return entry.bytes.toString('utf8')
 }
 
@@ -359,7 +431,92 @@ function notFound(file: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' })
 }
 
+function settleWindow(file: string, window: Window): void {
+  if (window.calls.size > 0 || window.recovery) {
+    publishWindow(file, window)
+    return
+  }
+  windows.delete(resolve(file))
+  try {
+    rmSync(windowPath(file), { force: true })
+  } catch (error) {
+    console.warn(
+      `[typeclaw] could not clear the published ${basename(file)} state (${errorText(error)}); host typeclaw config commands keep building on the last authorized ${basename(file)} until the agent restarts`,
+    )
+  }
+}
+
+function publishWindow(file: string, window: Window): void {
+  const bytes = contentOf(window.trusted)
+  try {
+    writeStateFileSync(windowPath(file), {
+      generation: window.generation ?? 0,
+      content: bytes === undefined ? null : bytes.toString('base64'),
+    })
+  } catch (error) {
+    console.warn(
+      `[typeclaw] could not publish the trusted ${basename(file)} state (${errorText(error)}); a host typeclaw config command run during a bash command may keep that command's unchecked change`,
+    )
+  }
+}
+
+// The trusted state a runtime published for its open window, advanced to any
+// newer commit, or undefined when no window is open.
+function publishedTrustedEntry(file: string): ConfigFileEntry | undefined {
+  let published: Record<string, unknown> | undefined
+  try {
+    published = readStateFileSync(windowPath(file))
+  } catch (error) {
+    console.warn(
+      `[typeclaw] could not read the agent's open ${basename(file)} state (${errorText(error)}); building on the file as it is`,
+    )
+    return undefined
+  }
+  if (published === undefined) return undefined
+  const commit = readConfigCommitSync(file)
+  const generation = typeof published.generation === 'number' ? published.generation : 0
+  if (commit !== undefined && commit.generation > generation) return withContent({ kind: 'missing' }, commit.bytes)
+  const content = typeof published.content === 'string' ? Buffer.from(published.content, 'base64') : undefined
+  return withContent({ kind: 'missing' }, content)
+}
+
+function readStateFileSync(path: string): Record<string, unknown> | undefined {
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+  const parsed = JSON.parse(raw) as unknown
+  return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined
+}
+
+function writeStateFileSync(path: string, value: Record<string, unknown>): void {
+  ensureOwnerOnlyDir(dirname(path))
+  const temporary = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  writeFileSync(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' })
+  try {
+    renameSync(temporary, path)
+  } catch (error) {
+    unlinkSync(temporary)
+    throw error
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 function commitPath(file: string): string {
+  return statePath(file, 'commit')
+}
+
+function windowPath(file: string): string {
+  return statePath(file, 'window')
+}
+
+function statePath(file: string, kind: 'commit' | 'window'): string {
   const absolute = resolve(file)
-  return join(dirname(absolute), CREDENTIAL_STAGING_RELATIVE_DIR, `${basename(absolute)}.commit.json`)
+  return join(dirname(absolute), CREDENTIAL_STAGING_RELATIVE_DIR, `${basename(absolute)}.${kind}.json`)
 }

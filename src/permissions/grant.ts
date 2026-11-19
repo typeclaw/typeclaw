@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { tryRecordConfigCommitSync } from '@/config/config-commits'
+import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { commitSystemFileSync } from '@/git/system-commit'
 
@@ -131,14 +131,13 @@ type LoadedConfig = {
 
 function loadConfigObject(cwd: string, roleName: string): LoadedConfig | { ok: false; reason: string } {
   const path = join(cwd, CONFIG_FILE)
-  if (!existsSync(path)) {
-    return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}` }
-  }
-
   let raw: string
   try {
-    raw = readFileSync(path, 'utf8')
+    raw = readConfigForWriteSync(path)
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { ok: false, reason: `${CONFIG_FILE} not found at ${cwd}` }
+    }
     return { ok: false, reason: `failed to read ${CONFIG_FILE}: ${describeError(error)}` }
   }
 

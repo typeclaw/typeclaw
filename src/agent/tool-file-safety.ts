@@ -26,20 +26,21 @@ import {
 } from '@/bundled-plugins/security/policies/private-surface-read'
 import {
   closeConfigWindow,
+  concurrentCallGuards,
   contentOf,
-  equalBytes,
   identityOf,
   MANAGED_CONFIG_FILES,
-  newerConfigCommit,
+  noteConfigWriteSync,
   openConfigWindowSync,
   readConfigEntrySync,
   recordConfigCommitSync,
   restoreConfigEntrySync,
   runWithConfigBaseline,
   sameConfigContent,
-  setValidatedConfigEntry,
-  validatedConfigState,
-  withContent,
+  setConfigRecovery,
+  setTrustedConfigEntry,
+  trustedConfigState,
+  type ConfigCallGuard,
   type ConfigFileEntry,
   type ConfigFileIdentity,
 } from '@/config/config-commits'
@@ -909,6 +910,7 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
       // A call cancelled while queued, while its guards ran, or during the entry
       // check above must not write; nothing is awaited between here and the write.
       commit.signal?.throwIfAborted()
+      noteConfigWriteSync(destination, content)
       await writeOutputNoFollow(targetPath, content)
       recordConfigCommitSync(destination, content)
     })
@@ -935,75 +937,84 @@ async function managedConfigDestination(agentDir: string, targetPath: string): P
 }
 
 // Per bash call: what each managed path looked like (lstat identity, plus the
-// identity of the file a symlink names) when the call started. An unchanged
-// identity after the call costs nothing more than these stats.
-export type ManagedConfigSnapshot = ReadonlyMap<string, CallIdentity>
+// identity of the file a symlink names) and the newest authorized commit when
+// the call started. An unchanged identity after the call costs nothing more.
+export type ManagedConfigSnapshot = {
+  call: symbol
+  guard: ManagedConfigGuardCheck
+  files: ReadonlyMap<string, { identity: CallIdentity; generation: number | undefined }>
+}
 
 type CallIdentity = { link: ConfigFileIdentity | undefined; resolved: ConfigFileIdentity | undefined }
 
 // Returns the guard's denial reason, or undefined when the content may land.
-export type ManagedConfigGuardCheck = (content: string, destination: string) => Promise<string | undefined>
+export type ManagedConfigGuardCheck = ConfigCallGuard
 
 export type RecheckSeams = { writeInPlace?: (path: string, bytes: Buffer) => void }
 
-export function snapshotManagedConfigFiles(agentDir: string): ManagedConfigSnapshot {
-  const snapshot = new Map<string, CallIdentity>()
+export function snapshotManagedConfigFiles(agentDir: string, guard: ManagedConfigGuardCheck): ManagedConfigSnapshot {
+  const call = Symbol('bash call')
+  const files = new Map<string, { identity: CallIdentity; generation: number | undefined }>()
   try {
     for (const file of MANAGED_CONFIG_FILES) {
       const destination = path.join(path.resolve(agentDir), file)
-      openConfigWindowSync(destination)
-      snapshot.set(destination, callIdentity(destination))
+      const generation = openConfigWindowSync(destination, call, guard)
+      files.set(destination, { identity: callIdentity(destination), generation })
     }
   } catch (error) {
-    for (const destination of snapshot.keys()) closeConfigWindow(destination)
+    for (const destination of files.keys()) closeConfigWindow(destination, call)
     throw error
   }
-  return snapshot
+  return { call, guard, files }
 }
 
 // Model bash for roles that keep agent-root writes can rewrite typeclaw.json and
 // cron.json directly, past the write/edit guards. bwrap runs every bash call
 // with --die-with-parent in its own PID namespace, so each of its writes has
 // landed by the time the call returns. A changed file is checked under the
-// config lock, in the checked-write queue, against state only authorized
-// writers can produce (src/config/config-commits.ts):
+// config lock, in the checked-write queue, against the newest authorized state
+// (src/config/config-commits.ts), which only authorized writers can produce:
 //
-// - bytes equal to the validated state, or to a commit an authorized writer
-//   recorded during the call, are left as they are;
-// - anything else is a bash change: this session's guards run on it as a
-//   `write`, against the validated bytes passed as their baseline, so the live
-//   file is never rewritten to run them. A change that passes is recorded as
-//   the new authorized commit. A blocked one is put back to the latest
-//   authorized state, in place, only if the file still holds the checked bytes.
+// - bytes equal to that state are left as they are. When an authorized writer
+//   replaced a bash candidate during this call, the call is told its change to
+//   the file was discarded;
+// - anything else is a bash change: it runs as a `write` through this
+//   session's guards, and through those of every other bash call in flight on
+//   the file (a session with fewer permissions may own the change), against
+//   the authorized bytes passed as their baseline, so the live file is never
+//   rewritten to run them. A change every guard passes is recorded as the new
+//   authorized commit. A blocked one is put back to the authorized state, in
+//   place, only if the file still holds the checked bytes; if that fails, the
+//   authorized view stays in force for runtime readers until the file is back.
 //
 // A symlinked path is followed, as loaders and the guards follow it, so a change
 // to the file it names is caught too. A deleted file is left deleted: no guard
 // evaluates a deletion. A directory or FIFO is never opened and is left alone.
-// Returns one model-facing notice per reverted (or unrevertable) file.
+// Returns one model-facing notice per reverted, discarded, or unrevertable file.
 export async function recheckManagedConfigAfterBash(
   snapshot: ManagedConfigSnapshot,
-  check: ManagedConfigGuardCheck,
   seams: RecheckSeams = {},
 ): Promise<string[]> {
   const notices: string[] = []
   try {
-    for (const [destination, before] of snapshot) {
-      if (sameCallIdentity(before, callIdentity(destination))) continue
-      const notice = await recheckManagedEntry(destination, check, seams).catch(
+    for (const [destination, before] of snapshot.files) {
+      if (sameCallIdentity(before.identity, callIdentity(destination))) continue
+      const notice = await recheckManagedEntry(destination, snapshot, before.generation, seams).catch(
         (error: unknown) =>
           `[TypeClaw config guard] Could not re-check ${path.basename(destination)} after this command: ${errorMessage(error)}`,
       )
       if (notice !== undefined) notices.push(notice)
     }
   } finally {
-    for (const destination of snapshot.keys()) closeConfigWindow(destination)
+    for (const destination of snapshot.files.keys()) closeConfigWindow(destination, snapshot.call)
   }
   return notices
 }
 
 async function recheckManagedEntry(
   destination: string,
-  check: ManagedConfigGuardCheck,
+  snapshot: ManagedConfigSnapshot,
+  startGeneration: number | undefined,
   seams: RecheckSeams,
 ): Promise<string | undefined> {
   let locked = false
@@ -1011,17 +1022,24 @@ async function recheckManagedEntry(
     withConfigFileLock(destination, async () => {
       locked = true
       const live = readConfigEntrySync(destination)
-      const pending = unauthorizedChange(destination, live)
-      if (pending === undefined) return undefined
-      const baseline = contentOf(pending.validated)
-      const reason = await runWithConfigBaseline(destination, baseline, () =>
-        check(live.kind === 'missing' || live.kind === 'other' ? '' : live.bytes.toString('utf8'), destination),
-      ).catch((error: unknown) => `the config guard check failed: ${errorMessage(error)}`)
-      if (reason === undefined) {
-        recordConfigCommitSync(destination, contentOf(live))
+      const { entry: trusted, commit } = trustedConfigState(destination)
+      if (sameConfigContent(live, trusted)) {
+        setConfigRecovery(destination, false)
+        const committedDuringCall =
+          commit !== undefined && (startGeneration === undefined || commit.generation > startGeneration)
+        return committedDuringCall && commit.superseded ? discardedNotice(path.basename(destination)) : undefined
+      }
+      if (live.kind === 'missing') {
+        setTrustedConfigEntry(destination, live)
         return undefined
       }
-      return revert(destination, live, pending.revertTo, reason, seams)
+      if (live.kind === 'other') return undefined
+      const reason = await checkUnderEveryCall(destination, snapshot, live.bytes, contentOf(trusted))
+      if (reason === undefined) {
+        recordConfigCommitSync(destination, live.bytes)
+        return undefined
+      }
+      return revert(destination, live, trusted, reason, seams)
     }),
   )
   checkedWrites = recheck.catch(() => {})
@@ -1032,35 +1050,45 @@ async function recheckManagedEntry(
     // an unavailable lock must not leave an unchecked change in place.
     if (locked) throw error
     const live = readConfigEntrySync(destination)
-    const pending = unauthorizedChange(destination, live)
-    if (pending === undefined) throw error
+    const { entry: trusted } = trustedConfigState(destination)
+    if (sameConfigContent(live, trusted) || live.kind === 'missing' || live.kind === 'other') throw error
     return revert(
       destination,
       live,
-      pending.revertTo,
+      trusted,
       `the config file lock was unavailable, so the change could not be checked: ${errorMessage(error)}`,
       seams,
     )
   }
 }
 
-// What a bash change is checked against and put back to, or undefined when the
-// file holds state an authorized writer produced (or a change no guard can
-// evaluate: a deletion, or something that is not a regular file).
-function unauthorizedChange(
+// A change on a file several bash calls overlap on may belong to any of them,
+// so it must pass this call's guards and those of every other call in flight.
+async function checkUnderEveryCall(
   destination: string,
-  live: ConfigFileEntry,
-): { validated: ConfigFileEntry; revertTo: ConfigFileEntry } | undefined {
-  const { entry: validated, generation } = validatedConfigState(destination)
-  if (sameConfigContent(live, validated)) return undefined
-  const commit = newerConfigCommit(destination, generation)
-  if (commit !== undefined && equalBytes(contentOf(live), commit.bytes)) return undefined
-  if (live.kind === 'missing') {
-    setValidatedConfigEntry(destination, live)
-    return undefined
+  snapshot: ManagedConfigSnapshot,
+  candidate: Buffer,
+  baseline: Buffer | undefined,
+): Promise<string | undefined> {
+  const run = (guard: ManagedConfigGuardCheck) =>
+    runWithConfigBaseline(destination, baseline, () => guard(candidate.toString('utf8'), destination)).catch(
+      (error: unknown) => `the config guard check failed: ${errorMessage(error)}`,
+    )
+  const own = await run(snapshot.guard)
+  if (own !== undefined) return own
+  for (const guard of concurrentCallGuards(destination, snapshot.call)) {
+    if ((await run(guard)) !== undefined) {
+      return 'a concurrent command from a session without permission to make this change was running, and config changes made while it runs must pass its checks too'
+    }
   }
-  if (live.kind === 'other') return undefined
-  return { validated, revertTo: commit === undefined ? validated : withContent(validated, commit.bytes) }
+  return undefined
+}
+
+function discardedNotice(name: string): string {
+  return [
+    `[TypeClaw config guard] An authorized write committed ${name} during this command, so any change this command made to ${name} was discarded.`,
+    `Redo that change with the write or edit tool, which checks ${name} before writing.`,
+  ].join('\n')
 }
 
 function revert(
@@ -1082,10 +1110,11 @@ function revert(
   try {
     restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
   } catch (error) {
+    setConfigRecovery(destination, true)
     return [
       `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
       `blocked: ${reason}`,
-      `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content: restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
+      `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content; the agent keeps using the last authorized ${name} until it is fixed. Restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
     ].join('\n')
   }
   return [

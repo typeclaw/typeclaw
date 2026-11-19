@@ -8085,7 +8085,12 @@ describe('managed config recheck after bash', () => {
 
   // The real guard plugin's internal guards (managedConfig) plus the real
   // rolePromotion check, as for a role that holds no bypass for it.
-  function guardHooks(agentDir: string, onWriteCheck?: () => Promise<void>) {
+  // Pass `bypassRolePromotion` for a session that holds that bypass (owner).
+  function guardHooks(
+    agentDir: string,
+    onWriteCheck?: () => Promise<void>,
+    options: { bypassRolePromotion?: boolean } = {},
+  ) {
     const hooks = createHookBus()
     const checked: string[] = []
     hooks.registerAll('guard', agentDir, noopLogger, {})
@@ -8094,10 +8099,26 @@ describe('managed config recheck after bash', () => {
         if (event.tool !== 'write') return undefined
         checked.push(String(event.args.content))
         await onWriteCheck?.()
+        if (options.bypassRolePromotion === true) return undefined
         return checkRolePromotionGuard({ tool: event.tool, args: event.args, agentDir })
       },
     })
     return { hooks, checked }
+  }
+
+  // A host CLI grant (`typeclaw role`), run in its own process like the CLI.
+  async function hostGrant(agentDir: string, matchRule: string): Promise<void> {
+    const grant = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { grantRole } from './src/permissions/grant.ts'; const r = grantRole({ cwd: ${JSON.stringify(agentDir)}, roleName: 'trusted', matchRule: ${JSON.stringify(matchRule)} }); if (!r.ok) { console.error(r.reason); process.exit(1) }`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+    expect(await grant.exited).toBe(0)
   }
 
   async function runBash(agentDir: string, hooks: ReturnType<typeof createHookBus>, command: string) {
@@ -8370,6 +8391,92 @@ describe('managed config recheck after bash', () => {
       // then: the file goes back to the authorized commit
       expect(text).toMatch(/rolePromotion/)
       expect(await readFile(config, 'utf8')).toBe(committed)
+    })
+  })
+
+  for (const writer of ['in-process', 'host CLI'] as const) {
+    test(`a ${writer} grant during an in-flight bash edit applies only the grant, not the bash change`, async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a bash call renamed the agent and is still in flight
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; ${hold.wait}`,
+        )
+        const release = await hold.reached()
+
+        // when: an authorized writer grants a role meanwhile
+        if (writer === 'in-process') {
+          expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' }).ok).toBe(true)
+        } else {
+          await hostGrant(agentDir, 'discord:user:9')
+        }
+
+        // then: the grant builds on the authorized file, not on bash's unchecked rename
+        const granted = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+        expect(granted.alias).toEqual(['atlas'])
+        expect(granted.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+        await release()
+        const text = await execution
+        expect(text).toContain('An authorized write committed typeclaw.json during this command')
+        expect(text).toContain('Redo that change with the write or edit tool')
+        expect(JSON.parse(await readFile(config, 'utf8'))).toEqual(granted)
+      })
+    })
+  }
+
+  test('a change made while a session without the bypass has bash in flight must pass its guards too', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: a trusted session without the rolePromotion bypass has a bash call in flight
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const trusted = guardHooks(agentDir)
+      const owner = guardHooks(agentDir, undefined, { bypassRolePromotion: true })
+      const hold = await holdBash(agentDir)
+      const trustedCall = runBash(agentDir, trusted.hooks, hold.wait)
+      const release = await hold.reached()
+
+      // when: an owner bash call adds a role match rule during the overlap
+      const change = `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`
+      const overlapped = await runBash(agentDir, owner.hooks, change)
+
+      // then: it is blocked under the concurrent session's permissions
+      expect(overlapped).toContain('a concurrent command from a session without permission')
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      await release()
+      await trustedCall
+
+      // and: the same change with only the owner call in flight is kept
+      expect(await runBash(agentDir, owner.hooks, change)).not.toContain('reverted')
+      expect(await readFile(config, 'utf8')).toContain('discord:user:1')
+    })
+  })
+
+  test('a host commit during a bash call is part of the baseline the bash edit is checked against', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: a bash call in flight, and a host CLI commit that adds a role rule
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const { hooks } = guardHooks(agentDir)
+      const hold = await holdBash(agentDir)
+      const execution = runBash(
+        agentDir,
+        hooks,
+        `${hold.wait}; c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
+      )
+      const release = await hold.reached()
+      await hostGrant(agentDir, 'discord:user:9')
+
+      // when: bash then makes its own unrelated alias edit on top of it
+      await release()
+      const text = await execution
+
+      // then: the alias edit is kept, not blocked as if it had added the role rule
+      expect(text).not.toContain('reverted')
+      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+      expect(after.alias).toEqual(['atlas', '아틀라스'])
+      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
     })
   })
 
