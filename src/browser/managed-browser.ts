@@ -11,6 +11,7 @@ import { rejectHardlinkAliases } from '@/sandbox/hidden-paths'
 import type { SandboxMount, SandboxProcStrategy } from '@/sandbox/policy'
 import { shellQuote } from '@/sandbox/quote'
 
+import { createBrowserSessions } from './agent-tabs'
 import { startSocksEgress } from './egress'
 import { BSK_BIN, CHROME_LAUNCHER, type BrowserConfig, extensionDir } from './registry'
 import { cdpWebSocketUrl, startCdpRelay, startTokenStreamRelay } from './relay'
@@ -34,6 +35,10 @@ export type ManagedBrowser = {
   // Loopback address of the token-gated BrowserSkill daemon relay.
   bskRelay: string | undefined
   token: string
+  // Same access as `cdpUrl`, but the tabs opened through it close when
+  // `endSession` is called for that session.
+  sessionCdpUrl: (sessionId: string) => string
+  endSession: (sessionId: string) => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -81,7 +86,9 @@ export async function startManagedBrowser(options: {
   }
   const launch = await buildLaunch(entry, filesDir, profileDir)
   const token = randomBytes(32).toString('hex')
-  const relay = await startCdpRelay({ token, upstreamSocket: devtoolsSocket(RUN_DIR) })
+  const sessions = createBrowserSessions(devtoolsSocket(RUN_DIR))
+  const relay = await startCdpRelay({ token, upstreamSocket: devtoolsSocket(RUN_DIR), sessions: sessions.relay })
+  const observer = sessions.observe(cdpWebSocketUrl(relay.port, token))
   const bskRelay =
     bskHome === undefined
       ? undefined
@@ -125,8 +132,15 @@ export async function startManagedBrowser(options: {
     filesDir,
     bskRelay: bskRelay === undefined ? undefined : `127.0.0.1:${bskRelay.port}`,
     token,
+    sessionCdpUrl: (sessionId) => cdpWebSocketUrl(relay.port, sessions.tokenFor(sessionId)),
+    endSession: async (sessionId) => {
+      relay.disconnect(sessionId)
+      const closed = await sessions.end(sessionId)
+      if (closed > 0) logger.info(`closed ${closed} browser tab(s) left open by session ${sessionId}`)
+    },
     stop: async () => {
       stopped = true
+      observer.stop()
       child?.kill()
       await Promise.allSettled([relay.close(), egress.close(), bskRelay?.close(), exchange.close(), profile.close()])
     },
