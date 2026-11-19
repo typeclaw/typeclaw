@@ -6,6 +6,7 @@ import { isAbsolute, join, posix, relative, resolve } from 'node:path'
 
 import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } from '@/agent-messenger/config-dir'
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
+import { leftoverConfigRecoveryWarnings } from '@/config/config-commits'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
 import { syncConfiguredGitRemotes } from '@/git/configured-remotes'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
@@ -425,6 +426,11 @@ async function runStart({
       }
     }
 
+    for (const leftover of leftoverConfigRecoveryWarnings(cwd)) {
+      const warning = `typeclaw: ${leftover}`
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
     const githubCliConfig = await loadTypeclawConfig(cwd)
     // The container is confirmed down here, so no sandbox holds the read-only
     // .git/config bind that git's rename-based config writes below would detach.
