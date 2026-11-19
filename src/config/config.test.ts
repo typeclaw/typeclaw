@@ -1400,6 +1400,8 @@ describe('git.user schema', () => {
     [{ name: 'Eve <eve@b.c>', email: 'a@b.c' }],
     [{ name: 'Eve', email: 'not-an-email' }],
     [{ name: 'Eve', email: 'a@b.c other@d.e' }],
+    [{ name: 'Eve', email: 'eve\u0000@b.c' }],
+    [{ name: 'Eve', email: 'eve@b.c\u0007' }],
   ])('rejects %j because it would corrupt the git ident line', (user) => {
     expect(() => configSchema.parse({ models: { default: VALID_MODEL }, git: { user } })).toThrow()
   })

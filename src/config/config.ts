@@ -322,7 +322,9 @@ export const gitUserSchema = z.object({
   email: z
     .string()
     .trim()
-    .regex(/^[^\s<>@]+@[^\s<>@]+$/, { message: 'git.user.email must be one address like name@example.com' }),
+    .regex(/^[^\s\p{Cc}<>@]+@[^\s\p{Cc}<>@]+$/u, {
+      message: 'git.user.email must be one address like name@example.com',
+    }),
 })
 
 export type GitUserConfig = z.infer<typeof gitUserSchema>
