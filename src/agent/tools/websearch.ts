@@ -4,6 +4,13 @@ import { Type } from 'typebox'
 import { CurlImpersonateError, isCurlExitTimeout } from './curl-impersonate'
 import { ddgSearch, DdgCaptchaError, type DdgResult } from './ddg'
 import { exaSearch, ExaSearchError, type ExaResult } from './exa'
+import {
+  nativeSearch,
+  NativeSearchError,
+  nativeSearchRoute,
+  type NativeSearchRegistry,
+  type NativeSearchResult,
+} from './native-search'
 import { activeCooldown, type SearchBlockReason, type SearchEngineId } from './search-cooldown'
 import { wikipediaSearch, type WikipediaResult } from './wikipedia'
 
@@ -12,7 +19,7 @@ const MAX_LIMIT = 20
 
 const SOURCES_REMINDER = 'Cite the URLs you rely on from these results as sources in your answer.'
 
-type SearchResult = DdgResult | ExaResult | WikipediaResult
+type SearchResult = NativeSearchResult | DdgResult | ExaResult | WikipediaResult
 
 type WebEngine = {
   id: SearchEngineId
@@ -20,10 +27,12 @@ type WebEngine = {
   search: (query: string, limit: number, signal?: AbortSignal) => Promise<SearchResult[]>
 }
 
-// Keyless engines only, tried in order until one answers with results. Exa's
-// JSON API is not fingerprinted, so it goes first; DuckDuckGo's SERP needs
-// curl-impersonate and trips its CAPTCHA under bursts, so it is the fallback.
-const WEB_ENGINES: readonly WebEngine[] = [
+// Engines are tried in order until one answers with results. The session
+// model's own hosted search goes first when it runs on a subscription login
+// (see native-search.ts). Then the keyless engines: Exa's JSON API is not
+// fingerprinted, so it comes before DuckDuckGo, whose SERP needs
+// curl-impersonate and trips its CAPTCHA under bursts.
+const KEYLESS_ENGINES: readonly WebEngine[] = [
   { id: 'exa', label: 'Exa', search: exaSearch },
   { id: 'ddg', label: 'DuckDuckGo', search: ddgSearch },
 ]
@@ -58,7 +67,7 @@ export const webSearchTool = defineTool({
   name: 'web_search',
   label: 'Web Search',
   description:
-    'Search the public web. Returns a ranked list of {title, url, snippet} entries. Use `source: "wikipedia"` for encyclopedic lookups; otherwise general web results come from Exa, falling back to DuckDuckGo when Exa is unavailable. Pair this with the `read` tool by visiting URLs you find with `bash` (curl) when you need full page contents.\n' +
+    'Search the public web. Returns a ranked list of {title, url, snippet} entries. Use `source: "wikipedia"` for encyclopedic lookups; otherwise general web results come from your model provider\'s own web search when your login supports it, then Exa, then DuckDuckGo. Pair this with the `read` tool by visiting URLs you find with `bash` (curl) when you need full page contents.\n' +
     'If `spawn_subagent` is available to you, PREFER delegating to the `scout` subagent by default: spawn it whenever the research is non-trivial (more than 1-2 queries, any "across multiple sources" framing, or follow-up fetches of the results). Scout runs `web_search`/`web_fetch` in its own context window and returns a distilled, citation-backed answer, so the search churn never pollutes yours. Only call this tool directly for a single query whose top result you will cite immediately — or whenever you cannot spawn subagents (e.g. you are yourself a subagent), in which case run the searches here.',
   parameters: Type.Object({
     query: Type.String({ description: 'The search query.' }),
@@ -71,12 +80,12 @@ export const webSearchTool = defineTool({
     ),
     source: Type.Optional(
       Type.Union([Type.Literal('web'), Type.Literal('wikipedia')], {
-        description: 'Which engine to query. Defaults to "web" (Exa, then DuckDuckGo).',
+        description: 'Which engine to query. Defaults to "web" (provider search, then Exa, then DuckDuckGo).',
       }),
     ),
   }),
 
-  async execute(_toolCallId, params, signal) {
+  async execute(_toolCallId, params, signal, _onUpdate, ctx) {
     const query = params.query.trim()
     if (!query) {
       return errorResult('Query is empty.')
@@ -87,7 +96,8 @@ export const webSearchTool = defineTool({
       if (params.source === 'wikipedia') {
         return successResult(query, 'wikipedia', await wikipediaSearch(query, limit, signal), [])
       }
-      const { engine, results, attempts } = await searchWeb(query, limit, signal)
+      const engines = [...nativeEngines(ctx?.model, ctx?.modelRegistry), ...KEYLESS_ENGINES]
+      const { engine, results, attempts } = await searchWeb(engines, query, limit, signal)
       if (engine) return successResult(query, 'web', results, attempts, engine)
       return noResultsOrFailure(query, attempts)
     } catch (error) {
@@ -97,13 +107,29 @@ export const webSearchTool = defineTool({
   },
 })
 
+function nativeEngines(
+  model: Parameters<typeof nativeSearchRoute>[0],
+  registry: NativeSearchRegistry | undefined,
+): WebEngine[] {
+  const route = nativeSearchRoute(model, registry)
+  if (!route || !model || !registry) return []
+  return [
+    {
+      id: route.engine,
+      label: route.label,
+      search: (query, limit, signal) => nativeSearch(route, model, registry, query, limit, signal),
+    },
+  ]
+}
+
 async function searchWeb(
+  engines: readonly WebEngine[],
   query: string,
   limit: number,
   signal: AbortSignal | undefined,
 ): Promise<{ engine?: string; results: SearchResult[]; attempts: SearchAttempt[] }> {
   const attempts: SearchAttempt[] = []
-  for (const engine of WEB_ENGINES) {
+  for (const engine of engines) {
     const cooldown = activeCooldown(engine.id)
     if (cooldown) {
       const seconds = Math.ceil(cooldown.remainingMs / 1000)
@@ -163,7 +189,7 @@ function noResultsOrFailure(query: string, attempts: SearchAttempt[]) {
 function isTransientEngineError(error: unknown): boolean {
   if (error instanceof DdgCaptchaError) return true
   if (error instanceof CurlImpersonateError && isCurlExitTimeout(error)) return true
-  return error instanceof ExaSearchError && error.transient
+  return (error instanceof ExaSearchError || error instanceof NativeSearchError) && error.transient
 }
 
 function failureMessage(error: unknown): string {
