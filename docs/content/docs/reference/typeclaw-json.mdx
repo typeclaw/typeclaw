@@ -39,7 +39,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 
 Plugin-owned config blocks live at the top level under their plugin name and are validated by the plugin's own `configSchema`.
 
-Edit `typeclaw.json` by hand while the agent is stopped, or use `typeclaw` commands, which coordinate with the running agent. A hand edit made while the agent is running can conflict with an agent write to the file; that write is then refused and retried.
+Edit `typeclaw.json` by hand only while the agent is stopped, or use `typeclaw` commands, which coordinate with the running agent. Hand edits while the agent runs are unsupported: conflict detection is best-effort, and an agent write that conflicts with one is refused, so the agent must retry it. If the agent was stopped in the middle of a command, `typeclaw start` may restore the last checked `typeclaw.json` and says so; re-apply your edit, then start again.
 
 The `updateCheck` notice is host-stage only — the container never reads it. Every CLI command does a cheap disk read of a cached "latest" version under `~/.typeclaw/` and prints a single line to stderr when a newer release exists; a detached, throttled (once per 24h) background process refreshes that cache off the hot path. The check never blocks or fails a command. Disable it persistently with `"updateCheck": { "enabled": false }`, or per-invocation with the `TYPECLAW_NO_UPDATE_CHECK` / `NO_UPDATE_NOTIFIER` / `CI` env vars.
 
