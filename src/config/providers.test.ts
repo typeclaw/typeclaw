@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { clampThinkingLevel, getSupportedThinkingLevels, normalizeContext } from '@earendil-works/pi-ai'
+import { calculateCost, clampThinkingLevel, getSupportedThinkingLevels, normalizeContext } from '@earendil-works/pi-ai'
 import type {
   Api,
   KnownApi,
@@ -82,12 +82,15 @@ describe('KNOWN_PROVIDERS', () => {
       'anthropic/claude-opus-4-7',
       'anthropic/claude-opus-4-8',
       'anthropic/claude-sonnet-5',
+      'anthropic/claude-sonnet-5-5',
       'anthropic/claude-opus-5-5',
       'anthropic/claude-fable-5',
       'openai/gpt-6-sol',
       'openai/gpt-6-luna',
+      'openai/gpt-6.1-terra',
       'openai-codex/gpt-6-sol',
       'openai-codex/gpt-6-luna',
+      'openai-codex/gpt-6.1-terra',
       'xai/grok-4.7',
       'xai/grok-4.3',
     ]
@@ -271,17 +274,44 @@ describe('listKnownModelRefs', () => {
     expect(refs).toContain('zai-coding/glm-5.1')
   })
 
-  test('includes GPT-6 Sol and Luna for API-key and Codex OAuth routing', () => {
+  test('includes GPT-6 Sol, Luna, and 6.1 Terra for API-key and Codex OAuth routing', () => {
     const refs = listKnownModelRefs()
     const expected = [
       ['openai/gpt-6-sol', 'openai'],
       ['openai/gpt-6-luna', 'openai'],
+      ['openai/gpt-6.1-terra', 'openai'],
       ['openai-codex/gpt-6-sol', 'openai-codex'],
       ['openai-codex/gpt-6-luna', 'openai-codex'],
+      ['openai-codex/gpt-6.1-terra', 'openai-codex'],
     ] as const
     for (const [ref, providerId] of expected) {
       expect(refs).toContain(ref)
       expect(providerForModelRef(ref)).toBe(providerId)
+    }
+  })
+
+  test('prices GPT-6.1 Terra at the long-context rate only above 272K input tokens', () => {
+    const cost = (model: Model<Api>, input: number) =>
+      calculateCost(model, {
+        input,
+        output: 1_000_000,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: input + 1_000_000,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      })
+    for (const model of [
+      KNOWN_PROVIDERS.openai.models['gpt-6.1-terra'],
+      KNOWN_PROVIDERS['openai-codex'].models['gpt-6.1-terra'],
+    ]) {
+      // given a request exactly at the threshold, then the base rate applies
+      const base = cost(model, 272_000)
+      expect(base.input).toBeCloseTo(0.272, 9)
+      expect(base.output).toBeCloseTo(5, 9)
+      // given a request one token above, then the whole request is billed at 2x/1.5x
+      const long = cost(model, 272_001)
+      expect(long.input).toBeCloseTo(0.544002, 9)
+      expect(long.output).toBeCloseTo(7.5, 9)
     }
   })
 
