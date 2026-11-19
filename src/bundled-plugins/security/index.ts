@@ -19,7 +19,6 @@ import { GUARD_NOTICE_TARGET_SEVERITY, checkNoticeTargetGuard } from './policies
 import { GUARD_OUTBOUND_SECRET_SEVERITY, checkOutboundSecretGuard } from './policies/outbound-secret-scan'
 import { GUARD_PLUGIN_ADDITION_SEVERITY, checkPluginAdditionGuard } from './policies/plugin-addition'
 import { checkPrivateSurfaceReadGuard } from './policies/private-surface-read'
-import { applyPromptInjectionDefense } from './policies/prompt-injection'
 import { clearSessionTaints } from './policies/remote-taint-state'
 import { GUARD_ROLE_PROMOTION_SEVERITY, checkRolePromotionGuard } from './policies/role-promotion'
 import { GUARD_SECRET_EXFIL_BASH_SEVERITY, checkSecretExfilBashGuard } from './policies/secret-exfil-bash'
@@ -175,9 +174,6 @@ export default definePlugin({
   ownerWildcardExclusions: [],
   plugin: async (ctx) => ({
     hooks: {
-      'session.prompt': async (event) => {
-        applyPromptInjectionDefense(event)
-      },
       'tool.before': async (event) => {
         try {
           const can = (perm: string) => ctx.permissions.has(event.origin, perm)
