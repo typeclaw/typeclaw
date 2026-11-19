@@ -62,11 +62,13 @@ export const KNOWN_PROVIDERS = {
     apiKeyEnv: 'OPENAI_API_KEY',
     oauthProviderId: null,
     // Costs and context windows mirror models.dev as of 2026-05-10; the GPT-6
-    // Sol/Luna records mirror OpenAI's model docs as of 2026-09-22.
+    // Sol/Luna records mirror OpenAI's model docs as of 2026-09-22, and GPT-6.1
+    // Terra as of 2026-11-19.
     // GPT-6 bills cache writes at 1.25x input; pi 0.87's Responses transport
     // reads cache_write_tokens (openai-responses-shared.js), so that rate is
-    // applied. The >272K-input 2x/1.5x tier is not expressible in TypeClaw's
-    // flat cost shape, so these records use the standard rate. When
+    // applied. GPT-6.1 Terra carries the >272K-input tier (2x input and cache,
+    // 1.5x output for the whole request) from pi-ai's catalog, which
+    // `calculateCost` applies; the Sol/Luna records keep the flat standard rate. When
     // refreshing, also rerun `scripts/generate-schema.ts` so
     // typeclaw.schema.json picks up new enum values.
     models: {
@@ -166,6 +168,44 @@ export const KNOWN_PROVIDERS = {
         reasoning: true,
         input: ['text', 'image'],
         cost: { input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 },
+        contextWindow: 1050000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsStrictMode: true,
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+          supportsMidConvoEffort: true,
+          supportsExplicitPromptCacheMode: true,
+        },
+      },
+      // GPT-6.1 Terra (Oct 26 2026): fast mid tier between Sol and Luna. Map
+      // and compat are pi-ai 1.5.0's catalog values.
+      'gpt-6.1-terra': {
+        id: 'gpt-6.1-terra',
+        name: 'GPT-6.1 Terra',
+        api: 'openai-responses',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: {
+          input: 1,
+          output: 5,
+          cacheRead: 0.05,
+          cacheWrite: 1.25,
+          tiers: [{ inputTokensAbove: 272000, input: 2, output: 7.5, cacheRead: 0.1, cacheWrite: 2.5 }],
+        },
         contextWindow: 1050000,
         maxTokens: 128000,
         thinkingLevelMap: {
@@ -306,6 +346,40 @@ export const KNOWN_PROVIDERS = {
           supportsMidConvoSystemMessages: true,
         },
       },
+      // Terra's Codex context window is pi-ai 1.5.0's catalog value.
+      'gpt-6.1-terra': {
+        id: 'gpt-6.1-terra',
+        name: 'GPT-6.1 Terra',
+        api: 'openai-codex-responses',
+        provider: 'openai-codex',
+        baseUrl: 'https://chatgpt.com/backend-api',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: {
+          input: 1,
+          output: 5,
+          cacheRead: 0.05,
+          cacheWrite: 1.25,
+          tiers: [{ inputTokensAbove: 272000, input: 2, output: 7.5, cacheRead: 0.1, cacheWrite: 2.5 }],
+        },
+        contextWindow: 500000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: 'none',
+          minimal: 'low',
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsOpenAIGrammarTools: true,
+          supportsAdditionalTools: true,
+          supportsToolSearch: true,
+          supportsMidConvoSystemMessages: true,
+        },
+      },
     },
   },
   // Anthropic Claude — both the Anthropic Console API (ANTHROPIC_API_KEY)
@@ -343,8 +417,8 @@ export const KNOWN_PROVIDERS = {
   // not the recommended path. Claude Mythos 5 (Fable 5's classifier-free
   // sibling, limited availability via Project Glasswing) is intentionally
   // NOT listed — access is gated per-org and a registry entry would fail for
-  // everyone else. Opus 5.5 (Sep 22 2026) was added on its own; Claude Opus 5
-  // and Fable 5.1 are not registered yet.
+  // everyone else. Opus 5.5 (Sep 22 2026) and Sonnet 5.5 (Sep 28 2026) were
+  // added on their own; Claude Opus 5 and Fable 5.1 are not registered yet.
   //
   // ID semantics differ across the lineup and matter for forward-compat:
   //   - `claude-haiku-4-5` is a 4.5-generation CONVENIENCE ALIAS that
@@ -444,6 +518,37 @@ export const KNOWN_PROVIDERS = {
         maxTokens: 128000,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
         compat: { forceAdaptiveThinking: true },
+      },
+      // Sonnet 5.5 (Sep 28 2026) succeeds Sonnet 5 at $2/$10 with a 5% cache
+      // read. Like Opus 5.5 it rejects disabled thinking and sampling params,
+      // and `supportsMidConvoEffort` keeps level changes on the cached prefix.
+      'claude-sonnet-5-5': {
+        id: 'claude-sonnet-5-5',
+        name: 'Claude Sonnet 5.5',
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        reasoning: true,
+        input: ['text', 'image'],
+        cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+        contextWindow: 1000000,
+        maxTokens: 128000,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: 'low',
+          medium: 'medium',
+          high: 'high',
+          xhigh: 'xhigh',
+          max: 'max',
+        },
+        compat: {
+          supportsMidConvoEffort: true,
+          supportsMidConvoSystemMessages: true,
+          supportsMidConvoToolChanges: true,
+          forceAdaptiveThinking: true,
+          supportsTemperature: false,
+        },
       },
       'claude-opus-4-7': {
         id: 'claude-opus-4-7',

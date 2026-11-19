@@ -2076,15 +2076,15 @@ function providersForVendorInCatalog(vendorId: KnownProviderVendorId, options: M
 // Per-provider recommended model refs. Surfaces a "(Recommended)" suffix in
 // the picker label and floats the entry to the top of the list (which also
 // makes it the default `initialValue` when the caller has no prior choice).
-// Kept narrow on purpose: one recommendation per provider. gpt-5.4-mini is
+// Kept narrow on purpose: one recommendation per provider. gpt-6.1-terra is
 // listed under both `openai` and `openai-codex` because the same model is
 // the right default whether the user authenticates with an API key or with
-// a ChatGPT Plus/Pro subscription. claude-sonnet-4-6 follows Anthropic's
-// own current-tier guidance (see the model lineup notes in providers.ts).
+// a ChatGPT Plus/Pro subscription. claude-sonnet-5-5 is Anthropic's current
+// Sonnet (see the model lineup notes in providers.ts).
 const RECOMMENDED_MODEL_REFS: ReadonlySet<KnownModelRef> = new Set<KnownModelRef>([
-  'openai/gpt-5.4-mini',
-  'openai-codex/gpt-5.4-mini',
-  'anthropic/claude-sonnet-4-6',
+  'openai/gpt-6.1-terra',
+  'openai-codex/gpt-6.1-terra',
+  'anthropic/claude-sonnet-5-5',
 ])
 
 export function formatModelLabel(o: ModelOption): string {
