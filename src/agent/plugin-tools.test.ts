@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
-import { readdirSync } from 'node:fs'
+import { readdirSync, writeFileSync } from 'node:fs'
 import {
   link,
   lstat,
@@ -31,7 +31,8 @@ import { createWriteReportTool } from '@/bundled-plugins/researcher/write-report
 import { checkPrivateSurfaceReadGuard } from '@/bundled-plugins/security/policies/private-surface-read'
 import { checkRolePromotionGuard } from '@/bundled-plugins/security/policies/role-promotion'
 import { loadConfigSync } from '@/config'
-import { configFileLockPath } from '@/config/config-file-lock'
+import { __setConfigReadHookForTests, readConfigCommitSync, recordConfigCommitSync } from '@/config/config-commits'
+import { configFileLockPath, withConfigFileLockSync } from '@/config/config-file-lock'
 import { loadCron } from '@/cron'
 import { buildOperationalIncidentChecks } from '@/doctor/operational-incidents'
 import { hooklessGitArgs } from '@/git/hookless'
@@ -7752,6 +7753,97 @@ describe('managed config commit check', () => {
     },
   )
 
+  test.skipIf(lacksInodeAnchoring)(
+    'an edit whose base changed before its commit is refused and writes nothing',
+    async () => {
+      // given: a checked cron.json write is held inside its commit check, so a
+      // typeclaw.json edit reads its base and then queues behind it
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-edit-base-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const hooks = createHookBus()
+      const checked: string[] = []
+      let release: (() => void) | undefined
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let reachedCronCommit: (() => void) | undefined
+      const cronAtCommit = new Promise<void>((resolve) => {
+        reachedCronCommit = resolve
+      })
+      hooks.registerAll('hold-cron', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          // Only the commit check carries the absolute managed destination.
+          if (event.tool !== 'write' || !path.isAbsolute(String(event.args.path))) return undefined
+          checked.push(event.callId)
+          if (event.callId === 'cron') {
+            reachedCronCommit?.()
+            await held
+          }
+          return undefined
+        },
+      })
+      try {
+        const cron = builtin('write', agentDir, hooks).execute(
+          'cron',
+          { path: 'cron.json', content: '{"jobs":[]}\n' } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        await cronAtCommit
+        // The edit's read of its base is a cross-process config read, whose seam
+        // tells when that read happened.
+        let readBase: (() => void) | undefined
+        const baseRead = new Promise<void>((resolve) => {
+          readBase = resolve
+        })
+        __setConfigReadHookForTests((stage) => {
+          if (stage !== 'after-live') return
+          __setConfigReadHookForTests(undefined)
+          readBase?.()
+        })
+        const edit = builtin('edit', agentDir, hooks).execute(
+          'edit',
+          { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"atlas","아틀라스"' }] } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        const editOutcome = edit.then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+
+        await baseRead
+
+        // when: an authorized writer commits typeclaw.json in place (same inode)
+        // before the edit's commit
+        const granted = '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:9"]}}}\n'
+        withConfigFileLockSync(config, () => {
+          writeFileSync(config, granted)
+          recordConfigCommitSync(config, granted)
+        })
+        const generation = readConfigCommitSync(config)?.generation
+        release?.()
+        await cron
+
+        // then: the edit is refused before its guard check, writes nothing, and
+        // records no commit; the other writer's bytes stand
+        const editError = await editOutcome
+        expect(editError).toBeInstanceOf(Error)
+        expect((editError as Error).message).toContain('typeclaw.json changed after this edit read it')
+        expect(checked).toEqual(['cron'])
+        expect(await readFile(config, 'utf8')).toBe(granted)
+        expect(generation).toBe(1)
+        expect(readConfigCommitSync(config)?.generation).toBe(generation)
+      } finally {
+        __setConfigReadHookForTests(undefined)
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
   test.skipIf(lacksInodeAnchoring)('the commit check waits for another process holding the config lock', async () => {
     // given: another process holds the config lock; once the write passes its
     // pre-check, that process changes the locked alias and releases
@@ -8518,6 +8610,52 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
       },
     )
   }
+
+  test.skipIf(fifosUnavailable || lacksInodeAnchoring)(
+    "an authorized edit during an in-flight bash change builds on the trusted bytes, not bash's unchecked ones",
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a bash call without the bypass wrote an unchecked role rule and is still in flight
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `printf '%s\\n' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
+        )
+        const release = await hold.reached()
+
+        // when: an owner session edits only the alias meanwhile
+        const definition = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'edit')
+        if (definition === undefined) throw new Error('edit tool definition not found')
+        const edit = wrapBuiltinToolDefinition(definition, {
+          agentDir,
+          sessionId: 'bash-recheck-owner',
+          hooks: guardHooks(agentDir, undefined, { bypassRolePromotion: true }).hooks,
+          guards: buildInternalGuards(agentDir),
+          getOrigin: () => tui,
+          permissions: createPermissionService(),
+        })
+        await edit.execute(
+          'e',
+          { path: 'typeclaw.json', edits: [{ oldText: '"atlas"', newText: '"atlas","아틀라스"' }] } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: only the alias lands on the trusted bytes, and the role rule is never published
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas","아틀라스"]}\n')
+        expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+        await release()
+        const text = await execution
+        expect(text).toContain('An authorized write committed typeclaw.json during this command')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas","아틀라스"]}\n')
+        expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+      })
+    },
+  )
 
   test.skipIf(fifosUnavailable)(
     'a change made while a session without the bypass has bash in flight must pass its guards too',

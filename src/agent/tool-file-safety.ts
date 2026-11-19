@@ -6,6 +6,7 @@ import {
   mkdtemp,
   open,
   readdir,
+  readFile,
   realpath,
   rm,
   stat,
@@ -36,6 +37,8 @@ import {
   noteConfigWriteSync,
   openConfigWindow,
   readConfigEntrySync,
+  readConfigForWriteSync,
+  readValidatedConfigFileSync,
   recordConfigCommitSync,
   restoreConfigEntrySync,
   runWithConfigBaseline,
@@ -897,6 +900,24 @@ export function runWithManagedConfigCommitCheck<T>(check: ManagedConfigCommitChe
   return managedConfigCommitCheck.run(check, fn)
 }
 
+// The bytes each checked edit of a managed file was built from.
+const editBases = new WeakMap<ManagedConfigCommitCheck, Map<string, string>>()
+
+// The edit tool's read. For typeclaw.json/cron.json it is what runtime readers
+// load, so while a bash call is in flight the edit builds on the trusted bytes,
+// never on that call's unchecked change; its commit then verifies, under the
+// lock, that those bytes are still the trusted ones.
+export async function readEditToolInput(absolutePath: string): Promise<Buffer> {
+  const commit = managedConfigCommitCheck.getStore()
+  const destination = commit === undefined ? undefined : await managedConfigDestination(commit.agentDir, absolutePath)
+  if (commit === undefined || destination === undefined) return readFile(absolutePath)
+  const base = readValidatedConfigFileSync(destination)
+  const bases = editBases.get(commit) ?? new Map<string, string>()
+  bases.set(destination, base)
+  editBases.set(commit, bases)
+  return Buffer.from(base)
+}
+
 export async function writeToolOutputNoFollow(targetPath: string, content: string): Promise<void> {
   const commit = managedConfigCommitCheck.getStore()
   const destination = commit === undefined ? undefined : await managedConfigDestination(commit.agentDir, targetPath)
@@ -908,6 +929,13 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
       // the pinned descriptor must still be that entry's inode, before the check
       // and again before any byte is truncated.
       await assertPinnedEntry(targetPath, destination)
+      const base = editBases.get(commit)?.get(destination)
+      if (base !== undefined && readConfigForWriteSync(destination) !== base) {
+        const name = path.basename(destination)
+        throw new Error(
+          `${name} changed after this edit read it, so the edit was not applied. Read ${name} again and retry the edit.`,
+        )
+      }
       await commit.check(content, destination)
       await assertPinnedEntry(targetPath, destination)
       // A call cancelled while queued, while its guards ran, or during the entry

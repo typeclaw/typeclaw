@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { constants } from 'node:fs'
-import { access, mkdir, readFile } from 'node:fs/promises'
+import { access, mkdir } from 'node:fs/promises'
 import { relative, sep } from 'node:path'
 
 import {
@@ -83,6 +83,7 @@ import {
   runWithManagedConfigCommitCheck,
   snapshotManagedConfigFiles,
   type ManagedConfigSnapshot,
+  readEditToolInput,
   writeToolOutputNoFollow,
 } from './tool-file-safety'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
@@ -238,7 +239,7 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
       // commit-time guard check too.
       return piCreateEditToolDefinition(cwd, {
         operations: {
-          readFile: (absolutePath) => readFile(absolutePath),
+          readFile: readEditToolInput,
           writeFile: writeToolOutputNoFollow,
           access: (absolutePath) => access(absolutePath, constants.R_OK | constants.W_OK),
         },
