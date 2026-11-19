@@ -1,15 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import {
-  chownSync,
-  existsSync,
-  lstatSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs'
+import { chownSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,7 +13,6 @@ import {
   publishConfigWithCredential,
   publishCredential,
   stageCredential,
-  writeConfigInPlace,
 } from './staged-write'
 
 const mode = (path: string) => statSync(path).mode & 0o777
@@ -47,35 +36,6 @@ const otherGroup = (() => {
     rmSync(dir, { recursive: true, force: true })
   }
 })()
-
-describe('writeConfigInPlace', () => {
-  test.skipIf(process.platform === 'win32')('writes the target of a symlink and keeps the link', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
-    const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-staged-target-'))
-    const target = join(elsewhere, 'typeclaw.json')
-    await writeFile(target, '{}\n')
-    await symlink(target, join(cwd, 'typeclaw.json'))
-
-    writeConfigInPlace(join(cwd, 'typeclaw.json'), '{"alias":["atlas"]}\n')
-
-    expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
-    expect(readFileSync(target, 'utf8')).toBe('{"alias":["atlas"]}\n')
-    expect(readdirSync(elsewhere)).toEqual(['typeclaw.json'])
-    expect(readdirSync(cwd)).toEqual(['typeclaw.json'])
-  })
-
-  test.skipIf(process.platform === 'win32')('creates the file a dangling symlink names', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-'))
-    const elsewhere = await mkdtemp(join(tmpdir(), 'typeclaw-staged-target-'))
-    const target = join(elsewhere, 'typeclaw.json')
-    await symlink(target, join(cwd, 'typeclaw.json'))
-
-    writeConfigInPlace(join(cwd, 'typeclaw.json'), '{}\n')
-
-    expect(lstatSync(join(cwd, 'typeclaw.json')).isSymbolicLink()).toBe(true)
-    expect(readFileSync(target, 'utf8')).toBe('{}\n')
-  })
-})
 
 describe('config publication keeps the file object', () => {
   // A new inode would take its directory's default group and ACLs; writing in

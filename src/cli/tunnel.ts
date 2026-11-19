@@ -6,16 +6,17 @@ import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
 import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
-import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
+import {
+  commitConfigWriteSync,
+  prepareConfigWriteSync,
+  readConfigForWriteSync,
+  tryRecordConfigCommitSync,
+  type VerifiedConfigWrite,
+} from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import {
-  credentialStagingDir,
-  publishConfigWithCredential,
-  type PublishSeams,
-  writeConfigInPlace,
-} from '@/init/staged-write'
+import { credentialStagingDir, publishConfigWithCredential, type PublishSeams } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -958,7 +959,13 @@ export function writeConfigAndToken(
           stagingDir: credentialStagingDir(cwd),
         }
   const configBytes = `${JSON.stringify(raw, null, 2)}\n`
-  const published = publishConfigWithCredential(join(cwd, 'typeclaw.json'), configBytes, credential, seams)
+  let config: VerifiedConfigWrite
+  try {
+    config = prepareConfigWriteSync(join(cwd, 'typeclaw.json'))
+  } catch (error) {
+    return { ok: false, reason: `failed to store the tunnel: ${(error as Error).message}` }
+  }
+  const published = publishConfigWithCredential(config, configBytes, credential, seams)
   if (published.ok) tryRecordConfigCommitSync(join(cwd, 'typeclaw.json'), configBytes)
   return published.ok
     ? { ok: true, value: undefined }
@@ -992,9 +999,7 @@ function readRawConfig(cwd: string): Record<string, unknown> {
 }
 
 function writeRawConfig(cwd: string, config: Record<string, unknown>): void {
-  const bytes = `${JSON.stringify(config, null, 2)}\n`
-  writeConfigInPlace(join(cwd, 'typeclaw.json'), bytes)
-  tryRecordConfigCommitSync(join(cwd, 'typeclaw.json'), bytes)
+  commitConfigWriteSync(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

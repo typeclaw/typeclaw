@@ -76,10 +76,6 @@ export type ConfigWrite = {
 // A failed in-place config write whose prior content could not be put back.
 export class ConfigRestoreError extends Error {}
 
-export function writeConfigInPlace(path: string, content: string | Buffer, writeInPlace?: WriteInPlace): void {
-  publishConfigWrite(prepareConfigWrite(path, content), writeInPlace)
-}
-
 // Resolves the file to write and reads its prior bytes. A read-only
 // destination is refused, as the in-place write would be.
 export function prepareConfigWrite(path: string, content: string | Buffer): ConfigWrite {
@@ -237,9 +233,10 @@ export type CredentialUpdate = { path: string; content: string; stagingDir: stri
 // put back if typeclaw.json cannot be. A failure never leaves either file
 // partly written; a .env this created is left empty rather than removed.
 // `seams` let tests fail a step after writing has begun and take the Windows
-// .env path on any platform.
+// .env path on any platform. `config` is the config file's path, or a write
+// the caller verified (prepareConfigWriteSync), whose own in-place writer is used.
 export function publishConfigWithCredential(
-  configPath: string,
+  config: string | { path: string; writeInPlace: WriteInPlace },
   configBytes: string,
   credential: CredentialUpdate | undefined,
   seams: PublishSeams = {},
@@ -251,10 +248,14 @@ export function publishConfigWithCredential(
     if (credential !== undefined) {
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
+    const configPath = typeof config === 'string' ? config : config.path
     const configWrite = prepareConfigWrite(configPath, configBytes)
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      publishConfigWrite(configWrite, seams.writeInPlace)
+      publishConfigWrite(
+        configWrite,
+        seams.writeInPlace ?? (typeof config === 'string' ? undefined : config.writeInPlace),
+      )
     } catch (error) {
       const configState = error instanceof ConfigRestoreError ? error.message : 'typeclaw.json was not changed'
       const cause = error instanceof ConfigRestoreError ? '' : `${describe(error)}. `

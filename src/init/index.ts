@@ -12,7 +12,12 @@ import {
   type CustomModelMeta,
 } from '@/config'
 import { isGithubChannelTunnel } from '@/config/channels-mutation'
-import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
+import {
+  commitConfigWriteSync,
+  prepareConfigWriteSync,
+  readConfigForWriteSync,
+  tryRecordConfigCommitSync,
+} from '@/config/config-commits'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -748,7 +753,9 @@ export async function scaffold(root: string, options: ScaffoldOptions = {}): Pro
       await writeFile(configPath, configBytes, { flag: 'wx' })
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      await writeFile(configPath, configBytes)
+      // The retry replaces the file it finds, but only that verified regular file.
+      commitConfigWriteSync(configPath, configBytes)
+      return
     }
     tryRecordConfigCommitSync(configPath, configBytes)
   })
@@ -1613,7 +1620,7 @@ function writeConfigWithToken(
           content: withEnvKey(existsSync(envPath) ? readFileSync(envPath, 'utf8') : '', token.env, token.value),
           stagingDir: credentialStagingDir(cwd),
         }
-  const published = publishConfigWithCredential(configPath, configBytes, credential, seams)
+  const published = publishConfigWithCredential(prepareConfigWriteSync(configPath), configBytes, credential, seams)
   if (!published.ok) throw new Error(`failed to write ${CONFIG_FILE}: ${published.reason}`)
   tryRecordConfigCommitSync(configPath, configBytes)
 }
@@ -1784,9 +1791,7 @@ async function appendGithubMatchRules(cwd: string, repos: readonly string[]): Pr
     member.match = Array.from(merged)
     roles.member = member
     parsed.roles = roles
-    const bytes = `${JSON.stringify(parsed, null, 2)}\n`
-    await writeFile(path, bytes)
-    tryRecordConfigCommitSync(path, bytes)
+    commitConfigWriteSync(path, `${JSON.stringify(parsed, null, 2)}\n`)
   })
 }
 
