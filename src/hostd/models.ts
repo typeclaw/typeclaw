@@ -1,7 +1,6 @@
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { env as transformersEnv, pipeline } from '@huggingface/transformers'
 import lockfile from 'proper-lockfile'
 
 import { EMBEDDING_MODEL_DTYPE, EMBEDDING_MODEL_NAME, writeModelSentinel } from '@/models/embedding-model'
@@ -47,7 +46,9 @@ async function ensureModelsLocked(): Promise<void> {
     stale: 30_000,
   })
   try {
-    configureTransformers(dir)
+    const { env, pipeline } = await import('@huggingface/transformers')
+    env.localModelPath = dir
+    env.cacheDir = dir
     await pipeline('feature-extraction', MODEL_NAME, { dtype: MODEL_DTYPE })
     // Stamp the cache with the version that produced it, still under the lock,
     // so the container can verify the producer matches its consumer before a
@@ -56,9 +57,4 @@ async function ensureModelsLocked(): Promise<void> {
   } finally {
     await release()
   }
-}
-
-function configureTransformers(dir: string): void {
-  transformersEnv.localModelPath = dir
-  ;(transformersEnv as typeof transformersEnv & { cacheDir: string }).cacheDir = dir
 }
