@@ -281,14 +281,33 @@ export function prepareConfigWriteSync(file: string, base?: string): VerifiedCon
     supersededCandidates.delete(resolve(file))
     throw refusedWrite(file, target)
   }
-  const { path, id, prior } = target
+  const { path, id, prior, managed } = target
   return {
     path,
     prior,
     writeInPlace: (into, content) =>
       id === undefined
         ? createConfigFileSync(into, Buffer.from(content))
-        : writeConfigInPlaceSync(into, Buffer.from(content), id),
+        : writeConfigInPlaceSync(into, Buffer.from(content), id, () => assertStillManaged(file, managed)),
+  }
+}
+
+// The managed path must still be the entry that was verified: the same file,
+// or the same link (identity and target) to the file being written. Checked
+// right before the write and again after it, so a link re-pointed meanwhile
+// never leaves the write on a file the config no longer names.
+function assertStillManaged(file: string, managed: { id: ConfigFileIdentity; target: string | undefined }): void {
+  let stats: BigIntStats
+  try {
+    stats = lstatSync(file, { bigint: true })
+  } catch (error) {
+    throw refusedWrite(file, errorText(error))
+  }
+  if (stats.dev !== managed.id.dev || stats.ino !== managed.id.ino) {
+    throw refusedWrite(file, 'it was replaced after it was checked')
+  }
+  if (managed.target !== undefined && readlinkSync(file) !== managed.target) {
+    throw refusedWrite(file, 'its link was re-pointed after it was checked')
   }
 }
 
@@ -309,18 +328,32 @@ export function commitConfigWriteSync(file: string, bytes: string, base?: string
 function verifiedWriteTarget(
   file: string,
   base: string | undefined,
-): { path: string; id: ConfigFileIdentity | undefined; prior: Buffer | undefined } | string {
+):
+  | {
+      path: string
+      id: ConfigFileIdentity | undefined
+      prior: Buffer | undefined
+      managed: { id: ConfigFileIdentity; target: string | undefined }
+    }
+  | string {
   try {
     const live = readConfigEntrySync(file)
     if (live.kind === 'missing') {
-      return base === undefined ? { path: file, id: undefined, prior: undefined } : 'it was removed after it was read'
+      return base === undefined
+        ? { path: file, id: undefined, prior: undefined, managed: { id: zeroIdentity(), target: undefined } }
+        : 'it was removed after it was read'
     }
     if (live.kind === 'other') return 'it is not a regular file'
     if (live.kind === 'link' && !authorizedLink(file, live)) return 'it is a symlink the agent has not accepted'
     const path = live.kind === 'link' ? live.resolved : file
     if (lstatOrUndefined(path)?.nlink !== 1n) return 'it has more than one hard link'
     if (base !== undefined && live.bytes.toString('utf8') !== base) return 'it changed after it was read'
-    return { path, id: live.kind === 'link' ? live.resolvedId : live.id, prior: live.bytes }
+    return {
+      path,
+      id: live.kind === 'link' ? live.resolvedId : live.id,
+      prior: live.bytes,
+      managed: { id: live.id, target: live.kind === 'link' ? live.target : undefined },
+    }
   } catch (error) {
     return errorText(error)
   }
@@ -670,10 +703,17 @@ export function __setConfigWriteSyncForTests(write: typeof writeBytesSync | unde
 }
 
 // `expected`: the entry the caller verified; the descriptor must still be it.
-// The prior bytes are read on the same descriptor, and a write that fails
-// partway puts them back there (never truncating first); if that fails too,
-// the error names the file and how to recover it.
-export function writeConfigInPlaceSync(path: string, bytes: Buffer, expected?: ConfigFileIdentity): void {
+// `assertManaged` throws when the managed path no longer names this file; it
+// runs before the write and after it. The prior bytes are read on the same
+// descriptor, and a write that fails partway, or lands after the managed path
+// moved, puts them back there (never truncating first); if that fails too, the
+// error names the file and how to recover it.
+export function writeConfigInPlaceSync(
+  path: string,
+  bytes: Buffer,
+  expected?: ConfigFileIdentity,
+  assertManaged?: () => void,
+): void {
   let fd: number
   try {
     // Windows rejects numeric open flags with EINVAL and has no FIFOs or
@@ -695,9 +735,11 @@ export function writeConfigInPlaceSync(path: string, bytes: Buffer, expected?: C
     if (expected !== undefined && (opened.dev !== expected.dev || opened.ino !== expected.ino)) {
       throw refusedWrite(path, 'it was replaced after it was checked')
     }
+    assertManaged?.()
     const prior = readFileSync(fd)
     try {
       writeAllSync(fd, bytes)
+      assertManaged?.()
     } catch (error) {
       try {
         writeAllSync(fd, prior)

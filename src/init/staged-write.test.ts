@@ -9,12 +9,13 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { prepareConfigWriteSync, readConfigCommitSync } from '@/config/config-commits'
+import { __setConfigWriteSyncForTests, prepareConfigWriteSync, readConfigCommitSync } from '@/config/config-commits'
 import { failingConfigPublish, INJECTED_CONFIG_PUBLISH_FAILURE } from '@/test-helpers/config-publish-seams'
 
 import {
@@ -425,6 +426,109 @@ describe('a verified config publication', () => {
       },
     )
   }
+
+  // typeclaw.json links to configs/a.json; configs/b.json is another file.
+  async function linkedAgent() {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-linked-'))
+    const config = join(cwd, 'typeclaw.json')
+    const a = join(cwd, 'configs', 'a.json')
+    const b = join(cwd, 'configs', 'b.json')
+    await mkdir(join(cwd, 'configs'))
+    await writeFile(a, '{"alias":["atlas"]}\n')
+    await writeFile(b, '{"alias":["other"]}\n')
+    await symlink(a, config)
+    await writeFile(join(cwd, '.env'), 'OLD=1\n')
+    return { cwd, config, a, b, env: join(cwd, '.env') }
+  }
+
+  test.skipIf(process.platform === 'win32')(
+    'refuses when a symlinked config is re-pointed after it was verified, and restores .env',
+    async () => {
+      const { cwd, config, a, b, env } = await linkedAgent()
+      try {
+        // given: the linked config is verified, then its link is re-pointed to another file
+        const verified = prepareConfigWriteSync(config)
+        await rm(config)
+        await symlink(b, config)
+
+        // when: the config and a .env token are published together
+        const result = publishConfigWithCredential(verified, '{"alias":["renamed"]}\n', {
+          path: env,
+          content: 'OLD=1\nNEW=2\n',
+          stagingDir: credentialStagingDir(cwd),
+        })
+
+        // then: neither file the link named was written, .env is restored, and no commit is recorded
+        expect(result.ok).toBe(false)
+        expect(result.ok ? '' : result.reason).toContain(
+          'typeclaw.json changed or is not a regular file; nothing was written',
+        )
+        expect(readFileSync(a, 'utf8')).toBe('{"alias":["atlas"]}\n')
+        expect(readFileSync(b, 'utf8')).toBe('{"alias":["other"]}\n')
+        expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+        expect(readConfigCommitSync(config)).toBeUndefined()
+      } finally {
+        await rm(cwd, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(process.platform === 'win32')('publishes through an unchanged symlinked config', async () => {
+    const { cwd, config, a, env } = await linkedAgent()
+    try {
+      const verified = prepareConfigWriteSync(config)
+
+      const result = publishConfigWithCredential(verified, '{"alias":["renamed"]}\n', {
+        path: env,
+        content: 'OLD=1\nNEW=2\n',
+        stagingDir: credentialStagingDir(cwd),
+      })
+
+      expect(result).toEqual({ ok: true })
+      expect(lstatSync(config).isSymbolicLink()).toBe(true)
+      expect(readFileSync(a, 'utf8')).toBe('{"alias":["renamed"]}\n')
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\nNEW=2\n')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('a config write that fails partway is restored once, by the verified writer, and .env is restored', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-verified-'))
+    const config = join(cwd, 'typeclaw.json')
+    const env = join(cwd, '.env')
+    const writes: number[] = []
+    __setConfigWriteSyncForTests((fd, buffer, offset, length, position) => {
+      writes.push(length)
+      if (writes.length > 1) return writeSync(fd, buffer, offset, length, position)
+      writeSync(fd, buffer, offset, Math.floor(length / 2), position)
+      throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' })
+    })
+    try {
+      // given: a verified config whose write fails halfway
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      await writeFile(env, 'OLD=1\n')
+      const verified = prepareConfigWriteSync(config)
+
+      // when: it is published with a .env token
+      const result = publishConfigWithCredential(verified, '{"alias":["renamed-to-something-longer"]}\n', {
+        path: env,
+        content: 'OLD=1\nNEW=2\n',
+        stagingDir: credentialStagingDir(cwd),
+      })
+
+      // then: one failed write, one restore of the prior bytes, the original error, and .env restored
+      expect(writes).toEqual([42, 20])
+      expect(result.ok).toBe(false)
+      expect(result.ok ? '' : result.reason).toContain('EIO: i/o error, write. typeclaw.json was not changed')
+      expect(readFileSync(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+      expect(readConfigCommitSync(config)).toBeUndefined()
+    } finally {
+      __setConfigWriteSyncForTests(undefined)
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
 
   test('creates a missing config exclusively through the verified writer', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-staged-verified-'))

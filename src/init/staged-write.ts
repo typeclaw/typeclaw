@@ -96,23 +96,16 @@ export function prepareConfigWrite(path: string, content: string | Buffer): Conf
 }
 
 // Writes the target in place (O_WRONLY|O_TRUNC), or creates it if it did not
-// exist (through `create` when given), putting the prior bytes back if the
-// write fails; a failed restore throws `ConfigRestoreError`. A refused write
-// wrote nothing, so there is nothing to put back.
-export function publishConfigWrite(
-  write: ConfigWrite,
-  writeInPlace: WriteInPlace = writeExistingInPlace,
-  create?: WriteInPlace,
-): void {
+// exist, putting the prior bytes back if the write fails; a failed restore
+// throws `ConfigRestoreError`.
+export function publishConfigWrite(write: ConfigWrite, writeInPlace: WriteInPlace = writeExistingInPlace): void {
   if (write.prior === undefined) {
-    if (create !== undefined) create(write.path, write.content)
-    else writeFileSync(write.path, write.content, { flag: 'wx' })
+    writeFileSync(write.path, write.content, { flag: 'wx' })
     return
   }
   try {
     writeInPlace(write.path, write.content)
   } catch (error) {
-    if (error instanceof ConfigWriteRefusedError || error instanceof ConfigRestoreError) throw error
     try {
       writeInPlace(write.path, write.prior)
     } catch (restoreError) {
@@ -122,13 +115,6 @@ export function publishConfigWrite(
     }
     throw error
   }
-}
-
-// A verified config's write, refused like prepareConfigWrite's when the file
-// is read-only, before the paired .env update is published.
-function verifiedConfigWrite(verified: VerifiedConfigFile, content: string): ConfigWrite {
-  if (verified.prior !== undefined) accessSync(verified.path, constants.W_OK)
-  return { path: verified.path, content: Buffer.from(content), prior: verified.prior }
 }
 
 // The file a write to `path` lands in: its real path through any symlinks, or
@@ -275,13 +261,19 @@ export function publishConfigWithCredential(
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
     const verified = typeof config === 'string' ? undefined : config
+    // A read-only verified config is refused here, as prepareConfigWrite refuses
+    // a path, before the paired .env update is published.
+    if (verified?.prior !== undefined) accessSync(verified.path, constants.W_OK)
     const configWrite =
       verified === undefined
         ? prepareConfigWrite(config as string, configBytes)
-        : verifiedConfigWrite(verified, configBytes)
+        : { path: verified.path, content: Buffer.from(configBytes), prior: verified.prior }
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      publishConfigWrite(configWrite, seams.writeInPlace ?? verified?.writeInPlace, verified?.writeInPlace)
+      // The verified writer owns its rollback (on its own descriptor); only the
+      // path-based write takes the generic one. A test seam keeps the latter.
+      if (verified !== undefined && seams.writeInPlace === undefined) verified.writeInPlace(verified.path, configBytes)
+      else publishConfigWrite(configWrite, seams.writeInPlace)
     } catch (error) {
       const configState = error instanceof ConfigRestoreError ? error.message : 'typeclaw.json was not changed'
       const cause = error instanceof ConfigRestoreError ? '' : `${describe(error)}. `
