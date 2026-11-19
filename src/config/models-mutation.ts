@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { commitSystemFileSync } from '@/git/system-commit'
@@ -11,7 +11,7 @@ import {
   type CustomModelMeta,
   type ThinkingLevel,
 } from './config'
-import { readConfigForWriteSync, tryRecordConfigCommitSync } from './config-commits'
+import { commitConfigWriteSync, ConfigWriteRefusedError, readConfigForWriteSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   KNOWN_PROVIDERS,
@@ -335,8 +335,9 @@ function writeConfig(
   }
   const bytes = `${JSON.stringify(parsed, null, 2)}\n`
   try {
-    writeFileSync(path, bytes)
+    commitConfigWriteSync(path, bytes)
   } catch (error) {
+    if (error instanceof ConfigWriteRefusedError) return { ok: false, reason: error.message }
     const code = error instanceof Error && 'code' in error ? error.code : undefined
     if (code === 'EACCES' || code === 'EPERM') {
       return {
@@ -351,7 +352,6 @@ function writeConfig(
       reason: `Failed to write ${CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
-  tryRecordConfigCommitSync(path, bytes)
   return { ok: true, commitMessage }
 }
 

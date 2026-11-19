@@ -1,7 +1,6 @@
-import { renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { readConfigForWriteSync, tryRecordConfigCommitSync } from '@/config/config-commits'
+import { commitConfigWriteSync, readConfigForWriteSync } from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { commitSystemFileSync } from '@/git/system-commit'
 
@@ -10,8 +9,8 @@ import { parseMatchRule } from './match-rule'
 
 // Appends `rule` to `typeclaw.json#roles.<name>.match`, creating the role
 // block when missing. Idempotent: re-granting the same rule is a no-op.
-// Atomic: writes via temp+rename so a crashed write never leaves a partial
-// JSON file that would brick the next `typeclaw start`.
+// Writes in place through commitConfigWriteSync, which refuses, writing
+// nothing, unless typeclaw.json is still the regular file the grant read.
 //
 // Used by the role-claim flow (after a successful handshake) and by any
 // future operator-direct grant command. The match rule is validated
@@ -162,25 +161,11 @@ function writeConfigObject(cwd: string, obj: Record<string, unknown>): GrantResu
   const path = join(cwd, CONFIG_FILE)
   const bytes = `${JSON.stringify(obj, null, 2)}\n`
   try {
-    writeAtomic(path, bytes)
+    commitConfigWriteSync(path, bytes)
   } catch (error) {
     return { ok: false, reason: `failed to write ${CONFIG_FILE}: ${describeError(error)}` }
   }
-  tryRecordConfigCommitSync(path, bytes)
   return { ok: true, added: true }
-}
-
-function writeAtomic(path: string, content: string): void {
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`
-  writeFileSync(tmp, content)
-  try {
-    renameSync(tmp, path)
-  } catch (error) {
-    try {
-      unlinkSync(tmp)
-    } catch {}
-    throw error
-  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

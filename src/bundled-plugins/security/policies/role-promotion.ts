@@ -60,7 +60,7 @@ export const GUARD_ROLE_PROMOTION = 'rolePromotion'
 //
 // What this guard does NOT cover, by design:
 //   - `grantRole()` in src/permissions/grant.ts. That function writes
-//     `typeclaw.json` directly via writeFileSync (atomic temp+rename) and
+//     `typeclaw.json` directly (commitConfigWriteSync, in place) and
 //     bypasses `tool.before` by construction. The only production caller
 //     is the role-claim flow (src/role-claim/controller.ts), which is
 //     gated by an operator-issued pairing code from the host CLI: the
