@@ -34,6 +34,7 @@ export type CdpRelaySessions = {
   ownerOf: (token: string) => string | undefined
   onTabCreated: (owner: string, targetId: string) => void
   onTabUsed: (owner: string, targetId: string) => void
+  onConnection: (owner: string, open: boolean) => void
   // A pending promise holds the session's new connection until it settles.
   admit: (owner: string) => Promise<unknown> | undefined
 }
@@ -97,7 +98,12 @@ function handleClient(
     const relayPort = (server.address() as { port: number }).port
     if (request.isUpgrade) {
       const taps = owner === undefined || options.sessions === undefined ? undefined : tabTaps(owner, options.sessions)
-      if (owner !== undefined) trackConnection(connections, owner, client)
+      if (owner !== undefined && options.sessions !== undefined) {
+        const sessions = options.sessions
+        trackConnection(connections, owner, client)
+        sessions.onConnection(owner, true)
+        client.once('close', () => sessions.onConnection(owner, false))
+      }
       const gate = owner === undefined ? undefined : options.sessions?.admit(owner)
       if (gate === undefined) pipeUpgrade(client, options.upstreamSocket, request, rest, taps)
       else void gate.then(() => pipeUpgrade(client, options.upstreamSocket, request, rest, taps))

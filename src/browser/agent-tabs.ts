@@ -7,6 +7,17 @@ const OBSERVER_RETRY_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const
 // is let through anyway (Chrome may simply not be up yet).
 const OBSERVER_SYNC_WAIT_MS = 5_000
 
+// A long-lived session (a channel conversation, a TUI) can sit open for hours,
+// so its tabs also close once nothing has used them for a while, and the
+// oldest go first when sessions together hold more than the cap. Tabs a
+// script is connected to right now, or that were used moments ago, are never
+// closed this way.
+export const TAB_IDLE_MS = 15 * 60_000
+export const TAB_CAP = 10
+export const TAB_RECENT_MS = 2 * 60_000
+// How long a reconnecting owner waits for Chrome to finish closing its tabs.
+const CLOSE_SETTLE_MS = 2_000
+
 export type BrowserSessions = {
   relay: CdpRelaySessions
   tokenFor: (sessionId: string) => string
@@ -18,6 +29,9 @@ export type BrowserSessions = {
   // are attributed and closed tabs forgotten even when no session script is
   // connected. Reconnects until stopped.
   observe: (browserUrl: string) => TargetObserver
+  // Closes idle tabs, the oldest ones over the cap, and released tabs a
+  // previous close left open. Failed closes stay tracked for the next sweep.
+  reap: () => Promise<{ closed: number; failed: number }>
 }
 
 export type TargetObserver = {
@@ -26,8 +40,11 @@ export type TargetObserver = {
   stop: () => void
 }
 
-export function createBrowserSessions(upstreamSocket: string): BrowserSessions {
+export function createBrowserSessions(upstreamSocket: string, now: () => number = Date.now): BrowserSessions {
   const tabs = new AgentTabRegistry()
+  // Owners whose tabs are being closed by a sweep; their new connections wait,
+  // so a resumed script never attaches to a tab that is about to disappear.
+  const closingFor = new Map<string, Promise<unknown>>()
   const tokens = new Map<string, string>()
   // Keyed by digest so a lookup's timing reveals nothing about stored tokens.
   const ownerByDigest = new Map<string, string>()
@@ -53,7 +70,7 @@ export function createBrowserSessions(upstreamSocket: string): BrowserSessions {
     if (due.length > 0) void closeTabs(upstreamSocket, due)
   }
   const closeUnowned = (targetIds: string[]): Promise<number> => {
-    if (unsynced === undefined) return closeTabs(upstreamSocket, targetIds)
+    if (unsynced === undefined) return closeTabs(upstreamSocket, targetIds).then((closed) => closed.length)
     for (const targetId of targetIds) deferred.add(targetId)
     return Promise.resolve(0)
   }
@@ -63,24 +80,31 @@ export function createBrowserSessions(upstreamSocket: string): BrowserSessions {
       // A create Chrome answers after its session ended would otherwise
       // outlive the cleanup that already ran.
       onTabCreated: (owner, targetId) => {
-        if (tokens.has(owner)) tabs.created(owner, targetId)
-        else if (!tabs.adoptShared(targetId)) {
+        if (tokens.has(owner)) tabs.created(owner, targetId, now())
+        else if (!tabs.adoptShared(targetId, now())) {
           tabs.markReleased(targetId)
           void closeUnowned([targetId])
         }
         // Popups reported before this tab was registered can be attributed now.
-        const orphans = tabs.resolveAwaiting(targetId)
+        const orphans = tabs.resolveAwaiting(targetId, now())
         if (orphans.length > 0) void closeUnowned(orphans)
       },
       onTabUsed: (owner, targetId) => {
         if (!tokens.has(owner)) return
-        if (deferred.delete(targetId)) tabs.reclaim(owner, targetId)
-        else tabs.used(owner, targetId)
+        if (deferred.delete(targetId)) tabs.reclaim(owner, targetId, now())
+        else tabs.used(owner, targetId, now())
       },
-      admit: () =>
-        unsynced === undefined
-          ? undefined
-          : Promise.race([unsynced.done, new Promise((resolve) => setTimeout(resolve, OBSERVER_SYNC_WAIT_MS).unref())]),
+      onConnection: (owner, open) => (open ? tabs.connected(owner) : tabs.disconnected(owner, now())),
+      // Each wait is bounded, HTTP included, so a stalled Chrome only delays a
+      // session's new connection, never refuses it.
+      admit: (owner) => {
+        const closing = closingFor.get(owner)
+        if (unsynced === undefined && closing === undefined) return undefined
+        return Promise.all([
+          unsynced === undefined ? undefined : within(unsynced.done, OBSERVER_SYNC_WAIT_MS),
+          closing === undefined ? undefined : within(closing, CLOSE_SETTLE_MS),
+        ])
+      },
     },
     tokenFor: (sessionId) => {
       let token = tokens.get(sessionId)
@@ -101,9 +125,32 @@ export function createBrowserSessions(upstreamSocket: string): BrowserSessions {
       if (orphaned.length === 0) return 0
       return closeUnowned(orphaned)
     },
+    reap: async () => {
+      // Closing an opener the observer has not caught up with would strand its popups.
+      if (tabs.size === 0 || unsynced !== undefined) return { closed: 0, failed: 0 }
+      // Tabs a script closed itself must not count toward the cap, even if
+      // the observer missed their destruction while reconnecting.
+      const generation = tabs.generation
+      tabs.retainOnly(await listPageTargets(upstreamSocket), generation)
+      // Selection and dispatch run in one tick, so no owner can connect in between.
+      const picked = [...tabs.reapable(now()), ...tabs.releasedTabs()]
+      if (picked.length === 0) return { closed: 0, failed: 0 }
+      const closing = closeTabs(upstreamSocket, picked).then(async (closed) => {
+        await tabs.whenGone(closed, CLOSE_SETTLE_MS)
+        return closed.length
+      })
+      const owners = tabs.ownersOf(picked)
+      for (const owner of owners) closingFor.set(owner, closing)
+      try {
+        const closed = await closing
+        return { closed, failed: picked.length - closed }
+      } finally {
+        for (const owner of owners) if (closingFor.get(owner) === closing) closingFor.delete(owner)
+      }
+    },
     observe: (browserUrl) => {
       markUnsynced()
-      const observer = observeTargets(browserUrl, tabs, {
+      const observer = observeTargets(browserUrl, tabs, now, {
         closeOrphan: (targetId) => void closeUnowned([targetId]),
         onSynced: markSynced,
         onLost: markUnsynced,
@@ -123,7 +170,12 @@ const DISCOVER_ID = 1
 
 type ObserverHooks = { closeOrphan: (targetId: string) => void; onSynced: () => void; onLost: () => void }
 
-function observeTargets(browserUrl: string, tabs: AgentTabRegistry, hooks: ObserverHooks): TargetObserver {
+function observeTargets(
+  browserUrl: string,
+  tabs: AgentTabRegistry,
+  now: () => number,
+  hooks: ObserverHooks,
+): TargetObserver {
   let stopped = false
   let failures = 0
   let socket: WebSocket | undefined
@@ -160,7 +212,7 @@ function observeTargets(browserUrl: string, tabs: AgentTabRegistry, hooks: Obser
         if (info?.['type'] !== 'page' || typeof info['targetId'] !== 'string') return
         if (discovering) live.add(info['targetId'])
         if (typeof info['openerId'] !== 'string') return
-        for (const orphan of tabs.opened(info['targetId'], info['openerId'])) hooks.closeOrphan(orphan)
+        for (const orphan of tabs.opened(info['targetId'], info['openerId'], now())) hooks.closeOrphan(orphan)
       } else if (message?.['method'] === 'Target.targetDestroyed' && typeof params?.['targetId'] === 'string') {
         tabs.forget(params['targetId'])
       }
@@ -193,6 +245,10 @@ function parseJson(text: string): Record<string, unknown> | undefined {
   }
 }
 
+function within(promise: Promise<unknown>, ms: number): Promise<unknown> {
+  return Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms).unref())])
+}
+
 function tokenDigest(token: string): string {
   return createHash('sha256').update(token).digest('hex')
 }
@@ -202,7 +258,7 @@ function tokenDigest(token: string): string {
 // their renderers. Each tab is owned by the sessions that opened or attached
 // to it, and closes once the last of them ends. Tabs no session opened (the
 // operator's own tabs, ones restored at launch) are never tracked or closed.
-type TrackedTab = { owners: Set<string>; generation: number }
+type TrackedTab = { owners: Set<string>; generation: number; lastUsedAt: number }
 
 export class AgentTabRegistry {
   readonly #tabs = new Map<string, TrackedTab>()
@@ -216,29 +272,37 @@ export class AgentTabRegistry {
   // stay out of cleanup; they join the owners if a session created the tab.
   readonly #earlyShares = new Map<string, { owners: Set<string>; generation: number }>()
   readonly #awaitingOpener = new Map<string, string>()
+  readonly #openConnections = new Map<string, number>()
+  readonly #goneWaiters = new Map<string, (() => void)[]>()
   #generation = 0
 
   get generation(): number {
     return this.#generation
   }
 
-  created(owner: string, targetId: string): void {
+  get size(): number {
+    return this.#tabs.size + this.#released.size
+  }
+
+  created(owner: string, targetId: string, at: number): void {
     const tab = this.#tabs.get(targetId)
     if (tab !== undefined) {
       tab.owners.add(owner)
+      tab.lastUsedAt = at
       return
     }
     const owners = new Set([owner, ...(this.#earlyShares.get(targetId)?.owners ?? [])])
     this.#earlyShares.delete(targetId)
-    this.#tabs.set(targetId, { owners, generation: ++this.#generation })
+    this.#tabs.set(targetId, { owners, generation: ++this.#generation, lastUsedAt: at })
   }
 
   // Attaching to a tracked tab shares it, so handing a tab to another live
   // session keeps it open until that session ends too.
-  used(owner: string, targetId: string): void {
+  used(owner: string, targetId: string, at: number): void {
     const tab = this.#tabs.get(targetId)
     if (tab !== undefined) {
       tab.owners.add(owner)
+      tab.lastUsedAt = at
       return
     }
     if (this.#released.has(targetId)) return
@@ -250,11 +314,11 @@ export class AgentTabRegistry {
 
   // A session-created tab whose creator ended before Chrome's reply arrived
   // stays open for the live sessions that already attached to it.
-  adoptShared(targetId: string): boolean {
+  adoptShared(targetId: string, at: number): boolean {
     const early = this.#earlyShares.get(targetId)
     this.#earlyShares.delete(targetId)
     if (early === undefined || early.owners.size === 0) return false
-    this.#tabs.set(targetId, { owners: early.owners, generation: ++this.#generation })
+    this.#tabs.set(targetId, { owners: early.owners, generation: ++this.#generation, lastUsedAt: at })
     return true
   }
 
@@ -263,7 +327,7 @@ export class AgentTabRegistry {
   // left has no owner to wait for. Chrome may report a popup before its opener
   // is known (discovery order, a late create reply), so it waits for it.
   // Returns the popups, this one and any waiting on it, to close.
-  opened(targetId: string, openerId: string): string[] {
+  opened(targetId: string, openerId: string, at: number): string[] {
     if (this.#tabs.has(targetId) || this.#released.has(targetId)) return []
     const opener = this.#tabs.get(openerId)
     if (opener === undefined && !this.#released.has(openerId)) {
@@ -274,14 +338,14 @@ export class AgentTabRegistry {
     const owners = new Set([...(opener?.owners ?? []), ...(this.#earlyShares.get(targetId)?.owners ?? [])])
     this.#earlyShares.delete(targetId)
     if (owners.size === 0) this.#released.set(targetId, ++this.#generation)
-    else this.#tabs.set(targetId, { owners, generation: ++this.#generation })
-    return [...(owners.size === 0 ? [targetId] : []), ...this.resolveAwaiting(targetId)]
+    else this.#tabs.set(targetId, { owners, generation: ++this.#generation, lastUsedAt: at })
+    return [...(owners.size === 0 ? [targetId] : []), ...this.resolveAwaiting(targetId, at)]
   }
 
-  resolveAwaiting(openerId: string): string[] {
+  resolveAwaiting(openerId: string, at: number): string[] {
     const orphans: string[] = []
     for (const [popup, waitingFor] of this.#awaitingOpener) {
-      if (waitingFor === openerId) orphans.push(...this.opened(popup, openerId))
+      if (waitingFor === openerId) orphans.push(...this.opened(popup, openerId, at))
     }
     return orphans
   }
@@ -297,9 +361,22 @@ export class AgentTabRegistry {
   }
 
   // A live session attached to a released tab before its close was issued.
-  reclaim(owner: string, targetId: string): void {
+  reclaim(owner: string, targetId: string, at: number): void {
     if (!this.#released.delete(targetId)) return
-    this.#tabs.set(targetId, { owners: new Set([owner]), generation: ++this.#generation })
+    this.#tabs.set(targetId, { owners: new Set([owner]), generation: ++this.#generation, lastUsedAt: at })
+  }
+
+  connected(owner: string): void {
+    this.#openConnections.set(owner, (this.#openConnections.get(owner) ?? 0) + 1)
+  }
+
+  // Engines that drive a page without an explicit attach (Playwright
+  // auto-attaches) still count as using every tab their session owns.
+  disconnected(owner: string, at: number): void {
+    const remaining = (this.#openConnections.get(owner) ?? 1) - 1
+    if (remaining > 0) this.#openConnections.set(owner, remaining)
+    else this.#openConnections.delete(owner)
+    for (const tab of this.#tabs.values()) if (tab.owners.has(owner)) tab.lastUsedAt = at
   }
 
   forget(targetId: string): void {
@@ -307,16 +384,18 @@ export class AgentTabRegistry {
     this.#released.delete(targetId)
     this.#earlyShares.delete(targetId)
     this.#awaitingOpener.delete(targetId)
+    for (const resolve of this.#goneWaiters.get(targetId) ?? []) resolve()
+    this.#goneWaiters.delete(targetId)
   }
 
   // Drops tabs Chrome no longer has, so closed tabs stop counting as owned.
   // Only entries tracked at or before `generation` are judged against the list.
   retainOnly(liveTargetIds: ReadonlySet<string>, generation: number): void {
     for (const [targetId, tab] of this.#tabs) {
-      if (tab.generation <= generation && !liveTargetIds.has(targetId)) this.#tabs.delete(targetId)
+      if (tab.generation <= generation && !liveTargetIds.has(targetId)) this.forget(targetId)
     }
     for (const [targetId, tracked] of this.#released) {
-      if (tracked <= generation && !liveTargetIds.has(targetId)) this.#released.delete(targetId)
+      if (tracked <= generation && !liveTargetIds.has(targetId)) this.forget(targetId)
     }
     for (const [targetId, early] of this.#earlyShares) {
       if (early.generation <= generation && !liveTargetIds.has(targetId)) this.#earlyShares.delete(targetId)
@@ -337,9 +416,72 @@ export class AgentTabRegistry {
     }
     return orphaned
   }
+
+  releasedTabs(): string[] {
+    return [...this.#released.keys()]
+  }
+
+  ownersOf(targetIds: readonly string[]): Set<string> {
+    const owners = new Set<string>()
+    for (const targetId of targetIds) for (const owner of this.#tabs.get(targetId)?.owners ?? []) owners.add(owner)
+    return owners
+  }
+
+  // Picks tabs idle past TAB_IDLE_MS, then the least recently used beyond
+  // TAB_CAP that were not used within TAB_RECENT_MS. A tab whose session has a
+  // script connected is never picked. Picked tabs stay tracked until Chrome
+  // confirms they are gone, so a failed close is retried by the next sweep.
+  reapable(now: number): string[] {
+    const candidates = [...this.#tabs]
+      .filter(([, tab]) => !this.#inUse(tab))
+      .toSorted(([, a], [, b]) => a.lastUsedAt - b.lastUsedAt)
+    const picked: string[] = []
+    let open = this.#tabs.size
+    for (const [targetId, tab] of candidates) {
+      const age = now - tab.lastUsedAt
+      if (age < TAB_IDLE_MS && (open <= TAB_CAP || age < TAB_RECENT_MS)) continue
+      picked.push(targetId)
+      open -= 1
+    }
+    return picked
+  }
+
+  // Resolves once every tab is forgotten (Chrome reported it destroyed) or
+  // after `timeoutMs`, whichever is first.
+  whenGone(targetIds: readonly string[], timeoutMs: number): Promise<void> {
+    const pending = targetIds.filter((targetId) => this.#tabs.has(targetId) || this.#released.has(targetId))
+    if (pending.length === 0) return Promise.resolve()
+    return new Promise((resolve) => {
+      let remaining = pending.length
+      const timer = setTimeout(resolve, timeoutMs)
+      for (const targetId of pending) {
+        const waiters = this.#goneWaiters.get(targetId) ?? []
+        waiters.push(() => {
+          remaining -= 1
+          if (remaining > 0) return
+          clearTimeout(timer)
+          resolve()
+        })
+        this.#goneWaiters.set(targetId, waiters)
+      }
+    })
+  }
+
+  #inUse(tab: TrackedTab): boolean {
+    for (const owner of tab.owners) if (this.#openConnections.has(owner)) return true
+    return false
+  }
 }
 
-async function closeTabs(upstreamSocket: string, targetIds: readonly string[]): Promise<number> {
+async function listPageTargets(upstreamSocket: string): Promise<Set<string>> {
+  const response = await fetch('http://127.0.0.1/json/list', { unix: upstreamSocket } as RequestInit)
+  if (!response.ok) throw new Error(`DevTools answered ${response.status} for /json/list`)
+  const targets = (await response.json()) as { id: string; type: string }[]
+  return new Set(targets.filter((target) => target.type === 'page').map((target) => target.id))
+}
+
+// Resolves to the tabs Chrome accepted a close for.
+async function closeTabs(upstreamSocket: string, targetIds: readonly string[]): Promise<string[]> {
   const results = await Promise.allSettled(
     targetIds.map(async (targetId) => {
       const response = await fetch(`http://127.0.0.1/json/close/${encodeURIComponent(targetId)}`, {
@@ -348,5 +490,8 @@ async function closeTabs(upstreamSocket: string, targetIds: readonly string[]): 
       return response.ok
     }),
   )
-  return results.filter((result) => result.status === 'fulfilled' && result.value).length
+  return targetIds.filter((_, index) => {
+    const result = results[index]!
+    return result.status === 'fulfilled' && result.value
+  })
 }
