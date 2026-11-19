@@ -14,6 +14,7 @@
 
 import { CurlImpersonateError, curlImpersonate, isCurlExitTimeout } from './curl-impersonate'
 import { createKeyedSemaphore } from './keyed-semaphore'
+import { createRequestPacer, type PacerOptions } from './request-pacer'
 import { activeCooldown, blockGeneration, recordEngineBlock, recordEngineSuccess } from './search-cooldown'
 import { type SearchRetryOptions, withSearchRetry } from './search-retry'
 
@@ -52,24 +53,13 @@ export const DDG_MIN_REQUEST_INTERVAL_MS = 1_500
 // the engine (search-cooldown.ts): calls inside the pause fail fast without
 // touching the network.
 
-type Pacing = {
-  intervalMs: number
-  now: () => number
-  sleep: (ms: number, signal?: AbortSignal) => Promise<void>
-}
-const DEFAULT_PACING: Pacing = {
-  intervalMs: DDG_MIN_REQUEST_INTERVAL_MS,
-  now: () => Date.now(),
-  sleep: abortableSleep,
-}
-let pacing: Pacing = DEFAULT_PACING
-let nextRequestAt = 0
+const DEFAULT_PACING: PacerOptions = { intervalMs: DDG_MIN_REQUEST_INTERVAL_MS }
+let pacer = createRequestPacer(DEFAULT_PACING)
 
 // Test-only seam: swaps the clock/sleep and interval, and resets the
 // process-wide pacing state so tests don't leak a request slot into each other.
-export function _setDdgPacingForTest(override: Partial<Pacing> | null): void {
-  pacing = { ...DEFAULT_PACING, ...override }
-  nextRequestAt = 0
+export function _setDdgPacingForTest(override: Partial<PacerOptions> | null): void {
+  pacer = createRequestPacer({ ...DEFAULT_PACING, ...override })
 }
 
 export type DdgResult = {
@@ -96,7 +86,7 @@ export async function ddgSearch(query: string, limit: number, signal?: AbortSign
         async () => {
           for (const binary of DDG_PROFILES) {
             if (activeCooldown('ddg')) throw new DdgCaptchaError()
-            await waitForRequestSlot(signal)
+            await pacer.waitForSlot(signal)
             // A concurrent search may have started the cooldown while this one waited.
             if (activeCooldown('ddg')) throw new DdgCaptchaError()
             const generation = blockGeneration('ddg')
@@ -125,28 +115,6 @@ export async function ddgSearch(query: string, limit: number, signal?: AbortSign
 // (DNS, refused, TLS) is NOT retried either; it won't fix itself on a re-run.
 export function isTransientSearchError(error: unknown): boolean {
   return error instanceof CurlImpersonateError && isCurlExitTimeout(error)
-}
-
-function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason)
-    const onAbort = (): void => {
-      clearTimeout(timer)
-      reject(signal?.reason)
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }, ms)
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-async function waitForRequestSlot(signal?: AbortSignal): Promise<void> {
-  const now = pacing.now()
-  const slot = Math.max(now, nextRequestAt)
-  nextRequestAt = slot + pacing.intervalMs
-  if (slot > now) await pacing.sleep(slot - now, signal)
 }
 
 export class DdgCaptchaError extends Error {
