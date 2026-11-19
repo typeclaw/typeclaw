@@ -26,17 +26,19 @@ const managed = {
 const hookContext = { agentDir: '/agent', pluginName: 'managed-browser', logger: { info() {}, warn() {}, error() {} } }
 
 async function runHook(origin: Parameters<ReturnType<typeof createPermissionService>['has']>[0], tool = 'bash') {
-  const hook = sharedBrowserBashHook(createPermissionService(), { TYPECLAW_BROWSER_CDP_URL: managed.cdpUrl })
+  const hook = sharedBrowserBashHook(createPermissionService(), (sessionId) => ({
+    TYPECLAW_BROWSER_CDP_URL: `${managed.cdpUrl}-${sessionId}`,
+  }))
   const args: Record<string, unknown> = { command: 'true', [TYPECLAW_INTERNAL_BASH_ENV]: { GH_REPO: 'acme/app' } }
   await hook({ tool, sessionId: 's', callId: 'c', args, origin }, hookContext)
   return args[TYPECLAW_INTERNAL_BASH_ENV]
 }
 
 describe('shared browser bash access', () => {
-  test('injects the browser URL for a role holding browser.shared, keeping existing overlay entries', async () => {
+  test("injects the calling session's browser URL for a role holding browser.shared, keeping existing overlay entries", async () => {
     expect(await runHook({ kind: 'tui', sessionId: 's' })).toEqual({
       GH_REPO: 'acme/app',
-      TYPECLAW_BROWSER_CDP_URL: managed.cdpUrl,
+      TYPECLAW_BROWSER_CDP_URL: `${managed.cdpUrl}-s`,
     })
   })
 

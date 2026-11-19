@@ -33,8 +33,10 @@ export default definePlugin({
       ctx.logger.error(`managed browser failed to start; browser engines are unavailable: ${String(error)}`)
       return { skillsDirs }
     }
-    const overlay = browserEnvOverlay(browser, managed)
-    const bashHook = sharedBrowserBashHook(ctx.permissions, overlay)
+    // Each session gets its own CDP URL so the tabs it opens close when it ends.
+    const bashHook = sharedBrowserBashHook(ctx.permissions, (sessionId) =>
+      browserEnvOverlay(browser, { ...managed, cdpUrl: managed.sessionCdpUrl(sessionId) }),
+    )
     const fillGuard = fillSecretGuardHook(ctx.permissions)
 
     return {
@@ -45,6 +47,7 @@ export default definePlugin({
           await bashHook(event, hookCtx)
           return fillGuard(event, hookCtx)
         },
+        'session.end': (event) => managed.endSession(event.sessionId),
       },
       onDispose: () => managed.stop(),
     }
@@ -53,14 +56,14 @@ export default definePlugin({
 
 export function sharedBrowserBashHook(
   permissions: PermissionService,
-  overlay: Record<string, string>,
+  overlayFor: (sessionId: string) => Record<string, string>,
 ): NonNullable<Hooks['tool.before']> {
   return (event) => {
     if (event.tool !== 'bash') return
     if (!permissions.has(event.origin, CORE_PERMISSIONS.browserShared)) return
     const existing = event.args[TYPECLAW_INTERNAL_BASH_ENV]
     const current = existing !== null && typeof existing === 'object' ? (existing as Record<string, string>) : {}
-    event.args[TYPECLAW_INTERNAL_BASH_ENV] = { ...current, ...overlay }
+    event.args[TYPECLAW_INTERNAL_BASH_ENV] = { ...current, ...overlayFor(event.sessionId) }
   }
 }
 
