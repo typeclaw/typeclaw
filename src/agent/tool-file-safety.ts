@@ -985,7 +985,11 @@ type CallIdentity = { link: ConfigFileIdentity | undefined; resolved: ConfigFile
 // Returns the guard's denial reason, or undefined when the content may land.
 export type ManagedConfigGuardCheck = ConfigCallGuard
 
-export type RecheckSeams = { writeInPlace?: (path: string, bytes: Buffer) => void }
+export type RecheckSeams = {
+  writeInPlace?: (path: string, bytes: Buffer) => void
+  // The rollback's read of the live file, before it restores.
+  readLive?: (path: string) => ConfigFileEntry
+}
 
 export async function snapshotManagedConfigFiles(
   agentDir: string,
@@ -1151,6 +1155,10 @@ async function recheckManagedEntry(
           : undefined
       const reason = await checkUnderEveryCall(destination, snapshot, live.bytes, contentOf(trusted))
       if (reason === undefined) {
+        // Only bytes that are live are recorded: a writer that replaced them during
+        // the check left bytes no check has seen.
+        const now = readLiveEntry(destination)
+        if (!sameConfigContent(now, live)) return holdReplaced(destination, now, producingGuards(destination, snapshot))
         recordConfigCommitSync(destination, live.bytes)
         return undefined
       }
@@ -1225,9 +1233,25 @@ function holdUnreadable(destination: string, producers: readonly ManagedConfigGu
   return `[TypeClaw config guard] ${name} could not be read after this command, so the agent keeps using the last checked ${name} until it is readable and checked again.`
 }
 
-function readLiveEntry(destination: string): ConfigFileEntry {
+// Bytes that replaced a checked change: a newer authorized commit stands, and
+// anything else keeps the trusted view in recovery under the producing guards.
+function holdReplaced(
+  destination: string,
+  now: ConfigFileEntry,
+  producers: readonly ManagedConfigGuardCheck[],
+): string {
+  const name = path.basename(destination)
+  if (sameConfigContent(now, trustedConfigState(destination).entry)) return discardedNotice(name)
+  setConfigRecovery(destination, true, producers)
+  return `[TypeClaw config guard] ${name} changed again while this command's change was checked, so it was left as it is now. Until a later check verifies it, the agent keeps using the last authorized ${name}, and that check also applies this command's checks.`
+}
+
+function readLiveEntry(
+  destination: string,
+  read: (path: string) => ConfigFileEntry = readConfigEntrySync,
+): ConfigFileEntry {
   try {
-    return readConfigEntrySync(destination)
+    return read(destination)
   } catch {
     return { kind: 'other', id: { dev: 0n, ino: 0n, size: 0n, mtimeNs: 0n, ctimeNs: 0n }, unreadable: true }
   }
@@ -1257,7 +1281,16 @@ function revert(
     : [
         `This command could not be coordinated with host typeclaw commands, so ${name} was checked against the last state the agent knew; a typeclaw command run on the host during this command may need to be run again.`,
       ]
-  const now = readConfigEntrySync(destination)
+  const now = readLiveEntry(destination, seams.readLive)
+  if (now.kind === 'other' && now.unreadable === true) {
+    // The rollback cannot tell what the file holds now: keep the trusted view.
+    setConfigRecovery(destination, true, producers)
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} could not be read to revert it, so the agent keeps using the last checked ${name} until it is readable and checked again.`,
+    ].join('\n')
+  }
   if (!sameConfigContent(now, live)) {
     // Only a newer authorized commit is trusted as it stands. Any other change may
     // still carry the blocked content, so the window keeps the trusted bytes in

@@ -9181,8 +9181,10 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
       // when: the bash change passes its check
       await runBash(agentDir, hooks, `printf '%s\\n' '{"alias":["from-bash"]}' > typeclaw.json`)
 
-      // then: the other writer's bytes are left in place
+      // then: the other writer's bytes are left in place, but no check has seen
+      // them, so a reload keeps the trusted bytes rather than the replacement
       expect(await readFile(config, 'utf8')).toBe('{"alias":["other-writer"]}\n')
+      expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
     })
   })
 })

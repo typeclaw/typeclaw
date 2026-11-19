@@ -7,6 +7,7 @@ import path from 'node:path'
 import { loadConfigSync } from '@/config'
 import {
   __failConfigEpochWritesForTests,
+  closeConfigWindow,
   __setConfigReadHookForTests,
   readValidatedConfigFileSync,
   recordConfigCommitSync,
@@ -813,3 +814,70 @@ test('a blocked change left by a failed restore under an unavailable lock keeps 
     await rm(agentDir, { recursive: true, force: true })
   }
 }, 30_000)
+
+const roleRule = '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}\n'
+const withoutRoleBypass = async (content: string) =>
+  content.includes('discord:user:1') ? 'Guard `rolePromotion` blocked write' : undefined
+
+test('a rollback that cannot read the file keeps the trusted window and the blocking guard', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-rollback-read-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  try {
+    // given: a session without the bypass adds a role rule, and the rollback's read fails
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const first = await snapshotManagedConfigFiles(agentDir, withoutRoleBypass)
+    await writeFile(config, roleRule)
+    const notices = await recheckManagedConfigAfterBash(first, {
+      readLive: () => {
+        throw new Error('EIO: i/o error, read')
+      },
+    })
+
+    // then: once the error clears, a reload still serves the trusted bytes
+    expect(notices.join('\n')).toContain('typeclaw.json could not be read to revert it')
+    expect(await readFile(config, 'utf8')).toBe(roleRule)
+    expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+    expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+
+    // when: an owner session's later call re-checks the file
+    const later = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    const recheck = await recheckManagedConfigAfterBash(later)
+
+    // then: the original session's guard still blocks the rule, and the file is reverted
+    expect(recheck.join('\n')).toContain('the command that left this change ran in a session without permission')
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a window never releases its trusted view while the live file holds unchecked bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-release-invariant-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const record = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+  try {
+    // given: a call's window is open, and the file changes with no check and no commit
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const first = await snapshotManagedConfigFiles(agentDir, withoutRoleBypass)
+    await writeFile(config, roleRule)
+
+    // when: the call closes without its post-check having run
+    for (const file of first.files.keys()) await closeConfigWindow(file, first.call)
+
+    // then: the window is not released, and a reload serves the trusted bytes
+    expect(existsSync(record)).toBe(true)
+    expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+    expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+
+    // when: an owner session's later call re-checks the file
+    const later = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    const notices = await recheckManagedConfigAfterBash(later)
+
+    // then: the guard of the call that touched the window still applies
+    expect(notices.join('\n')).toContain('the command that left this change ran in a session without permission')
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    expect(existsSync(record)).toBe(false)
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})

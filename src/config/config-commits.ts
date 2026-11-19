@@ -87,6 +87,9 @@ type Window = {
   // that left those unverified bytes; a later re-check must pass them too.
   recovery: boolean
   recoveryGuards: ConfigCallGuard[]
+  // The guard of every call that has touched this window: if the window cannot
+  // release (see evictWindow), these become its recovery guards.
+  touched: ConfigCallGuard[]
   // False once the window could not be captured under the config lock or
   // published: a host command may then have built on unchecked bytes, so its
   // commits are not trusted to skip the post-bash check, and bash calls that
@@ -289,7 +292,10 @@ export async function openConfigWindow(
     }
   }
   const window = windows.get(key)
-  window?.calls.set(call, guard)
+  if (window !== undefined) {
+    window.calls.set(call, guard)
+    if (!window.touched.includes(guard)) window.touched.push(guard)
+  }
   return {
     generation: trustedConfigState(file).generation,
     uncoordinated: window?.coordinated === false ? window.uncoordinatedReason : undefined,
@@ -658,6 +664,7 @@ function captureWindow(file: string, uncoordinatedReason?: string): void {
     generation: readConfigCommitSync(file)?.generation,
     recovery: false,
     recoveryGuards: [],
+    touched: [],
     coordinated: uncoordinatedReason === undefined,
     ...(uncoordinatedReason === undefined ? {} : { uncoordinatedReason }),
     owner: randomUUID(),
@@ -685,7 +692,10 @@ function settleWindow(file: string, window: Window): void {
     publishWindow(file, window)
     return
   }
-  if (!evictWindow(file, window)) return
+  if (!evictWindow(file, window)) {
+    if (window.recovery) publishWindow(file, window)
+    return
+  }
   // Callers hold the config lock. Only this window's own record is removed, and
   // only once the epoch has advanced; otherwise a host read could miss the whole
   // window, so the record stays and host readers keep its trusted bytes.
@@ -709,11 +719,37 @@ function settleWindow(file: string, window: Window): void {
 // The only way a window leaves memory: it must still be the window registered
 // for the file, with no call in flight and no unrecovered rollback. Runtime
 // readers fall back to the file itself once it is gone.
+//
+// Invariant: a window releases its trusted view only while the live file holds
+// the trusted bytes, or a verified authorized commit (trustedConfigState adopts
+// a recorded commit whose bytes are live). Anything else, including a live read
+// that fails or is inconclusive, puts the window in recovery instead: it keeps
+// the trusted baseline, and the guards of every call that touched it must pass
+// before a later check accepts the live bytes. Every exit path, errors included,
+// releases through here. Callers hold the config lock, except a close that could
+// not take it; that close compares without it, and a mismatch still holds.
 function evictWindow(file: string, window: Window): boolean {
   const key = resolve(file)
   if (windows.get(key) !== window || window.calls.size > 0 || window.recovery) return false
+  if (!liveMatchesTrusted(file)) {
+    window.recovery = true
+    window.recoveryGuards = [...new Set([...window.recoveryGuards, ...window.touched])]
+    return false
+  }
   windows.delete(key)
   return true
+}
+
+function liveMatchesTrusted(file: string): boolean {
+  try {
+    const live = readConfigEntrySync(file)
+    // A confirmed FIFO, directory, socket, or device holds no bytes a reader
+    // would load: readers refuse it, so it never stands in for the config.
+    if (live.kind === 'other') return live.unreadable !== true
+    return sameConfigContent(live, trustedConfigState(file).entry)
+  } catch {
+    return false
+  }
 }
 
 function warnKeptRecord(file: string, window: Window, reason: string): void {
