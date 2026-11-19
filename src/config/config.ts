@@ -1,4 +1,4 @@
-import { accessSync, constants as fsConstants, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, constants as fsConstants, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, resolve } from 'node:path'
 
@@ -20,6 +20,7 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
+import { readValidatedConfigFileSync, tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1359,7 +1360,7 @@ export function extractPluginConfigs(raw: unknown): Record<string, unknown> {
 export function loadPluginConfigsSync(cwd: string): Record<string, unknown> {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return {}
   }
@@ -1379,7 +1380,7 @@ export function loadPluginConfigsSync(cwd: string): Record<string, unknown> {
 export function loadConfigSync(cwd: string): Config {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return configSchema.parse({})
   }
@@ -1411,7 +1412,7 @@ export function loadConfigSync(cwd: string): Config {
 export function loadConfigBundleSync(cwd: string): { config: Config; pluginConfigs: Record<string, unknown> } {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return { config: configSchema.parse({}), pluginConfigs: {} }
   }
@@ -1560,8 +1561,12 @@ function persistMigratedConfig(cwd: string): void {
     // Migrate the file as it is under the lock, not the caller's earlier read,
     // so a write that landed in between is not rolled back.
     applied = withConfigFileLockSync(file, () => {
-      const migrated = migrateLegacyConfigShape(JSON.parse(readFileSync(file, 'utf8')))
-      if (migrated.changed) writeFileSync(file, `${JSON.stringify(migrated.json, null, 2)}\n`)
+      const migrated = migrateLegacyConfigShape(JSON.parse(readValidatedConfigFileSync(file)))
+      if (migrated.changed) {
+        const bytes = `${JSON.stringify(migrated.json, null, 2)}\n`
+        writeFileSync(file, bytes)
+        tryRecordConfigCommitSync(file, bytes)
+      }
       return migrated.applied
     })
   } catch {
@@ -1614,7 +1619,7 @@ export type ValidateConfigOptions = {
 export function validateConfig(cwd: string, options: ValidateConfigOptions = {}): ValidateConfigResult {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return { ok: true }
   }
