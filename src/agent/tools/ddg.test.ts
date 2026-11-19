@@ -18,6 +18,7 @@ import {
   isTransientSearchError,
   parseDdgHtml,
 } from './ddg'
+import { _resetSearchCooldownsForTest } from './search-cooldown'
 
 const onWindows = isWindows()
 
@@ -276,12 +277,14 @@ describe.skipIf(onWindows)('ddgSearch (retry + concurrency)', () => {
     scratchDir = mkdtempSync(join(tmpdir(), 'ddg-search-test-'))
     _setSearchRetryForTest({ attempts: 3, sleep: async () => {} })
     _setDdgPacingForTest({ intervalMs: 0 })
+    _resetSearchCooldownsForTest()
   })
 
   afterEach(() => {
     _setCurlBinaryForTest(null)
     _setSearchRetryForTest(null)
     _setDdgPacingForTest(null)
+    _resetSearchCooldownsForTest()
     rmSync(scratchDir, { recursive: true, force: true })
   })
 
@@ -295,7 +298,8 @@ describe.skipIf(onWindows)('ddgSearch (retry + concurrency)', () => {
   test('a CAPTCHA is not retried and starts a cooldown that sends no requests until it ends', async () => {
     // given: every profile is challenged until an "ok" flag file appears
     let clock = 0
-    _setDdgPacingForTest({ intervalMs: 0, cooldownMs: 60_000, now: () => clock })
+    _setDdgPacingForTest({ intervalMs: 0, now: () => clock })
+    _resetSearchCooldownsForTest(() => clock)
     const counter = join(scratchDir, 'count')
     const okFlag = join(scratchDir, 'ok')
     installFakeBinary(`

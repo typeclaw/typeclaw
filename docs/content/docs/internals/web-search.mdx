@@ -1,10 +1,33 @@
 ---
 title: Web search
-description: Why DDG goes through curl-impersonate, the lexiforest pin, failure modes
+description: The keyless engine chain (Exa, then DDG), engine cooldowns, why DDG goes through curl-impersonate, failure modes
 icon: Search
 ---
 
-`src/agent/tools/websearch.ts` exposes general web search to the agent. Default source goes through `src/agent/tools/ddg.ts` (DuckDuckGo's `lite.duckduckgo.com/lite/` SERP — the only major engine that serves a parseable, key-free SERP). `wikipedia` is a separate narrower path.
+`src/agent/tools/websearch.ts` exposes general web search to the agent. `wikipedia` is a separate narrower path; the default `web` source walks a chain of keyless engines.
+
+## The engine chain
+
+TypeClaw only uses search services that need no API key or account. `web` tries, in order, and stops at the first engine that answers with results:
+
+1. **Exa** (`src/agent/tools/exa.ts`) — the anonymous tier of Exa's hosted MCP server (`POST https://mcp.exa.ai/mcp?tools=web_search_exa`, JSON-RPC `tools/call`). It is a JSON API that does not fingerprint the client, so it uses plain `fetch`. Its anonymous tier answers about three requests per second per source IP and rejects bursts beyond that with a 429, so `exaSearch` spaces every outbound request by `EXA_MIN_REQUEST_INTERVAL_MS` (500ms, process-wide, via the shared `request-pacer.ts` that DDG also uses). A 429 or 403 body (an invitation to create an API key) is not passed to the model.
+2. **DuckDuckGo** (`src/agent/tools/ddg.ts`) — the `lite.duckduckgo.com/lite/` SERP through curl-impersonate (below).
+
+Each query is sent to Exa first, and to DuckDuckGo only when Exa fails, is cooling down, or returns nothing. Neither receives a key, an account, a session id, or any other part of the conversation.
+
+When the answer comes from a fallback, the result text carries a `Routing attempts:` line naming what happened to each earlier engine (for example `Exa skipped (cooling down for 42s after a rate limit) -> DuckDuckGo 10 results`); `details.engine` and `details.attempts` carry the same information. Every result list ends with a one-line reminder to cite the URLs used. When no engine produced results and every failure was transient (rate limit, CAPTCHA, network timeout, cooldown skip), the tool returns a terminal "do not retry this tool now" message instead, so the model reports what it has rather than looping the tool with rephrased queries.
+
+## Engine cooldowns
+
+`src/agent/tools/search-cooldown.ts` keeps one process-wide cooldown per engine, because every session, subagent, and cron in the agent shares one egress IP. A block — a DDG CAPTCHA on every profile, an Exa HTTP 429 or 403, or an Exa network failure — pauses that engine:
+
+- the first block pauses it for 1 minute (`ENGINE_COOLDOWN_BASE_MS`);
+- each further block in a row doubles the pause, up to 15 minutes (`ENGINE_COOLDOWN_MAX_MS`);
+- a `Retry-After` header can lengthen a pause, never beyond the cap;
+- a block reported while the engine is already paused (a concurrent request that raced into it) is not counted as another block in a row;
+- one successful answer clears the engine's record, unless a newer block was recorded after that request was sent (each block bumps a per-engine generation), so a slow older success never lifts a fresh pause.
+
+The chain skips a paused engine without touching the network. An Exa 429 or 403 is decided from its status and `Retry-After` header alone; its body is cancelled unread. An Exa HTTP 5xx fails that one request without pausing the engine but still counts as transient, so a 5xx followed by a DDG CAPTCHA keeps the terminal "do not retry" message. A JSON-RPC error fails the request without either.
 
 ## Why curl-impersonate, not fetch
 
@@ -12,7 +35,7 @@ icon: Search
 
 **DDG search uses the Firefox, then Safari, profiles — not Chrome.** Since 2026-10, DDG-lite answers every desktop Chrome fingerprint (`curl_chrome124`–`curl_chrome146`) with a 202 challenge from IPs where `curl_firefox147` and `curl_safari184` still get a normal SERP. `ddgSearch` tries `DDG_PROFILES` in order and reports a CAPTCHA only when every profile is challenged. `web_fetch` keeps the `curl_chrome136` default.
 
-**DDG requests are paced and a CAPTCHA triggers a cooldown, not a retry.** The `DDG_CONCURRENCY` cap bounds parallelism but not rate, so a subagent fan-out could still trip the gate. `ddgSearch` spaces every outbound request by `DDG_MIN_REQUEST_INTERVAL_MS` (process-wide). When every profile is challenged it stops sending for `DDG_CAPTCHA_COOLDOWN_MS`; calls inside the window fail fast with `DdgCaptchaError` and touch no network, because each request to a boxed IP keeps the box alive. Only curl connection timeouts are retried.
+**DDG requests are paced and a CAPTCHA triggers a cooldown, not a retry.** The `DDG_CONCURRENCY` cap bounds parallelism but not rate, so a subagent fan-out could still trip the gate. `ddgSearch` spaces every outbound request by `DDG_MIN_REQUEST_INTERVAL_MS` (process-wide). When every profile is challenged it records a block for `ddg` in the engine cooldowns above; calls inside the pause fail fast with `DdgCaptchaError` and touch no network (including a call that was already waiting for its request slot), because each request to a boxed IP keeps the box alive. Only curl connection timeouts are retried.
 
 ## The pin
 
@@ -29,7 +52,8 @@ Edit the four `CURL_IMPERSONATE_*` constants in `src/init/dockerfile.ts`, verify
 ## Failure modes
 
 - `curl_chrome136` not on PATH → `ENOENT` → tool error. Container is broken; `typeclaw start --build` is the fix.
-- CAPTCHA despite impersonation → `DdgCaptchaError`. Mitigations: cookie warmup, vqd preflight, request jitter.
+- CAPTCHA despite impersonation → `DdgCaptchaError`, DDG pauses. Mitigations: cookie warmup, vqd preflight, request jitter.
+- Exa rate limit (429), refusal (403), or network failure → `ExaSearchError` with `blocked` set, Exa pauses and the chain falls through to DDG.
 - Network timeout (>30s) → curl exits non-zero. Cap is `REQUEST_TIMEOUT_SECONDS`.
 
 ## `web_fetch` uses the safe Node transport
