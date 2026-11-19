@@ -234,6 +234,8 @@ There are two Webex adapters. `typeclaw channel add webex-bot` takes a **bot tok
 
 GitHub delivers events over webhooks, so it needs a public URL to reach your container. The CLI offers to create a free Cloudflare tunnel during `channel add` — that path is covered in [Expose a port](/docs/guides/first-tunnel). For the full PR-reviewer setup, see the [Code reviewer recipe](/docs/recipes/code-reviewer).
 
+For GitHub App auth, choose **Create a new GitHub App for me**. The CLI opens GitHub with every required permission filled in, so you confirm once instead of setting each one. It then opens the install page, waits for you to install the App, and offers the repositories you granted it as the repos to allow. Choose **Use an existing GitHub App** to enter an App ID and private key instead. See [Create the App from a manifest](/docs/reference/github#create-the-app-from-a-manifest) for what the CLI does and how to run the same steps by hand.
+
 </Accordion>
 
 <Accordion title="LINE — a personal account, not a bot">
