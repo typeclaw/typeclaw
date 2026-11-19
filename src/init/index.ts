@@ -12,6 +12,7 @@ import {
   type CustomModelMeta,
 } from '@/config'
 import { isGithubChannelTunnel } from '@/config/channels-mutation'
+import { tryRecordConfigCommitSync } from '@/config/config-commits'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -749,6 +750,7 @@ export async function scaffold(root: string, options: ScaffoldOptions = {}): Pro
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       await writeFile(configPath, configBytes)
     }
+    tryRecordConfigCommitSync(configPath, configBytes)
   })
 
   const cron = {
@@ -1613,6 +1615,7 @@ function writeConfigWithToken(
         }
   const published = publishConfigWithCredential(configPath, configBytes, credential, seams)
   if (!published.ok) throw new Error(`failed to write ${CONFIG_FILE}: ${published.reason}`)
+  tryRecordConfigCommitSync(configPath, configBytes)
 }
 
 function buildGithubChannelConfig(options: Extract<AddChannelOptions, { channel: 'github' }>): Record<string, unknown> {
@@ -1781,7 +1784,9 @@ async function appendGithubMatchRules(cwd: string, repos: readonly string[]): Pr
     member.match = Array.from(merged)
     roles.member = member
     parsed.roles = roles
-    await writeFile(path, `${JSON.stringify(parsed, null, 2)}\n`)
+    const bytes = `${JSON.stringify(parsed, null, 2)}\n`
+    await writeFile(path, bytes)
+    tryRecordConfigCommitSync(path, bytes)
   })
 }
 

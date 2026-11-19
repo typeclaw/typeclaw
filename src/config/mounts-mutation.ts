@@ -11,6 +11,7 @@ import {
   validateMount,
   type Mount,
 } from './config'
+import { tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -141,11 +142,13 @@ function writeMounts(cwd: string, record: Record<string, unknown>): { ok: true }
     return { ok: false, reason: `mounts block would be invalid: ${parsed.error.issues.map(formatIssue).join('; ')}` }
   }
 
+  const bytes = `${JSON.stringify(record, null, 2)}\n`
   try {
-    writeFileSync(join(cwd, CONFIG_FILE), `${JSON.stringify(record, null, 2)}\n`)
+    writeFileSync(join(cwd, CONFIG_FILE), bytes)
   } catch (error) {
     return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
   }
+  tryRecordConfigCommitSync(join(cwd, CONFIG_FILE), bytes)
   return { ok: true }
 }
 

@@ -11,6 +11,7 @@ import {
   type CustomModelMeta,
   type ThinkingLevel,
 } from './config'
+import { tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   KNOWN_PROVIDERS,
@@ -332,8 +333,9 @@ function writeConfig(
       reason: `config would be invalid: ${check.error.issues.map((i) => i.message).join('; ')}`,
     }
   }
+  const bytes = `${JSON.stringify(parsed, null, 2)}\n`
   try {
-    writeFileSync(path, `${JSON.stringify(parsed, null, 2)}\n`)
+    writeFileSync(path, bytes)
   } catch (error) {
     const code = error instanceof Error && 'code' in error ? error.code : undefined
     if (code === 'EACCES' || code === 'EPERM') {
@@ -349,6 +351,7 @@ function writeConfig(
       reason: `Failed to write ${CONFIG_FILE}: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
+  tryRecordConfigCommitSync(path, bytes)
   return { ok: true, commitMessage }
 }
 

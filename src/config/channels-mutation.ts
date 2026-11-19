@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { SecretsBackend } from '@/secrets'
 
+import { tryRecordConfigCommitSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -266,11 +267,13 @@ function channelSecretsOrEmpty(read: ChannelSecretsRead): Record<string, unknown
 }
 
 function writeConfig(cwd: string, record: Record<string, unknown>): { ok: true } | { ok: false; reason: string } {
+  const bytes = `${JSON.stringify(record, null, 2)}\n`
   try {
-    writeFileSync(join(cwd, CONFIG_FILE), `${JSON.stringify(record, null, 2)}\n`)
+    writeFileSync(join(cwd, CONFIG_FILE), bytes)
   } catch (error) {
     return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
   }
+  tryRecordConfigCommitSync(join(cwd, CONFIG_FILE), bytes)
   return { ok: true }
 }
 
