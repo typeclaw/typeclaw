@@ -133,6 +133,8 @@ The `session.turn.start` hook renders memory into `event.retrievalContext.result
 
 **Channel-origin always uses index mode** regardless of shard size — a memory-bleed defense, since the agent can treat injected memory as instructions when channel users can see it. Direct-mode channel turns keep every topic discoverable as a heading; over-budget turns use top-K hybrid retrieval. Both paths strip full bodies until the agent explicitly opens a topic.
 
+When the vector index is already current at startup, the runtime defers loading the embedding model until the first operation that needs it. The model stays loaded for later operations; startup still loads it when missing index entries need embeddings.
+
 For the vector store, embedder, and parent-child hybrid-search internals, see the [memory README](https://github.com/typeclaw/typeclaw/blob/main/src/bundled-plugins/memory/README.md).
 
 ### Vector relevance bands

@@ -1,0 +1,41 @@
+import { expect, test } from 'bun:test'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { __setTransformersImporterForTests, embed } from '@/bundled-plugins/memory/vector/embedder'
+import { rmTempDir } from '@/test-helpers/rm-temp-dir'
+
+import { startAgent } from './index'
+
+test('an up-to-date vector index boots without loading the embedding model', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-vector-startup-'))
+  let attemptedModelLoad = false
+  __setTransformersImporterForTests(async () => {
+    attemptedModelLoad = true
+    throw new Error('model unavailable in startup fixture')
+  })
+
+  try {
+    await writeFile(
+      join(cwd, 'typeclaw.json'),
+      JSON.stringify({ models: { default: 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo' } }),
+    )
+    const running = await startAgent({
+      cwd,
+      port: 0,
+      attachTui: false,
+      exportGithubCliStore: () => ({ action: 'skipped', reason: 'no-github-cli-credential' }),
+      refreshProviderOAuth: async () => undefined,
+    })
+    try {
+      expect(attemptedModelLoad).toBe(false)
+      await expect(embed(['a vector query'], 'query')).rejects.toThrow('model unavailable in startup fixture')
+    } finally {
+      await running.stop()
+    }
+  } finally {
+    __setTransformersImporterForTests(undefined)
+    await rmTempDir(cwd)
+  }
+})

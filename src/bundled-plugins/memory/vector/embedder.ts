@@ -187,22 +187,12 @@ export class Embedder {
 let embedderInstance: Promise<Embedder> | null = null
 
 export function getEmbedder(): Promise<Embedder> {
-  // Clear the memo on rejection so a transient load failure (e.g. boot warm-up
-  // racing the host model mount) degrades to a retry on the next call instead
-  // of caching the rejected promise and poisoning every later per-turn embed.
+  // A transient failure must not poison later indexing or query attempts.
   embedderInstance ??= Embedder.load().catch((err) => {
     embedderInstance = null
     throw err
   })
   return embedderInstance
-}
-
-// Boot-time readiness step: force the lazy embedder to load now so the first
-// per-turn query embed doesn't pay the ~2-5s ONNX init on the critical path.
-// Only called on the vector-enabled boot path (see src/run/index.ts), which
-// preserves embedder.ts's lazy-import guarantee for vector-off boots.
-export async function warmEmbedder(): Promise<void> {
-  await getEmbedder()
 }
 
 export async function embed(texts: string[], type: EmbedType): Promise<Float32Array[]> {

@@ -25,7 +25,6 @@ import {
   type SubagentShared,
 } from '@/agent/subagents'
 import { clearTodosForOrigin, markRestartAbortPendingForOrigin } from '@/agent/todo/continuation-wiring'
-import { embed, warmEmbedder } from '@/bundled-plugins/memory/vector/embedder'
 import { buildStartupVectorIndex } from '@/bundled-plugins/memory/vector/startup'
 import { resolveCapOptionsFromConfig } from '@/bundled-plugins/tool-result-cap'
 import { cronExecVaultEnv } from '@/bundled-plugins/typevault/runtime'
@@ -356,7 +355,9 @@ async function startAgentRuntime(
       : null
   const lastWords = lastWordsRun !== null ? startLastWordsRecorder({ agentDir: cwd, run: lastWordsRun }) : null
   registerBootCleanup(() => lastWords?.dispose())
-  const vectorStartupPromise = runVectorStartup(cwd)
+  const vectorStartupPromise = buildStartupVectorIndex(cwd).catch((err) => {
+    console.warn(`[vector] startup index build failed: ${err instanceof Error ? err.message : String(err)}`)
+  })
   let pluginsLoaded: LoadPluginsResult
   try {
     const [loaded] = await Promise.all([pluginsLoadedPromise, vectorStartupPromise])
@@ -1240,20 +1241,6 @@ async function startAgentRuntime(
     channelManager,
     stop,
   }
-}
-
-async function runVectorStartup(cwd: string): Promise<void> {
-  await buildStartupVectorIndex(cwd, embed).catch((err) => {
-    console.warn(`[vector] startup index build failed: ${err instanceof Error ? err.message : String(err)}`)
-  })
-
-  // Warm the embedder after the index pass (even when the index needed no
-  // rebuild above, which skips embed() entirely) so the first channel turn's
-  // query embed doesn't pay the one-time ONNX init on its critical path.
-  // Non-fatal: a failure here degrades to the per-turn lazy load.
-  await warmEmbedder().catch((err) => {
-    console.warn(`[vector] embedder warm-up failed: ${err instanceof Error ? err.message : String(err)}`)
-  })
 }
 
 function buildLocalTuiUrl(port: number, token: string | null): string {
