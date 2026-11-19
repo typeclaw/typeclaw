@@ -26,6 +26,7 @@ const READY_TIMEOUT_MS = 60_000
 const READY_POLL_MS = 250
 const RESTART_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000] as const
 const HEALTHY_RESET_MS = 5 * 60_000
+const TAB_REAP_INTERVAL_MS = 60_000
 
 export type ManagedBrowserLogger = { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void }
 
@@ -89,6 +90,16 @@ export async function startManagedBrowser(options: {
   const sessions = createBrowserSessions(devtoolsSocket(RUN_DIR))
   const relay = await startCdpRelay({ token, upstreamSocket: devtoolsSocket(RUN_DIR), sessions: sessions.relay })
   const observer = sessions.observe(cdpWebSocketUrl(relay.port, token))
+  const reaper = setInterval(() => {
+    sessions.reap().then(
+      ({ closed, failed }) => {
+        if (closed > 0) logger.info(`closed ${closed} idle browser tab(s) no script was using`)
+        if (failed > 0) logger.warn(`could not close ${failed} browser tab(s); retrying on the next sweep`)
+      },
+      (error: unknown) => logger.warn(`browser tab cleanup failed: ${String(error)}`),
+    )
+  }, TAB_REAP_INTERVAL_MS)
+  reaper.unref()
   const bskRelay =
     bskHome === undefined
       ? undefined
@@ -141,6 +152,7 @@ export async function startManagedBrowser(options: {
     stop: async () => {
       stopped = true
       observer.stop()
+      clearInterval(reaper)
       child?.kill()
       await Promise.allSettled([relay.close(), egress.close(), bskRelay?.close(), exchange.close(), profile.close()])
     },
