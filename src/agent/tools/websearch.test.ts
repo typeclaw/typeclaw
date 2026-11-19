@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { isWindows } from '@/shared'
 
 import { _setCurlBinaryForTest, _setDdgPacingForTest, _setSearchRetryForTest } from './ddg'
+import { _resetSearchCooldownsForTest } from './search-cooldown'
 import { webSearchTool } from './websearch'
 
 const onWindows = isWindows()
@@ -18,6 +19,7 @@ const originalFetch = globalThis.fetch
 
 beforeEach(() => {
   fetchCalls = []
+  _resetSearchCooldownsForTest()
   globalThis.fetch = (async (input: FetchInput, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString()
     const args = { url, init }
@@ -28,6 +30,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch
+  _resetSearchCooldownsForTest()
 })
 
 const ctx = {} as Parameters<typeof webSearchTool.execute>[4]

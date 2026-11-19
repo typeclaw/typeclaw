@@ -14,6 +14,7 @@
 
 import { CurlImpersonateError, curlImpersonate, isCurlExitTimeout } from './curl-impersonate'
 import { createKeyedSemaphore } from './keyed-semaphore'
+import { activeCooldown, blockGeneration, recordEngineBlock, recordEngineSuccess } from './search-cooldown'
 import { type SearchRetryOptions, withSearchRetry } from './search-retry'
 
 export { _setCurlBinaryForTest } from './curl-impersonate'
@@ -47,32 +48,28 @@ const DDG_KEY = 'ddg'
 export const DDG_MIN_REQUEST_INTERVAL_MS = 1_500
 
 // Once DDG serves a challenge to every profile the source IP is boxed for
-// minutes, and each further request keeps the box alive. Stop sending for a
-// cooldown window: calls inside it fail fast without touching the network.
-export const DDG_CAPTCHA_COOLDOWN_MS = 5 * 60_000
+// minutes, and each further request keeps the box alive. The challenge pauses
+// the engine (search-cooldown.ts): calls inside the pause fail fast without
+// touching the network.
 
 type Pacing = {
   intervalMs: number
-  cooldownMs: number
   now: () => number
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>
 }
 const DEFAULT_PACING: Pacing = {
   intervalMs: DDG_MIN_REQUEST_INTERVAL_MS,
-  cooldownMs: DDG_CAPTCHA_COOLDOWN_MS,
   now: () => Date.now(),
   sleep: abortableSleep,
 }
 let pacing: Pacing = DEFAULT_PACING
 let nextRequestAt = 0
-let cooldownUntil = 0
 
-// Test-only seam: swaps the clock/sleep and interval/cooldown, and resets the
-// process-wide pacing state so tests don't leak a cooldown into each other.
+// Test-only seam: swaps the clock/sleep and interval, and resets the
+// process-wide pacing state so tests don't leak a request slot into each other.
 export function _setDdgPacingForTest(override: Partial<Pacing> | null): void {
   pacing = { ...DEFAULT_PACING, ...override }
   nextRequestAt = 0
-  cooldownUntil = 0
 }
 
 export type DdgResult = {
@@ -98,14 +95,18 @@ export async function ddgSearch(query: string, limit: number, signal?: AbortSign
       withSearchRetry(
         async () => {
           for (const binary of DDG_PROFILES) {
-            if (pacing.now() < cooldownUntil) throw new DdgCaptchaError()
+            if (activeCooldown('ddg')) throw new DdgCaptchaError()
             await waitForRequestSlot(signal)
             // A concurrent search may have started the cooldown while this one waited.
-            if (pacing.now() < cooldownUntil) throw new DdgCaptchaError()
+            if (activeCooldown('ddg')) throw new DdgCaptchaError()
+            const generation = blockGeneration('ddg')
             const html = await fetchDdgHtml(query, signal, binary)
-            if (!isCaptcha(html)) return parseDdgHtml(html).slice(0, limit)
+            if (!isCaptcha(html)) {
+              recordEngineSuccess('ddg', generation)
+              return parseDdgHtml(html).slice(0, limit)
+            }
           }
-          cooldownUntil = pacing.now() + pacing.cooldownMs
+          recordEngineBlock('ddg', 'challenge')
           throw new DdgCaptchaError()
         },
         { ...retryOverride, shouldRetry: isTransientSearchError, signal },
@@ -150,7 +151,7 @@ async function waitForRequestSlot(signal?: AbortSignal): Promise<void> {
 
 export class DdgCaptchaError extends Error {
   constructor() {
-    super('DuckDuckGo returned a CAPTCHA page (rate-limited). Try again later or with a different query.')
+    super('DuckDuckGo returned a CAPTCHA page (rate-limited).')
     this.name = 'DdgCaptchaError'
   }
 }
