@@ -105,6 +105,9 @@ export type BashSandboxRequest = {
   readonly envWithhold?: string[]
   readonly deferredPreparation?: DeferredBashPreparation
   readonly reveal?: BashSandboxReveal
+  // Existing files bound read-only for this call only, on top of the role's
+  // writable zones (the config files when coordination failed).
+  readonly readOnlyFiles?: readonly string[]
   readonly boundary?: BashSandboxBoundary
   readonly network?: SandboxNetwork
 }
@@ -164,7 +167,9 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
         : { dirs: [], files: [] }
     const protectedZones = {
       dirs: baseProtectedZones.dirs,
-      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+      files: [
+        ...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles, ...(options.readOnlyFiles ?? [])]),
+      ],
     }
     const writableDirSet = new Set(writable.dirs)
     const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'

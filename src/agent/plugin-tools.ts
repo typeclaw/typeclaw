@@ -78,9 +78,11 @@ import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
 import {
   enforceAndPinToolFiles,
+  readOnlyConfigNotice,
   recheckManagedConfigAfterBash,
   runWithManagedConfigCommitCheck,
   snapshotManagedConfigFiles,
+  type ManagedConfigSnapshot,
   writeToolOutputNoFollow,
 } from './tool-file-safety'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
@@ -668,6 +670,29 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         const attemptArgs = { ...originalArgs }
         let spawnEnvContext: BashSpawnEnvContext | undefined
         let managedConfigNotices: string[] = []
+        let managedConfigBefore: ManagedConfigSnapshot | undefined
+        let managedConfigRechecked = false
+        // typeclaw.json and cron.json changes are re-checked against this
+        // session's guards as a `write` of the exact bytes they would hold.
+        const managedConfigBlock = async (
+          content: string,
+          destination: string,
+          acknowledgements: typeof envelope.acknowledgements | undefined,
+        ): Promise<string | undefined> => {
+          const block = await opts.hooks.runToolBefore(
+            {
+              tool: 'write',
+              sessionId: opts.sessionId,
+              callId: toolCallId,
+              args: { path: destination, content },
+              toolProvenance: 'first-party',
+              ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+            },
+            opts.guards,
+            acknowledgements,
+          )
+          return block?.reason
+        }
         try {
           if (tool.name === 'bash') {
             if (opts.permissions === undefined) {
@@ -676,7 +701,18 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               )
             }
             if (typeof attemptArgs.command !== 'string') throw new SandboxPolicyError('bash command must be a string')
+            // Bash writes these files directly, so its changes are checked after
+            // the call. Bash takes no acknowledgements, so a guard that asks for
+            // one blocks here; the notice points the model at write/edit. The
+            // window opens before the sandbox is built: a call that cannot be
+            // coordinated with host typeclaw commands gets them read-only.
+            managedConfigBefore = await snapshotManagedConfigFiles(opts.agentDir, (content, destination) =>
+              managedConfigBlock(content, destination, undefined),
+            )
             preparedSandboxRuntime = await prepareBashSandbox({
+              ...(managedConfigBefore.readOnly !== undefined
+                ? { readOnlyFiles: managedConfigBefore.readOnly.files }
+                : {}),
               getGithubSelf: opts.getGithubSelf,
               command: attemptArgs.command,
               permissions: opts.permissions,
@@ -729,27 +765,6 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             bashEnvStore.run(spawnEnvContext, () =>
               tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
             )
-          // typeclaw.json and cron.json changes are re-checked against this
-          // session's guards as a `write` of the exact bytes they would hold.
-          const managedConfigBlock = async (
-            content: string,
-            destination: string,
-            acknowledgements: typeof envelope.acknowledgements | undefined,
-          ): Promise<string | undefined> => {
-            const block = await opts.hooks.runToolBefore(
-              {
-                tool: 'write',
-                sessionId: opts.sessionId,
-                callId: toolCallId,
-                args: { path: destination, content },
-                toolProvenance: 'first-party',
-                ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
-              },
-              opts.guards,
-              acknowledgements,
-            )
-            return block?.reason
-          }
           let executed: Awaited<ReturnType<typeof run>>
           if (tool.name === 'write' || tool.name === 'edit') {
             // Checked at commit, on the exact bytes (see writeToolOutputNoFollow).
@@ -764,22 +779,19 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               },
               run,
             )
-          } else if (tool.name === 'bash') {
-            // Bash writes these files directly, so its changes are checked after
-            // the call. Bash takes no acknowledgements, so a guard that asks for
-            // one blocks here; the notice points the model at write/edit.
-            const managedConfigBefore = await snapshotManagedConfigFiles(opts.agentDir, (content, destination) =>
-              managedConfigBlock(content, destination, undefined),
-            )
+          } else if (tool.name === 'bash' && managedConfigBefore !== undefined) {
             try {
               executed = await run()
             } finally {
+              managedConfigRechecked = true
               managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore)
             }
-            if (managedConfigNotices.length > 0) {
+            const readOnlyNotice = readOnlyConfigNotice(managedConfigBefore)
+            if (managedConfigNotices.length > 0 || readOnlyNotice !== undefined) {
               executed = {
                 ...executed,
                 content: [
+                  ...(readOnlyNotice === undefined ? [] : [{ type: 'text' as const, text: readOnlyNotice }]),
                   ...executed.content,
                   ...managedConfigNotices.map((text) => ({ type: 'text' as const, text })),
                 ],
@@ -805,6 +817,13 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         } catch (error) {
           executionError =
             spawnEnvContext?.oomNote === undefined ? error : appendErrorText(error, spawnEnvContext.oomNote)
+          // A call that failed before its post-check still closes its window.
+          if (managedConfigBefore !== undefined && !managedConfigRechecked) {
+            managedConfigRechecked = true
+            managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore)
+            const readOnlyNotice = readOnlyConfigNotice(managedConfigBefore)
+            if (readOnlyNotice !== undefined) executionError = prependErrorText(executionError, readOnlyNotice)
+          }
           // Notices still pending here belong to a call that threw before it
           // produced a result to carry them.
           for (const notice of managedConfigNotices) executionError = appendErrorText(executionError, notice)
@@ -990,6 +1009,14 @@ function renderSandboxPolicyNote(withheld: PreparedBashSandbox['withheld'], agen
     'it is NOT evidence about authentication of any account, workspace, or upstream service and must not be ' +
     'reported as such.]'
   )
+}
+
+function prependErrorText(error: unknown, text: string): Error {
+  if (error instanceof Error) {
+    error.message = `${text}\n\n${error.message}`
+    return error
+  }
+  return new Error(`${text}\n\n${String(error)}`)
 }
 
 function appendErrorText(error: unknown, text: string): Error {

@@ -75,8 +75,17 @@ type Window = {
   recovery: boolean
   // False once the window could not be captured under the config lock or
   // published: a host command may then have built on unchecked bytes, so its
-  // commits are not trusted to skip the post-bash check.
+  // commits are not trusted to skip the post-bash check, and bash calls that
+  // open on it get the file read-only.
   coordinated: boolean
+  uncoordinatedReason?: string
+}
+
+let configReadHook: ((stage: 'after-window' | 'after-live') => void) | undefined
+
+// Test seam: runs between the reads of a cross-process config read.
+export function __setConfigReadHookForTests(hook: typeof configReadHook): void {
+  configReadHook = hook
 }
 
 const windows = new Map<string, Window>()
@@ -222,22 +231,23 @@ export async function openConfigWindow(
   file: string,
   call: symbol,
   guard: ConfigCallGuard,
-): Promise<number | undefined> {
+): Promise<{ generation: number | undefined; uncoordinated: string | undefined }> {
   const key = resolve(file)
   if (!windows.has(key)) {
     try {
-      await withConfigFileLock(file, async () => captureWindow(file, true))
+      await withConfigFileLock(file, async () => captureWindow(file))
     } catch (error) {
       if (!windows.has(key)) {
-        console.warn(
-          `[typeclaw] could not take the ${basename(file)} lock to coordinate a bash command with host typeclaw commands (${errorText(error)}); its changes to ${basename(file)} are checked against the last state known to the agent`,
-        )
-        captureWindow(file, false)
+        captureWindow(file, `the ${basename(file)} lock could not be taken: ${errorText(error)}`)
       }
     }
   }
-  windows.get(key)?.calls.set(call, guard)
-  return trustedConfigState(file).generation
+  const window = windows.get(key)
+  window?.calls.set(call, guard)
+  return {
+    generation: trustedConfigState(file).generation,
+    uncoordinated: window?.coordinated === false ? window.uncoordinatedReason : undefined,
+  }
 }
 
 export function markRuntimeOwnsConfigWindows(): void {
@@ -311,11 +321,11 @@ export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): 
 export function readValidatedConfigFileSync(file: string): string {
   const window = windows.get(resolve(file))
   if (window === undefined) {
-    const live = readConfigEntrySync(file)
+    if (runtimeOwnsWindows) return textOf(file, readConfigEntrySync(file))
     // In another process (host `typeclaw start`, CLI reads), an agent that has
     // a window open, or stopped with one, may have left rejected bytes on disk.
-    const published = runtimeOwnsWindows ? undefined : publishedTrustedEntry(file)
-    return textOf(file, published !== undefined && !sameConfigContent(live, published) ? published : live)
+    const { live, trusted } = readAcrossProcessesSync(file)
+    return textOf(file, trusted !== undefined && !sameConfigContent(live, trusted) ? trusted : live)
   }
   const live = readConfigEntrySync(file)
   const { entry: trusted } = trustedConfigState(file)
@@ -352,26 +362,32 @@ export async function readConfigBaseline(file: string): Promise<string> {
 export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
   for (const name of MANAGED_CONFIG_FILES) {
     const file = join(resolve(agentDir), name)
-    const trusted = publishedTrustedEntry(file)
-    if (trusted === undefined) continue
-    if (!sameConfigContent(readConfigEntrySync(file), trusted)) {
-      try {
-        withConfigFileLockSync(file, () => {
-          const live = readConfigEntrySync(file)
-          if (sameConfigContent(live, trusted)) return
-          restoreConfigEntrySync(file, live, withContent(live, contentOf(trusted)))
+    // Only the runtime creates window state, and it is not running yet, so an
+    // absent record cannot appear meanwhile; everything else is decided under
+    // the lock, so a host commit that lands while startup waits is kept.
+    if (readWindowRawSync(file) === undefined) continue
+    let reverted = false
+    try {
+      withConfigFileLockSync(file, () => {
+        const trusted = publishedTrustedEntry(file)
+        if (trusted === undefined) return
+        if (!matchesTrustedEntry(file, trusted)) {
+          restoreTrustedEntrySync(file, trusted)
           recordConfigCommitSync(file, contentOf(trusted))
-        })
-      } catch (error) {
-        throw new Error(
-          `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
-        )
-      }
+          reverted = true
+        }
+        rmSync(windowPath(file), { force: true })
+      })
+    } catch (error) {
+      throw new Error(
+        `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
+      )
+    }
+    if (reverted) {
       console.warn(
         `[typeclaw] ${name} held a bash change that was never checked or that was blocked and could not be reverted before the agent stopped; it was reverted to the last authorized ${name} at startup`,
       )
     }
-    rmSync(windowPath(file), { force: true })
   }
 }
 
@@ -488,7 +504,7 @@ function notFound(file: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' })
 }
 
-function captureWindow(file: string, publish: boolean): void {
+function captureWindow(file: string, uncoordinatedReason?: string): void {
   const key = resolve(file)
   if (windows.has(key)) return
   const window: Window = {
@@ -496,10 +512,13 @@ function captureWindow(file: string, publish: boolean): void {
     trusted: readConfigEntrySync(file),
     generation: readConfigCommitSync(file)?.generation,
     recovery: false,
-    coordinated: publish,
+    coordinated: uncoordinatedReason === undefined,
+    ...(uncoordinatedReason === undefined ? {} : { uncoordinatedReason }),
   }
   windows.set(key, window)
-  if (publish) publishWindow(file, window)
+  if (window.coordinated) publishWindow(file, window)
+  else
+    console.warn(`[typeclaw] a bash command could not coordinate with host typeclaw commands (${uncoordinatedReason})`)
 }
 
 function settleWindow(file: string, window: Window): void {
@@ -524,11 +543,13 @@ function publishWindow(file: string, window: Window): void {
     writeStateFileSync(windowPath(file), {
       generation: window.generation ?? 0,
       content: bytes === undefined ? null : bytes.toString('base64'),
+      entry: describeEntry(window.trusted),
     })
   } catch (error) {
     window.coordinated = false
+    window.uncoordinatedReason = `the agent's ${basename(file)} state could not be written to ${windowPath(file)}: ${errorText(error)}; make that path writable (restarting the agent clears it)`
     console.warn(
-      `[typeclaw] could not publish the trusted ${basename(file)} state (${errorText(error)}); changes to ${basename(file)} during this bash command are checked against the last state known to the agent`,
+      `[typeclaw] a bash command could not coordinate with host typeclaw commands (${window.uncoordinatedReason})`,
     )
   }
 }
@@ -537,29 +558,181 @@ function publishWindow(file: string, window: Window): void {
 // newer commit, or undefined when no window is open. Published state that exists
 // but cannot be read is an error, never a reason to trust the file as it is.
 function publishedTrustedEntry(file: string): ConfigFileEntry | undefined {
-  const path = windowPath(file)
-  let published: Record<string, unknown> | undefined
-  try {
-    published = readStateFileSync(path)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOTDIR') return undefined
-    throw unreadableWindowState(file, path, errorText(error))
-  }
-  if (published === undefined) return undefined
-  const { generation, content } = published
-  if (typeof generation !== 'number' || (content !== null && typeof content !== 'string')) {
-    throw unreadableWindowState(file, path, 'it is not valid window state')
-  }
-  const commit = readConfigCommitSync(file)
-  if (commit !== undefined && commit.generation > generation) return withContent({ kind: 'missing' }, commit.bytes)
-  return withContent({ kind: 'missing' }, typeof content === 'string' ? Buffer.from(content, 'base64') : undefined)
+  return parseWindowRecord(file, readWindowRawSync(file))
 }
 
-function unreadableWindowState(file: string, path: string, detail: string): Error {
+// A cross-process read without the lock: the window state, then the file, then
+// the window state again, retried while a rollback or commit moves either, so a
+// rollback that lands between them cannot hand back the rejected bytes. Host
+// reads (`typeclaw start`, status) stay off the lock in the common case; after a
+// few moving reads it falls back to reading under the lock's normal bound.
+function readAcrossProcessesSync(file: string): { live: ConfigFileEntry; trusted: ConfigFileEntry | undefined } {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const before = windowStamp(file)
+    configReadHook?.('after-window')
+    const live = readConfigEntrySync(file)
+    configReadHook?.('after-live')
+    const after = windowStamp(file)
+    if (before.raw === after.raw && before.generation === after.generation) {
+      return { live, trusted: parseWindowRecord(file, before.raw) }
+    }
+  }
+  return withConfigFileLockSync(file, () => ({
+    live: readConfigEntrySync(file),
+    trusted: publishedTrustedEntry(file),
+  }))
+}
+
+function windowStamp(file: string): { raw: string | undefined; generation: number | undefined } {
+  return { raw: readWindowRawSync(file), generation: readConfigCommitSync(file)?.generation }
+}
+
+// Only a missing record means no window; anything else that is not valid
+// window state is an error, never a reason to trust the file as it is.
+function readWindowRawSync(file: string): string | undefined {
+  const path = windowPath(file)
+  try {
+    return readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw invalidWindowState(file, path, errorText(error))
+  }
+}
+
+function parseWindowRecord(file: string, raw: string | undefined): ConfigFileEntry | undefined {
+  if (raw === undefined) return undefined
+  const path = windowPath(file)
+  let record: unknown
+  try {
+    record = JSON.parse(raw)
+  } catch (error) {
+    throw invalidWindowState(file, path, errorText(error))
+  }
+  const entry = isRecord(record) ? trustedEntryFromRecord(record) : undefined
+  if (entry === undefined || !isRecord(record) || typeof record.generation !== 'number') {
+    throw invalidWindowState(file, path, 'it is not valid window state')
+  }
+  const commit = readConfigCommitSync(file)
+  return commit !== undefined && commit.generation > record.generation ? withContent(entry, commit.bytes) : entry
+}
+
+function invalidWindowState(file: string, path: string, detail: string): Error {
+  const name = basename(file)
   return new Error(
-    `${basename(file)} was not changed: the agent's open ${basename(file)} state at ${path} could not be read (${detail}). Restart the agent with \`typeclaw restart\` to clear it, or delete that file while the agent is stopped.`,
+    `${name} was not changed: the agent's open ${name} state at ${path} is invalid (${detail}). Delete that file (after restoring ${name} with \`git checkout -- ${name}\` if it holds an unwanted change) and try again.`,
   )
+}
+
+// The entry shape a window was opened on, so startup restores the same kind of
+// entry and never writes through a link bash swapped in.
+type EntryRecord =
+  | { kind: 'missing' }
+  | { kind: 'other' }
+  | { kind: 'file'; mode: number }
+  | { kind: 'link'; mode: number; target: string; resolved: string; dev: string; ino: string }
+
+function describeEntry(entry: ConfigFileEntry): EntryRecord {
+  if (entry.kind === 'missing') return { kind: 'missing' }
+  if (entry.kind === 'file') return { kind: 'file', mode: entry.mode }
+  if (entry.kind === 'link') {
+    return {
+      kind: 'link',
+      mode: entry.mode,
+      target: entry.target,
+      resolved: entry.resolved,
+      dev: String(entry.resolvedId.dev),
+      ino: String(entry.resolvedId.ino),
+    }
+  }
+  return { kind: 'other' }
+}
+
+function trustedEntryFromRecord(record: Record<string, unknown>): ConfigFileEntry | undefined {
+  const { content, entry } = record
+  if (content !== null && typeof content !== 'string') return undefined
+  if (!isRecord(entry)) return undefined
+  const bytes = typeof content === 'string' ? Buffer.from(content, 'base64') : undefined
+  if (entry.kind === 'missing') return bytes === undefined ? { kind: 'missing' } : undefined
+  if (entry.kind === 'other') return bytes === undefined ? { kind: 'other', id: zeroIdentity() } : undefined
+  if (bytes === undefined || typeof entry.mode !== 'number') return undefined
+  if (entry.kind === 'file') return { kind: 'file', bytes, mode: entry.mode, id: zeroIdentity() }
+  if (
+    entry.kind !== 'link' ||
+    typeof entry.target !== 'string' ||
+    typeof entry.resolved !== 'string' ||
+    typeof entry.dev !== 'string' ||
+    typeof entry.ino !== 'string'
+  ) {
+    return undefined
+  }
+  return {
+    kind: 'link',
+    target: entry.target,
+    resolved: entry.resolved,
+    bytes,
+    mode: entry.mode,
+    id: zeroIdentity(),
+    resolvedId: { ...zeroIdentity(), dev: BigInt(entry.dev), ino: BigInt(entry.ino) },
+  }
+}
+
+// The file already is the trusted entry: same kind of entry, the same link and
+// link target file, and the trusted bytes.
+function matchesTrustedEntry(file: string, trusted: ConfigFileEntry): boolean {
+  const live = readConfigEntrySync(file)
+  if (live.kind === 'other' && trusted.kind === 'other') return true
+  if (!sameConfigContent(live, trusted) || live.kind !== trusted.kind) return false
+  if (live.kind !== 'link' || trusted.kind !== 'link') return true
+  return (
+    live.target === trusted.target &&
+    live.resolved === trusted.resolved &&
+    live.resolvedId.dev === trusted.resolvedId.dev &&
+    live.resolvedId.ino === trusted.resolvedId.ino
+  )
+}
+
+// Puts back the entry a window was opened on. Whatever bash left at the managed
+// path is removed, never written through; a regular file is rewritten in place,
+// and a link is recreated and its target file rewritten in place only if that
+// file is still the one the window recorded.
+function restoreTrustedEntrySync(file: string, trusted: ConfigFileEntry): void {
+  const current = lstatOrUndefined(file)
+  if (current !== undefined && !current.isFile() && !current.isSymbolicLink()) {
+    throw new Error(`${file} is no longer a regular file or symlink`)
+  }
+  if (trusted.kind === 'other') throw new Error(`${file} was not a regular file before`)
+  if (trusted.kind === 'missing') {
+    if (current !== undefined) unlinkSync(file)
+    return
+  }
+  if (trusted.kind === 'file') {
+    if (current?.isFile() === true) {
+      writeConfigInPlaceSync(file, trusted.bytes)
+      return
+    }
+    if (current !== undefined) unlinkSync(file)
+    createExclusiveSync(file, trusted.bytes, trusted.mode)
+    return
+  }
+  const target = lstatOrUndefined(trusted.resolved)
+  if (
+    target === undefined ||
+    !target.isFile() ||
+    target.dev !== trusted.resolvedId.dev ||
+    target.ino !== trusted.resolvedId.ino
+  ) {
+    throw new Error(`${trusted.resolved}, the file ${basename(file)} linked to, is no longer the same file`)
+  }
+  if (current?.isSymbolicLink() !== true || readlinkSync(file) !== trusted.target) {
+    if (current !== undefined) unlinkSync(file)
+    symlinkSync(trusted.target, file)
+  }
+  if (realpathSync(file) !== trusted.resolved) throw new Error(`${file} does not resolve to ${trusted.resolved}`)
+  writeConfigInPlaceSync(trusted.resolved, trusted.bytes)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function readStateFileSync(path: string): Record<string, unknown> | undefined {

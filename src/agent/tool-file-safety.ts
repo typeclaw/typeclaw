@@ -943,6 +943,10 @@ export type ManagedConfigSnapshot = {
   call: symbol
   guard: ManagedConfigGuardCheck
   files: ReadonlyMap<string, { identity: CallIdentity; generation: number | undefined }>
+  // When the call could not be coordinated with host typeclaw commands, the
+  // managed files it must get read-only (existing regular files; the sandbox
+  // can only bind those) and why.
+  readOnly?: { files: string[]; reasons: string[] }
 }
 
 type CallIdentity = { link: ConfigFileIdentity | undefined; resolved: ConfigFileIdentity | undefined }
@@ -958,17 +962,49 @@ export async function snapshotManagedConfigFiles(
 ): Promise<ManagedConfigSnapshot> {
   const call = Symbol('bash call')
   const files = new Map<string, { identity: CallIdentity; generation: number | undefined }>()
+  const readOnlyFiles: string[] = []
+  const reasons: string[] = []
   try {
     for (const file of MANAGED_CONFIG_FILES) {
       const destination = path.join(path.resolve(agentDir), file)
-      const generation = await openConfigWindow(destination, call, guard)
-      files.set(destination, { identity: callIdentity(destination), generation })
+      let opened: Awaited<ReturnType<typeof openConfigWindow>>
+      try {
+        opened = await openConfigWindow(destination, call, guard)
+      } catch (error) {
+        // The check could not be set up: never fail the call over it, run it
+        // with the file read-only instead.
+        reasons.push(`the ${file} check could not be prepared: ${errorMessage(error)}`)
+        if (isRegularFile(destination)) readOnlyFiles.push(destination)
+        continue
+      }
+      files.set(destination, { identity: callIdentity(destination), generation: opened.generation })
+      if (opened.uncoordinated !== undefined) {
+        reasons.push(opened.uncoordinated)
+        if (isRegularFile(destination)) readOnlyFiles.push(destination)
+      }
     }
   } catch (error) {
     for (const destination of files.keys()) closeConfigWindow(destination, call)
     throw error
   }
-  return { call, guard, files }
+  return { call, guard, files, ...(reasons.length > 0 ? { readOnly: { files: readOnlyFiles, reasons } } : {}) }
+}
+
+// Prepended to the result of a call that ran with the config files read-only.
+export function readOnlyConfigNotice(snapshot: ManagedConfigSnapshot): string | undefined {
+  if (snapshot.readOnly === undefined) return undefined
+  return [
+    `[TypeClaw config guard] typeclaw.json and cron.json were read-only for this command: the agent could not coordinate it with host typeclaw commands (${snapshot.readOnly.reasons.join('; ')}).`,
+    'Any change this command tried to make to them failed. Retry it once that is cleared, or make the change with the write or edit tool.',
+  ].join('\n')
+}
+
+function isRegularFile(destination: string): boolean {
+  try {
+    return lstatSync(destination).isFile()
+  } catch {
+    return false
+  }
 }
 
 // Model bash for roles that keep agent-root writes can rewrite typeclaw.json and
