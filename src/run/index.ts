@@ -25,6 +25,7 @@ import {
   type SubagentShared,
 } from '@/agent/subagents'
 import { clearTodosForOrigin, markRestartAbortPendingForOrigin } from '@/agent/todo/continuation-wiring'
+import { startEmbedderProcess } from '@/bundled-plugins/memory/vector/embedder'
 import { buildStartupVectorIndex } from '@/bundled-plugins/memory/vector/startup'
 import { resolveCapOptionsFromConfig } from '@/bundled-plugins/tool-result-cap'
 import { cronExecVaultEnv } from '@/bundled-plugins/typevault/runtime'
@@ -355,6 +356,8 @@ async function startAgentRuntime(
       : null
   const lastWords = lastWordsRun !== null ? startLastWordsRecorder({ agentDir: cwd, run: lastWordsRun }) : null
   registerBootCleanup(() => lastWords?.dispose())
+  const stopEmbedder = startEmbedderProcess()
+  registerBootCleanup(stopEmbedder)
   const vectorStartupPromise = buildStartupVectorIndex(cwd).catch((err) => {
     console.warn(`[vector] startup index build failed: ${err instanceof Error ? err.message : String(err)}`)
   })
@@ -1170,6 +1173,7 @@ async function startAgentRuntime(
       await channelManager.stop()
       await mcpManager?.closeAll()
     } finally {
+      await stopEmbedder()
       await inboundJournal.close().catch((error) => console.warn(`[run] inbound continuity close failed: ${error}`))
       await backgroundObligations
         .flush()

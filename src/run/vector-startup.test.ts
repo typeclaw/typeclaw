@@ -1,18 +1,17 @@
-import { expect, test } from 'bun:test'
+import { expect, spyOn, test } from 'bun:test'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { __setTransformersImporterForTests, embed } from '@/bundled-plugins/memory/vector/embedder'
+import { embed } from '@/bundled-plugins/memory/vector/embedder'
+import { EmbedderProcess } from '@/bundled-plugins/memory/vector/embedder-process'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 
 import { startAgent } from './index'
 
 test('an up-to-date vector index boots without loading the embedding model', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'typeclaw-vector-startup-'))
-  let attemptedModelLoad = false
-  __setTransformersImporterForTests(async () => {
-    attemptedModelLoad = true
+  const attemptedEmbedding = spyOn(EmbedderProcess.prototype, 'embed').mockImplementation(async () => {
     throw new Error('model unavailable in startup fixture')
   })
 
@@ -29,13 +28,13 @@ test('an up-to-date vector index boots without loading the embedding model', asy
       refreshProviderOAuth: async () => undefined,
     })
     try {
-      expect(attemptedModelLoad).toBe(false)
+      expect(attemptedEmbedding).not.toHaveBeenCalled()
       await expect(embed(['a vector query'], 'query')).rejects.toThrow('model unavailable in startup fixture')
     } finally {
       await running.stop()
     }
   } finally {
-    __setTransformersImporterForTests(undefined)
+    attemptedEmbedding.mockRestore()
     await rmTempDir(cwd)
   }
 })
