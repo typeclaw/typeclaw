@@ -7943,6 +7943,59 @@ describe('managed config commit check', () => {
   )
 
   test.skipIf(lacksInodeAnchoring)(
+    'a write whose file an operator edits in place during its commit check is refused, then succeeds on retry',
+    async () => {
+      // given: typeclaw.json names an origin; while the write's commit check runs,
+      // an operator retargets origin with an unlocked in-place edit (same inode)
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-hand-edit-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      const operator = '{"git":{"remotes":{"origin":"https://example.com/new.git"}}}\n'
+      await writeFile(config, '{"git":{"remotes":{"origin":"https://example.com/old.git"}}}\n')
+      const hooks = createHookBus()
+      let edited = false
+      hooks.registerAll('hand-edit', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          // Only the commit check carries the absolute managed destination.
+          if (event.tool !== 'write' || !path.isAbsolute(String(event.args.path)) || edited) return undefined
+          edited = true
+          writeFileSync(config, operator)
+          return undefined
+        },
+      })
+      const stale = '{"git":{"remotes":{"origin":"https://example.com/old.git"}},"alias":["atlas"]}\n'
+      try {
+        // when: the write built from the old file commits
+        const write = builtin('write', agentDir, hooks).execute(
+          'write',
+          { path: 'typeclaw.json', content: stale } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: it is refused, the operator's bytes stand, and no commit is recorded
+        await expect(write).rejects.toThrow('typeclaw.json changed while this write was being checked')
+        expect(await readFile(config, 'utf8')).toBe(operator)
+        expect(readConfigCommitSync(config)).toBeUndefined()
+
+        // and: a retry with no concurrent edit goes through
+        const retried = '{"git":{"remotes":{"origin":"https://example.com/new.git"}},"alias":["atlas"]}\n'
+        await builtin('write', agentDir, hooks).execute(
+          'write',
+          { path: 'typeclaw.json', content: retried } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+        expect(await readFile(config, 'utf8')).toBe(retried)
+        expect(readConfigCommitSync(config)?.generation).toBe(1)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)(
     'rejects invalid typeclaw.json through the real guards by path and file: URI',
     async () => {
       const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-real-bad-'))

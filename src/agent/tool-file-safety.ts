@@ -936,8 +936,18 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
           `${name} changed after this edit read it, so the edit was not applied. Read ${name} again and retry the edit.`,
         )
       }
+      // The bytes the guards check this change against. An unlocked in-place
+      // edit (an operator's hand edit keeps the inode) that lands while they run
+      // would otherwise be overwritten by a write checked against older bytes.
+      const checkedAgainst = readConfigForWriteSync(destination)
       await commit.check(content, destination)
       await assertPinnedEntry(targetPath, destination)
+      if (readConfigForWriteSync(destination) !== checkedAgainst) {
+        const name = path.basename(destination)
+        throw new Error(
+          `${name} changed while this ${base === undefined ? 'write' : 'edit'} was being checked, so it was not applied. Read ${name} again and retry.`,
+        )
+      }
       // A call cancelled while queued, while its guards ran, or during the entry
       // check above must not write; nothing is awaited between here and the write.
       commit.signal?.throwIfAborted()
