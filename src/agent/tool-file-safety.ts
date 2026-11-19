@@ -1,11 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { constants, createWriteStream, lstatSync, type Stats } from 'node:fs'
+import { closeSync, constants, createWriteStream, fstatSync, lstatSync, openSync, statSync, type Stats } from 'node:fs'
 import {
   chmod,
   mkdir,
   mkdtemp,
   open,
   readdir,
+  readFile,
   realpath,
   rm,
   stat,
@@ -24,6 +25,31 @@ import {
   createPrivateSurfaceReadIdentityVerifier,
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
+import {
+  closeConfigWindow,
+  configRecoveryGuards,
+  configRecoveryPending,
+  concurrentCallGuards,
+  contentOf,
+  identityOf,
+  MANAGED_CONFIG_FILES,
+  noteConfigRollbackSync,
+  noteConfigWriteSync,
+  openConfigWindow,
+  readConfigEntrySync,
+  readConfigForWriteSync,
+  readValidatedConfigFileSync,
+  recordConfigCommitSync,
+  restoreConfigEntrySync,
+  runWithConfigBaseline,
+  sameConfigContent,
+  setConfigRecovery,
+  setTrustedConfigEntry,
+  trustedConfigState,
+  type ConfigCallGuard,
+  type ConfigFileEntry,
+  type ConfigFileIdentity,
+} from '@/config/config-commits'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
@@ -863,15 +889,33 @@ export type ManagedConfigCommitCheck = {
 // The queue serializes checked writes in this process, and each one holds the
 // cross-process config file lock (src/config/config-file-lock.ts) from its check
 // through its write, which host-side typeclaw config commands share. Writers
-// that take no lock, namely privileged model bash (roles that keep agent-root
-// writes, which already bypass the medium-tier config guards) and hand edits,
-// can still land between a check and its write and then be overwritten; see #1718.
-const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
+// that take no lock, namely model bash for roles that keep agent-root writes
+// and hand edits, can still land between a check and its write and then be
+// overwritten; see #1718. Bash is checked after the fact instead, by
+// recheckManagedConfigAfterBash below.
 const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
 let checkedWrites: Promise<unknown> = Promise.resolve()
 
 export function runWithManagedConfigCommitCheck<T>(check: ManagedConfigCommitCheck, fn: () => Promise<T>): Promise<T> {
   return managedConfigCommitCheck.run(check, fn)
+}
+
+// The bytes each checked edit of a managed file was built from.
+const editBases = new WeakMap<ManagedConfigCommitCheck, Map<string, string>>()
+
+// The edit tool's read. For typeclaw.json/cron.json it is what runtime readers
+// load, so while a bash call is in flight the edit builds on the trusted bytes,
+// never on that call's unchecked change; its commit then verifies, under the
+// lock, that those bytes are still the trusted ones.
+export async function readEditToolInput(absolutePath: string): Promise<Buffer> {
+  const commit = managedConfigCommitCheck.getStore()
+  const destination = commit === undefined ? undefined : await managedConfigDestination(commit.agentDir, absolutePath)
+  if (commit === undefined || destination === undefined) return readFile(absolutePath)
+  const base = readValidatedConfigFileSync(destination)
+  const bases = editBases.get(commit) ?? new Map<string, string>()
+  bases.set(destination, base)
+  editBases.set(commit, bases)
+  return Buffer.from(base)
 }
 
 export async function writeToolOutputNoFollow(targetPath: string, content: string): Promise<void> {
@@ -885,12 +929,21 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
       // the pinned descriptor must still be that entry's inode, before the check
       // and again before any byte is truncated.
       await assertPinnedEntry(targetPath, destination)
+      const base = editBases.get(commit)?.get(destination)
+      if (base !== undefined && readConfigForWriteSync(destination) !== base) {
+        const name = path.basename(destination)
+        throw new Error(
+          `${name} changed after this edit read it, so the edit was not applied. Read ${name} again and retry the edit.`,
+        )
+      }
       await commit.check(content, destination)
       await assertPinnedEntry(targetPath, destination)
       // A call cancelled while queued, while its guards ran, or during the entry
       // check above must not write; nothing is awaited between here and the write.
       commit.signal?.throwIfAborted()
+      noteConfigWriteSync(destination, content)
       await writeOutputNoFollow(targetPath, content)
+      recordConfigCommitSync(destination, content)
     })
   })
   checkedWrites = write.catch(() => {})
@@ -912,6 +965,394 @@ async function managedConfigDestination(agentDir: string, targetPath: string): P
     if (destination === managed || destination === (await realpath(managed).catch(() => managed))) return managed
   }
   return undefined
+}
+
+// Per bash call: what each managed path looked like (lstat identity, plus the
+// identity of the file a symlink names) and the newest authorized commit when
+// the call started. An unchanged identity after the call costs nothing more.
+export type ManagedConfigSnapshot = {
+  call: symbol
+  guard: ManagedConfigGuardCheck
+  files: ReadonlyMap<string, { identity: CallIdentity; generation: number | undefined }>
+  // When the call could not be coordinated with host typeclaw commands, the
+  // managed files it must get read-only (existing regular files; the sandbox
+  // can only bind those) and why.
+  readOnly?: { files: string[]; reasons: string[] }
+}
+
+type CallIdentity = { link: ConfigFileIdentity | undefined; resolved: ConfigFileIdentity | undefined }
+
+// Returns the guard's denial reason, or undefined when the content may land.
+export type ManagedConfigGuardCheck = ConfigCallGuard
+
+export type RecheckSeams = {
+  writeInPlace?: (path: string, bytes: Buffer) => void
+  // The rollback's read of the live file, before it restores.
+  readLive?: (path: string) => ConfigFileEntry
+}
+
+export async function snapshotManagedConfigFiles(
+  agentDir: string,
+  guard: ManagedConfigGuardCheck,
+): Promise<ManagedConfigSnapshot> {
+  const call = Symbol('bash call')
+  const files = new Map<string, { identity: CallIdentity; generation: number | undefined }>()
+  const readOnlyFiles: string[] = []
+  const reasons: string[] = []
+  const refusals: string[] = []
+  // A call that cannot be coordinated with host typeclaw commands gets the file
+  // read-only, so it cannot leave a change no host writer or restart can see.
+  const makeReadOnly = (destination: string, reason: string): void => {
+    reasons.push(reason)
+    const target = readOnlyTarget(destination)
+    if ('path' in target) readOnlyFiles.push(target.path)
+    else refusals.push(target.refuse)
+  }
+  try {
+    for (const file of MANAGED_CONFIG_FILES) {
+      const destination = path.join(path.resolve(agentDir), file)
+      let opened: Awaited<ReturnType<typeof openConfigWindow>>
+      try {
+        opened = await openConfigWindow(destination, call, guard)
+      } catch (error) {
+        makeReadOnly(destination, `the ${file} check could not be prepared: ${errorMessage(error)}`)
+        continue
+      }
+      files.set(destination, { identity: callIdentity(destination), generation: opened.generation })
+      if (opened.uncoordinated !== undefined) makeReadOnly(destination, opened.uncoordinated)
+    }
+  } catch (error) {
+    for (const destination of files.keys()) await closeConfigWindow(destination, call)
+    throw error
+  }
+  if (refusals.length > 0) {
+    // Rare and scoped to this one call: the file cannot be held read-only, and
+    // running it unchecked could leave a change nothing can coordinate.
+    for (const destination of files.keys()) await closeConfigWindow(destination, call)
+    throw new Error(
+      `[TypeClaw config guard] This command was not run: the agent could not coordinate config writes with host typeclaw commands (${reasons.join('; ')}), and ${refusals.join('; ')}. Retry the command once that is cleared.`,
+    )
+  }
+  return { call, guard, files, ...(reasons.length > 0 ? { readOnly: { files: readOnlyFiles, reasons } } : {}) }
+}
+
+// Only a regular file at its fixed agent-root path can be held read-only: a
+// read-only bind cannot stop a missing path from being created, or a symlink's
+// directory entry from being replaced. It binds the path, not the inode, so the
+// file must also have no other hard link that would keep its bytes writable.
+function readOnlyTarget(destination: string): { path: string } | { refuse: string } {
+  const name = path.basename(destination)
+  let entry: Stats
+  try {
+    entry = lstatSync(destination)
+  } catch {
+    return { refuse: `${name} does not exist, so it cannot be made read-only for it` }
+  }
+  if (entry.isFile()) {
+    return singleLinkOnOpen(destination, entry)
+      ? { path: destination }
+      : { refuse: `${name} has another hard link, so it cannot be made read-only for it` }
+  }
+  if (entry.isSymbolicLink()) return { refuse: `${name} is a symlink, so it cannot be made read-only for it` }
+  return { refuse: `${name} is not a regular file, so it cannot be made read-only for it` }
+}
+
+function singleLinkOnOpen(destination: string, entry: Stats): boolean {
+  if (entry.nlink !== 1) return false
+  let fd: number
+  try {
+    fd = openSync(destination, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+  } catch {
+    return false
+  }
+  try {
+    const opened = fstatSync(fd)
+    return opened.isFile() && opened.nlink === 1 && opened.dev === entry.dev && opened.ino === entry.ino
+  } finally {
+    closeSync(fd)
+  }
+}
+
+// Prepended to the result of a call that ran with the config files read-only.
+export function readOnlyConfigNotice(snapshot: ManagedConfigSnapshot): string | undefined {
+  if (snapshot.readOnly === undefined) return undefined
+  return [
+    `[TypeClaw config guard] typeclaw.json and cron.json were read-only for this command: the agent could not coordinate it with host typeclaw commands (${snapshot.readOnly.reasons.join('; ')}).`,
+    'Any change this command tried to make to them failed. Retry it once that is cleared, or make the change with the write or edit tool.',
+  ].join('\n')
+}
+
+// Model bash for roles that keep agent-root writes can rewrite typeclaw.json and
+// cron.json directly, past the write/edit guards. bwrap runs every bash call
+// with --die-with-parent in its own PID namespace, so each of its writes has
+// landed by the time the call returns. A changed file is checked under the
+// config lock, in the checked-write queue, against the newest authorized state
+// (src/config/config-commits.ts), which only authorized writers can produce:
+//
+// - bytes equal to that state are left as they are. When an authorized writer
+//   replaced a bash candidate during this call, the call is told its change to
+//   the file was discarded;
+// - anything else is a bash change: it runs as a `write` through this
+//   session's guards, and through those of every other bash call in flight on
+//   the file (a session with fewer permissions may own the change), against
+//   the authorized bytes passed as their baseline, so the live file is never
+//   rewritten to run them. A change every guard passes is recorded as the new
+//   authorized commit. A blocked one is put back to the authorized state, in
+//   place, only if the file still holds the checked bytes; if that fails, the
+//   authorized view stays in force for runtime readers until the file is back.
+//
+// A symlinked path is followed, as loaders and the guards follow it, so a change
+// to the file it names is caught too. A deleted file is left deleted: no guard
+// evaluates a deletion. A directory or FIFO is never opened and is left alone.
+// Returns one model-facing notice per reverted, discarded, or unrevertable file.
+export async function recheckManagedConfigAfterBash(
+  snapshot: ManagedConfigSnapshot,
+  seams: RecheckSeams = {},
+): Promise<string[]> {
+  const notices: string[] = []
+  try {
+    for (const [destination, before] of snapshot.files) {
+      // A window in recovery is re-checked even when this call left the file
+      // alone, so a call that runs once the file is readable can verify it.
+      if (sameCallIdentity(before.identity, callIdentity(destination)) && !configRecoveryPending(destination)) continue
+      const notice = await recheckManagedEntry(destination, snapshot, before.generation, seams).catch(
+        (error: unknown) =>
+          `[TypeClaw config guard] Could not re-check ${path.basename(destination)} after this command: ${errorMessage(error)}`,
+      )
+      if (notice !== undefined) notices.push(notice)
+    }
+  } finally {
+    for (const destination of snapshot.files.keys()) await closeConfigWindow(destination, snapshot.call)
+  }
+  return notices
+}
+
+async function recheckManagedEntry(
+  destination: string,
+  snapshot: ManagedConfigSnapshot,
+  startGeneration: number | undefined,
+  seams: RecheckSeams,
+): Promise<string | undefined> {
+  let locked = false
+  const recheck = checkedWrites.then(() =>
+    withConfigFileLock(destination, async () => {
+      locked = true
+      const live = readLiveEntry(destination)
+      const { entry: trusted, commit, coordinated } = trustedConfigState(destination)
+      if (sameConfigContent(live, trusted)) {
+        setConfigRecovery(destination, false)
+        const committedDuringCall =
+          commit !== undefined && (startGeneration === undefined || commit.generation > startGeneration)
+        return committedDuringCall && commit.superseded ? discardedNotice(path.basename(destination)) : undefined
+      }
+      if (live.kind === 'missing') {
+        setTrustedConfigEntry(destination, live)
+        return undefined
+      }
+      if (live.kind === 'other')
+        return live.unreadable === true
+          ? holdUnreadable(destination, producingGuards(destination, snapshot))
+          : undefined
+      const reason = await checkUnderEveryCall(destination, snapshot, live.bytes, contentOf(trusted))
+      if (reason === undefined) {
+        // Only bytes that are live are recorded: a writer that replaced them during
+        // the check left bytes no check has seen.
+        const now = readLiveEntry(destination)
+        if (!sameConfigContent(now, live)) return holdReplaced(destination, now, producingGuards(destination, snapshot))
+        recordConfigCommitSync(destination, live.bytes)
+        return undefined
+      }
+      return revert(destination, live, trusted, reason, seams, coordinated, producingGuards(destination, snapshot))
+    }),
+  )
+  checkedWrites = recheck.catch(() => {})
+  try {
+    return await recheck
+  } catch (error) {
+    // The lock file sits in the agent root, which this bash call could write, so
+    // an unavailable lock must not leave an unchecked change in place.
+    if (locked) throw error
+    const live = readLiveEntry(destination)
+    const { entry: trusted, coordinated } = trustedConfigState(destination)
+    if (live.kind === 'other' && live.unreadable === true)
+      return holdUnreadable(destination, producingGuards(destination, snapshot))
+    if (sameConfigContent(live, trusted) || live.kind === 'missing' || live.kind === 'other') throw error
+    return revert(
+      destination,
+      live,
+      trusted,
+      `the config file lock was unavailable, so the change could not be checked: ${errorMessage(error)}`,
+      seams,
+      coordinated,
+      producingGuards(destination, snapshot),
+    )
+  }
+}
+
+// A change on a file several bash calls overlap on may belong to any of them,
+// so it must pass this call's guards and those of every other call in flight.
+async function checkUnderEveryCall(
+  destination: string,
+  snapshot: ManagedConfigSnapshot,
+  candidate: Buffer,
+  baseline: Buffer | undefined,
+): Promise<string | undefined> {
+  const run = (guard: ManagedConfigGuardCheck) =>
+    runWithConfigBaseline(destination, baseline, () => guard(candidate.toString('utf8'), destination)).catch(
+      (error: unknown) => `the config guard check failed: ${errorMessage(error)}`,
+    )
+  const own = await run(snapshot.guard)
+  if (own !== undefined) return own
+  for (const guard of concurrentCallGuards(destination, snapshot.call)) {
+    if ((await run(guard)) !== undefined) {
+      return 'a concurrent command from a session without permission to make this change was running, and config changes made while it runs must pass its checks too'
+    }
+  }
+  // Bytes still unverified from an earlier call (left unreadable, or a failed
+  // rollback) may be that call's change, so they must pass its checks too.
+  for (const guard of configRecoveryGuards(destination)) {
+    if ((await run(guard)) !== undefined) {
+      return "the command that left this change ran in a session without permission to make it, and its change must pass that session's checks too"
+    }
+  }
+  return undefined
+}
+
+// The calls whose bytes this check is about: this call and every other call in flight.
+function producingGuards(destination: string, snapshot: ManagedConfigSnapshot): ManagedConfigGuardCheck[] {
+  return [snapshot.guard, ...concurrentCallGuards(destination, snapshot.call)]
+}
+
+// A regular file whose bytes cannot be read (permissions, I/O) is not a FIFO: it
+// may hold an unchecked change. The window stays in recovery, so readers keep
+// the trusted bytes and its record stays published until a later check verifies
+// the file or an authorized commit replaces it.
+function holdUnreadable(destination: string, producers: readonly ManagedConfigGuardCheck[]): string {
+  setConfigRecovery(destination, true, producers)
+  const name = path.basename(destination)
+  return `[TypeClaw config guard] ${name} could not be read after this command, so the agent keeps using the last checked ${name} until it is readable and checked again.`
+}
+
+// Bytes that replaced a checked change: a newer authorized commit stands, and
+// anything else keeps the trusted view in recovery under the producing guards.
+function holdReplaced(
+  destination: string,
+  now: ConfigFileEntry,
+  producers: readonly ManagedConfigGuardCheck[],
+): string {
+  const name = path.basename(destination)
+  if (sameConfigContent(now, trustedConfigState(destination).entry)) return discardedNotice(name)
+  setConfigRecovery(destination, true, producers)
+  return `[TypeClaw config guard] ${name} changed again while this command's change was checked, so it was left as it is now. Until a later check verifies it, the agent keeps using the last authorized ${name}, and that check also applies this command's checks.`
+}
+
+function readLiveEntry(
+  destination: string,
+  read: (path: string) => ConfigFileEntry = readConfigEntrySync,
+): ConfigFileEntry {
+  try {
+    return read(destination)
+  } catch {
+    return { kind: 'other', id: { dev: 0n, ino: 0n, size: 0n, mtimeNs: 0n, ctimeNs: 0n }, unreadable: true }
+  }
+}
+
+function discardedNotice(name: string): string {
+  return [
+    `[TypeClaw config guard] An authorized write committed ${name} during this command, so any change this command made to ${name} was discarded.`,
+    `Redo that change with the write or edit tool, which checks ${name} before writing.`,
+  ].join('\n')
+}
+
+function revert(
+  destination: string,
+  live: ConfigFileEntry,
+  revertTo: ConfigFileEntry,
+  reason: string,
+  seams: RecheckSeams,
+  coordinated: boolean,
+  // The guards of the calls that left these bytes: a failed restore keeps them
+  // with the recovery state so a later permissive call cannot approve the bytes.
+  producers: readonly ManagedConfigGuardCheck[],
+): string {
+  const name = path.basename(destination)
+  const uncoordinated = coordinated
+    ? []
+    : [
+        `This command could not be coordinated with host typeclaw commands, so ${name} was checked against the last state the agent knew; a typeclaw command run on the host during this command may need to be run again.`,
+      ]
+  const now = readLiveEntry(destination, seams.readLive)
+  if (now.kind === 'other' && now.unreadable === true) {
+    // The rollback cannot tell what the file holds now: keep the trusted view.
+    setConfigRecovery(destination, true, producers)
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} could not be read to revert it, so the agent keeps using the last checked ${name} until it is readable and checked again.`,
+    ].join('\n')
+  }
+  if (!sameConfigContent(now, live)) {
+    // Only a newer authorized commit is trusted as it stands. Any other change may
+    // still carry the blocked content, so the window keeps the trusted bytes in
+    // recovery and the next check also runs the guards of the calls that left it.
+    if (sameConfigContent(now, trustedConfigState(destination).entry)) {
+      return [
+        `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+        `blocked: ${reason}`,
+        `${name} changed again before it could be reverted, so it was left as it is now; that change is checked on its own.`,
+      ].join('\n')
+    }
+    setConfigRecovery(destination, true, producers)
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} changed again before it could be reverted, so it was left as it is now. Until a later check verifies it, the agent keeps using the last authorized ${name}, and that check also applies the checks this command failed.`,
+    ].join('\n')
+  }
+  try {
+    restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
+  } catch (error) {
+    noteConfigRollbackSync(destination)
+    setConfigRecovery(destination, true, producers)
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content; the agent keeps using the last authorized ${name} until it is fixed. Restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
+    ].join('\n')
+  }
+  noteConfigRollbackSync(destination)
+  setConfigRecovery(destination, false)
+  return [
+    `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
+    `blocked: ${reason}`,
+    `Every change this command made to ${name} was discarded, not only the blocked one. Redo the allowed changes with the write or edit tool, which check ${name} before writing; a guard that accepts an acknowledgement accepts it only there.`,
+    ...uncoordinated,
+  ].join('\n')
+}
+
+function callIdentity(destination: string): CallIdentity {
+  return { link: statIdentity(destination, false), resolved: statIdentity(destination, true) }
+}
+
+function statIdentity(destination: string, follow: boolean): ConfigFileIdentity | undefined {
+  try {
+    return identityOf(follow ? statSync(destination, { bigint: true }) : lstatSync(destination, { bigint: true }))
+  } catch {
+    return undefined
+  }
+}
+
+function sameCallIdentity(a: CallIdentity, b: CallIdentity): boolean {
+  return sameIdentity(a.link, b.link) && sameIdentity(a.resolved, b.resolved)
+}
+
+function sameIdentity(a: ConfigFileIdentity | undefined, b: ConfigFileIdentity | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 async function writeOutputNoFollow(targetPath: string, content: string): Promise<void> {

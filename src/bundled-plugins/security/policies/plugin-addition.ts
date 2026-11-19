@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { normalizeFileReference } from '@/agent/file-reference'
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 import { splitPluginEntrySpec } from '@/plugin'
 
 import type { SecuritySeverity } from '../permissions'
@@ -119,7 +120,7 @@ function parsePluginsFromContent(content: string): readonly string[] | undefined
 async function readExistingPlugins(targetPath: string): Promise<readonly string[]> {
   let raw: string
   try {
-    raw = await readFile(targetPath, 'utf8')
+    raw = await readConfigBaseline(targetPath)
   } catch {
     return []
   }

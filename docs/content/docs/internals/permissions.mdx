@@ -86,7 +86,7 @@ Legacy five-field channel principals implicitly belong to the target adapter's n
 
 ## Wiring
 
-1. **Config**: top-level `roles?` parsed by `rolesConfigSchema`. **`roles` is restart-required**.
+1. **Config**: top-level `roles?` parsed by `rolesConfigSchema`. **`roles.<name>.match` applies on reload** (the config reloadable updates the live permission service); **`roles.<name>.permissions` is restart-required**.
 2. **Plugin registration**: `definePlugin({ permissions: [...] })`. Read at boot before any factory runs; the union expands the owner wildcard and powers the boot-time typo warning.
 3. **`PluginContext.permissions: PermissionService`** is constructed once at plugin load and lives for the plugin's lifetime.
 4. **`ToolBeforeEvent.origin` carries the LIVE origin** via a mutable `originRef` on `CreateSessionOptions`. Channel sessions update the holder per-turn in `src/channels/router.ts` so the event sees current-turn `lastInboundAuthorId`. TUI/cron/subagent sessions pass `origin` directly.
@@ -115,7 +115,7 @@ Internal owner markers share the `tool.before` registration sequence. Each owner
 
   To narrow a role's tier cap, declare the explicit list in `roles.<role>.permissions[]` (replaces the default). To widen a lower role for one guard, add the per-guard string. New guards MUST export a severity constant or `SEVERITY_PERMISSION` indexing fails — no silent permissive fallback.
 
-  Trusted bypassing medium widens its default authority over agent state in exchange for fewer acks. Defense leans on operator review of auto-backup commits to `typeclaw.json` and `cron.json`. Deployments that don't review backup commits should keep trusted's match narrow OR subtract `security.bypass.medium`.
+  Trusted bypassing medium widens its default authority over agent state in exchange for fewer acks. Defense leans on operator review of auto-backup commits to `typeclaw.json` and `cron.json`. Deployments that don't review backup commits should keep trusted's match narrow OR subtract `security.bypass.medium`. A role without the bypass is held to these guards in model bash too: a bash change to `typeclaw.json` or `cron.json` is re-checked after the command and reverted when blocked (see [sandbox](/docs/internals/sandbox)).
 
 - **The recorder-vs-checker split in the security plugin is load-bearing.** `recordGitRemoteTaintIfAny` runs unconditionally for any actor who could execute `set-url`, independent of `checkGitRemoteTaintedGuard`'s decision. The split is what makes `gitExfil → medium` safe: trusted's first-step retarget succeeds AND the recorder fires; second-step push hits the high-tier `gitRemoteTainted` block. Collapsing recorder and checker disables the two-step defense.
 - **Plugin-contributed cron defaults to `scheduledByRole: 'owner'`.** Without this, the bundled memory dreaming cron resolves to `guest` and loses every bypass it needs.

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { commitSystemFileSync } from '@/git/system-commit'
@@ -11,6 +11,7 @@ import {
   type CustomModelMeta,
   type ThinkingLevel,
 } from './config'
+import { commitConfigWriteSync, ConfigWriteRefusedError, readConfigForWriteSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   KNOWN_PROVIDERS,
@@ -312,7 +313,7 @@ function writeConfig(
   const path = join(cwd, CONFIG_FILE)
   let parsed: Record<string, unknown>
   try {
-    const raw = readFileSync(path, 'utf8')
+    const raw = readConfigForWriteSync(path)
     parsed = JSON.parse(raw) as Record<string, unknown>
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -332,9 +333,11 @@ function writeConfig(
       reason: `config would be invalid: ${check.error.issues.map((i) => i.message).join('; ')}`,
     }
   }
+  const bytes = `${JSON.stringify(parsed, null, 2)}\n`
   try {
-    writeFileSync(path, `${JSON.stringify(parsed, null, 2)}\n`)
+    commitConfigWriteSync(path, bytes)
   } catch (error) {
+    if (error instanceof ConfigWriteRefusedError) return { ok: false, reason: error.message }
     const code = error instanceof Error && 'code' in error ? error.code : undefined
     if (code === 'EACCES' || code === 'EPERM') {
       return {

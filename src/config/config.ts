@@ -1,4 +1,4 @@
-import { accessSync, constants as fsConstants, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { accessSync, constants as fsConstants, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, resolve } from 'node:path'
 
@@ -20,6 +20,7 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
+import { commitConfigWriteSync, readConfigForWriteSync, readValidatedConfigFileSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1359,7 +1360,7 @@ export function extractPluginConfigs(raw: unknown): Record<string, unknown> {
 export function loadPluginConfigsSync(cwd: string): Record<string, unknown> {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return {}
   }
@@ -1379,9 +1380,12 @@ export function loadPluginConfigsSync(cwd: string): Record<string, unknown> {
 export function loadConfigSync(cwd: string): Config {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
-  } catch {
-    return configSchema.parse({})
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
+  } catch (error) {
+    // Only a missing file means defaults; one that cannot be read as a regular
+    // file must not replace the live config with them on reload.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return configSchema.parse({})
+    throw error
   }
 
   let json: unknown
@@ -1411,7 +1415,7 @@ export function loadConfigSync(cwd: string): Config {
 export function loadConfigBundleSync(cwd: string): { config: Config; pluginConfigs: Record<string, unknown> } {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
   } catch {
     return { config: configSchema.parse({}), pluginConfigs: {} }
   }
@@ -1560,8 +1564,19 @@ function persistMigratedConfig(cwd: string): void {
     // Migrate the file as it is under the lock, not the caller's earlier read,
     // so a write that landed in between is not rolled back.
     applied = withConfigFileLockSync(file, () => {
-      const migrated = migrateLegacyConfigShape(JSON.parse(readFileSync(file, 'utf8')))
-      if (migrated.changed) writeFileSync(file, `${JSON.stringify(migrated.json, null, 2)}\n`)
+      const base = readConfigForWriteSync(file)
+      const migrated = migrateLegacyConfigShape(JSON.parse(base))
+      if (migrated.changed) {
+        const bytes = `${JSON.stringify(migrated.json, null, 2)}\n`
+        // Only onto the verified file it was built from; otherwise the migration
+        // stays in memory and the write-back retries on a later load.
+        try {
+          commitConfigWriteSync(file, bytes, base)
+        } catch (error) {
+          console.warn(`[typeclaw] deferred the ${CONFIG_FILE} migration write-back: ${(error as Error).message}`)
+          return []
+        }
+      }
       return migrated.applied
     })
   } catch {
@@ -1614,9 +1629,13 @@ export type ValidateConfigOptions = {
 export function validateConfig(cwd: string, options: ValidateConfigOptions = {}): ValidateConfigResult {
   let raw: string
   try {
-    raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
-  } catch {
-    return { ok: true }
+    raw = readValidatedConfigFileSync(join(cwd, CONFIG_FILE))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true }
+    return {
+      ok: false,
+      reason: `${CONFIG_FILE} could not be read: ${error instanceof Error ? error.message : String(error)}`,
+    }
   }
 
   const parsed = parseConfigJson(raw, { migrate: true, persistTarget: cwd })

@@ -6,15 +6,17 @@ import { select, text, password, isCancel, cancel, log } from '@clack/prompts'
 import { defineCommand } from 'citty'
 
 import { loadConfigSync, parseConfigJson, validateConfig } from '@/config'
+import {
+  commitConfigWriteSync,
+  prepareConfigWriteSync,
+  readConfigForWriteSync,
+  tryRecordConfigCommitSync,
+  type VerifiedConfigWrite,
+} from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { CONTAINER_PORT, resolveHostPort, resolveTuiToken } from '@/container'
 import { findAgentDir, hasEnvKey, isInitialized, withEnvKey } from '@/init'
-import {
-  credentialStagingDir,
-  publishConfigWithCredential,
-  type PublishSeams,
-  writeConfigInPlace,
-} from '@/init/staged-write'
+import { credentialStagingDir, publishConfigWithCredential, type PublishSeams } from '@/init/staged-write'
 import type { ClientMessage, ServerMessage, TunnelLogsServerMessage, TunnelSnapshot } from '@/shared'
 import type { TunnelConfig, TunnelFor, TunnelProvider } from '@/tunnels'
 
@@ -956,12 +958,15 @@ export function writeConfigAndToken(
           content: withEnvKey(readFileOrUndefined(envPath)?.toString('utf8') ?? '', token.env, token.value),
           stagingDir: credentialStagingDir(cwd),
         }
-  const published = publishConfigWithCredential(
-    join(cwd, 'typeclaw.json'),
-    `${JSON.stringify(raw, null, 2)}\n`,
-    credential,
-    seams,
-  )
+  const configBytes = `${JSON.stringify(raw, null, 2)}\n`
+  let config: VerifiedConfigWrite
+  try {
+    config = prepareConfigWriteSync(join(cwd, 'typeclaw.json'))
+  } catch (error) {
+    return { ok: false, reason: `failed to store the tunnel: ${(error as Error).message}` }
+  }
+  const published = publishConfigWithCredential(config, configBytes, credential, seams)
+  if (published.ok) tryRecordConfigCommitSync(join(cwd, 'typeclaw.json'), configBytes)
   return published.ok
     ? { ok: true, value: undefined }
     : { ok: false, reason: `failed to store the tunnel: ${published.reason}` }
@@ -979,14 +984,14 @@ function readFileOrUndefined(path: string): Buffer | undefined {
 // Tunnels as typeclaw.json holds them now. Parsed without persisting a
 // migration, so nothing under the config lock commits to git.
 function readTunnelsInLock(cwd: string): LiveResult<TunnelConfig[]> {
-  const parsed = parseConfigJson(readFileSync(join(cwd, 'typeclaw.json'), 'utf8'))
+  const parsed = parseConfigJson(readConfigForWriteSync(join(cwd, 'typeclaw.json')))
   return parsed.ok ? { ok: true, value: parsed.config.tunnels } : parsed
 }
 
 function readRawConfig(cwd: string): Record<string, unknown> {
   const file = join(cwd, 'typeclaw.json')
   try {
-    return JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+    return JSON.parse(readConfigForWriteSync(file)) as Record<string, unknown>
   } catch (err) {
     if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return {}
     throw err
@@ -994,7 +999,7 @@ function readRawConfig(cwd: string): Record<string, unknown> {
 }
 
 function writeRawConfig(cwd: string, config: Record<string, unknown>): void {
-  writeConfigInPlace(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
+  commitConfigWriteSync(join(cwd, 'typeclaw.json'), `${JSON.stringify(config, null, 2)}\n`)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

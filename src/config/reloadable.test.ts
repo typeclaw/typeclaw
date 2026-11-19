@@ -8,6 +8,10 @@ import { createConfigReloadable } from './reloadable'
 
 const VALID_MODEL_A = 'fireworks/accounts/fireworks/routers/kimi-k2p6-turbo'
 
+// Windows has no FIFOs (mkfifo), which these tests use to hold a bash call or a
+// process at a known point, or to stand in for a non-regular config file.
+const fifosUnavailable = process.platform === 'win32'
+
 describe('createConfigReloadable', () => {
   let cwd: string
 
@@ -19,6 +23,25 @@ describe('createConfigReloadable', () => {
     __resetConfigForTesting()
     await rm(cwd, { recursive: true, force: true })
   })
+
+  test.skipIf(fifosUnavailable)(
+    'a FIFO at typeclaw.json fails the reload promptly and keeps the live config',
+    async () => {
+      // given: a live config, then typeclaw.json replaced by a FIFO nobody writes to
+      await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, port: 9001 }))
+      const reloadable = createConfigReloadable({ cwd })
+      expect((await reloadable.reload()).ok).toBe(true)
+      await rm(join(cwd, 'typeclaw.json'))
+      expect(await Bun.spawn(['mkfifo', join(cwd, 'typeclaw.json')]).exited).toBe(0)
+
+      // when: the config reloads (a blocking open would hang here until the test times out)
+      const result = await reloadable.reload()
+
+      // then: the reload fails without opening the FIFO and the live config stands
+      expect(result.ok).toBe(false)
+      expect(getConfig().port).toBe(9001)
+    },
+  )
 
   test('atomicity: invalid JSON leaves the live config untouched', async () => {
     await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, port: 9001 }))

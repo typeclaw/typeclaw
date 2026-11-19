@@ -1,7 +1,7 @@
-import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 
 import type { SecuritySeverity } from '../permissions'
 import type { SecurityBlock } from '../policy'
@@ -42,7 +42,7 @@ export async function checkNoticeTargetGuard(options: {
 
   // An unreadable or unparseable existing file reads as "no notice", so any
   // proposed target looks new and is blocked: the safe direction.
-  const before = noticeIn(await readFile(targetPath, 'utf8').catch(() => '{}')) ?? null
+  const before = noticeIn(await readConfigBaseline(targetPath).catch(() => '{}')) ?? null
   if (JSON.stringify(before) === JSON.stringify(after)) return undefined
 
   return {

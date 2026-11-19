@@ -1,4 +1,3 @@
-import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { commitSystemFileSync } from '@/git/system-commit'
@@ -11,6 +10,7 @@ import {
   validateMount,
   type Mount,
 } from './config'
+import { commitConfigWriteSync, ConfigWriteRefusedError, readConfigForWriteSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -113,7 +113,7 @@ function buildMount(
 
 function readConfigRecord(cwd: string): { ok: true; value: Record<string, unknown> } | { ok: false; reason: string } {
   try {
-    const raw = readFileSync(join(cwd, CONFIG_FILE), 'utf8')
+    const raw = readConfigForWriteSync(join(cwd, CONFIG_FILE))
     const parsed = JSON.parse(raw) as unknown
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { ok: false, reason: `${CONFIG_FILE} must contain a JSON object.` }
@@ -141,10 +141,17 @@ function writeMounts(cwd: string, record: Record<string, unknown>): { ok: true }
     return { ok: false, reason: `mounts block would be invalid: ${parsed.error.issues.map(formatIssue).join('; ')}` }
   }
 
+  const bytes = `${JSON.stringify(record, null, 2)}\n`
   try {
-    writeFileSync(join(cwd, CONFIG_FILE), `${JSON.stringify(record, null, 2)}\n`)
+    commitConfigWriteSync(join(cwd, CONFIG_FILE), bytes)
   } catch (error) {
-    return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
+    return {
+      ok: false,
+      reason:
+        error instanceof ConfigWriteRefusedError
+          ? error.message
+          : `Failed to write ${CONFIG_FILE}: ${(error as Error).message}`,
+    }
   }
   return { ok: true }
 }

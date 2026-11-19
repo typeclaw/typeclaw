@@ -2,6 +2,7 @@ import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 import { isBuiltinRoleName, type RoleConfig, type RolesConfig } from '@/permissions'
 
 import type { SecuritySeverity } from '../permissions'
@@ -59,7 +60,7 @@ export const GUARD_ROLE_PROMOTION = 'rolePromotion'
 //
 // What this guard does NOT cover, by design:
 //   - `grantRole()` in src/permissions/grant.ts. That function writes
-//     `typeclaw.json` directly via writeFileSync (atomic temp+rename) and
+//     `typeclaw.json` directly (commitConfigWriteSync, in place) and
 //     bypasses `tool.before` by construction. The only production caller
 //     is the role-claim flow (src/role-claim/controller.ts), which is
 //     gated by an operator-issued pairing code from the host CLI: the
@@ -231,7 +232,7 @@ function parseRolesFromContent(content: string): RolesConfig | undefined {
 async function readExistingRoles(targetPath: string): Promise<RolesConfig> {
   let raw: string
   try {
-    raw = await readFile(targetPath, 'utf8')
+    raw = await readConfigBaseline(targetPath)
   } catch {
     // No existing file (first write) — treat every role as a new grant.
     return {}

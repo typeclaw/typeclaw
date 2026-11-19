@@ -22,6 +22,7 @@ import {
   resolveWritableZones,
   SandboxDegradedProcError,
   SandboxProcProbeUnverifiedError,
+  SandboxPolicyError,
   subtractMasked,
   verifyHiddenMaskTargets,
   verifyPrivilegedSandboxRuntime,
@@ -105,6 +106,9 @@ export type BashSandboxRequest = {
   readonly envWithhold?: string[]
   readonly deferredPreparation?: DeferredBashPreparation
   readonly reveal?: BashSandboxReveal
+  // Existing files bound read-only for this call only, on top of the role's
+  // writable zones (the config files when coordination failed).
+  readonly readOnlyFiles?: readonly string[]
   readonly boundary?: BashSandboxBoundary
   readonly network?: SandboxNetwork
 }
@@ -162,9 +166,20 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
       writableRoot || writable.dirs.includes(join(agentDir, '.git'))
         ? subtractMasked(await resolveProtectedZones(agentDir), { dirs, files })
         : { dirs: [], files: [] }
+    // A read-only bind renders after the masks, so one on or inside a hidden
+    // path would re-expose it: refuse the call instead of binding.
+    const readOnlyFiles = options.readOnlyFiles ?? []
+    const hiddenReadOnly = readOnlyFiles.filter(
+      (file) => !subtractMasked({ dirs: [], files: [file] }, { dirs, files }).files.includes(file),
+    )
+    if (hiddenReadOnly.length > 0) {
+      throw new SandboxPolicyError(
+        `[TypeClaw config guard] This command was not run: ${hiddenReadOnly.join(', ')} would have to be bound read-only inside a path hidden from this command, which would expose it. Retry the command once the agent can coordinate config writes with host typeclaw commands again.`,
+      )
+    }
     const protectedZones = {
       dirs: baseProtectedZones.dirs,
-      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles])],
+      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles, ...readOnlyFiles])],
     }
     const writableDirSet = new Set(writable.dirs)
     const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'

@@ -76,9 +76,16 @@ export type ConfigWrite = {
 // A failed in-place config write whose prior content could not be put back.
 export class ConfigRestoreError extends Error {}
 
-export function writeConfigInPlace(path: string, content: string | Buffer, writeInPlace?: WriteInPlace): void {
-  publishConfigWrite(prepareConfigWrite(path, content), writeInPlace)
-}
+// A config write refused before any byte was written: retrying once the file
+// is back to a checked regular file succeeds. Thrown by the verified writer
+// (prepareConfigWriteSync in src/config/config-commits.ts).
+export class ConfigWriteRefusedError extends Error {}
+
+// A config file write the caller verified (prepareConfigWriteSync): its prior
+// bytes were read on the verified entry, and its writer only writes that entry
+// (or, with no prior bytes, creates the file exclusively), restoring the prior
+// bytes itself if a write fails partway.
+export type VerifiedConfigFile = { path: string; prior: Buffer | undefined; writeInPlace: WriteInPlace }
 
 // Resolves the file to write and reads its prior bytes. A read-only
 // destination is refused, as the in-place write would be.
@@ -237,9 +244,11 @@ export type CredentialUpdate = { path: string; content: string; stagingDir: stri
 // put back if typeclaw.json cannot be. A failure never leaves either file
 // partly written; a .env this created is left empty rather than removed.
 // `seams` let tests fail a step after writing has begun and take the Windows
-// .env path on any platform.
+// .env path on any platform. `config` is the config file's path, or a write
+// the caller verified (prepareConfigWriteSync): its path is not resolved again
+// and its prior bytes are not read again, and its own writer is used.
 export function publishConfigWithCredential(
-  configPath: string,
+  config: string | VerifiedConfigFile,
   configBytes: string,
   credential: CredentialUpdate | undefined,
   seams: PublishSeams = {},
@@ -251,10 +260,20 @@ export function publishConfigWithCredential(
     if (credential !== undefined) {
       staged = stageCredential(credential.path, credential.content, credential.stagingDir, seams.platform)
     }
-    const configWrite = prepareConfigWrite(configPath, configBytes)
+    const verified = typeof config === 'string' ? undefined : config
+    // A read-only verified config is refused here, as prepareConfigWrite refuses
+    // a path, before the paired .env update is published.
+    if (verified?.prior !== undefined) accessSync(verified.path, constants.W_OK)
+    const configWrite =
+      verified === undefined
+        ? prepareConfigWrite(config as string, configBytes)
+        : { path: verified.path, content: Buffer.from(configBytes), prior: verified.prior }
     if (staged !== undefined) publishCredential(staged, seams.writeInPlace)
     try {
-      publishConfigWrite(configWrite, seams.writeInPlace)
+      // The verified writer owns its rollback (on its own descriptor); only the
+      // path-based write takes the generic one. A test seam keeps the latter.
+      if (verified !== undefined && seams.writeInPlace === undefined) verified.writeInPlace(verified.path, configBytes)
+      else publishConfigWrite(configWrite, seams.writeInPlace)
     } catch (error) {
       const configState = error instanceof ConfigRestoreError ? error.message : 'typeclaw.json was not changed'
       const cause = error instanceof ConfigRestoreError ? '' : `${describe(error)}. `

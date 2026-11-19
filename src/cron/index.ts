@@ -1,8 +1,7 @@
-import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import type { SubagentRegistry } from '@/agent/subagents'
+import { readValidatedConfigFileSync } from '@/config/config-commits'
 
 import { type CronFile, type CronParseWarning, type ParseCronMode, parseCronFile } from './schema'
 
@@ -43,12 +42,11 @@ export type LoadCronOptions = {
 
 export async function loadCron(agentDir: string, options: LoadCronOptions = {}): Promise<LoadCronResult> {
   const path = join(agentDir, CRON_FILE)
-  if (!existsSync(path)) return { ok: true, file: null }
-
   let raw: string
   try {
-    raw = await readFile(path, 'utf8')
+    raw = readValidatedConfigFileSync(path)
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, file: null }
     return { ok: false, reason: `failed to read cron.json: ${errorMessage(err)}` }
   }
 
