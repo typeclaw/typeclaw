@@ -1229,19 +1229,19 @@ describe('recommended models', () => {
     }
   }
 
-  test('formatModelLabel marks gpt-5.4-mini under openai as Recommended', () => {
-    const o = model('openai/gpt-5.4-mini', { modelName: 'GPT-5.4 mini' })
-    expect(formatModelLabel(o)).toBe('GPT-5.4 mini (Recommended)')
+  test('formatModelLabel marks gpt-6.1-terra under openai as Recommended', () => {
+    const o = model('openai/gpt-6.1-terra', { modelName: 'GPT-6.1 Terra' })
+    expect(formatModelLabel(o)).toBe('GPT-6.1 Terra (Recommended)')
   })
 
-  test('formatModelLabel marks gpt-5.4-mini under openai-codex as Recommended', () => {
-    const o = model('openai-codex/gpt-5.4-mini', { modelName: 'GPT-5.4 mini' })
-    expect(formatModelLabel(o)).toBe('GPT-5.4 mini (Recommended)')
+  test('formatModelLabel marks gpt-6.1-terra under openai-codex as Recommended', () => {
+    const o = model('openai-codex/gpt-6.1-terra', { modelName: 'GPT-6.1 Terra' })
+    expect(formatModelLabel(o)).toBe('GPT-6.1 Terra (Recommended)')
   })
 
-  test('formatModelLabel marks claude-sonnet-4-6 as Recommended', () => {
-    const o = model('anthropic/claude-sonnet-4-6', { modelName: 'Claude Sonnet 4.6' })
-    expect(formatModelLabel(o)).toBe('Claude Sonnet 4.6 (Recommended)')
+  test('formatModelLabel marks claude-sonnet-5-5 as Recommended', () => {
+    const o = model('anthropic/claude-sonnet-5-5', { modelName: 'Claude Sonnet 5.5' })
+    expect(formatModelLabel(o)).toBe('Claude Sonnet 5.5 (Recommended)')
   })
 
   test('formatModelLabel leaves non-recommended models unchanged', () => {
@@ -1250,11 +1250,11 @@ describe('recommended models', () => {
   })
 
   test('sortRecommendedFirst floats the recommended OpenAI model to the top', () => {
-    const nano = model('openai/gpt-5.4-nano', { modelName: 'GPT-5.4 nano' })
-    const mini = model('openai/gpt-5.4-mini', { modelName: 'GPT-5.4 mini' })
-    const full = model('openai/gpt-5.4', { modelName: 'GPT-5.4' })
-    const sorted = sortRecommendedFirst([nano, mini, full])
-    expect(sorted.map((o) => o.ref)).toEqual(['openai/gpt-5.4-mini', 'openai/gpt-5.4-nano', 'openai/gpt-5.4'])
+    const sol = model('openai/gpt-6-sol', { modelName: 'GPT-6 Sol' })
+    const luna = model('openai/gpt-6-luna', { modelName: 'GPT-6 Luna' })
+    const terra = model('openai/gpt-6.1-terra', { modelName: 'GPT-6.1 Terra' })
+    const sorted = sortRecommendedFirst([sol, luna, terra])
+    expect(sorted.map((o) => o.ref)).toEqual(['openai/gpt-6.1-terra', 'openai/gpt-6-sol', 'openai/gpt-6-luna'])
   })
 
   test('sortRecommendedFirst floats the recommended Anthropic model to the top', () => {
@@ -1264,10 +1264,12 @@ describe('recommended models', () => {
     const opus47 = model('anthropic/claude-opus-4-7', { modelName: 'Claude Opus 4.7' })
     const opus48 = model('anthropic/claude-opus-4-8', { modelName: 'Claude Opus 4.8' })
     const fable5 = model('anthropic/claude-fable-5', { modelName: 'Claude Fable 5' })
-    const sorted = sortRecommendedFirst([haiku, sonnet, sonnet5, opus47, opus48, fable5])
+    const sonnet55 = model('anthropic/claude-sonnet-5-5', { modelName: 'Claude Sonnet 5.5' })
+    const sorted = sortRecommendedFirst([haiku, sonnet, sonnet5, sonnet55, opus47, opus48, fable5])
     expect(sorted.map((o) => o.ref)).toEqual([
-      'anthropic/claude-sonnet-4-6',
+      'anthropic/claude-sonnet-5-5',
       'anthropic/claude-haiku-4-5',
+      'anthropic/claude-sonnet-4-6',
       'anthropic/claude-sonnet-5',
       'anthropic/claude-opus-4-7',
       'anthropic/claude-opus-4-8',
