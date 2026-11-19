@@ -16,7 +16,6 @@ import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all'
 import {
   defaultThinkingLevelForRef,
   isKnownModelRef,
-  isOpenAiFamilyRef,
   isModelRef,
   KNOWN_PROVIDERS,
   type KnownProviderId,
@@ -232,7 +231,7 @@ describe('KNOWN_PROVIDER_VENDORS', () => {
   })
 
   test('opengateway does not join the OpenAI family even though it proxies OpenAI models', () => {
-    expect(isOpenAiFamilyRef('opengateway/openai/gpt-5.5')).toBe(false)
+    expect(vendorForProviderId('opengateway')).not.toBe('openai')
   })
 })
 
@@ -389,14 +388,6 @@ describe('listKnownModelRefs', () => {
 describe('providerForModelRef anthropic', () => {
   test('routes claude-sonnet-4-6 to anthropic', () => {
     expect(providerForModelRef('anthropic/claude-sonnet-4-6')).toBe('anthropic')
-  })
-})
-
-describe('isOpenAiFamilyRef', () => {
-  test('tracks every provider in the OpenAI vendor family', () => {
-    expect(isOpenAiFamilyRef('openai/gpt-5.4-nano')).toBe(true)
-    expect(isOpenAiFamilyRef('openai-codex/gpt-5.5')).toBe(true)
-    expect(isOpenAiFamilyRef('anthropic/claude-opus-4-7')).toBe(false)
   })
 })
 

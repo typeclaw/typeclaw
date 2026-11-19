@@ -1819,10 +1819,6 @@ function knownProviderForModelRef(ref: string): KnownProviderId | null {
   return null
 }
 
-export function isOpenAiFamilyRef(ref: KnownModelRef | ModelRef | string): boolean {
-  return vendorForProviderId(providerForModelRef(ref)) === 'openai'
-}
-
 // Returning `undefined` defers to pi-coding-agent's SDK default (`medium`);
 // returning a level pins it at session-creation time. No family is pinned: the
 // prior OpenAI `low` pin was dropped so GPT-5.x reasons at SDK strength like
