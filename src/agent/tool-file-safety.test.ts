@@ -4,6 +4,7 @@ import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, wri
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
+import { loadConfigSync } from '@/config'
 import {
   __failConfigEpochWritesForTests,
   __setConfigReadHookForTests,
@@ -664,3 +665,45 @@ console.log('file:' + JSON.stringify(readFileSync(config, 'utf8')))`,
     await rm(agentDir, { recursive: true, force: true })
   }
 }, 30_000)
+
+test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'a config a bash call leaves unreadable keeps the trusted window until a later call checks it',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-unreadable-config-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const record = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+    const allow = async () => undefined
+    try {
+      // given: a call writes new bytes to typeclaw.json, then makes it unreadable
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const first = await snapshotManagedConfigFiles(agentDir, allow)
+      await writeFile(config, '{"alias":["renamed"]}\n')
+      await chmod(config, 0o000)
+
+      // when: the call closes
+      const notices = await recheckManagedConfigAfterBash(first)
+
+      // then: it is told, the window and its record are kept, and a reload uses the trusted bytes
+      expect(notices.join('\n')).toContain(
+        'typeclaw.json could not be read after this command, so the agent keeps using the last checked typeclaw.json',
+      )
+      expect(existsSync(record)).toBe(true)
+      expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+
+      // and: once readable again, the unchecked bytes are still not adopted
+      await chmod(config, 0o644)
+      expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+
+      // when: a later call runs (and leaves the file alone)
+      const second = await snapshotManagedConfigFiles(agentDir, allow)
+      await recheckManagedConfigAfterBash(second)
+
+      // then: it checked the file, committed it, and the window settled
+      expect(existsSync(record)).toBe(false)
+      expect(loadConfigSync(agentDir).alias).toEqual(['renamed'])
+    } finally {
+      await chmod(config, 0o644).catch(() => {})
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)

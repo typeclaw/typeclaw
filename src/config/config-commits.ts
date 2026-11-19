@@ -60,7 +60,10 @@ export type ConfigFileEntry =
       id: ConfigFileIdentity
       resolvedId: ConfigFileIdentity
     }
-  | { kind: 'other'; id: ConfigFileIdentity }
+  // `unreadable`: lstat says a regular file (or a link to one), but it could not be
+  // opened or verified, so its bytes are unknown, unlike a confirmed FIFO,
+  // directory, socket, or device.
+  | { kind: 'other'; id: ConfigFileIdentity; unreadable?: true }
 
 // `entry` is the kind of entry the writer left (file or link, with its mode and
 // link target), so restoring a commit never reuses an older window's entry.
@@ -116,7 +119,10 @@ export function readConfigEntrySync(file: string): ConfigFileEntry {
   if (link === undefined) return { kind: 'missing' }
   if (!link.isSymbolicLink()) {
     const read = readRegularSync(file, link)
-    return read === undefined ? { kind: 'other', id: identityOf(link) } : { kind: 'file', ...read }
+    if (read !== undefined) return { kind: 'file', ...read }
+    return link.isFile()
+      ? { kind: 'other', id: identityOf(link), unreadable: true }
+      : { kind: 'other', id: identityOf(link) }
   }
   let target: string
   let resolved: string
@@ -128,7 +134,11 @@ export function readConfigEntrySync(file: string): ConfigFileEntry {
   }
   const resolvedStats = lstatOrUndefined(resolved)
   const read = resolvedStats === undefined ? undefined : readRegularSync(resolved, resolvedStats)
-  if (read === undefined) return { kind: 'other', id: identityOf(link) }
+  if (read === undefined) {
+    return resolvedStats?.isFile() === true
+      ? { kind: 'other', id: identityOf(link), unreadable: true }
+      : { kind: 'other', id: identityOf(link) }
+  }
   return {
     kind: 'link',
     target,
@@ -402,6 +412,10 @@ export function setTrustedConfigEntry(file: string, entry: ConfigFileEntry): voi
 export function setConfigRecovery(file: string, recovery: boolean): void {
   const window = windows.get(resolve(file))
   if (window !== undefined) window.recovery = recovery
+}
+
+export function configRecoveryPending(file: string): boolean {
+  return windows.get(resolve(file))?.recovery === true
 }
 
 export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): ConfigFileEntry {

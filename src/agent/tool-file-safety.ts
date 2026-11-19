@@ -26,6 +26,7 @@ import {
 } from '@/bundled-plugins/security/policies/private-surface-read'
 import {
   closeConfigWindow,
+  configRecoveryPending,
   concurrentCallGuards,
   contentOf,
   identityOf,
@@ -1078,7 +1079,9 @@ export async function recheckManagedConfigAfterBash(
   const notices: string[] = []
   try {
     for (const [destination, before] of snapshot.files) {
-      if (sameCallIdentity(before.identity, callIdentity(destination))) continue
+      // A window in recovery is re-checked even when this call left the file
+      // alone, so a call that runs once the file is readable can verify it.
+      if (sameCallIdentity(before.identity, callIdentity(destination)) && !configRecoveryPending(destination)) continue
       const notice = await recheckManagedEntry(destination, snapshot, before.generation, seams).catch(
         (error: unknown) =>
           `[TypeClaw config guard] Could not re-check ${path.basename(destination)} after this command: ${errorMessage(error)}`,
@@ -1101,7 +1104,7 @@ async function recheckManagedEntry(
   const recheck = checkedWrites.then(() =>
     withConfigFileLock(destination, async () => {
       locked = true
-      const live = readConfigEntrySync(destination)
+      const live = readLiveEntry(destination)
       const { entry: trusted, commit, coordinated } = trustedConfigState(destination)
       if (sameConfigContent(live, trusted)) {
         setConfigRecovery(destination, false)
@@ -1113,7 +1116,7 @@ async function recheckManagedEntry(
         setTrustedConfigEntry(destination, live)
         return undefined
       }
-      if (live.kind === 'other') return undefined
+      if (live.kind === 'other') return live.unreadable === true ? holdUnreadable(destination) : undefined
       const reason = await checkUnderEveryCall(destination, snapshot, live.bytes, contentOf(trusted))
       if (reason === undefined) {
         recordConfigCommitSync(destination, live.bytes)
@@ -1129,8 +1132,9 @@ async function recheckManagedEntry(
     // The lock file sits in the agent root, which this bash call could write, so
     // an unavailable lock must not leave an unchecked change in place.
     if (locked) throw error
-    const live = readConfigEntrySync(destination)
+    const live = readLiveEntry(destination)
     const { entry: trusted } = trustedConfigState(destination)
+    if (live.kind === 'other' && live.unreadable === true) return holdUnreadable(destination)
     if (sameConfigContent(live, trusted) || live.kind === 'missing' || live.kind === 'other') throw error
     return revert(
       destination,
@@ -1162,6 +1166,24 @@ async function checkUnderEveryCall(
     }
   }
   return undefined
+}
+
+// A regular file whose bytes cannot be read (permissions, I/O) is not a FIFO: it
+// may hold an unchecked change. The window stays in recovery, so readers keep
+// the trusted bytes and its record stays published until a later check verifies
+// the file or an authorized commit replaces it.
+function holdUnreadable(destination: string): string {
+  setConfigRecovery(destination, true)
+  const name = path.basename(destination)
+  return `[TypeClaw config guard] ${name} could not be read after this command, so the agent keeps using the last checked ${name} until it is readable and checked again.`
+}
+
+function readLiveEntry(destination: string): ConfigFileEntry {
+  try {
+    return readConfigEntrySync(destination)
+  } catch {
+    return { kind: 'other', id: { dev: 0n, ino: 0n, size: 0n, mtimeNs: 0n, ctimeNs: 0n }, unreadable: true }
+  }
 }
 
 function discardedNotice(name: string): string {
@@ -1205,6 +1227,7 @@ function revert(
     ].join('\n')
   }
   noteConfigRollbackSync(destination)
+  setConfigRecovery(destination, false)
   return [
     `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
     `blocked: ${reason}`,
