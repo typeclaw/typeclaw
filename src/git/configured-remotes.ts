@@ -62,23 +62,21 @@ export async function syncConfiguredGitRemotes(
   return { warnings: problems }
 }
 
-// Mirrors the backup runner: a branch with an upstream (branch.<name>.remote
-// and .merge) is pushed with a bare `git push`, which goes to
+// Mirrors the backup runner (resolvePushPlan): a branch whose @{upstream}
+// resolves is pushed with a bare `git push`, which goes to
 // branch.<name>.pushRemote, then remote.pushDefault, then the upstream's remote;
-// a branch with no upstream is pushed to origin by name, so routing keys do not
-// apply to it.
+// a branch whose upstream does not resolve (none configured, or its tracking ref
+// pruned) is pushed to origin by name, so routing keys do not apply to it.
 async function backupPushRemote(
   git: (args: string[]) => ReturnType<typeof runGit>,
 ): Promise<{ branch: string; remote: string; key: string } | null> {
   const head = await git(['symbolic-ref', '--short', '-q', 'HEAD'])
   const branch = head.exitCode === 0 ? head.stdout.trim() : ''
   if (branch.length === 0) return null
-  const tracked = await Promise.all(
-    ['remote', 'merge'].map(
-      async (field) => (await git(['config', '--get', `branch.${branch}.${field}`])).exitCode === 0,
-    ),
-  )
-  if (!tracked.every(Boolean)) return { branch, remote: 'origin', key: 'the default' }
+  const upstream = await git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'])
+  if (upstream.exitCode !== 0 || upstream.stdout.trim().length === 0) {
+    return { branch, remote: 'origin', key: 'the default' }
+  }
   for (const key of [`branch.${branch}.pushRemote`, 'remote.pushDefault', `branch.${branch}.remote`]) {
     const value = await git(['config', '--get', key])
     if (value.exitCode === 0 && value.stdout.trim().length > 0) return { branch, remote: value.stdout.trim(), key }

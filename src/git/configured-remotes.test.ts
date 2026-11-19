@@ -110,10 +110,24 @@ describe('syncConfiguredGitRemotes', () => {
   })
 
   // A tracked branch: the backup runner pushes it with a bare `git push`.
-  async function trackedMain(repo: string, upstream: string): Promise<void> {
+  // main tracks <upstream>/main the way `git push -u` leaves it: the branch
+  // config plus the tracking ref, unless `withTrackingRef` is false (pruned).
+  async function trackedMain(repo: string, upstream: string, withTrackingRef = true): Promise<void> {
     await git(repo, ['symbolic-ref', 'HEAD', 'refs/heads/main'])
+    await git(repo, [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      'commit',
+      '-q',
+      '--allow-empty',
+      '-m',
+      'init',
+    ])
     await git(repo, ['config', 'branch.main.remote', upstream])
     await git(repo, ['config', 'branch.main.merge', 'refs/heads/main'])
+    if (withTrackingRef) await git(repo, ['update-ref', `refs/remotes/${upstream}/main`, 'HEAD'])
   }
 
   test.each([
@@ -144,6 +158,19 @@ describe('syncConfiguredGitRemotes', () => {
     const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
 
     // then: the first backup push goes to origin by name
+    expect(warnings).toEqual([])
+  })
+
+  test('does not warn when the tracking ref is pruned, since backup then pushes to origin by name', async () => {
+    // given: main has upstream config but its tracking ref is gone, and pushes default elsewhere
+    const repo = await agentRepo()
+    await git(repo, ['remote', 'add', 'mirror', 'https://example.com/mirror.git'])
+    await trackedMain(repo, 'origin', false)
+    await git(repo, ['config', 'remote.pushDefault', 'mirror'])
+
+    const { warnings } = await syncConfiguredGitRemotes(repo, { origin: 'https://example.com/new.git' })
+
+    // then: @{upstream} does not resolve, so the backup runner pushes to origin
     expect(warnings).toEqual([])
   })
 
