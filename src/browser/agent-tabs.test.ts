@@ -5,7 +5,7 @@ import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { createBrowserSessions } from './agent-tabs'
+import { AgentTabRegistry, createBrowserSessions, TAB_CAP, TAB_IDLE_MS, TAB_RECENT_MS } from './agent-tabs'
 import { cdpWebSocketUrl, startCdpRelay } from './relay'
 
 const MASTER_TOKEN = 'm'.repeat(64)
@@ -46,8 +46,10 @@ type FakeChrome = {
   holdCreates: () => Hold
   holdDiscovery: () => Hold
   holdVersion: () => Hold
+  holdList: () => Hold
   holdClose: () => Hold
   attachOthers: (targetId: string) => void
+  failNextClose: () => void
   upgrades: () => number
   nextClose: () => Promise<string>
   nextDisconnect: () => Promise<void>
@@ -55,7 +57,7 @@ type FakeChrome = {
 
 // Stands in for Chrome's DevTools socket: creates numbered tabs, announces
 // targets to discovering clients (existing ones first, before the discovery
-// reply, like Chrome), and records `/json/close` calls. It negotiates
+// reply, like Chrome), lists open tabs, and records `/json/close` calls. It negotiates
 // compression whenever a client offers it, like Chrome does.
 async function startFakeChrome(): Promise<FakeChrome> {
   const socket = join(tmpdir(), `typeclaw-tabs-${randomUUID()}.sock`)
@@ -68,7 +70,9 @@ async function startFakeChrome(): Promise<FakeChrome> {
   let heldCreates: ReturnType<typeof createHold> | undefined
   let heldDiscovery: ReturnType<typeof createHold> | undefined
   let heldVersion: ReturnType<typeof createHold> | undefined
+  let heldList: ReturnType<typeof createHold> | undefined
   let heldClose: ReturnType<typeof createHold> | undefined
+  let failClose = false
   let upgrades = 0
   let nextTab = 0
   const announce = (ws: Bun.ServerWebSocket<undefined>, targetId: string, openerId: string | undefined) =>
@@ -88,8 +92,18 @@ async function startFakeChrome(): Promise<FakeChrome> {
         if (hold === undefined) return version()
         return new Promise<Response>((resolve) => hold.arrive(() => resolve(version())))
       }
+      if (url.pathname === '/json/list') {
+        const list = Response.json([...open.keys()].map((id) => ({ id, type: 'page' })))
+        const hold = heldList
+        if (hold === undefined) return list
+        return new Promise<Response>((resolve) => hold.arrive(() => resolve(list)))
+      }
       if (url.pathname.startsWith('/json/close/')) {
         const targetId = decodeURIComponent(url.pathname.slice('/json/close/'.length))
+        if (failClose) {
+          failClose = false
+          return new Response('busy', { status: 500 })
+        }
         const close = () => {
           closed.push(targetId)
           open.delete(targetId)
@@ -161,11 +175,13 @@ async function startFakeChrome(): Promise<FakeChrome> {
     holdDiscovery: () => (heldDiscovery = createHold()),
     holdVersion: () => (heldVersion = createHold()),
     upgrades: () => upgrades,
+    holdList: () => (heldList = createHold()),
     holdClose: () => (heldClose = createHold()),
     attachOthers: (targetId) => {
       const attached = { method: 'Target.attachedToTarget', params: { targetInfo: { targetId, type: 'page' } } }
       for (const ws of autoAttaching) ws.send(JSON.stringify(attached))
     },
+    failNextClose: () => void (failClose = true),
     nextClose: () => new Promise((resolve) => closeWaiters.push(resolve)),
     nextDisconnect: () => new Promise((resolve) => disconnects.push(resolve)),
   }
@@ -199,9 +215,9 @@ async function connectCdp(url: string): Promise<CdpClient & { closed: Promise<vo
   }
 }
 
-async function setup() {
+async function setup(now: () => number = Date.now) {
   const chrome = await startFakeChrome()
-  const sessions = createBrowserSessions(chrome.socket)
+  const sessions = createBrowserSessions(chrome.socket, now)
   const relay = await startCdpRelay({ token: MASTER_TOKEN, upstreamSocket: chrome.socket, sessions: sessions.relay })
   cleanups.push(() => relay.close())
   const connectAs = (sessionId: string) => connectCdp(cdpWebSocketUrl(relay.port, sessions.tokenFor(sessionId)))
@@ -599,5 +615,154 @@ describe('session-owned browser tabs', () => {
 
     expect((await fetch(`http://127.0.0.1:${relay.port}/json/version?token=${token}`)).status).toBe(401)
     expect((await fetch(`http://127.0.0.1:${relay.port}/json/version?token=${MASTER_TOKEN}`)).status).toBe(200)
+  })
+})
+
+describe('idle and over-cap tab reaping', () => {
+  const MINUTE = 60_000
+
+  test('closes tabs idle past the limit and keeps those a connected script still holds', () => {
+    const registry = new AgentTabRegistry()
+    registry.created('idle-session', 'idle-tab', 0)
+    registry.created('busy-session', 'busy-tab', 0)
+    registry.connected('busy-session')
+
+    expect(registry.reapable(TAB_IDLE_MS - 1)).toEqual([])
+    expect(registry.reapable(TAB_IDLE_MS)).toEqual(['idle-tab'])
+  })
+
+  test('over the cap, closes the least recently used first and spares recently used tabs', () => {
+    const registry = new AgentTabRegistry()
+    const total = TAB_CAP + 3
+    for (let i = 0; i < total; i++) registry.created('session', `T${i}`, i * MINUTE)
+
+    expect(registry.reapable((total - 1) * MINUTE)).toEqual(['T0', 'T1', 'T2'])
+  })
+
+  test('never goes below the cap by closing tabs used within the recent window', () => {
+    const registry = new AgentTabRegistry()
+    for (let i = 0; i < TAB_CAP + 2; i++) registry.created('session', `T${i}`, 0)
+
+    expect(registry.reapable(TAB_RECENT_MS - 1)).toEqual([])
+  })
+
+  test('a script disconnecting counts as use of every tab its session owns', () => {
+    const registry = new AgentTabRegistry()
+    registry.created('session', 'tab', 0)
+    registry.connected('session')
+
+    registry.disconnected('session', 10 * MINUTE)
+
+    expect(registry.reapable(TAB_IDLE_MS)).toEqual([])
+    expect(registry.reapable(10 * MINUTE + TAB_IDLE_MS)).toEqual(['tab'])
+  })
+
+  test('reaps an idle tab through the relay once its script disconnects, and forgets tabs a page closed itself', async () => {
+    let clock = 0
+    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    await observe()
+    const client = await connectAs('session-a')
+    const kept = await openTab(client)
+    chrome.closeFromPage(await openTab(client))
+
+    relay.disconnect('session-a')
+    await client.closed
+    clock = TAB_IDLE_MS
+
+    expect(await sessions.reap()).toEqual({ closed: 1, failed: 0 })
+    expect(chrome.closed).toEqual([kept])
+    expect(await sessions.end('session-a')).toBe(0)
+  })
+
+  test('keeps a tab opened while the sweep was waiting for the page list', async () => {
+    const { chrome, sessions, connectAs } = await setup()
+    const client = await connectAs('session-a')
+    const first = await openTab(client)
+    const hold = chrome.holdList()
+    const reaping = sessions.reap()
+    await hold.received
+
+    const second = await openTab(client)
+    hold.release()
+    await reaping
+
+    expect(await sessions.end('session-a')).toBe(2)
+    expect(chrome.closed.toSorted()).toEqual([first, second].toSorted())
+  })
+
+  test('does not sweep while the observer is behind, and sweeps once it catches up', async () => {
+    let clock = 0
+    const { chrome, sessions, relay, connectAs, startObserver } = await setup(() => clock)
+    const client = await connectAs('session-a')
+    const tab = await openTab(client)
+    relay.disconnect('session-a')
+    await client.closed
+    const unreachable = sessions.observe('ws://127.0.0.1:9/devtools/browser/unreachable')
+    cleanups.push(() => unreachable.stop())
+    clock = TAB_IDLE_MS
+
+    expect(await sessions.reap()).toEqual({ closed: 0, failed: 0 })
+    await startObserver().ready
+    expect(await sessions.reap()).toEqual({ closed: 1, failed: 0 })
+    expect(chrome.closed).toEqual([tab])
+  })
+
+  test('retries a tab whose close failed on the next sweep', async () => {
+    let clock = 0
+    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    await observe()
+    const client = await connectAs('session-a')
+    const tab = await openTab(client)
+    relay.disconnect('session-a')
+    await client.closed
+    clock = TAB_IDLE_MS
+
+    chrome.failNextClose()
+    expect(await sessions.reap()).toEqual({ closed: 0, failed: 1 })
+    expect(await sessions.reap()).toEqual({ closed: 1, failed: 0 })
+    expect(chrome.closed).toEqual([tab])
+  })
+
+  test('lets a reconnecting owner through once the bounded wait ends, even if Chrome never answers the close', async () => {
+    let clock = 0
+    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    await observe()
+    const client = await connectAs('session-a')
+    await openTab(client)
+    relay.disconnect('session-a')
+    await client.closed
+    clock = TAB_IDLE_MS
+
+    const hold = chrome.holdClose()
+    const reaping = sessions.reap()
+    await hold.received
+    await connectAs('session-a')
+
+    hold.release()
+    expect(await reaping).toEqual({ closed: 1, failed: 0 })
+  })
+
+  test('holds a reconnecting owner until the sweep closing its tabs has finished', async () => {
+    let clock = 0
+    const { chrome, sessions, relay, connectAs, observe } = await setup(() => clock)
+    await observe()
+    const client = await connectAs('session-a')
+    await openTab(client)
+    relay.disconnect('session-a')
+    await client.closed
+    clock = TAB_IDLE_MS
+    const upgradesBefore = chrome.upgrades()
+
+    const hold = chrome.holdClose()
+    const reaping = sessions.reap()
+    await hold.received
+    const reconnecting = connectAs('session-a')
+    await connectAs('session-b')
+    expect(chrome.upgrades()).toBe(upgradesBefore + 1)
+
+    hold.release()
+    expect(await reaping).toEqual({ closed: 1, failed: 0 })
+    await reconnecting
+    expect(chrome.upgrades()).toBe(upgradesBefore + 2)
   })
 })

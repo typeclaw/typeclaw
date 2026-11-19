@@ -29,7 +29,7 @@ console.log(compactSnapshot(await page.snapshot())) // refs like [ref=e1]
 await page.locator('e1').click()
 ```
 
-Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for your next script and close when your session ends.
+Always connect with `await using browser = await connect(...)`, as above. With a plain `const`, the open connection keeps Bun running, so the script prints its output and then hangs until the bash timeout kills it. `await using` also closes the connection when the script throws. Tabs made with `createAgentTabs` stay open for your next script and close when your session ends or after 15 minutes unused.
 
 A "Command timed out" result after the script printed output means the script did not exit, not that the browser or the site failed. Do not report a browser timeout and do not blindly rerun it: its actions (a click, a submit) may already have gone through. Reattach to the tab with `attachPage`, snapshot it, and continue from what the page shows; repeat a step only if the page shows it did not happen.
 
@@ -114,7 +114,7 @@ async function humanType(page, ref, text) {
 
 ## Shared browser rules
 
-- One TypeClaw-managed Chrome serves every engine and every session that has `browser.shared`. Logins persist across bash calls and sessions. Tabs your session opens persist across its bash calls and close when the session ends, so reopen the page in a later session instead of looking for an old tab.
+- One TypeClaw-managed Chrome serves every engine and every session that has `browser.shared`. Logins persist across bash calls and sessions. Tabs your session opens persist across its bash calls and close when the session ends or after 15 minutes unused, so reopen the page in a later session instead of looking for an old tab.
 - Work only in tabs you opened. Never navigate or close a tab another engine or session is using.
 - Files: downloads land in `$TYPECLAW_BROWSER_FILES`; to upload a file, copy it there first and pass that path. Chrome cannot see other paths.
 - The browser runs in its own sandbox with no view of the agent folder, so `file://` URLs outside `$TYPECLAW_BROWSER_FILES` fail by design.
