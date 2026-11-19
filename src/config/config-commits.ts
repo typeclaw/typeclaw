@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import {
   closeSync,
   constants,
@@ -88,6 +89,10 @@ type Window = {
   uncoordinatedReason?: string
   // Set when a rollback could not advance the epoch: the record outlives the window.
   keepRecord?: boolean
+  // The record this window published, if any. A window only ever removes its
+  // own record, and an uncoordinated window (which never published) none.
+  owner: string
+  published: boolean
 }
 
 let configReadHook: ((stage: 'after-window' | 'after-live') => void) | undefined
@@ -284,8 +289,10 @@ export async function closeConfigWindow(file: string, call: symbol): Promise<voi
     settleWindow(file, window)
     return
   }
-  // The close bumps the epoch under the lock, as the open did.
-  await withConfigFileLock(file, async () => settleWindow(file, window)).catch(() => settleWindow(file, window))
+  // The record is removed only after the epoch advances under the lock.
+  await withConfigFileLock(file, async () => settleWindow(file, window)).catch((error: unknown) =>
+    keepRecord(file, window, `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`),
+  )
 }
 
 // Bumped when a window opens, closes, or rolls a change back, and kept when the
@@ -415,7 +422,11 @@ export function readValidatedConfigFileSync(file: string): string {
   if (!sameConfigContent(live, trusted)) return textOf(file, trusted)
   if (window.recovery) {
     window.recovery = false
-    settleWindow(file, window)
+    try {
+      withConfigFileLockSync(file, () => settleWindow(file, window))
+    } catch (error) {
+      keepRecord(file, window, `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`)
+    }
   }
   return textOf(file, live)
 }
@@ -459,8 +470,15 @@ export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
           recordConfigCommitSync(file, contentOf(trusted))
           reverted = true
         }
-        rmSync(windowPath(file), { force: true })
-        bumpConfigEpochSync(file)
+        // The epoch advances before the record goes; if it cannot, the record
+        // stays, so host readers keep using its trusted bytes.
+        const bumped = bumpConfigEpochSync(file)
+        if (bumped.ok) rmSync(windowPath(file), { force: true })
+        else {
+          console.warn(
+            `[typeclaw] ${bumped.reason}; the agent's ${name} state at ${windowPath(file)} stays published, so host typeclaw commands keep using the last authorized ${name}`,
+          )
+        }
       })
     } catch (error) {
       throw new Error(
@@ -598,6 +616,8 @@ function captureWindow(file: string, uncoordinatedReason?: string): void {
     recovery: false,
     coordinated: uncoordinatedReason === undefined,
     ...(uncoordinatedReason === undefined ? {} : { uncoordinatedReason }),
+    owner: randomUUID(),
+    published: false,
   }
   windows.set(key, window)
   if (window.coordinated) {
@@ -622,23 +642,41 @@ function settleWindow(file: string, window: Window): void {
     return
   }
   windows.delete(resolve(file))
+  // Callers hold the config lock. Only this window's own record is removed, and
+  // only once the epoch has advanced; otherwise a host read could miss the whole
+  // window, so the record stays and host readers keep its trusted bytes.
+  if (!window.published || recordOwner(file) !== window.owner) return
+  if (window.keepRecord === true) {
+    keepRecord(file, window, `the ${basename(file)} window epoch could not be advanced during a rollback`)
+    return
+  }
   const bumped = bumpConfigEpochSync(file)
-  if (!bumped.ok || window.keepRecord === true) {
-    // Without an epoch advance a host read could miss this window entirely, so
-    // its record stays and host readers keep using the trusted bytes.
-    if (window.coordinated) {
-      console.warn(
-        `[typeclaw] ${bumped.ok ? `the ${basename(file)} window epoch could not be advanced during a rollback` : bumped.reason}; the agent's open ${basename(file)} state stays published until it restarts`,
-      )
-      return
-    }
+  if (!bumped.ok) {
+    keepRecord(file, window, bumped.reason)
+    return
   }
   try {
     rmSync(windowPath(file), { force: true })
   } catch (error) {
-    console.warn(
-      `[typeclaw] could not clear the published ${basename(file)} state (${errorText(error)}); host typeclaw config commands keep building on the last authorized ${basename(file)} until the agent restarts`,
-    )
+    keepRecord(file, window, `the record could not be removed: ${errorText(error)}`)
+  }
+}
+
+function keepRecord(file: string, window: Window, reason: string): void {
+  windows.delete(resolve(file))
+  if (!window.published) return
+  console.warn(
+    `[typeclaw] ${reason}; the agent's ${basename(file)} state at ${windowPath(file)} stays published until the agent restarts, so host typeclaw commands keep using the last authorized ${basename(file)}`,
+  )
+}
+
+function recordOwner(file: string): string | undefined {
+  try {
+    const raw = readWindowRawSync(file)
+    const record = raw === undefined ? undefined : (JSON.parse(raw) as unknown)
+    return isRecord(record) && typeof record.owner === 'string' ? record.owner : undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -650,7 +688,9 @@ function publishWindow(file: string, window: Window): void {
       generation: window.generation ?? 0,
       content: bytes === undefined ? null : bytes.toString('base64'),
       entry: describeEntry(window.trusted),
+      owner: window.owner,
     })
+    window.published = true
   } catch (error) {
     window.coordinated = false
     window.uncoordinatedReason = `the agent's ${basename(file)} state could not be written to ${windowPath(file)}: ${errorText(error)}; make that path writable (restarting the agent clears it)`

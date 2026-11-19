@@ -8746,6 +8746,32 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
   )
 
   test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
+    'under coordination failure a hard-linked typeclaw.json refuses that one call and nothing runs',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: typeclaw.json has a writable second hard link and its window cannot be published
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
+        await mkdir(path.join(agentDir, 'workspace'))
+        await link(config, path.join(agentDir, 'workspace', 'alias.json'))
+        await mkdir(path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json', 'occupied'), {
+          recursive: true,
+        })
+        const { run, argv } = bwrapBash(agentDir)
+
+        // when: a command runs
+        const text = await run(`printf '%s\\n' '{"alias":["renamed"]}' > workspace/alias.json; touch ran-marker`)
+
+        // then: it was refused, no sandbox was built, and nothing ran
+        expect(text).toContain('typeclaw.json has another hard link, so it cannot be made read-only')
+        expect(argv).toEqual([])
+        expect(await Bun.file(path.join(agentDir, 'ran-marker')).exists()).toBe(false)
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      })
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
     'under coordination failure a missing cron.json refuses that one call and nothing runs',
     async () => {
       await withAgentDir(async (agentDir, config) => {

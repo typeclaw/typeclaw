@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -9,6 +9,7 @@ import {
   __setConfigReadHookForTests,
   readValidatedConfigFileSync,
   recordConfigCommitSync,
+  reconcileLeftoverConfigWindowsSync,
 } from '@/config/config-commits'
 
 import {
@@ -425,8 +426,19 @@ test('a close whose epoch cannot advance keeps the window record, so host reads 
 
     // then: the record stays, and a host read uses its trusted bytes over unchecked ones on disk
     expect(existsSync(window)).toBe(true)
+    const kept = await readFile(window, 'utf8')
     await writeFile(config, '{"alias":["unchecked"]}\n')
     expect(readValidatedConfigFileSync(config)).toBe(trusted)
+
+    // when: a later window opens uncoordinated (its epoch cannot advance either) and closes
+    await writeFile(config, trusted)
+    await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
+    const later = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    expect(later.readOnly).toBeDefined()
+    await recheckManagedConfigAfterBash(later)
+
+    // then: its cleanup leaves the earlier record exactly as it was
+    expect(await readFile(window, 'utf8')).toBe(kept)
   } finally {
     __failConfigEpochWritesForTests(false)
     await rm(agentDir, { recursive: true, force: true })
@@ -533,6 +545,62 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
     expect(await readFile(config, 'utf8')).toBe(granted)
     expect(JSON.parse(granted)).toMatchObject({ alias: ['atlas'], roles: { trusted: { match: ['discord:user:9'] } } })
     expect(await readFile(oldTarget, 'utf8')).toBe('{"alias":["rejected"]}\n')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('startup recovery whose epoch cannot advance keeps the window record, so host reads stay on trusted bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-startup-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+  const window = path.join(staging, 'typeclaw.json.window.json')
+  const trusted = '{"alias":["atlas"]}\n'
+  try {
+    // given: a leftover window over rejected bytes, and epoch writes that fail
+    await mkdir(staging, { recursive: true })
+    await writeFile(
+      window,
+      JSON.stringify({
+        generation: 0,
+        content: Buffer.from(trusted).toString('base64'),
+        entry: { kind: 'file', mode: 0o644 },
+      }),
+    )
+    await writeFile(config, '{"alias":["rejected"]}\n')
+    __failConfigEpochWritesForTests(true)
+
+    // when: startup reconciles
+    reconcileLeftoverConfigWindowsSync(agentDir)
+
+    // then: the file is restored, startup did not fail, the record stays, and a host read keeps trusted bytes
+    expect(await readFile(config, 'utf8')).toBe(trusted)
+    expect(existsSync(window)).toBe(true)
+    await writeFile(config, '{"alias":["unchecked"]}\n')
+    expect(readValidatedConfigFileSync(config)).toBe(trusted)
+  } finally {
+    __failConfigEpochWritesForTests(false)
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('under coordination failure a hard-linked typeclaw.json refuses the call', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-readonly-hardlink-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  try {
+    // given: typeclaw.json has a second hard link and its window cannot be published
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
+    await mkdir(path.join(agentDir, 'workspace'))
+    await link(config, path.join(agentDir, 'workspace', 'alias.json'))
+    await mkdir(path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json', 'occupied'), {
+      recursive: true,
+    })
+
+    // when / then: a read-only bind could not hold its bytes, so the call is refused
+    await expect(snapshotManagedConfigFiles(agentDir, async () => undefined)).rejects.toThrow(
+      /This command was not run: the agent could not coordinate config writes[\s\S]*typeclaw\.json has another hard link, so it cannot be made read-only/,
+    )
   } finally {
     await rm(agentDir, { recursive: true, force: true })
   }

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { constants, createWriteStream, lstatSync, statSync, type Stats } from 'node:fs'
+import { closeSync, constants, createWriteStream, fstatSync, lstatSync, openSync, statSync, type Stats } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -1004,7 +1004,8 @@ export async function snapshotManagedConfigFiles(
 
 // Only a regular file at its fixed agent-root path can be held read-only: a
 // read-only bind cannot stop a missing path from being created, or a symlink's
-// directory entry from being replaced.
+// directory entry from being replaced. It binds the path, not the inode, so the
+// file must also have no other hard link that would keep its bytes writable.
 function readOnlyTarget(destination: string): { path: string } | { refuse: string } {
   const name = path.basename(destination)
   let entry: Stats
@@ -1013,9 +1014,29 @@ function readOnlyTarget(destination: string): { path: string } | { refuse: strin
   } catch {
     return { refuse: `${name} does not exist, so it cannot be made read-only for it` }
   }
-  if (entry.isFile()) return { path: destination }
+  if (entry.isFile()) {
+    return singleLinkOnOpen(destination, entry)
+      ? { path: destination }
+      : { refuse: `${name} has another hard link, so it cannot be made read-only for it` }
+  }
   if (entry.isSymbolicLink()) return { refuse: `${name} is a symlink, so it cannot be made read-only for it` }
   return { refuse: `${name} is not a regular file, so it cannot be made read-only for it` }
+}
+
+function singleLinkOnOpen(destination: string, entry: Stats): boolean {
+  if (entry.nlink !== 1) return false
+  let fd: number
+  try {
+    fd = openSync(destination, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+  } catch {
+    return false
+  }
+  try {
+    const opened = fstatSync(fd)
+    return opened.isFile() && opened.nlink === 1 && opened.dev === entry.dev && opened.ino === entry.ino
+  } finally {
+    closeSync(fd)
+  }
 }
 
 // Prepended to the result of a call that ran with the config files read-only.
