@@ -51,7 +51,7 @@ import { RecoveryOutbox } from '@/channels/recovery-outbox'
 import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
 import { retainCodingAgentService } from '@/coding-agent'
 import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
-import { clearPublishedConfigWindowsSync } from '@/config/config-commits'
+import { markRuntimeOwnsConfigWindows, reconcileLeftoverConfigWindowsSync } from '@/config/config-commits'
 import {
   type CountStore,
   type CronConsumer,
@@ -280,7 +280,8 @@ async function startAgentRuntime(
   let sigtermHandler: (() => void) | null = null
   registerBootCleanup(disposeProcessGlobals)
 
-  clearPublishedConfigWindowsSync(cwd)
+  reconcileLeftoverConfigWindowsSync(cwd)
+  markRuntimeOwnsConfigWindows()
   const { config: cwdConfig, pluginConfigs: pluginConfigsByName } = loadConfigBundleSync(cwd)
   const githubTokenBridge = createGithubTokenBridge({
     // Only names the operator declared in .env: the runtime-exported identity

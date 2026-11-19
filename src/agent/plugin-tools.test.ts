@@ -8106,6 +8106,63 @@ describe('managed config recheck after bash', () => {
     return { hooks, checked }
   }
 
+  // A host grant that takes the config lock, reports READY, and waits for
+  // `go` on a FIFO before it commits, holding the lock throughout.
+  async function hostGrantHoldingLock(agentDir: string, matchRule: string) {
+    const go = path.join(agentDir, 'go.fifo')
+    expect(await Bun.spawn(['mkfifo', go]).exited).toBe(0)
+    const proc = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { readFileSync } from 'node:fs'
+import { withConfigFileLockSync } from './src/config/config-file-lock.ts'
+import { grantRole } from './src/permissions/grant.ts'
+withConfigFileLockSync(${JSON.stringify(path.join(agentDir, 'typeclaw.json'))}, () => {
+  console.log('READY')
+  readFileSync(${JSON.stringify(go)})
+  const r = grantRole({ cwd: ${JSON.stringify(agentDir)}, roleName: 'trusted', matchRule: ${JSON.stringify(matchRule)} })
+  if (!r.ok) { console.error(r.reason); process.exit(1) }
+})`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'pipe',
+      stderr: 'inherit',
+    })
+    const reader = proc.stdout.getReader()
+    let seen = ''
+    while (!seen.includes('READY')) {
+      const chunk = await reader.read()
+      if (chunk.done) throw new Error('host grant exited before taking the lock')
+      seen += new TextDecoder().decode(chunk.value)
+    }
+    return {
+      async commit() {
+        const writer = await open(go, 'w')
+        await writer.write('go\n')
+        await writer.close()
+        expect(await proc.exited).toBe(0)
+      },
+    }
+  }
+
+  async function hostGrantResult(agentDir: string, matchRule: string) {
+    const proc = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { grantRole } from './src/permissions/grant.ts'
+const r = grantRole({ cwd: ${JSON.stringify(agentDir)}, roleName: 'trusted', matchRule: ${JSON.stringify(matchRule)} })
+if (!r.ok) { console.error(r.reason); process.exit(1) }`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'pipe',
+    })
+    const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()])
+    return { code, stderr }
+  }
+
   // A host CLI grant (`typeclaw role`), run in its own process like the CLI.
   async function hostGrant(agentDir: string, matchRule: string): Promise<void> {
     const grant = Bun.spawn({
@@ -8477,6 +8534,76 @@ describe('managed config recheck after bash', () => {
       const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
       expect(after.alias).toEqual(['atlas', '아틀라스'])
       expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+    })
+  })
+
+  test('a host commit holding the lock when bash opens its first window becomes the baseline', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: a host grant holds the config lock, not yet committed
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const { hooks, checked } = guardHooks(agentDir)
+      const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
+
+      // when: a bash call starts, waits for the lock, and edits the alias on top of the grant
+      const execution = runBash(
+        agentDir,
+        hooks,
+        `c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
+      )
+      await host.commit()
+      const text = await execution
+
+      // then: the grant is the baseline, so the edit is checked and only the alias is new
+      expect(checked).toHaveLength(1)
+      expect(checked[0]).toContain('discord:user:9')
+      expect(text).not.toContain('reverted')
+      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+      expect(after.alias).toEqual(['atlas', '아틀라스'])
+      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+    })
+  })
+
+  test('when the window cannot be published, a host commit during the call does not exempt the bash edit', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: window state cannot be published (a directory sits at its path)
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+      await mkdir(path.join(blocker, 'occupied'), { recursive: true })
+      const { hooks } = guardHooks(agentDir)
+      const hold = await holdBash(agentDir)
+      const execution = runBash(
+        agentDir,
+        hooks,
+        `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
+      )
+      const release = await hold.reached()
+
+      // when: with no published window, a host grant builds on the live file, bash's edit included
+      await rm(blocker, { recursive: true })
+      await hostGrant(agentDir, 'discord:user:9')
+      await release()
+      const text = await execution
+
+      // then: the bash edit is still checked and reverted, and the notice says why
+      expect(text).toMatch(/rolePromotion/)
+      expect(text).toContain('could not be coordinated with host typeclaw commands')
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    })
+  })
+
+  test('a host mutation stops on unreadable window state and leaves typeclaw.json unchanged', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+      await mkdir(staging, { recursive: true })
+      await writeFile(path.join(staging, 'typeclaw.json.window.json'), '{not json')
+
+      const result = await hostGrantResult(agentDir, 'discord:user:9')
+
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain('typeclaw.json.window.json could not be read')
+      expect(result.stderr).toContain('typeclaw restart')
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
     })
   })
 

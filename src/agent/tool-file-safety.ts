@@ -31,7 +31,7 @@ import {
   identityOf,
   MANAGED_CONFIG_FILES,
   noteConfigWriteSync,
-  openConfigWindowSync,
+  openConfigWindow,
   readConfigEntrySync,
   recordConfigCommitSync,
   restoreConfigEntrySync,
@@ -952,13 +952,16 @@ export type ManagedConfigGuardCheck = ConfigCallGuard
 
 export type RecheckSeams = { writeInPlace?: (path: string, bytes: Buffer) => void }
 
-export function snapshotManagedConfigFiles(agentDir: string, guard: ManagedConfigGuardCheck): ManagedConfigSnapshot {
+export async function snapshotManagedConfigFiles(
+  agentDir: string,
+  guard: ManagedConfigGuardCheck,
+): Promise<ManagedConfigSnapshot> {
   const call = Symbol('bash call')
   const files = new Map<string, { identity: CallIdentity; generation: number | undefined }>()
   try {
     for (const file of MANAGED_CONFIG_FILES) {
       const destination = path.join(path.resolve(agentDir), file)
-      const generation = openConfigWindowSync(destination, call, guard)
+      const generation = await openConfigWindow(destination, call, guard)
       files.set(destination, { identity: callIdentity(destination), generation })
     }
   } catch (error) {
@@ -1022,7 +1025,7 @@ async function recheckManagedEntry(
     withConfigFileLock(destination, async () => {
       locked = true
       const live = readConfigEntrySync(destination)
-      const { entry: trusted, commit } = trustedConfigState(destination)
+      const { entry: trusted, commit, coordinated } = trustedConfigState(destination)
       if (sameConfigContent(live, trusted)) {
         setConfigRecovery(destination, false)
         const committedDuringCall =
@@ -1039,7 +1042,7 @@ async function recheckManagedEntry(
         recordConfigCommitSync(destination, live.bytes)
         return undefined
       }
-      return revert(destination, live, trusted, reason, seams)
+      return revert(destination, live, trusted, reason, seams, coordinated)
     }),
   )
   checkedWrites = recheck.catch(() => {})
@@ -1097,8 +1100,14 @@ function revert(
   revertTo: ConfigFileEntry,
   reason: string,
   seams: RecheckSeams,
+  coordinated = true,
 ): string {
   const name = path.basename(destination)
+  const uncoordinated = coordinated
+    ? []
+    : [
+        `This command could not be coordinated with host typeclaw commands, so ${name} was checked against the last state the agent knew; a typeclaw command run on the host during this command may need to be run again.`,
+      ]
   const now = readConfigEntrySync(destination)
   if (!sameConfigContent(now, live)) {
     return [
@@ -1121,6 +1130,7 @@ function revert(
     `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
     `blocked: ${reason}`,
     `Every change this command made to ${name} was discarded, not only the blocked one. Redo the allowed changes with the write or edit tool, which check ${name} before writing; a guard that accepts an acknowledgement accepts it only there.`,
+    ...uncoordinated,
   ].join('\n')
 }
 

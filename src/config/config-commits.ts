@@ -8,7 +8,6 @@ import {
   openSync,
   readFileSync,
   readlinkSync,
-  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -21,6 +20,8 @@ import {
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { CREDENTIAL_STAGING_RELATIVE_DIR, ensureOwnerOnlyDir } from '@/init/staged-write'
+
+import { withConfigFileLock, withConfigFileLockSync } from './config-file-lock'
 
 // typeclaw.json and cron.json are guarded on every write/edit, but model bash for
 // roles that keep agent-root writes changes them directly and is checked only
@@ -72,6 +73,10 @@ type Window = {
   // A blocked change whose rollback failed: the trusted view stays in force,
   // even with no call in flight, until the file is back to an authorized state.
   recovery: boolean
+  // False once the window could not be captured under the config lock or
+  // published: a host command may then have built on unchecked bytes, so its
+  // commits are not trusted to skip the post-bash check.
+  coordinated: boolean
 }
 
 const windows = new Map<string, Window>()
@@ -79,6 +84,9 @@ const baselineOverride = new AsyncLocalStorage<{ file: string; bytes: Buffer | u
 // Set by a guard-free writer's baseline read when the file held a bash candidate
 // that its write replaces; consumed by the commit it records under the same lock.
 const supersededCandidates = new Set<string>()
+// Set in the container runtime, which owns the in-process windows. Any other
+// process (host CLI) reads the state the runtime published instead.
+let runtimeOwnsWindows = false
 
 export function readConfigEntrySync(file: string): ConfigFileEntry {
   const link = lstatOrUndefined(file)
@@ -180,7 +188,11 @@ export function tryRecordConfigCommitSync(file: string, content: string | Buffer
 export function readConfigForWriteSync(file: string): string {
   const key = resolve(file)
   supersededCandidates.delete(key)
-  const trusted = windows.has(key) ? trustedConfigState(file).entry : publishedTrustedEntry(file)
+  const trusted = windows.has(key)
+    ? trustedConfigState(file).entry
+    : runtimeOwnsWindows
+      ? undefined
+      : publishedTrustedEntry(file)
   if (trusted === undefined) return textOf(file, readConfigEntrySync(file))
   if (!sameConfigContent(readConfigEntrySync(file), trusted)) supersededCandidates.add(key)
   return textOf(file, trusted)
@@ -201,22 +213,35 @@ export function noteConfigWriteSync(file: string, bytes: string | Buffer): void 
 
 // Opened by each bash call before it runs and closed after its post-call check.
 // The first open captures the file as trusted: no unchecked bash bytes can be
-// on disk while no bash call is in flight and no rollback is unrecovered.
-export function openConfigWindowSync(file: string, call: symbol, guard: ConfigCallGuard): number | undefined {
+// on disk while no bash call is in flight and no rollback is unrecovered. That
+// capture and its publication hold the config lock, which host writers hold from
+// read to write, so a host commit either lands first (and is the baseline) or
+// reads the published window. A lock that cannot be taken in time never blocks
+// the bash call: its window is kept in process only, as uncoordinated.
+export async function openConfigWindow(
+  file: string,
+  call: symbol,
+  guard: ConfigCallGuard,
+): Promise<number | undefined> {
   const key = resolve(file)
-  let window = windows.get(key)
-  if (window === undefined) {
-    window = {
-      calls: new Map(),
-      trusted: readConfigEntrySync(file),
-      generation: readConfigCommitSync(file)?.generation,
-      recovery: false,
+  if (!windows.has(key)) {
+    try {
+      await withConfigFileLock(file, async () => captureWindow(file, true))
+    } catch (error) {
+      if (!windows.has(key)) {
+        console.warn(
+          `[typeclaw] could not take the ${basename(file)} lock to coordinate a bash command with host typeclaw commands (${errorText(error)}); its changes to ${basename(file)} are checked against the last state known to the agent`,
+        )
+        captureWindow(file, false)
+      }
     }
-    windows.set(key, window)
-    publishWindow(file, window)
   }
-  window.calls.set(call, guard)
+  windows.get(key)?.calls.set(call, guard)
   return trustedConfigState(file).generation
+}
+
+export function markRuntimeOwnsConfigWindows(): void {
+  runtimeOwnsWindows = true
 }
 
 export function closeConfigWindow(file: string, call: symbol): void {
@@ -232,17 +257,24 @@ export function trustedConfigState(file: string): {
   entry: ConfigFileEntry
   generation: number | undefined
   commit: ConfigCommit | undefined
+  coordinated: boolean
 } {
   const window = windows.get(resolve(file))
   if (window === undefined) throw new Error(`${basename(file)} has no open bash config window`)
   const commit = readConfigCommitSync(file)
-  if (commit !== undefined && (window.generation === undefined || commit.generation > window.generation)) {
+  const newer = commit !== undefined && (window.generation === undefined || commit.generation > window.generation)
+  if (newer && window.coordinated) {
     const live = readConfigEntrySync(file)
     window.trusted = equalBytes(contentOf(live), commit.bytes) ? live : withContent(window.trusted, commit.bytes)
     window.generation = commit.generation
     publishWindow(file, window)
   }
-  return { entry: window.trusted, generation: window.generation, commit }
+  return {
+    entry: window.trusted,
+    generation: window.generation,
+    commit: newer && !window.coordinated ? undefined : commit,
+    coordinated: window.coordinated,
+  }
 }
 
 // The guards of the other bash calls in flight on this file, whose sessions may
@@ -278,7 +310,13 @@ export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): 
 // Throws ENOENT for a missing file, like readFileSync.
 export function readValidatedConfigFileSync(file: string): string {
   const window = windows.get(resolve(file))
-  if (window === undefined) return textOf(file, readConfigEntrySync(file))
+  if (window === undefined) {
+    const live = readConfigEntrySync(file)
+    // In another process (host `typeclaw start`, CLI reads), an agent that has
+    // a window open, or stopped with one, may have left rejected bytes on disk.
+    const published = runtimeOwnsWindows ? undefined : publishedTrustedEntry(file)
+    return textOf(file, published !== undefined && !sameConfigContent(live, published) ? published : live)
+  }
   const live = readConfigEntrySync(file)
   const { entry: trusted } = trustedConfigState(file)
   if (!sameConfigContent(live, trusted)) return textOf(file, trusted)
@@ -305,17 +343,36 @@ export async function readConfigBaseline(file: string): Promise<string> {
   return readValidatedConfigFileSync(file)
 }
 
-// A runtime that stopped with a window open left its published state behind;
-// the next runtime starts with no bash call in flight.
-export function clearPublishedConfigWindowsSync(agentDir: string): void {
-  const dir = join(resolve(agentDir), CREDENTIAL_STAGING_RELATIVE_DIR)
-  let names: string[]
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return
+// Run by `typeclaw run` before it loads typeclaw.json and cron.json. A runtime
+// that stopped with a window open (a bash call in flight, or a blocked change it
+// could not roll back) may have left unchecked or rejected bytes on disk. Those
+// are put back to the last authorized state before anything loads them; a file
+// that cannot be put back stops startup, as an invalid typeclaw.json does,
+// rather than load bytes no check passed. Only then is the window state cleared.
+export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
+  for (const name of MANAGED_CONFIG_FILES) {
+    const file = join(resolve(agentDir), name)
+    const trusted = publishedTrustedEntry(file)
+    if (trusted === undefined) continue
+    if (!sameConfigContent(readConfigEntrySync(file), trusted)) {
+      try {
+        withConfigFileLockSync(file, () => {
+          const live = readConfigEntrySync(file)
+          if (sameConfigContent(live, trusted)) return
+          restoreConfigEntrySync(file, live, withContent(live, contentOf(trusted)))
+          recordConfigCommitSync(file, contentOf(trusted))
+        })
+      } catch (error) {
+        throw new Error(
+          `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
+        )
+      }
+      console.warn(
+        `[typeclaw] ${name} held a bash change that was never checked or that was blocked and could not be reverted before the agent stopped; it was reverted to the last authorized ${name} at startup`,
+      )
+    }
+    rmSync(windowPath(file), { force: true })
   }
-  for (const name of names) if (name.endsWith('.window.json')) rmSync(join(dir, name), { force: true })
 }
 
 // Puts `to` back at `file`, given what is on disk now. A regular file is
@@ -431,6 +488,20 @@ function notFound(file: string): NodeJS.ErrnoException {
   return Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: 'ENOENT' })
 }
 
+function captureWindow(file: string, publish: boolean): void {
+  const key = resolve(file)
+  if (windows.has(key)) return
+  const window: Window = {
+    calls: new Map(),
+    trusted: readConfigEntrySync(file),
+    generation: readConfigCommitSync(file)?.generation,
+    recovery: false,
+    coordinated: publish,
+  }
+  windows.set(key, window)
+  if (publish) publishWindow(file, window)
+}
+
 function settleWindow(file: string, window: Window): void {
   if (window.calls.size > 0 || window.recovery) {
     publishWindow(file, window)
@@ -447,6 +518,7 @@ function settleWindow(file: string, window: Window): void {
 }
 
 function publishWindow(file: string, window: Window): void {
+  if (!window.coordinated) return
   const bytes = contentOf(window.trusted)
   try {
     writeStateFileSync(windowPath(file), {
@@ -454,30 +526,40 @@ function publishWindow(file: string, window: Window): void {
       content: bytes === undefined ? null : bytes.toString('base64'),
     })
   } catch (error) {
+    window.coordinated = false
     console.warn(
-      `[typeclaw] could not publish the trusted ${basename(file)} state (${errorText(error)}); a host typeclaw config command run during a bash command may keep that command's unchecked change`,
+      `[typeclaw] could not publish the trusted ${basename(file)} state (${errorText(error)}); changes to ${basename(file)} during this bash command are checked against the last state known to the agent`,
     )
   }
 }
 
 // The trusted state a runtime published for its open window, advanced to any
-// newer commit, or undefined when no window is open.
+// newer commit, or undefined when no window is open. Published state that exists
+// but cannot be read is an error, never a reason to trust the file as it is.
 function publishedTrustedEntry(file: string): ConfigFileEntry | undefined {
+  const path = windowPath(file)
   let published: Record<string, unknown> | undefined
   try {
-    published = readStateFileSync(windowPath(file))
+    published = readStateFileSync(path)
   } catch (error) {
-    console.warn(
-      `[typeclaw] could not read the agent's open ${basename(file)} state (${errorText(error)}); building on the file as it is`,
-    )
-    return undefined
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOTDIR') return undefined
+    throw unreadableWindowState(file, path, errorText(error))
   }
   if (published === undefined) return undefined
+  const { generation, content } = published
+  if (typeof generation !== 'number' || (content !== null && typeof content !== 'string')) {
+    throw unreadableWindowState(file, path, 'it is not valid window state')
+  }
   const commit = readConfigCommitSync(file)
-  const generation = typeof published.generation === 'number' ? published.generation : 0
   if (commit !== undefined && commit.generation > generation) return withContent({ kind: 'missing' }, commit.bytes)
-  const content = typeof published.content === 'string' ? Buffer.from(published.content, 'base64') : undefined
-  return withContent({ kind: 'missing' }, content)
+  return withContent({ kind: 'missing' }, typeof content === 'string' ? Buffer.from(content, 'base64') : undefined)
+}
+
+function unreadableWindowState(file: string, path: string, detail: string): Error {
+  return new Error(
+    `${basename(file)} was not changed: the agent's open ${basename(file)} state at ${path} could not be read (${detail}). Restart the agent with \`typeclaw restart\` to clear it, or delete that file while the agent is stopped.`,
+  )
 }
 
 function readStateFileSync(path: string): Record<string, unknown> | undefined {
