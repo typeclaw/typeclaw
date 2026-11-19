@@ -216,7 +216,7 @@ Not every lesson belongs in a skill:
 - **Deterministic requirements** (fixed codes, mappings, thresholds, mandatory items) belong in code or config with a check that exercises the behavior. Prose in a skill is not enforcement.
 - **A one-off event or transient failure** (a single timeout, a flaky network call) is not a standing rule. Report it; don't write it down as procedure.
 
-None of this grants edit rights you don't already have: operator-owned files (`package.json` and dependencies, `.env`, secrets) keep their own rules.
+None of this grants edit rights you don't already have: operator-owned files (the agent-root `package.json` and its dependencies, `.env`, secrets) keep their own rules.
 
 ## Authoring a user-created skill
 
