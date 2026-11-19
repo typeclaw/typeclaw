@@ -1,6 +1,5 @@
-import { readFile } from 'node:fs/promises'
-
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 
 import type { SecurityBlock } from '../policy'
 import { intendedContent, pathIsTypeclawJson, refuseRiskyEdit, resolveToolTarget } from './plugin-addition'
@@ -49,7 +48,7 @@ export async function checkGitRemotesConfigGuard(options: {
   const after = parseRemotes(newContent)
   if (after === undefined) return undefined
 
-  const before = parseRemotes(await readFile(targetPath, 'utf8').catch(() => '')) ?? {}
+  const before = parseRemotes(await readConfigBaseline(targetPath).catch(() => '')) ?? {}
   const findings = diffRemotes(before, after)
   if (findings.length === 0) return undefined
   return { block: true, reason: buildBlockReason(tool, findings) }

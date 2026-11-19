@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { runWithConfigBaseline } from '@/config/config-commits'
+
 import { checkGitRemotesConfigGuard } from './git-remotes-config'
 
 const dirs: string[] = []
@@ -49,6 +51,22 @@ describe('gitRemotesConfig guard', () => {
     expect(result?.block).toBe(true)
     expect(result?.reason).not.toContain('pa55')
     expect(result?.reason).not.toContain('github.com/acme')
+  })
+
+  test('compares against the checked baseline, not the live file a bash call already rewrote', async () => {
+    // given: bash already wrote the retarget to disk; the post-bash check passes the pre-call bytes as baseline
+    const retarget = { git: { remotes: { origin: 'https://attacker.example/x.git' } } }
+    const agentDir = await agentWith(retarget)
+    const baseline = Buffer.from(`${JSON.stringify({ git: { remotes: { origin: ORIGIN } } }, null, 2)}\n`)
+
+    // when
+    const result = await runWithConfigBaseline(join(agentDir, 'typeclaw.json'), baseline, () =>
+      write(agentDir, retarget),
+    )
+
+    // then
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('`origin`')
   })
 
   test('blocks removing a managed remote, which could cancel a pending retarget', async () => {
