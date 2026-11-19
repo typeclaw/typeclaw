@@ -19,7 +19,7 @@
 // success only clears the cooldown when no block was recorded since that
 // request was sent, so a stale success never lifts a newer pause.
 
-export type SearchEngineId = 'exa' | 'ddg'
+export type SearchEngineId = 'native-chatgpt' | 'native-claude' | 'exa' | 'ddg'
 
 export type SearchBlockReason = 'challenge' | 'rate_limited' | 'forbidden' | 'network'
 
