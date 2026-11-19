@@ -7729,12 +7729,21 @@ describe('managed config commit check', () => {
           undefined,
           {} as never,
         )
+        // The write can reject before the edit finishes its post-commit work, so a
+        // handler is attached now; `expect(...).rejects` would block on the
+        // still-pending write before `release` runs.
+        const writeOutcome = write.then(
+          () => undefined,
+          (error: unknown) => error,
+        )
         release?.()
 
         // then: the edit lands, the write's commit check sees it and rejects the
         // stale bytes, and the file holds exactly the edit's bytes
         await edit
-        await expect(write).rejects.toThrow(/stale version 2 over 2/)
+        const writeError = await writeOutcome
+        expect(writeError).toBeInstanceOf(Error)
+        expect((writeError as Error).message).toMatch(/stale version 2 over 2/)
         expect(commits).toEqual(['edit:{"version":2,"alias":["atlas"]}\n', 'write:{"version":2,"alias":["renamed"]}\n'])
         expect(await readFile(config, 'utf8')).toBe('{"version":2,"alias":["atlas"]}\n')
       } finally {
@@ -8057,6 +8066,10 @@ describe('managed config commit check', () => {
   })
 })
 
+// Windows has no FIFOs (mkfifo), which these tests use to hold a bash call or a
+// process at a known point, or to stand in for a non-regular config file.
+const fifosUnavailable = process.platform === 'win32'
+
 describe('managed config recheck after bash', () => {
   const tui: SessionOrigin = { kind: 'tui', sessionId: 'bash-recheck' }
 
@@ -8317,27 +8330,32 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
         `printf '%s' '{"alias":["atlas","아틀라스"]}' > ok.json; ln -sf ok.json typeclaw.json`,
       )
 
-      expect((await lstat(config)).isSymbolicLink()).toBe(true)
+      // Git Bash on Windows makes `ln -s` copy the file unless symlinks are enabled,
+      // so the allowed content is kept either way, but it is only a link elsewhere.
+      if (process.platform !== 'win32') expect((await lstat(config)).isSymbolicLink()).toBe(true)
       expect(JSON.parse(await readFile(config, 'utf8'))).toEqual({ alias: ['atlas', '아틀라스'] })
     })
   })
 
-  test('a FIFO at typeclaw.json, there before the call or made by it, never hangs bash', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      const { hooks, checked } = guardHooks(agentDir)
-      expect(await Bun.spawn(['mkfifo', config]).exited).toBe(0)
+  test.skipIf(fifosUnavailable)(
+    'a FIFO at typeclaw.json, there before the call or made by it, never hangs bash',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        const { hooks, checked } = guardHooks(agentDir)
+        expect(await Bun.spawn(['mkfifo', config]).exited).toBe(0)
 
-      expect(await runBash(agentDir, hooks, 'echo still-running')).toContain('still-running')
+        expect(await runBash(agentDir, hooks, 'echo still-running')).toContain('still-running')
 
-      await rm(config)
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      expect(await runBash(agentDir, hooks, 'rm typeclaw.json; mkfifo typeclaw.json; echo made-fifo')).toContain(
-        'made-fifo',
-      )
-      expect((await lstat(config)).isFIFO()).toBe(true)
-      expect(checked).toEqual([])
-    })
-  })
+        await rm(config)
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        expect(await runBash(agentDir, hooks, 'rm typeclaw.json; mkfifo typeclaw.json; echo made-fifo')).toContain(
+          'made-fifo',
+        )
+        expect((await lstat(config)).isFIFO()).toBe(true)
+        expect(checked).toEqual([])
+      })
+    },
+  )
 
   // Holds a bash call open after it ran its command so far, until released:
   // the command blocks reading a FIFO, and opening the FIFO's write end returns
@@ -8357,240 +8375,267 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
     }
   }
 
-  test('a reload during an in-flight bash edit never loads the value its check later blocks', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a bash call that adds a trusted match rule, then stays in flight
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const { hooks } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(
-        agentDir,
-        hooks,
-        `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
-      )
-      const release = await hold.reached()
-
-      // when: the runtime reloads typeclaw.json while the call is in flight
-      const duringCall = loadConfigSync(agentDir)
-
-      // then: the unchecked role never loads, and the file is reverted after the call
-      expect(await readFile(config, 'utf8')).toContain('discord:user:1')
-      expect(duringCall.roles?.trusted?.match ?? []).not.toContain('discord:user:1')
-      await release()
-      expect(await execution).toMatch(/rolePromotion/)
-      expect(loadConfigSync(agentDir).roles?.trusted?.match ?? []).not.toContain('discord:user:1')
-      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
-    })
-  })
-
-  test('a cron reload during an in-flight bash edit reads the validated cron.json', async () => {
-    await withAgentDir(async (agentDir) => {
-      const cron = path.join(agentDir, 'cron.json')
-      await writeFile(cron, '{"jobs":[]}\n')
-      const { hooks } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(agentDir, hooks, `printf 'not json' > cron.json; ${hold.wait}`)
-      const release = await hold.reached()
-
-      const duringCall = await loadCron(agentDir)
-
-      expect(duringCall).toEqual({ ok: true, file: { jobs: [] } })
-      await release()
-      expect(await execution).toMatch(/managedConfig/)
-      expect(await readFile(cron, 'utf8')).toBe('{"jobs":[]}\n')
-    })
-  })
-
-  test('an authorized commit during a bash call that makes no config edit is left as committed', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a read-only bash call in flight
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const { hooks, checked } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(agentDir, hooks, `cat typeclaw.json > /dev/null; ${hold.wait}`)
-      const release = await hold.reached()
-
-      // when: a host CLI grant commits a match rule under the config lock
-      expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' })).toEqual({
-        ok: true,
-        added: true,
-      })
-      const committed = await readFile(config, 'utf8')
-      await release()
-      const text = await execution
-
-      // then: the grant stands and no guard ran on it
-      expect(await readFile(config, 'utf8')).toBe(committed)
-      expect(committed).toContain('discord:user:9')
-      expect(checked).toEqual([])
-      expect(text).not.toContain('reverted')
-    })
-  })
-
-  test('a blocked bash edit after an authorized commit reverts to that commit, not the older baseline', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a host grant commits while a bash call is in flight
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const { hooks } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(
-        agentDir,
-        hooks,
-        `${hold.wait}; printf '%s' '{"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`,
-      )
-      const release = await hold.reached()
-      expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' }).ok).toBe(true)
-      const committed = await readFile(config, 'utf8')
-
-      // when: bash then writes its own role over it
-      await release()
-      const text = await execution
-
-      // then: the file goes back to the authorized commit
-      expect(text).toMatch(/rolePromotion/)
-      expect(await readFile(config, 'utf8')).toBe(committed)
-    })
-  })
-
-  for (const writer of ['in-process', 'host CLI'] as const) {
-    test(`a ${writer} grant during an in-flight bash edit applies only the grant, not the bash change`, async () => {
+  test.skipIf(fifosUnavailable)(
+    'a reload during an in-flight bash edit never loads the value its check later blocks',
+    async () => {
       await withAgentDir(async (agentDir, config) => {
-        // given: a bash call renamed the agent and is still in flight
+        // given: a bash call that adds a trusted match rule, then stays in flight
         await writeFile(config, '{"alias":["atlas"]}\n')
         const { hooks } = guardHooks(agentDir)
         const hold = await holdBash(agentDir)
         const execution = runBash(
           agentDir,
           hooks,
-          `printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; ${hold.wait}`,
+          `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
         )
         const release = await hold.reached()
 
-        // when: an authorized writer grants a role meanwhile
-        if (writer === 'in-process') {
-          expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' }).ok).toBe(true)
-        } else {
-          await hostGrant(agentDir, 'discord:user:9')
-        }
+        // when: the runtime reloads typeclaw.json while the call is in flight
+        const duringCall = loadConfigSync(agentDir)
 
-        // then: the grant builds on the authorized file, not on bash's unchecked rename
-        const granted = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
-        expect(granted.alias).toEqual(['atlas'])
-        expect(granted.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+        // then: the unchecked role never loads, and the file is reverted after the call
+        expect(await readFile(config, 'utf8')).toContain('discord:user:1')
+        expect(duringCall.roles?.trusted?.match ?? []).not.toContain('discord:user:1')
+        await release()
+        expect(await execution).toMatch(/rolePromotion/)
+        expect(loadConfigSync(agentDir).roles?.trusted?.match ?? []).not.toContain('discord:user:1')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      })
+    },
+  )
+
+  test.skipIf(fifosUnavailable)(
+    'a cron reload during an in-flight bash edit reads the validated cron.json',
+    async () => {
+      await withAgentDir(async (agentDir) => {
+        const cron = path.join(agentDir, 'cron.json')
+        await writeFile(cron, '{"jobs":[]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(agentDir, hooks, `printf 'not json' > cron.json; ${hold.wait}`)
+        const release = await hold.reached()
+
+        const duringCall = await loadCron(agentDir)
+
+        expect(duringCall).toEqual({ ok: true, file: { jobs: [] } })
+        await release()
+        expect(await execution).toMatch(/managedConfig/)
+        expect(await readFile(cron, 'utf8')).toBe('{"jobs":[]}\n')
+      })
+    },
+  )
+
+  test.skipIf(fifosUnavailable)(
+    'an authorized commit during a bash call that makes no config edit is left as committed',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a read-only bash call in flight
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks, checked } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(agentDir, hooks, `cat typeclaw.json > /dev/null; ${hold.wait}`)
+        const release = await hold.reached()
+
+        // when: a host CLI grant commits a match rule under the config lock
+        expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' })).toEqual({
+          ok: true,
+          added: true,
+        })
+        const committed = await readFile(config, 'utf8')
         await release()
         const text = await execution
-        expect(text).toContain('An authorized write committed typeclaw.json during this command')
-        expect(text).toContain('Redo that change with the write or edit tool')
-        expect(JSON.parse(await readFile(config, 'utf8'))).toEqual(granted)
+
+        // then: the grant stands and no guard ran on it
+        expect(await readFile(config, 'utf8')).toBe(committed)
+        expect(committed).toContain('discord:user:9')
+        expect(checked).toEqual([])
+        expect(text).not.toContain('reverted')
       })
-    })
+    },
+  )
+
+  test.skipIf(fifosUnavailable)(
+    'a blocked bash edit after an authorized commit reverts to that commit, not the older baseline',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a host grant commits while a bash call is in flight
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `${hold.wait}; printf '%s' '{"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`,
+        )
+        const release = await hold.reached()
+        expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' }).ok).toBe(true)
+        const committed = await readFile(config, 'utf8')
+
+        // when: bash then writes its own role over it
+        await release()
+        const text = await execution
+
+        // then: the file goes back to the authorized commit
+        expect(text).toMatch(/rolePromotion/)
+        expect(await readFile(config, 'utf8')).toBe(committed)
+      })
+    },
+  )
+
+  for (const writer of ['in-process', 'host CLI'] as const) {
+    test.skipIf(fifosUnavailable)(
+      `a ${writer} grant during an in-flight bash edit applies only the grant, not the bash change`,
+      async () => {
+        await withAgentDir(async (agentDir, config) => {
+          // given: a bash call renamed the agent and is still in flight
+          await writeFile(config, '{"alias":["atlas"]}\n')
+          const { hooks } = guardHooks(agentDir)
+          const hold = await holdBash(agentDir)
+          const execution = runBash(
+            agentDir,
+            hooks,
+            `printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; ${hold.wait}`,
+          )
+          const release = await hold.reached()
+
+          // when: an authorized writer grants a role meanwhile
+          if (writer === 'in-process') {
+            expect(grantRole({ cwd: agentDir, roleName: 'trusted', matchRule: 'discord:user:9' }).ok).toBe(true)
+          } else {
+            await hostGrant(agentDir, 'discord:user:9')
+          }
+
+          // then: the grant builds on the authorized file, not on bash's unchecked rename
+          const granted = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+          expect(granted.alias).toEqual(['atlas'])
+          expect(granted.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+          await release()
+          const text = await execution
+          expect(text).toContain('An authorized write committed typeclaw.json during this command')
+          expect(text).toContain('Redo that change with the write or edit tool')
+          expect(JSON.parse(await readFile(config, 'utf8'))).toEqual(granted)
+        })
+      },
+    )
   }
 
-  test('a change made while a session without the bypass has bash in flight must pass its guards too', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a trusted session without the rolePromotion bypass has a bash call in flight
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const trusted = guardHooks(agentDir)
-      const owner = guardHooks(agentDir, undefined, { bypassRolePromotion: true })
-      const hold = await holdBash(agentDir)
-      const trustedCall = runBash(agentDir, trusted.hooks, hold.wait)
-      const release = await hold.reached()
+  test.skipIf(fifosUnavailable)(
+    'a change made while a session without the bypass has bash in flight must pass its guards too',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a trusted session without the rolePromotion bypass has a bash call in flight
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const trusted = guardHooks(agentDir)
+        const owner = guardHooks(agentDir, undefined, { bypassRolePromotion: true })
+        const hold = await holdBash(agentDir)
+        const trustedCall = runBash(agentDir, trusted.hooks, hold.wait)
+        const release = await hold.reached()
 
-      // when: an owner bash call adds a role match rule during the overlap
-      const change = `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`
-      const overlapped = await runBash(agentDir, owner.hooks, change)
+        // when: an owner bash call adds a role match rule during the overlap
+        const change = `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`
+        const overlapped = await runBash(agentDir, owner.hooks, change)
 
-      // then: it is blocked under the concurrent session's permissions
-      expect(overlapped).toContain('a concurrent command from a session without permission')
-      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
-      await release()
-      await trustedCall
+        // then: it is blocked under the concurrent session's permissions
+        expect(overlapped).toContain('a concurrent command from a session without permission')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+        await release()
+        await trustedCall
 
-      // and: the same change with only the owner call in flight is kept
-      expect(await runBash(agentDir, owner.hooks, change)).not.toContain('reverted')
-      expect(await readFile(config, 'utf8')).toContain('discord:user:1')
-    })
-  })
+        // and: the same change with only the owner call in flight is kept
+        expect(await runBash(agentDir, owner.hooks, change)).not.toContain('reverted')
+        expect(await readFile(config, 'utf8')).toContain('discord:user:1')
+      })
+    },
+  )
 
-  test('a host commit during a bash call is part of the baseline the bash edit is checked against', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a bash call in flight, and a host CLI commit that adds a role rule
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const { hooks } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(
-        agentDir,
-        hooks,
-        `${hold.wait}; c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
-      )
-      const release = await hold.reached()
-      await hostGrant(agentDir, 'discord:user:9')
+  test.skipIf(fifosUnavailable)(
+    'a host commit during a bash call is part of the baseline the bash edit is checked against',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a bash call in flight, and a host CLI commit that adds a role rule
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `${hold.wait}; c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
+        )
+        const release = await hold.reached()
+        await hostGrant(agentDir, 'discord:user:9')
 
-      // when: bash then makes its own unrelated alias edit on top of it
-      await release()
-      const text = await execution
+        // when: bash then makes its own unrelated alias edit on top of it
+        await release()
+        const text = await execution
 
-      // then: the alias edit is kept, not blocked as if it had added the role rule
-      expect(text).not.toContain('reverted')
-      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
-      expect(after.alias).toEqual(['atlas', '아틀라스'])
-      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
-    })
-  })
+        // then: the alias edit is kept, not blocked as if it had added the role rule
+        expect(text).not.toContain('reverted')
+        const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+        expect(after.alias).toEqual(['atlas', '아틀라스'])
+        expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+      })
+    },
+  )
 
-  test('a host commit holding the lock when bash opens its first window becomes the baseline', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a host grant holds the config lock, not yet committed
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const { hooks, checked } = guardHooks(agentDir)
-      const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
+  test.skipIf(fifosUnavailable)(
+    'a host commit holding the lock when bash opens its first window becomes the baseline',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a host grant holds the config lock, not yet committed
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks, checked } = guardHooks(agentDir)
+        const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
 
-      // when: a bash call starts, waits for the lock, and edits the alias on top of the grant
-      const execution = runBash(
-        agentDir,
-        hooks,
-        `c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
-      )
-      await host.commit()
-      const text = await execution
+        // when: a bash call starts, waits for the lock, and edits the alias on top of the grant
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `c=$(cat typeclaw.json); printf '%s\\n' "\${c/\\"atlas\\"/\\"atlas\\",\\"아틀라스\\"}" > typeclaw.json`,
+        )
+        await host.commit()
+        const text = await execution
 
-      // then: the grant is the baseline, so the edit is checked and only the alias is new
-      expect(checked).toHaveLength(1)
-      expect(checked[0]).toContain('discord:user:9')
-      expect(text).not.toContain('reverted')
-      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
-      expect(after.alias).toEqual(['atlas', '아틀라스'])
-      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
-    })
-  })
+        // then: the grant is the baseline, so the edit is checked and only the alias is new
+        expect(checked).toHaveLength(1)
+        expect(checked[0]).toContain('discord:user:9')
+        expect(text).not.toContain('reverted')
+        const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+        expect(after.alias).toEqual(['atlas', '아틀라스'])
+        expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+      })
+    },
+  )
 
-  test('when the window cannot be published, a host commit during the call does not exempt the bash edit', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: window state cannot be published (a directory sits at its path)
-      await writeFile(config, '{"alias":["atlas"]}\n')
-      const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
-      await mkdir(path.join(blocker, 'occupied'), { recursive: true })
-      const { hooks } = guardHooks(agentDir)
-      const hold = await holdBash(agentDir)
-      const execution = runBash(
-        agentDir,
-        hooks,
-        `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
-      )
-      const release = await hold.reached()
+  test.skipIf(fifosUnavailable)(
+    'when the window cannot be published, a host commit during the call does not exempt the bash edit',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: window state cannot be published (a directory sits at its path)
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+        await mkdir(path.join(blocker, 'occupied'), { recursive: true })
+        const { hooks } = guardHooks(agentDir)
+        const hold = await holdBash(agentDir)
+        const execution = runBash(
+          agentDir,
+          hooks,
+          `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json; ${hold.wait}`,
+        )
+        const release = await hold.reached()
 
-      // when: with no published window, a host grant builds on the live file, bash's edit included
-      await rm(blocker, { recursive: true })
-      await hostGrant(agentDir, 'discord:user:9')
-      await release()
-      const text = await execution
+        // when: with no published window, a host grant builds on the live file, bash's edit included
+        await rm(blocker, { recursive: true })
+        await hostGrant(agentDir, 'discord:user:9')
+        await release()
+        const text = await execution
 
-      // then: the bash edit is still checked and reverted, and the notice says why
-      expect(text).toMatch(/rolePromotion/)
-      expect(text).toContain('could not be coordinated with host typeclaw commands')
-      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
-    })
-  })
+        // then: the bash edit is still checked and reverted, and the notice says why
+        expect(text).toMatch(/rolePromotion/)
+        expect(text).toContain('could not be coordinated with host typeclaw commands')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      })
+    },
+  )
 
   for (const [label, plant] of [
     ['invalid JSON', (staging: string) => writeFile(path.join(staging, 'typeclaw.json.window.json'), '{not json')],
@@ -8633,51 +8678,54 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
     })
   })
 
-  test('a host grant that commits while startup waits on the lock survives startup recovery', async () => {
-    await withAgentDir(async (agentDir, config) => {
-      // given: a leftover window (trusted atlas) over rejected bytes, and a host grant holding the lock
-      const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
-      await mkdir(staging, { recursive: true })
-      await writeFile(
-        path.join(staging, 'typeclaw.json.window.json'),
-        JSON.stringify({
-          generation: 0,
-          content: Buffer.from('{"alias":["atlas"]}\n').toString('base64'),
-          entry: { kind: 'file', mode: 0o644 },
-        }),
-      )
-      await writeFile(config, '{"alias":["rejected"]}\n')
-      const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
+  test.skipIf(fifosUnavailable)(
+    'a host grant that commits while startup waits on the lock survives startup recovery',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: a leftover window (trusted atlas) over rejected bytes, and a host grant holding the lock
+        const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+        await mkdir(staging, { recursive: true })
+        await writeFile(
+          path.join(staging, 'typeclaw.json.window.json'),
+          JSON.stringify({
+            generation: 0,
+            content: Buffer.from('{"alias":["atlas"]}\n').toString('base64'),
+            entry: { kind: 'file', mode: 0o644 },
+          }),
+        )
+        await writeFile(config, '{"alias":["rejected"]}\n')
+        const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
 
-      // when: the runtime starts, waits on the lock, and the grant commits meanwhile
-      const startup = Bun.spawn({
-        cmd: [
-          process.execPath,
-          '-e',
-          `import { reconcileLeftoverConfigWindowsSync } from './src/config/config-commits.ts'
+        // when: the runtime starts, waits on the lock, and the grant commits meanwhile
+        const startup = Bun.spawn({
+          cmd: [
+            process.execPath,
+            '-e',
+            `import { reconcileLeftoverConfigWindowsSync } from './src/config/config-commits.ts'
 console.log('STARTING')
 reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
-        ],
-        cwd: path.resolve(import.meta.dir, '../..'),
-        stdout: 'pipe',
-        stderr: 'inherit',
-      })
-      const reader = startup.stdout.getReader()
-      let seen = ''
-      while (!seen.includes('STARTING')) {
-        const chunk = await reader.read()
-        if (chunk.done) throw new Error('startup exited before reconciling')
-        seen += new TextDecoder().decode(chunk.value)
-      }
-      await host.commit()
-      expect(await startup.exited).toBe(0)
+          ],
+          cwd: path.resolve(import.meta.dir, '../..'),
+          stdout: 'pipe',
+          stderr: 'inherit',
+        })
+        const reader = startup.stdout.getReader()
+        let seen = ''
+        while (!seen.includes('STARTING')) {
+          const chunk = await reader.read()
+          if (chunk.done) throw new Error('startup exited before reconciling')
+          seen += new TextDecoder().decode(chunk.value)
+        }
+        await host.commit()
+        expect(await startup.exited).toBe(0)
 
-      // then: startup kept the grant, built on the trusted bytes, not the rejected ones
-      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
-      expect(after.alias).toEqual(['atlas'])
-      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
-    })
-  })
+        // then: startup kept the grant, built on the trusted bytes, not the rejected ones
+        const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+        expect(after.alias).toEqual(['atlas'])
+        expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+      })
+    },
+  )
 
   // Real bwrap bash for the read-only fallback, which the kernel enforces. Each
   // run returns the result or error text; `argv` holds each run's bwrap argv.

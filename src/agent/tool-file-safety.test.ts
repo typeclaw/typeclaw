@@ -100,6 +100,10 @@ test('plugin handoff lookalikes cannot exempt remote-looking or credential opera
   }
 })
 
+// Windows has no FIFOs (mkfifo), which these tests use to hold a bash call or a
+// process at a known point, or to stand in for a non-regular config file.
+const fifosUnavailable = process.platform === 'win32'
+
 test('a blocked bash change whose restore fails partway is reported with its recovery', async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-restore-fault-'))
   const config = path.join(agentDir, 'typeclaw.json')
@@ -446,22 +450,24 @@ test('a close whose epoch cannot advance keeps the window record, so host reads 
   }
 })
 
-test('a host read across a whole window lifecycle between its samples retries and returns trusted bytes', async () => {
-  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-read-'))
-  const config = path.join(agentDir, 'typeclaw.json')
-  const go = path.join(agentDir, 'go.fifo')
-  const trusted = '{"alias":["atlas"]}\n'
-  try {
-    await writeFile(config, trusted)
-    expect(await Bun.spawn(['mkfifo', go]).exited).toBe(0)
-    // A runtime in its own process: on the first `go` it opens a window and
-    // edits typeclaw.json as bash would; on the second its check blocks the edit,
-    // rolls it back, and closes the window. Each step leaves a marker file.
-    const runtime = Bun.spawn({
-      cmd: [
-        process.execPath,
-        '-e',
-        `import { readFileSync, writeFileSync } from 'node:fs'
+test.skipIf(fifosUnavailable)(
+  'a host read across a whole window lifecycle between its samples retries and returns trusted bytes',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-read-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const go = path.join(agentDir, 'go.fifo')
+    const trusted = '{"alias":["atlas"]}\n'
+    try {
+      await writeFile(config, trusted)
+      expect(await Bun.spawn(['mkfifo', go]).exited).toBe(0)
+      // A runtime in its own process: on the first `go` it opens a window and
+      // edits typeclaw.json as bash would; on the second its check blocks the edit,
+      // rolls it back, and closes the window. Each step leaves a marker file.
+      const runtime = Bun.spawn({
+        cmd: [
+          process.execPath,
+          '-e',
+          `import { readFileSync, writeFileSync } from 'node:fs'
 import { recheckManagedConfigAfterBash, snapshotManagedConfigFiles } from './src/agent/tool-file-safety.ts'
 const dir = ${JSON.stringify(agentDir)}
 readFileSync(${JSON.stringify(go)})
@@ -471,40 +477,41 @@ writeFileSync(dir + '/edited', '')
 readFileSync(${JSON.stringify(go)})
 await recheckManagedConfigAfterBash(snapshot)
 writeFileSync(dir + '/closed', '')`,
-      ],
-      cwd: path.resolve(import.meta.dir, '../..'),
-      stdout: 'ignore',
-      stderr: 'inherit',
-    })
-    const step = (marker: string) => {
-      writeFileSync(go, 'go\n')
-      const deadline = Date.now() + 20_000
-      while (!existsSync(path.join(agentDir, marker))) {
-        if (Date.now() > deadline) throw new Error(`runtime did not reach ${marker}`)
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+        ],
+        cwd: path.resolve(import.meta.dir, '../..'),
+        stdout: 'ignore',
+        stderr: 'inherit',
+      })
+      const step = (marker: string) => {
+        writeFileSync(go, 'go\n')
+        const deadline = Date.now() + 20_000
+        while (!existsSync(path.join(agentDir, marker))) {
+          if (Date.now() > deadline) throw new Error(`runtime did not reach ${marker}`)
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+        }
       }
+      let sawRejected = false
+      __setConfigReadHookForTests((stage) => {
+        if (stage === 'after-window' && !existsSync(path.join(agentDir, 'edited'))) step('edited')
+        if (stage === 'after-live' && !existsSync(path.join(agentDir, 'closed'))) {
+          sawRejected = readFileSync(config, 'utf8').includes('rejected')
+          step('closed')
+        }
+      })
+
+      // when: a host read samples, the whole window lifecycle runs between its samples
+      const read = readValidatedConfigFileSync(config)
+
+      // then: the epoch moved, so it re-read and returns the rolled-back file
+      expect(sawRejected).toBe(true)
+      expect(read).toBe(trusted)
+      expect(await runtime.exited).toBe(0)
+    } finally {
+      __setConfigReadHookForTests(undefined)
+      await rm(agentDir, { recursive: true, force: true })
     }
-    let sawRejected = false
-    __setConfigReadHookForTests((stage) => {
-      if (stage === 'after-window' && !existsSync(path.join(agentDir, 'edited'))) step('edited')
-      if (stage === 'after-live' && !existsSync(path.join(agentDir, 'closed'))) {
-        sawRejected = readFileSync(config, 'utf8').includes('rejected')
-        step('closed')
-      }
-    })
-
-    // when: a host read samples, the whole window lifecycle runs between its samples
-    const read = readValidatedConfigFileSync(config)
-
-    // then: the epoch moved, so it re-read and returns the rolled-back file
-    expect(sawRejected).toBe(true)
-    expect(read).toBe(trusted)
-    expect(await runtime.exited).toBe(0)
-  } finally {
-    __setConfigReadHookForTests(undefined)
-    await rm(agentDir, { recursive: true, force: true })
-  }
-})
+  },
+)
 
 test("a newer commit's own entry wins at startup over the window's older symlink entry", async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-entry-'))
@@ -703,6 +710,67 @@ test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
       expect(loadConfigSync(agentDir).alias).toEqual(['renamed'])
     } finally {
       await chmod(config, 0o644).catch(() => {})
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)
+
+test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'a later call re-checking an unreadable edit also applies the guard of the call that left it',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-recovery-guards-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const withoutBypass = async (content: string) =>
+      content.includes('discord:user:1') ? 'Guard `rolePromotion` blocked write' : undefined
+    const owner = async () => undefined
+    try {
+      // given: a session without the bypass adds a role rule, then leaves the file unreadable
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const first = await snapshotManagedConfigFiles(agentDir, withoutBypass)
+      await writeFile(config, '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}\n')
+      await chmod(config, 0o000)
+      await recheckManagedConfigAfterBash(first)
+      await chmod(config, 0o644)
+
+      // when: an owner session's later call re-checks the file
+      const later = await snapshotManagedConfigFiles(agentDir, owner)
+      const notices = await recheckManagedConfigAfterBash(later)
+
+      // then: the edit is blocked under the session that made it, and reverted
+      expect(notices.join('\n')).toContain('the command that left this change ran in a session without permission')
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    } finally {
+      await chmod(config, 0o644).catch(() => {})
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)
+
+test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'a symlinked config whose resolution fails inconclusively keeps the trusted window',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-link-resolution-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const locked = path.join(agentDir, 'workspace', 'locked')
+    const record = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+    try {
+      // given: typeclaw.json links into a workspace directory
+      await mkdir(locked, { recursive: true })
+      await writeFile(path.join(locked, 'tc.json'), '{"alias":["atlas"]}\n')
+      await symlink(path.join(locked, 'tc.json'), config)
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+
+      // when: the call edits through the link, then makes the link's directory unsearchable
+      await writeFile(path.join(locked, 'tc.json'), '{"alias":["renamed"]}\n')
+      await chmod(locked, 0o000)
+      const notices = await recheckManagedConfigAfterBash(snapshot)
+
+      // then: resolving the link failed (not a dangling link), so the trusted window is kept
+      expect(notices.join('\n')).toContain('typeclaw.json could not be read after this command')
+      expect(existsSync(record)).toBe(true)
+      expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+    } finally {
+      await chmod(locked, 0o755).catch(() => {})
       await rm(agentDir, { recursive: true, force: true })
     }
   },

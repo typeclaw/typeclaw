@@ -11,6 +11,10 @@ import type { CronJob } from './schema'
 
 let agentDir: string
 
+// Windows has no FIFOs (mkfifo), which these tests use to hold a bash call or a
+// process at a known point, or to stand in for a non-regular config file.
+const fifosUnavailable = process.platform === 'win32'
+
 beforeEach(async () => {
   agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-cron-reload-'))
 })
@@ -400,7 +404,7 @@ function job(id: string): CronJob {
   return { id, schedule: '* * * * *', kind: 'prompt', prompt: 'x', enabled: true }
 }
 
-test('a FIFO at cron.json fails the reload promptly and keeps the live schedule', async () => {
+test.skipIf(fifosUnavailable)('a FIFO at cron.json fails the reload promptly and keeps the live schedule', async () => {
   // given: a live schedule, then cron.json replaced by a FIFO nobody writes to
   const scheduler = recordingScheduler()
   await writeFile(join(agentDir, 'cron.json'), JSON.stringify({ jobs: [] }))
