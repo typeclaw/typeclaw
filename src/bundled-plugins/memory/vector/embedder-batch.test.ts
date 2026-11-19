@@ -6,12 +6,12 @@ import { EMBEDDING_DIMS } from '@/models/embedding-model'
 // embed is chunked (bounding peak memory) rather than run as one giant batch.
 const batchSizes: number[] = []
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
 async function freshEmbedderModule(): Promise<EmbedderModule> {
-  const mod = await import(`./embedder?batch=${crypto.randomUUID()}`)
+  const mod = await import(`./embedder-inference?batch=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   const pipeline = (async () => {
     return (texts: string[]) => {
@@ -41,10 +41,12 @@ describe('embedder batching', () => {
     const { embed } = await freshEmbedderModule()
     const inputs = Array.from({ length: 150 }, (_, i) => `passage ${i}`)
 
-    const out = await embed(inputs, 'passage')
+    const completed: number[] = []
+    const out = await embed(inputs, 'passage', (count) => completed.push(count))
 
     // given 150 inputs and a 64 batch → 64 + 64 + 22
     expect(batchSizes).toEqual([64, 64, 22])
+    expect(completed).toEqual([64, 128, 150])
     expect(batchSizes.every((n) => n <= 64)).toBe(true)
     expect(out).toHaveLength(150)
     // first lane carries the global index, so order is intact across chunks

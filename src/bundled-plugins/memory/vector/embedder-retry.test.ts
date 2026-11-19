@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 // A controllable transformers fake whose pipeline load can be made to fail on
-// demand, so we can prove getEmbedder/warmEmbedder recover from a transient
+// demand, so we can prove embedding recovers from a transient
 // pipeline failure instead of caching the rejection forever. Kept in its own
 // file (separate from embedder-lazy-load.test.ts) because the embedder memoizes
 // a module-level singleton across a file's tests — a failable mock here must
@@ -9,7 +9,7 @@ import { describe, expect, test } from 'bun:test'
 let pipelineCalls = 0
 let failNextPipeline = false
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
@@ -24,38 +24,22 @@ function fakeTransformersModule(): TransformersImporter {
   })
 }
 
-describe('embedder warm-up and retry-safe memoization', () => {
-  test('warmEmbedder loads the embedder so a later call reuses the singleton', async () => {
-    const { warmEmbedder, getEmbedder } = await freshEmbedderModule()
+describe('embedder reuse and retry', () => {
+  test('passage indexing and query embedding reuse the same model session', async () => {
+    const { embed } = await freshEmbedderModule()
     pipelineCalls = 0
 
-    await warmEmbedder()
-    await getEmbedder()
+    await embed(['hello'], 'passage')
+    await embed(['hello'], 'query')
 
     expect(pipelineCalls).toBe(1)
   })
 
-  test('a rejected load is not cached: the next call retries instead of replaying the rejection', async () => {
-    const { getEmbedder } = await freshEmbedderModule()
-    pipelineCalls = 0
-
-    // given: the first load fails
-    failNextPipeline = true
-    await expect(getEmbedder()).rejects.toThrow('model weights missing')
-
-    // when: the underlying cause clears and the caller retries
-    failNextPipeline = false
-    await getEmbedder()
-
-    // then: the second attempt actually re-ran the load (rejection wasn't memoized)
-    expect(pipelineCalls).toBe(2)
-  })
-
-  test('warmEmbedder failure degrades to a working per-turn load on retry', async () => {
-    const { warmEmbedder, embed } = await freshEmbedderModule()
+  test('a startup indexing load failure can be retried by a later query', async () => {
+    const { embed } = await freshEmbedderModule()
 
     failNextPipeline = true
-    await expect(warmEmbedder()).rejects.toThrow('model weights missing')
+    await expect(embed(['hello'], 'passage')).rejects.toThrow('model weights missing')
 
     failNextPipeline = false
     const embeddings = await embed(['hello'], 'query')
@@ -88,8 +72,8 @@ describe('embedder warm-up and retry-safe memoization', () => {
 // Bun's module registry memoizes embedder.ts across tests, so its singleton
 // would leak between the cases above. A cache-busting query string forces a
 // fresh module instance (and thus a fresh embedderInstance) per test.
-async function freshEmbedderModule(): Promise<typeof import('./embedder')> {
-  const mod = await import(`./embedder?warm=${crypto.randomUUID()}`)
+async function freshEmbedderModule(): Promise<EmbedderModule> {
+  const mod = await import(`./embedder-inference?retry=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   mod.__setTransformersImporterForTests(fakeTransformersModule())
   return mod

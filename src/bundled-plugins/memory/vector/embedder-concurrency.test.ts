@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { EMBEDDING_DIMS } from '@/models/embedding-model'
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
@@ -20,7 +20,7 @@ function deferred(): Deferred {
 // can observe how many embeds are inside inference at once. `started` fires each
 // time a forward pass enters; `gate` holds it there until resolved.
 async function gatedEmbedderModule(gate: Deferred, onStart: () => void): Promise<EmbedderModule> {
-  const mod = await import(`./embedder?concurrency=${crypto.randomUUID()}`)
+  const mod = await import(`./embedder-inference?concurrency=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   const pipeline = (async () => {
     return async (texts: string[]) => {

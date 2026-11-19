@@ -133,6 +133,10 @@ The `session.turn.start` hook renders memory into `event.retrievalContext.result
 
 **Channel-origin always uses index mode** regardless of shard size — a memory-bleed defense, since the agent can treat injected memory as instructions when channel users can see it. Direct-mode channel turns keep every topic discoverable as a heading; over-budget turns use top-K hybrid retrieval. Both paths strip full bodies until the agent explicitly opens a topic.
 
+The runtime starts a dedicated embedding subprocess only when an operation needs vectors. Startup still embeds missing index entries, but an up-to-date index does not load the model. After five minutes without embedding requests, the subprocess exits and releases the model's memory. The next request reloads the same model; vector retrieval stays enabled.
+
+Passage indexing can run longer than 15 minutes as long as it keeps completing batches. The stall watchdog resets after each completed batch; query requests still have a fixed 60-second deadline.
+
 For the vector store, embedder, and parent-child hybrid-search internals, see the [memory README](https://github.com/typeclaw/typeclaw/blob/main/src/bundled-plugins/memory/README.md).
 
 ### Vector relevance bands

@@ -12,7 +12,7 @@ import { DEFAULT_MAX_EMBED_THREADS } from './embed-threads'
 let transformersEvaluated = false
 let lastPipelineOptions: Record<string, unknown> | undefined
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
@@ -32,7 +32,7 @@ function fakeTransformersModule(): TransformersImporter {
 }
 
 async function freshEmbedderModule(): Promise<EmbedderModule> {
-  const mod = await import(`./embedder?lazy=${crypto.randomUUID()}`)
+  const mod = await import(`./embedder-inference?lazy=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   mod.__setTransformersImporterForTests(fakeTransformersModule())
   return mod
