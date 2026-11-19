@@ -185,7 +185,7 @@ The embedding model (`Xenova/multilingual-e5-base`) caps inputs at **512 tokens*
 
 ## Embedder resource tuning
 
-The embedding model is a single onnxruntime-node session shared process-wide (`vector/embedder.ts`, `getEmbedder()` singleton). Two session options bound its memory footprint, since the container runs with no docker `--cpus` limit:
+The embedding subprocess owns one onnxruntime-node session and exits after five minutes without embedding requests. The runtime retains the vector store and starts a new subprocess on demand. Two session options bound the child's memory footprint, since the container runs with no docker `--cpus` limit:
 
 - **Adaptive intra-op threads** (`vector/embed-threads.ts`). ORT's default (`intraOpNumThreads: 0`) sizes the shared session's intra-op thread pool to one worker per visible host core, each holding its own activation workspace for the singleton's lifetime. `resolveEmbedThreadCount()` caps this at half the visible cores, clamped to `[1, 4]`. The pool is session-level and shared — the transformers.js Node path calls `session.run()` directly (concurrent `Run()` is allowed; the serialization only applies to the web backend), so concurrent embeds contend for it. Capping trades some potential intra-op parallelism (per embed and across overlapping embeds) for RSS bounded by the cap rather than by host core count; for this workload of short per-turn query embeds that trade is worth it.
 - **CPU mem arena off** (`enableCpuMemArena: false`). ORT's arena never returns memory to the OS; for the intermittent per-turn query embed it would inflate steady-state RSS. Disabling frees per-embed at a negligible per-call malloc cost.
