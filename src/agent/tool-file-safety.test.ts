@@ -10,10 +10,12 @@ import {
   __failConfigEpochWritesForTests,
   closeConfigWindow,
   __setConfigReadHookForTests,
+  readConfigCommitSync,
   readValidatedConfigFileSync,
   recordConfigCommitSync,
   reconcileLeftoverConfigWindowsSync,
 } from '@/config/config-commits'
+import { addMount } from '@/config/mounts-mutation'
 import { createConfigReloadable } from '@/config/reloadable'
 
 import {
@@ -533,14 +535,24 @@ test("a newer commit's own entry wins at startup over the window's older symlink
       },
     })
 
-    // when: a host grant then renames a regular file over the path, and the agent starts again
+    // when: a host writer then replaces the link with a regular file and commits it,
+    // and the agent starts again
     const grant = Bun.spawn({
       cmd: [
         process.execPath,
         '-e',
-        `import { grantRole } from './src/permissions/grant.ts'
-const r = grantRole({ cwd: ${JSON.stringify(agentDir)}, roleName: 'trusted', matchRule: 'discord:user:9' })
-if (!r.ok) { console.error(r.reason); process.exit(1) }`,
+        `import { rmSync, writeFileSync } from 'node:fs'
+import { readConfigForWriteSync, recordConfigCommitSync } from './src/config/config-commits.ts'
+import { withConfigFileLockSync } from './src/config/config-file-lock.ts'
+const config = ${JSON.stringify(config)}
+withConfigFileLockSync(config, () => {
+  const next = JSON.parse(readConfigForWriteSync(config))
+  next.roles = { trusted: { match: ['discord:user:9'] } }
+  const bytes = JSON.stringify(next, null, 2) + '\\n'
+  rmSync(config)
+  writeFileSync(config, bytes, { flag: 'wx' })
+  recordConfigCommitSync(config, bytes)
+})`,
       ],
       cwd: path.resolve(import.meta.dir, '../..'),
       stdout: 'ignore',
@@ -942,6 +954,119 @@ test.skipIf(process.platform === 'win32')(
     } finally {
       __resetConfigForTesting()
       await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)
+
+// A host config command (`typeclaw mount add`) run while a bash call is in
+// flight and has replaced typeclaw.json, and in the normal case.
+async function hostWriterFixture() {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-host-writer-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const share = await mkdtemp(path.join(tmpdir(), 'typeclaw-host-writer-share-'))
+  await writeFile(config, '{"alias":["atlas"]}\n')
+  return {
+    agentDir,
+    config,
+    share,
+    async cleanup() {
+      await rm(agentDir, { recursive: true, force: true })
+      await rm(share, { recursive: true, force: true })
+    },
+  }
+}
+
+test.skipIf(process.platform === 'win32')(
+  'a host config command refuses a FIFO a bash call left at typeclaw.json, promptly and without writing',
+  async () => {
+    const { agentDir, config, share, cleanup } = await hostWriterFixture()
+    try {
+      // given: a bash call in flight has replaced typeclaw.json with a FIFO
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      await rm(config)
+      expect(await Bun.spawn(['mkfifo', config]).exited).toBe(0)
+
+      // when: a mount is added (a blocking open would hang here)
+      const result = addMount(agentDir, 'data', share)
+
+      // then: it is refused with a retry hint, the FIFO is untouched, and no commit is recorded
+      expect(result.ok).toBe(false)
+      expect(result.ok ? '' : result.reason).toContain(
+        'typeclaw.json changed or is not a regular file; nothing was written',
+      )
+      expect((await lstat(config)).isFIFO()).toBe(true)
+      expect(readConfigCommitSync(config)).toBeUndefined()
+      await recheckManagedConfigAfterBash(snapshot)
+    } finally {
+      await cleanup()
+    }
+  },
+)
+
+test.skipIf(process.platform === 'win32')(
+  'a host config command refuses a symlink a bash call swapped in, even to the same bytes',
+  async () => {
+    const { agentDir, config, share, cleanup } = await hostWriterFixture()
+    const target = path.join(agentDir, 'workspace', 'notes.json')
+    try {
+      // given: a bash call in flight has swapped typeclaw.json for a link to a
+      // workspace copy of the trusted bytes
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(target, '{"alias":["atlas"]}\n')
+      await rm(config)
+      await symlink(target, config)
+
+      // when: a mount is added
+      const result = addMount(agentDir, 'data', share)
+
+      // then: it is refused, the workspace file is untouched, and no commit is recorded
+      expect(result.ok).toBe(false)
+      expect(await readFile(target, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      expect(readConfigCommitSync(config)).toBeUndefined()
+      await recheckManagedConfigAfterBash(snapshot)
+    } finally {
+      await cleanup()
+    }
+  },
+)
+
+test('a host config command writes typeclaw.json in place and records the commit', async () => {
+  const { agentDir, config, share, cleanup } = await hostWriterFixture()
+  try {
+    const inode = (await lstat(config)).ino
+
+    const result = addMount(agentDir, 'data', share)
+
+    expect(result.ok).toBe(true)
+    expect(JSON.parse(await readFile(config, 'utf8')).mounts).toEqual([{ name: 'data', path: share, readOnly: false }])
+    expect((await lstat(config)).ino).toBe(inode)
+    expect(readConfigCommitSync(config)?.generation).toBe(1)
+  } finally {
+    await cleanup()
+  }
+})
+
+test.skipIf(process.platform === 'win32')(
+  "a host config command writes through the operator's own typeclaw.json symlink and keeps it",
+  async () => {
+    const { agentDir, config, share, cleanup } = await hostWriterFixture()
+    const elsewhere = await mkdtemp(path.join(tmpdir(), 'typeclaw-host-writer-target-'))
+    const target = path.join(elsewhere, 'typeclaw.json')
+    try {
+      // given: no bash call is in flight, and typeclaw.json links to a file outside the folder
+      await writeFile(target, '{"alias":["atlas"]}\n')
+      await rm(config)
+      await symlink(target, config)
+
+      const result = addMount(agentDir, 'data', share)
+
+      expect(result.ok).toBe(true)
+      expect((await lstat(config)).isSymbolicLink()).toBe(true)
+      expect(JSON.parse(await readFile(target, 'utf8')).mounts).toHaveLength(1)
+    } finally {
+      await rm(elsewhere, { recursive: true, force: true })
+      await cleanup()
     }
   },
 )

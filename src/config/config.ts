@@ -20,12 +20,7 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
-import {
-  readConfigForWriteSync,
-  readValidatedConfigFileSync,
-  tryRecordConfigCommitSync,
-  writeBackConfigSync,
-} from './config-commits'
+import { commitConfigWriteSync, readConfigForWriteSync, readValidatedConfigFileSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1573,14 +1568,14 @@ function persistMigratedConfig(cwd: string): void {
       const migrated = migrateLegacyConfigShape(JSON.parse(base))
       if (migrated.changed) {
         const bytes = `${JSON.stringify(migrated.json, null, 2)}\n`
-        // Only onto the verified regular file it was built from; otherwise the
-        // migration stays in memory and the write-back retries on a later load.
-        const deferred = writeBackConfigSync(file, base, bytes)
-        if (deferred !== undefined) {
-          console.warn(`[typeclaw] deferred the ${CONFIG_FILE} migration write-back: ${deferred}`)
+        // Only onto the verified file it was built from; otherwise the migration
+        // stays in memory and the write-back retries on a later load.
+        try {
+          commitConfigWriteSync(file, bytes, base)
+        } catch (error) {
+          console.warn(`[typeclaw] deferred the ${CONFIG_FILE} migration write-back: ${(error as Error).message}`)
           return []
         }
-        tryRecordConfigCommitSync(file, bytes)
       }
       return migrated.applied
     })

@@ -1,4 +1,3 @@
-import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { commitSystemFileSync } from '@/git/system-commit'
@@ -11,7 +10,7 @@ import {
   validateMount,
   type Mount,
 } from './config'
-import { readConfigForWriteSync, tryRecordConfigCommitSync } from './config-commits'
+import { commitConfigWriteSync, ConfigWriteRefusedError, readConfigForWriteSync } from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 
 const CONFIG_FILE = 'typeclaw.json'
@@ -144,11 +143,16 @@ function writeMounts(cwd: string, record: Record<string, unknown>): { ok: true }
 
   const bytes = `${JSON.stringify(record, null, 2)}\n`
   try {
-    writeFileSync(join(cwd, CONFIG_FILE), bytes)
+    commitConfigWriteSync(join(cwd, CONFIG_FILE), bytes)
   } catch (error) {
-    return { ok: false, reason: `Failed to write ${CONFIG_FILE}: ${(error as Error).message}` }
+    return {
+      ok: false,
+      reason:
+        error instanceof ConfigWriteRefusedError
+          ? error.message
+          : `Failed to write ${CONFIG_FILE}: ${(error as Error).message}`,
+    }
   }
-  tryRecordConfigCommitSync(join(cwd, CONFIG_FILE), bytes)
   return { ok: true }
 }
 

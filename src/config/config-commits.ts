@@ -256,27 +256,74 @@ export function readConfigForWriteSync(file: string): string {
   return textOf(file, trusted)
 }
 
-// A guard-free write-back (a config migration) under the config lock, with
-// `base` the bytes it built on (readConfigForWriteSync). It writes only when the
-// live entry is one regular file, not a link or a hard link, holding exactly
-// `base`: while a bash window or recovery holds unchecked bytes, live differs
-// from the trusted base and the write-back waits. Returns why it was deferred.
-export function writeBackConfigSync(file: string, base: string, bytes: string): string | undefined {
-  const name = basename(file)
+// Refused before anything was written: retrying once the file is back to a
+// checked regular file succeeds.
+export class ConfigWriteRefusedError extends Error {}
+
+export type VerifiedConfigWrite = { path: string; writeInPlace: (path: string, content: string | Buffer) => void }
+
+// Every guard-free writer (host CLI config commands, grants, migrations) writes
+// typeclaw.json/cron.json through here, under the config lock, after building
+// on readConfigForWriteSync. The live entry is verified on its own, not trusted
+// from that baseline: it must be one regular file with a single link (or the
+// authorized symlink to one), opened without following links or blocking and
+// matched by identity on the descriptor. Otherwise nothing is written. Such a
+// writer may replace a bash call's unchecked candidate (it built on the trusted
+// bytes, and the call is told its change was discarded); one given `base`, a
+// write-back that must replace nothing, also needs the file to hold exactly it.
+export function prepareConfigWriteSync(file: string, base?: string): VerifiedConfigWrite {
+  const key = resolve(file)
+  const target = verifiedWriteTarget(file, base)
+  if (typeof target === 'string') {
+    supersededCandidates.delete(key)
+    const name = basename(file)
+    throw new ConfigWriteRefusedError(
+      `${name} changed or is not a regular file; nothing was written (${target}). Retry once any running agent command has finished; if it keeps failing, put ${name} back as a regular file in the agent folder (for example \`git checkout -- ${name}\`).`,
+    )
+  }
+  return {
+    path: target.path,
+    writeInPlace: (path, content) => writeConfigInPlaceSync(path, Buffer.from(content), target.id),
+  }
+}
+
+// Writes `bytes` into the verified config file in place, then records the commit.
+export function commitConfigWriteSync(file: string, bytes: string, base?: string): void {
+  const write = prepareConfigWriteSync(file, base)
+  write.writeInPlace(write.path, bytes)
+  tryRecordConfigCommitSync(file, bytes)
+}
+
+function verifiedWriteTarget(
+  file: string,
+  base: string | undefined,
+): { path: string; id: ConfigFileIdentity } | string {
   try {
     const live = readConfigEntrySync(file)
-    if (live.kind !== 'file') return `${name} is not a regular file`
-    if (lstatOrUndefined(file)?.nlink !== 1n) return `${name} has more than one link`
-    if (live.bytes.toString('utf8') !== base) return `${name} holds bytes that have not been checked`
-    writeConfigInPlaceSync(file, Buffer.from(bytes), live.id)
-    return undefined
+    if (live.kind === 'missing' || live.kind === 'other') return 'it is not a regular file'
+    if (live.kind === 'link' && !authorizedLink(file, live)) return 'it is a symlink the agent has not accepted'
+    const path = live.kind === 'link' ? live.resolved : file
+    if (lstatOrUndefined(path)?.nlink !== 1n) return 'it has more than one hard link'
+    if (base !== undefined && live.bytes.toString('utf8') !== base) return 'it changed after it was read'
+    return { path, id: live.kind === 'link' ? live.resolvedId : live.id }
   } catch (error) {
     return errorText(error)
-  } finally {
-    // Nothing replaced a bash candidate unless the write landed, and a landed
-    // write had live equal to its base, so there was no candidate either way.
-    supersededCandidates.delete(resolve(file))
   }
+}
+
+// A symlinked config is written through only when it is the trusted entry: an
+// operator's layout, or a link a bash call made that its check accepted. A link
+// swapped in while a window or its record holds a different trusted entry is not.
+function authorizedLink(file: string, live: Extract<ConfigFileEntry, { kind: 'link' }>): boolean {
+  const trusted = windows.has(resolve(file))
+    ? trustedConfigState(file).entry
+    : runtimeOwnsWindows
+      ? undefined
+      : publishedTrustedEntry(file)
+  return (
+    trusted === undefined ||
+    (trusted.kind === 'link' && trusted.target === live.target && trusted.resolved === live.resolved)
+  )
 }
 
 // A checked write/edit lands `bytes`: if the file held a bash candidate that
@@ -602,7 +649,14 @@ export function restoreConfigEntrySync(
 
 // `expected`: the entry the caller verified; the descriptor must still be it.
 export function writeConfigInPlaceSync(path: string, bytes: Buffer, expected?: ConfigFileIdentity): void {
-  const fd = openSync(path, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
+  // Windows rejects numeric open flags with EINVAL and has no FIFOs or
+  // O_NOFOLLOW; there the identity check on the descriptor guards the entry.
+  const fd = openSync(
+    path,
+    process.platform === 'win32'
+      ? 'r+'
+      : constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+  )
   try {
     const opened = fstatSync(fd, { bigint: true })
     if (!opened.isFile()) throw new Error(`${path} is not a regular file`)
