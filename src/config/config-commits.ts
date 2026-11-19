@@ -729,6 +729,9 @@ export function writeConfigInPlaceSync(
   bytes: Buffer,
   expected?: ConfigFileIdentity,
   assertManaged?: (opened: { dev: bigint; ino: bigint }) => void,
+  // The bytes the caller saw in this file: read again on the descriptor, any
+  // difference refuses the write with `conflict()` before a byte is written.
+  expectedPrior?: { bytes: Buffer; conflict: () => Error },
 ): void {
   let fd: number
   try {
@@ -753,6 +756,7 @@ export function writeConfigInPlaceSync(
     }
     assertManaged?.(opened)
     const prior = readFileSync(fd)
+    if (expectedPrior !== undefined && !prior.equals(expectedPrior.bytes)) throw expectedPrior.conflict()
     try {
       writeAllSync(fd, bytes)
       assertManaged?.(opened)

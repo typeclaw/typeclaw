@@ -79,6 +79,8 @@ import {
   createPinnedSnapshotBudgetForTests,
   enforceAndPinToolFiles,
   type PinnedToolFiles,
+  recheckManagedConfigAfterBash,
+  snapshotManagedConfigFiles,
   TOOL_INPUT_MAX_BYTES,
   TOOL_INPUT_MAX_COUNT,
   TREE_SNAPSHOT_MAX_ENTRIES,
@@ -7990,6 +7992,73 @@ describe('managed config commit check', () => {
         expect(await readFile(config, 'utf8')).toBe(retried)
         expect(readConfigCommitSync(config)?.generation).toBe(1)
       } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)(
+    'during a bash call, a write whose file an operator edits in place during its commit check is refused',
+    async () => {
+      // given: a bash call is in flight (its window holds the trusted bytes), and
+      // an operator retargets origin in place while the write's commit check runs
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-window-edit-'))
+      const config = path.join(agentDir, 'typeclaw.json')
+      const operator = '{"git":{"remotes":{"origin":"https://example.com/new.git"}}}\n'
+      await writeFile(config, '{"git":{"remotes":{"origin":"https://example.com/old.git"}}}\n')
+      const bash = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      const hooks = createHookBus()
+      hooks.registerAll('hand-edit', agentDir, noopLogger, {
+        'tool.before': async (event) => {
+          if (event.tool === 'write' && path.isAbsolute(String(event.args.path))) writeFileSync(config, operator)
+          return undefined
+        },
+      })
+      try {
+        // when: a write built from the old file commits
+        const write = builtin('write', agentDir, hooks).execute(
+          'write',
+          {
+            path: 'typeclaw.json',
+            content: '{"git":{"remotes":{"origin":"https://example.com/old.git"}},"alias":["atlas"]}\n',
+          } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: it is refused and the operator's bytes stand
+        await expect(write).rejects.toThrow('typeclaw.json changed while this write was being checked')
+        expect(await readFile(config, 'utf8')).toBe(operator)
+      } finally {
+        await recheckManagedConfigAfterBash(bash)
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test.skipIf(lacksInodeAnchoring)(
+    'a first cron.json write during a bash call that saw it missing succeeds',
+    async () => {
+      // given: no cron.json, and a bash call in flight whose window captured it as missing
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-check-first-cron-'))
+      const cron = path.join(agentDir, 'cron.json')
+      await writeFile(path.join(agentDir, 'typeclaw.json'), '{}\n')
+      const bash = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      try {
+        // when: a valid cron.json is written
+        await builtin('write', agentDir, createHookBus()).execute(
+          'write',
+          { path: 'cron.json', content: '{"jobs":[]}\n' } as never,
+          undefined,
+          undefined,
+          {} as never,
+        )
+
+        // then: it is created
+        expect(await readFile(cron, 'utf8')).toBe('{"jobs":[]}\n')
+      } finally {
+        await recheckManagedConfigAfterBash(bash)
         await rm(agentDir, { recursive: true, force: true })
       }
     },
