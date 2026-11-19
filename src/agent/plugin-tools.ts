@@ -76,7 +76,13 @@ import { createLoopGuard, type LoopGuard, type LoopGuardDecision } from './loop-
 import { enforceSubagentBashPolicy, type SubagentBashPolicy } from './reviewer-bash-policy'
 import type { SessionOrigin } from './session-origin'
 import { remediateToolErrorMessage } from './tool-error-remediation'
-import { enforceAndPinToolFiles, runWithManagedConfigCommitCheck, writeToolOutputNoFollow } from './tool-file-safety'
+import {
+  enforceAndPinToolFiles,
+  recheckManagedConfigAfterBash,
+  runWithManagedConfigCommitCheck,
+  snapshotManagedConfigFiles,
+  writeToolOutputNoFollow,
+} from './tool-file-safety'
 import { SUBAGENT_OUTPUT_TOOL_NAME, type SubagentOutputToolDetails } from './tools/subagent-output'
 import { webFetchTool } from './tools/webfetch'
 import { webSearchTool } from './tools/websearch'
@@ -661,6 +667,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         sandboxedRealProcSucceeded = false
         const attemptArgs = { ...originalArgs }
         let spawnEnvContext: BashSpawnEnvContext | undefined
+        let managedConfigNotices: string[] = []
         try {
           if (tool.name === 'bash') {
             if (opts.permissions === undefined) {
@@ -722,33 +729,66 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             bashEnvStore.run(spawnEnvContext, () =>
               tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
             )
-          // A write/edit of typeclaw.json or cron.json re-runs this session's
-          // guards on the exact bytes at commit (see writeToolOutputNoFollow).
-          const executed =
-            tool.name === 'write' || tool.name === 'edit'
-              ? await runWithManagedConfigCommitCheck(
-                  {
-                    agentDir: opts.agentDir,
-                    ...(signal !== undefined ? { signal } : {}),
-                    check: async (content, destination) => {
-                      const block = await opts.hooks.runToolBefore(
-                        {
-                          tool: 'write',
-                          sessionId: opts.sessionId,
-                          callId: toolCallId,
-                          args: { path: destination, content },
-                          toolProvenance: 'first-party',
-                          ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
-                        },
-                        opts.guards,
-                        envelope.acknowledgements,
-                      )
-                      if (block !== undefined) throw new Error(`blocked: ${block.reason}`)
-                    },
-                  },
-                  run,
-                )
-              : await run()
+          // typeclaw.json and cron.json changes are re-checked against this
+          // session's guards as a `write` of the exact bytes they would hold.
+          const managedConfigBlock = async (
+            content: string,
+            destination: string,
+            acknowledgements: typeof envelope.acknowledgements | undefined,
+          ): Promise<string | undefined> => {
+            const block = await opts.hooks.runToolBefore(
+              {
+                tool: 'write',
+                sessionId: opts.sessionId,
+                callId: toolCallId,
+                args: { path: destination, content },
+                toolProvenance: 'first-party',
+                ...(liveOrigin !== undefined ? { origin: liveOrigin } : {}),
+              },
+              opts.guards,
+              acknowledgements,
+            )
+            return block?.reason
+          }
+          let executed: Awaited<ReturnType<typeof run>>
+          if (tool.name === 'write' || tool.name === 'edit') {
+            // Checked at commit, on the exact bytes (see writeToolOutputNoFollow).
+            executed = await runWithManagedConfigCommitCheck(
+              {
+                agentDir: opts.agentDir,
+                ...(signal !== undefined ? { signal } : {}),
+                check: async (content, destination) => {
+                  const reason = await managedConfigBlock(content, destination, envelope.acknowledgements)
+                  if (reason !== undefined) throw new Error(`blocked: ${reason}`)
+                },
+              },
+              run,
+            )
+          } else if (tool.name === 'bash') {
+            // Bash writes these files directly, so its changes are checked after
+            // the call. Bash takes no acknowledgements, so a guard that asks for
+            // one blocks here; the notice points the model at write/edit.
+            const managedConfigBefore = await snapshotManagedConfigFiles(opts.agentDir)
+            try {
+              executed = await run()
+            } finally {
+              managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore, (content, destination) =>
+                managedConfigBlock(content, destination, undefined),
+              )
+            }
+            if (managedConfigNotices.length > 0) {
+              executed = {
+                ...executed,
+                content: [
+                  ...executed.content,
+                  ...managedConfigNotices.map((text) => ({ type: 'text' as const, text })),
+                ],
+              }
+            }
+            managedConfigNotices = []
+          } else {
+            executed = await run()
+          }
           // Pi 0.99 bash returns a nonzero exit as an `isError` result whose text
           // is the message 0.87 threw (tools/bash.js). This wrapper returns only
           // content/details, so rethrow to keep the failure on the error path
@@ -765,6 +805,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         } catch (error) {
           executionError =
             spawnEnvContext?.oomNote === undefined ? error : appendErrorText(error, spawnEnvContext.oomNote)
+          // Notices still pending here belong to a call that threw before it
+          // produced a result to carry them.
+          for (const notice of managedConfigNotices) executionError = appendErrorText(executionError, notice)
         } finally {
           const cleanup = [pinnedFiles?.cleanup(), preparedSandboxRuntime?.cleanup()].filter(
             (task): task is Promise<void> => task !== undefined,
