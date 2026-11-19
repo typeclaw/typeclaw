@@ -12,11 +12,12 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
+  type BigIntStats,
   unlinkSync,
   writeFileSync,
   writeSync,
-  type BigIntStats,
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 
@@ -288,15 +289,21 @@ export function prepareConfigWriteSync(file: string, base?: string): VerifiedCon
     writeInPlace: (into, content) =>
       id === undefined
         ? createConfigFileSync(into, Buffer.from(content))
-        : writeConfigInPlaceSync(into, Buffer.from(content), id, () => assertStillManaged(file, managed)),
+        : writeConfigInPlaceSync(into, Buffer.from(content), id, (opened) => assertStillManaged(file, managed, opened)),
   }
 }
 
 // The managed path must still be the entry that was verified: the same file,
-// or the same link (identity and target) to the file being written. Checked
-// right before the write and again after it, so a link re-pointed meanwhile
-// never leaves the write on a file the config no longer names.
-function assertStillManaged(file: string, managed: { id: ConfigFileIdentity; target: string | undefined }): void {
+// or the same link (identity and target) to the file being written, and the
+// path must still resolve, through every link, to the open descriptor's file,
+// so an intermediate link changed meanwhile is caught too. Checked right before
+// the write and again after it, so the write never lands on a file the config
+// no longer names. stat is metadata-only, so it cannot block on a FIFO.
+function assertStillManaged(
+  file: string,
+  managed: { id: ConfigFileIdentity; target: string | undefined },
+  opened: { dev: bigint; ino: bigint },
+): void {
   let stats: BigIntStats
   try {
     stats = lstatSync(file, { bigint: true })
@@ -308,6 +315,15 @@ function assertStillManaged(file: string, managed: { id: ConfigFileIdentity; tar
   }
   if (managed.target !== undefined && readlinkSync(file) !== managed.target) {
     throw refusedWrite(file, 'its link was re-pointed after it was checked')
+  }
+  let resolved: BigIntStats
+  try {
+    resolved = statSync(file, { bigint: true })
+  } catch (error) {
+    throw refusedWrite(file, errorText(error))
+  }
+  if (resolved.dev !== opened.dev || resolved.ino !== opened.ino) {
+    throw refusedWrite(file, 'it no longer resolves to the file being written')
   }
 }
 
@@ -712,7 +728,7 @@ export function writeConfigInPlaceSync(
   path: string,
   bytes: Buffer,
   expected?: ConfigFileIdentity,
-  assertManaged?: () => void,
+  assertManaged?: (opened: { dev: bigint; ino: bigint }) => void,
 ): void {
   let fd: number
   try {
@@ -735,11 +751,11 @@ export function writeConfigInPlaceSync(
     if (expected !== undefined && (opened.dev !== expected.dev || opened.ino !== expected.ino)) {
       throw refusedWrite(path, 'it was replaced after it was checked')
     }
-    assertManaged?.()
+    assertManaged?.(opened)
     const prior = readFileSync(fd)
     try {
       writeAllSync(fd, bytes)
-      assertManaged?.()
+      assertManaged?.(opened)
     } catch (error) {
       try {
         writeAllSync(fd, prior)

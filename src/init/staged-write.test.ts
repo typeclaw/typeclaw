@@ -473,6 +473,43 @@ describe('a verified config publication', () => {
     },
   )
 
+  test.skipIf(process.platform === 'win32')(
+    'refuses when an intermediate link of a symlinked config is re-pointed after it was verified',
+    async () => {
+      const { cwd, config, a, b, env } = await linkedAgent()
+      const current = join(cwd, 'deploy', 'current')
+      try {
+        // given: typeclaw.json -> deploy/current -> configs/a.json, verified
+        await mkdir(join(cwd, 'deploy'))
+        await symlink(a, current)
+        await rm(config)
+        await symlink(current, config)
+        const verified = prepareConfigWriteSync(config)
+
+        // when: only deploy/current is re-pointed to another file, typeclaw.json's link unchanged
+        await rm(current)
+        await symlink(b, current)
+        const result = publishConfigWithCredential(verified, '{"alias":["renamed"]}\n', {
+          path: env,
+          content: 'OLD=1\nNEW=2\n',
+          stagingDir: credentialStagingDir(cwd),
+        })
+
+        // then: it is refused, both files are untouched, .env is restored, and no commit is recorded
+        expect(result.ok).toBe(false)
+        expect(result.ok ? '' : result.reason).toContain(
+          'typeclaw.json changed or is not a regular file; nothing was written',
+        )
+        expect(readFileSync(a, 'utf8')).toBe('{"alias":["atlas"]}\n')
+        expect(readFileSync(b, 'utf8')).toBe('{"alias":["other"]}\n')
+        expect(readFileSync(env, 'utf8')).toBe('OLD=1\n')
+        expect(readConfigCommitSync(config)).toBeUndefined()
+      } finally {
+        await rm(cwd, { recursive: true, force: true })
+      }
+    },
+  )
+
   test.skipIf(process.platform === 'win32')('publishes through an unchanged symlinked config', async () => {
     const { cwd, config, a, env } = await linkedAgent()
     try {
