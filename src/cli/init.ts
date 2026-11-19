@@ -83,8 +83,8 @@ import type { TeamsAccountType } from '@/secrets/schema'
 
 import { teamsDeviceCodeCallbacks } from './channel'
 import { fuzzyMatch } from './fuzzy-filter'
+import { promptGithubAppAuth } from './github-app-auth'
 import { buildOAuthCallbacks } from './oauth-callbacks'
-import { CANCEL_SYMBOL, promptPrivateKeyPem } from './prompt-pem'
 import {
   c,
   cornflower,
@@ -1747,7 +1747,9 @@ async function runGithubFlow(cwd: string): Promise<StepResult<CollectedInputs['c
     initialValue: 'app',
   })
   if (isCancel(authType)) return back()
-  const auth = authType === 'pat' ? await promptGithubPatAuth() : await promptGithubAppAuth()
+  const appAuth = authType === 'app' ? await promptGithubAppAuth(cwd) : undefined
+  if (appAuth === null) return back()
+  const auth = appAuth === undefined ? await promptGithubPatAuth() : appAuth.auth
   if (auth === null) return back()
   note('GitHub webhooks need a public URL. TypeClaw can manage a tunnel for you.', 'GitHub webhook tunnel')
   const tunnelProvider = await select<GithubTunnelProvider>({
@@ -1794,9 +1796,12 @@ async function runGithubFlow(cwd: string): Promise<StepResult<CollectedInputs['c
   // validate guard and never coerces to ''), so we normalize before the
   // length checks below to avoid a TypeError on the "leave blank" path.
   const enteredSecret = typeof secret === 'string' ? secret : ''
-  const reposRaw = await text({
-    message: 'Repositories to allow (comma-separated owner/repo, leave blank to skip)',
-  })
+  const reposRaw =
+    appAuth?.repos === undefined
+      ? await text({
+          message: 'Repositories to allow (comma-separated owner/repo, leave blank to skip)',
+        })
+      : undefined
   if (isCancel(reposRaw)) return back()
   const resolvedSecret = enteredSecret.length > 0 ? enteredSecret : randomBytes(32).toString('hex')
   return value({
@@ -1806,7 +1811,7 @@ async function runGithubFlow(cwd: string): Promise<StepResult<CollectedInputs['c
       ...(webhookUrl !== undefined ? { webhookUrl } : {}),
       webhookPort: Number(port),
       ...(namedCreds !== undefined ? namedCreds : {}),
-      repos: parseGithubRepos(reposRaw ?? ''),
+      repos: appAuth?.repos ?? parseGithubRepos(reposRaw ?? ''),
       auth,
     },
   })
@@ -1853,25 +1858,6 @@ async function promptGithubPatAuth(): Promise<{ type: 'pat'; pat: string } | nul
   return { type: 'pat', pat }
 }
 
-async function promptGithubAppAuth(): Promise<{
-  type: 'app'
-  appId: number
-  privateKey: string
-} | null> {
-  const appId = await text({
-    message: 'GitHub App ID',
-    validate: (v) => validatePositiveInteger(v ?? '', 'App ID is required'),
-  })
-  if (isCancel(appId)) return null
-  const privateKey = await promptPrivateKeyPem('GitHub App private key PEM, escaped PEM, or path to .pem file')
-  if (privateKey === CANCEL_SYMBOL) return null
-  return {
-    type: 'app',
-    appId: Number(appId),
-    privateKey,
-  }
-}
-
 function parseGithubRepos(input: string): string[] {
   return input
     .split(',')
@@ -1887,12 +1873,6 @@ function validateGithubUrl(v: string, requiredMessage: string): string | undefin
   } catch {
     return 'Must be a valid URL'
   }
-}
-
-function validatePositiveInteger(v: string, requiredMessage: string): string | undefined {
-  if (!v || v.length === 0) return requiredMessage
-  const parsed = Number(v)
-  return Number.isInteger(parsed) && parsed > 0 ? undefined : 'Must be a positive integer'
 }
 
 async function runTelegramFlow(): Promise<StepResult<CollectedInputs['channelSecrets']>> {
