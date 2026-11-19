@@ -35,9 +35,13 @@ One token, stored in [`secrets.json`](/docs/reference/secrets-json):
 CLI: `typeclaw channel add discord-bot` (interactive, prints invite URL), `typeclaw channel set discord-bot` (rotate).
 
 <Callout type="warn" title="MESSAGE_CONTENT intent is required">
-  The `MESSAGE_CONTENT` privileged intent must be enabled in the Discord developer portal AND present in the gateway
-  bitmask. Without it, inbound messages arrive with empty content — the bot receives events but can't read what was
-  said.
+  The adapter always requests the `MESSAGE_CONTENT` privileged intent, so it must be enabled in the Discord developer
+  portal (Bot → Privileged Gateway Intents). If it is off, Discord refuses the gateway connection with close code `4014`
+  and the bot never comes online. `typeclaw init` and `typeclaw channel add discord-bot` read the application's intent
+  toggles right after you paste the token. When Message Content is off they link the Bot page and let you check again,
+  or continue anyway, in which case the bot won't connect until you enable it. If the settings can't be read (network
+  error, rejected token) setup continues with a warning, so finishing setup does not by itself confirm Discord will
+  accept the connection. `typeclaw channel set discord-bot` (token rotation) skips the check.
 </Callout>
 
 ## Invite

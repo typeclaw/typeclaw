@@ -1,9 +1,10 @@
 import { emitKeypressEvents as nodeEmitKeypressEvents } from 'node:readline'
 
-import { cancel, intro, isCancel, log, note, outro, spinner as clackSpinner } from '@clack/prompts'
+import { cancel, intro, isCancel, log, note, outro, select, spinner as clackSpinner } from '@clack/prompts'
 
 import { buildDiscordInviteUrl, deriveAppIdFromBotToken } from '@/channels/adapters/discord-bot-invite'
 import { type AutoUpgradeOutcome, describeAutoUpgrade } from '@/init/auto-upgrade'
+import { checkDiscordBotIntents, type DiscordBotIntentCheck } from '@/init/discord-bot-intents'
 import { styled, type StyleFormat } from '@/shared'
 import { COMPACT_WORDMARK, WORDMARK_LINES, WORDMARK_WIDTH } from '@/shared/wordmark'
 
@@ -403,4 +404,62 @@ export function printDiscordInviteHint(token: string, output: NodeJS.WritableStr
   )
   output.write(`${buildDiscordInviteUrl(appId)}\n`)
   output.write('\n')
+}
+
+// The adapter always requests MESSAGE CONTENT, so a missing toggle means the
+// gateway refuses the bot (close 4014) and the agent never comes up. Hold the
+// operator here until it is enabled or they explicitly move on. A failed check
+// (network, unexpected response) only warns: it must never block onboarding.
+export async function confirmDiscordBotIntents(
+  token: string,
+  {
+    check = checkDiscordBotIntents,
+    choose = chooseAfterMissingMessageContent,
+  }: {
+    check?: (token: string) => Promise<DiscordBotIntentCheck>
+    choose?: () => Promise<'recheck' | 'continue' | 'cancel'>
+  } = {},
+): Promise<'continue' | 'cancel'> {
+  for (;;) {
+    const s = spinner()
+    s.start('Checking the Discord bot settings')
+    const result = await check(token)
+    if (result.status === 'ok') {
+      s.stop('Discord privileged intents are enabled.')
+      return 'continue'
+    }
+    if (result.status === 'unchecked') {
+      s.stop(`Couldn't verify Discord privileged intents: ${result.reason}`)
+      return 'continue'
+    }
+    s.error(`Discord privileged intents are off: ${result.intents.join(', ')}`)
+    const appId = deriveAppIdFromBotToken(token)
+    note(
+      [
+        'Open the Bot page below, then under Privileged Gateway Intents',
+        `enable ${result.intents.join(' and ')} and click Save Changes.`,
+        ...(result.intents.includes('MESSAGE CONTENT')
+          ? ["Without MESSAGE CONTENT, Discord refuses the bot's connection and the agent stays offline."]
+          : []),
+      ].join('\n'),
+      'Enable Discord privileged intents',
+    )
+    process.stdout.write(
+      `${appId === null ? 'https://discord.com/developers/applications' : `https://discord.com/developers/applications/${appId}/bot`}\n\n`,
+    )
+    if (!result.intents.includes('MESSAGE CONTENT')) return 'continue'
+    const next = await choose()
+    if (next !== 'recheck') return next
+  }
+}
+
+async function chooseAfterMissingMessageContent(): Promise<'recheck' | 'continue' | 'cancel'> {
+  const next = await select<'recheck' | 'continue'>({
+    message: 'Message Content intent is required',
+    options: [
+      { value: 'recheck', label: "I've enabled it, check again" },
+      { value: 'continue', label: 'Continue anyway (the bot will not connect)' },
+    ],
+  })
+  return isCancel(next) ? 'cancel' : next
 }

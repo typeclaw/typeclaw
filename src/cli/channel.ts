@@ -50,7 +50,15 @@ import { SecretsWebexCredentialStore } from '@/secrets/webex-store'
 import { promptGithubAppAuth } from './github-app-auth'
 import { CANCEL_SYMBOL, promptPrivateKeyPem } from './prompt-pem'
 import { displayQR } from './qr'
-import { c, done, errorLine, printDiscordInviteHint, printSlackAppManifestSetup, successLine } from './ui'
+import {
+  c,
+  confirmDiscordBotIntents,
+  done,
+  errorLine,
+  printDiscordInviteHint,
+  printSlackAppManifestSetup,
+  successLine,
+} from './ui'
 
 const CHANNEL_LABELS: Record<ChannelKind, string> = {
   'slack-bot': 'Slack',
@@ -1050,7 +1058,7 @@ async function collectCredentials(
     case 'discord':
       return { channel, runDiscordAuth: ({ cwd: agentDir }) => runDiscordQrAuth(agentDir) }
     case 'discord-bot':
-      return { channel, discordBotToken: await promptDiscordToken() }
+      return { channel, discordBotToken: await promptDiscordToken({ checkIntents: true }) }
     case 'slack-bot': {
       const slack = await promptSlackTokens()
       return { channel, slackBotToken: slack.bot, slackAppToken: slack.app }
@@ -1385,7 +1393,9 @@ function validateUrl(value: string, requiredMessage: string): string | undefined
   }
 }
 
-async function promptDiscordToken(): Promise<string> {
+// Only `channel add` checks intents. Rotation (`channel set`) must save the
+// replacement token unconditionally: the old one may already be revoked.
+async function promptDiscordToken({ checkIntents = false }: { checkIntents?: boolean } = {}): Promise<string> {
   note(
     [
       'https://discord.com/developers/applications',
@@ -1399,6 +1409,10 @@ async function promptDiscordToken(): Promise<string> {
     validate: (value) => (value && value.length > 0 ? undefined : 'Token is required'),
   })
   if (isCancel(token)) {
+    cancel('Aborted.')
+    process.exit(0)
+  }
+  if (checkIntents && (await confirmDiscordBotIntents(token)) === 'cancel') {
     cancel('Aborted.')
     process.exit(0)
   }

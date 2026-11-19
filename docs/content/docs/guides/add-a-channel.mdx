@@ -204,6 +204,8 @@ To build the URL yourself, drop your application ID into:
 https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+applications.commands&permissions=277025508416
 ```
 
+Before printing the URL, it also checks that the bot application has **Message Content** enabled under Bot → Privileged Gateway Intents. Without it Discord refuses the bot's connection, so when it's off the command links your app's Bot page and lets you check again once you've enabled it, or continue anyway (the bot then stays offline until you do). If Discord's settings can't be read, setup only warns and continues. **Server Members** is checked too but only warned about, since it's needed only for member lookups.
+
 See the [Discord adapter reference](/docs/reference/discord-bot) for the rest.
 
 </Accordion>
