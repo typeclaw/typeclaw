@@ -204,6 +204,90 @@ describe('analyzeGitCommand — clone flags', () => {
   })
 })
 
+describe('analyzeGitCommand — fetch/pull/ls-remote flags', () => {
+  const ghRemote = resolvers({ resolveRemoteUrl: async () => 'https://github.com/acme/widgets.git' })
+
+  test.each([
+    'git fetch -q origin main',
+    'git fetch --prune --tags origin',
+    'git fetch --depth 1 origin main',
+    'git fetch --depth=50 origin',
+    'git fetch --shallow-since=2026-01-01 origin',
+    'git -C /tmp/repo fetch --quiet origin main',
+    'git pull --rebase origin main',
+    'git pull -q --ff-only origin main',
+    'git ls-remote --heads origin',
+    'git ls-remote --tags https://github.com/acme/widgets.git',
+    'GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/acme/widgets.git refs/heads/main',
+    'GIT_TERMINAL_PROMPT=0 git fetch -q origin main',
+  ])('mints for an inert flag or prompt switch: %s', async (command) => {
+    expect(await analyze(command, ghRemote)).toMatchObject({ kind: 'inject', repoSlug: 'acme/widgets', access: 'read' })
+  })
+
+  // These ran tokenless before they were brokered, so a public repo outside
+  // channels.github.repos[] must keep reading anonymously when the mint is refused.
+  test.each(['git fetch -q origin main', 'git ls-remote --heads https://github.com/acme/widgets.git'])(
+    'a newly brokered read keeps its anonymous fallback: %s',
+    async (command) => {
+      expect(await analyze(command, ghRemote)).toMatchObject({ kind: 'inject', credentialOptional: true })
+    },
+  )
+
+  test('a flagged multi-repo fetch keeps running anonymously; the flagless one still blocks', async () => {
+    const twoRepos = resolvers({
+      resolveRemoteUrl: async (_cwd, remote) =>
+        remote === 'origin' ? 'https://github.com/acme/widgets.git' : 'https://github.com/other/gadgets.git',
+    })
+    expect(await analyze('git fetch -q --multiple origin upstream', twoRepos)).toEqual({
+      kind: 'pass-through',
+      multiRepo: true,
+    })
+    expect((await analyze('git fetch --multiple origin upstream', twoRepos)).kind).toBe('block')
+  })
+
+  test('a flagless fetch keeps its existing refusal behavior', async () => {
+    expect(await analyze('git fetch origin main', ghRemote)).toEqual({
+      kind: 'inject',
+      repoSlug: 'acme/widgets',
+      access: 'read',
+    })
+  })
+
+  test('safe-cd rewrite keeps the prompt switch in front of git', async () => {
+    const decision = await analyze('cd /tmp/repo && GIT_TERMINAL_PROMPT=0 git fetch -q origin main', ghRemote)
+    expect(decision).toMatchObject({
+      kind: 'inject',
+      rewrittenCommand: "GIT_TERMINAL_PROMPT=0 git -C '/tmp/repo' fetch -q origin main",
+    })
+  })
+
+  // Each of these can run a command, reach another repo with the token live, steer
+  // credentials, or smuggle a value. They must keep running tokenless.
+  test.each([
+    'git fetch --upload-pack=/bin/sh origin',
+    'git fetch --recurse-submodules origin',
+    'git fetch --all',
+    'git fetch -o evil origin',
+    'git fetch --depth evil;x origin',
+    'git fetch --depth',
+    'git fetch -q',
+    'git pull --upload-pack /bin/sh origin main',
+    'git pull -s ours origin main',
+    'git ls-remote --upload-pack=/bin/sh origin',
+    'GIT_TERMINAL_PROMPT=yes git fetch origin',
+    'GIT_TERMINAL_PROMPT="0" git fetch origin',
+    '"GIT_TERMINAL_PROMPT=0" git fetch origin',
+    "GIT_TERMINAL_PROMPT='0' git fetch -q origin main",
+    'cd /tmp/repo && GIT_TERMINAL_PROMPT="0" git fetch -q origin main',
+    '"git" fetch -q origin main',
+    'cd /tmp/repo && "git" fetch origin main',
+    'GIT_ASKPASS=/tmp/evil GIT_TERMINAL_PROMPT=0 git fetch origin',
+    'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND=evil git fetch origin',
+  ])('does not mint for an unsafe flag, value, or env prefix: %s', async (command) => {
+    expect((await analyze(command, ghRemote)).kind).not.toBe('inject')
+  })
+})
+
 describe('analyzeGitCommand — inject (explicit url)', () => {
   test('clone https', async () => {
     expect(await analyze('git clone https://github.com/acme/widgets.git')).toEqual({
@@ -262,13 +346,12 @@ describe('analyzeGitCommand — inject (remote resolution)', () => {
       credentialOptional: true,
     })
   })
-  test.each([
-    'git ls-remote --upload-pack=/bin/sh origin',
-    'git ls-remote -u /bin/sh origin',
-    'git ls-remote --heads origin',
-  ])('ls-remote with a flag is not mintable: %s', async (command) => {
-    expect(await analyze(command, ghRemote)).toEqual({ kind: 'pass-through' })
-  })
+  test.each(['git ls-remote --upload-pack=/bin/sh origin', 'git ls-remote -u /bin/sh origin'])(
+    'ls-remote with a command-running flag is not mintable: %s',
+    async (command) => {
+      expect(await analyze(command, ghRemote)).toEqual({ kind: 'pass-through' })
+    },
+  )
   test('ls-remote of a non-github remote', async () => {
     const glRemote = resolvers({ resolveRemoteUrl: async () => 'https://gitlab.com/acme/widgets.git' })
     expect(await analyze('git ls-remote origin', glRemote)).toEqual({ kind: 'pass-through' })
