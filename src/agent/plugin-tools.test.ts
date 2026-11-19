@@ -8591,21 +8591,148 @@ if (!r.ok) { console.error(r.reason); process.exit(1) }`,
     })
   })
 
-  test('a host mutation stops on unreadable window state and leaves typeclaw.json unchanged', async () => {
+  for (const [label, plant] of [
+    ['invalid JSON', (staging: string) => writeFile(path.join(staging, 'typeclaw.json.window.json'), '{not json')],
+    ['null', (staging: string) => writeFile(path.join(staging, 'typeclaw.json.window.json'), 'null')],
+    ['an array', (staging: string) => writeFile(path.join(staging, 'typeclaw.json.window.json'), '[]')],
+    [
+      'a wrong-shape object',
+      (staging: string) =>
+        writeFile(path.join(staging, 'typeclaw.json.window.json'), '{"generation":1,"content":"e30="}'),
+    ],
+  ] as const) {
+    test(`a host mutation stops on window state that is ${label} and leaves typeclaw.json unchanged`, async () => {
+      await withAgentDir(async (agentDir, config) => {
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+        await mkdir(staging, { recursive: true })
+        await plant(staging)
+
+        const result = await hostGrantResult(agentDir, 'discord:user:9')
+
+        expect(result.code).not.toBe(0)
+        expect(result.stderr).toContain('typeclaw.json.window.json is invalid')
+        expect(result.stderr).toContain('Delete that file')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      })
+    })
+  }
+
+  test('a host mutation stops when the window state cannot be reached (ENOTDIR)', async () => {
     await withAgentDir(async (agentDir, config) => {
       await writeFile(config, '{"alias":["atlas"]}\n')
-      const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
-      await mkdir(staging, { recursive: true })
-      await writeFile(path.join(staging, 'typeclaw.json.window.json'), '{not json')
+      await mkdir(path.join(agentDir, '.typeclaw'))
+      await writeFile(path.join(agentDir, '.typeclaw', 'credential-staging'), 'not-a-directory')
 
       const result = await hostGrantResult(agentDir, 'discord:user:9')
 
       expect(result.code).not.toBe(0)
-      expect(result.stderr).toContain('typeclaw.json.window.json could not be read')
-      expect(result.stderr).toContain('typeclaw restart')
+      expect(result.stderr).toContain('typeclaw.json.window.json is invalid')
       expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
     })
   })
+
+  test('a host grant that commits while startup waits on the lock survives startup recovery', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: a leftover window (trusted atlas) over rejected bytes, and a host grant holding the lock
+      const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+      await mkdir(staging, { recursive: true })
+      await writeFile(
+        path.join(staging, 'typeclaw.json.window.json'),
+        JSON.stringify({
+          generation: 0,
+          content: Buffer.from('{"alias":["atlas"]}\n').toString('base64'),
+          entry: { kind: 'file', mode: 0o644 },
+        }),
+      )
+      await writeFile(config, '{"alias":["rejected"]}\n')
+      const host = await hostGrantHoldingLock(agentDir, 'discord:user:9')
+
+      // when: the runtime starts, waits on the lock, and the grant commits meanwhile
+      const startup = Bun.spawn({
+        cmd: [
+          process.execPath,
+          '-e',
+          `import { reconcileLeftoverConfigWindowsSync } from './src/config/config-commits.ts'
+console.log('STARTING')
+reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
+        ],
+        cwd: path.resolve(import.meta.dir, '../..'),
+        stdout: 'pipe',
+        stderr: 'inherit',
+      })
+      const reader = startup.stdout.getReader()
+      let seen = ''
+      while (!seen.includes('STARTING')) {
+        const chunk = await reader.read()
+        if (chunk.done) throw new Error('startup exited before reconciling')
+        seen += new TextDecoder().decode(chunk.value)
+      }
+      await host.commit()
+      expect(await startup.exited).toBe(0)
+
+      // then: startup kept the grant, built on the trusted bytes, not the rejected ones
+      const after = JSON.parse(await readFile(config, 'utf8')) as { alias: string[]; roles: unknown }
+      expect(after.alias).toEqual(['atlas'])
+      expect(after.roles).toEqual({ trusted: { match: ['discord:user:9'] } })
+    })
+  })
+
+  // Real bwrap: the read-only fallback is a bind the kernel enforces.
+  test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
+    'a call that cannot be coordinated gets the config read-only in its sandbox; a normal call can still edit',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const { hooks } = guardHooks(agentDir)
+        const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+        if (bash === undefined) throw new Error('bash tool definition not found')
+        const sandboxed = wrapBuiltinToolDefinition(bash, {
+          agentDir,
+          sessionId: 'bash-recheck-bwrap',
+          hooks,
+          guards: buildInternalGuards(agentDir),
+          getOrigin: () => tui,
+          permissions: createPermissionService(),
+          bashSandboxBoundary: {
+            ensureAvailable: async () => {},
+            resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+            resolveRuntime: async () => ({ env: {}, mounts: [] }),
+            verifyRuntime: async () => {},
+            cleanupRuntime: async () => {},
+            buildCommand: (command, options) => buildSandboxedCommand(command, options ?? {}),
+          },
+        })
+        const run = async (command: string): Promise<string> => {
+          try {
+            const result = await sandboxed.execute('c', { command } as never, undefined, undefined, {} as never)
+            return result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+          } catch (error) {
+            return error instanceof Error ? error.message : String(error)
+          }
+        }
+
+        // given: window state cannot be published, so this call is uncoordinated
+        const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
+        await mkdir(path.join(blocker, 'occupied'), { recursive: true })
+
+        // when: it tries to edit typeclaw.json
+        const readOnly = await run(`printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; echo still-ran`)
+
+        // then: the write fails in the sandbox, the call still runs, and it is told why
+        expect(readOnly.startsWith('[TypeClaw config guard] typeclaw.json and cron.json were read-only')).toBe(true)
+        expect(readOnly).toContain('still-ran')
+        expect(readOnly).toMatch(/Read-only file system/i)
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+
+        // and: once coordination works again, a normal call edits the live file
+        await rm(blocker, { recursive: true })
+        const normal = await run(`printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json`)
+        expect(normal).not.toContain('read-only')
+        expect(await readFile(config, 'utf8')).toBe('{"alias":["renamed"]}\n')
+      })
+    },
+  )
 
   test("the guard check sees the call's bytes on disk; the live file is never flipped to run it", async () => {
     await withAgentDir(async (agentDir, config) => {

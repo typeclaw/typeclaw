@@ -1,14 +1,19 @@
 import { expect, test } from 'bun:test'
-import { openSync, writeSync, closeSync } from 'node:fs'
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { closeSync, openSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { readValidatedConfigFileSync, recordConfigCommitSync } from '@/config/config-commits'
+import {
+  __setConfigReadHookForTests,
+  readValidatedConfigFileSync,
+  recordConfigCommitSync,
+} from '@/config/config-commits'
 
 import {
   enforceAndPinToolFiles,
   enforceCanonicalSecretDenial,
+  readOnlyConfigNotice,
   recheckManagedConfigAfterBash,
   snapshotManagedConfigFiles,
 } from './tool-file-safety'
@@ -141,7 +146,10 @@ test('a blocked bash change whose restore fails partway is reported with its rec
 // A fresh process, as `typeclaw start` on the host and then `typeclaw run` are:
 // it reports the alias a host read sees, reconciles like runtime startup, and
 // reports the alias the runtime then loads.
-async function freshStart(agentDir: string): Promise<{ code: number; out: string; err: string }> {
+async function freshStart(
+  agentDir: string,
+  options: { hostRead?: boolean } = {},
+): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn({
     cmd: [
       process.execPath,
@@ -149,7 +157,7 @@ async function freshStart(agentDir: string): Promise<{ code: number; out: string
       `import { loadConfigSync } from './src/config/config.ts'
 import { markRuntimeOwnsConfigWindows, reconcileLeftoverConfigWindowsSync } from './src/config/config-commits.ts'
 const dir = ${JSON.stringify(agentDir)}
-console.log('host:' + JSON.stringify(loadConfigSync(dir).alias))
+if (${options.hostRead !== false}) console.log('host:' + JSON.stringify(loadConfigSync(dir).alias))
 reconcileLeftoverConfigWindowsSync(dir)
 markRuntimeOwnsConfigWindows()
 console.log('runtime:' + JSON.stringify(loadConfigSync(dir).alias))`,
@@ -215,6 +223,125 @@ test('a fresh start that cannot revert leftover blocked bytes refuses to load th
     expect(started.code).not.toBe(0)
     expect(started.err).toContain('refusing to load it')
     expect(started.err).toContain('git checkout -- typeclaw.json')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a call whose window cannot be published runs with the existing config files read-only', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-readonly-decision-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+  try {
+    // given: a normal call, then one whose window state path is occupied
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const normal = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await recheckManagedConfigAfterBash(normal)
+    await mkdir(path.join(staging, 'typeclaw.json.window.json', 'occupied'), { recursive: true })
+
+    // when: the second call opens its window
+    const blocked = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await recheckManagedConfigAfterBash(blocked)
+
+    // then: only that call gets typeclaw.json read-only (cron.json does not exist), with the reason
+    expect(normal.readOnly).toBeUndefined()
+    expect(readOnlyConfigNotice(normal)).toBeUndefined()
+    expect(blocked.readOnly?.files).toEqual([config])
+    const notice = readOnlyConfigNotice(blocked)
+    expect(notice).toContain('typeclaw.json and cron.json were read-only for this command')
+    expect(notice).toContain(path.join(staging, 'typeclaw.json.window.json'))
+    expect(notice).toContain('make the change with the write or edit tool')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a host read that races a rollback never returns the rolled-back bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-versioned-read-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+  const window = path.join(staging, 'typeclaw.json.window.json')
+  const trusted = '{"alias":["atlas"]}\n'
+  try {
+    // given: an open window whose trusted bytes differ from the rejected bytes on disk
+    await mkdir(staging, { recursive: true })
+    await writeFile(
+      window,
+      JSON.stringify({
+        generation: 0,
+        content: Buffer.from(trusted).toString('base64'),
+        entry: { kind: 'file', mode: 0o644 },
+      }),
+    )
+    await writeFile(config, '{"alias":["rejected"]}\n')
+    let interleaved = 0
+    __setConfigReadHookForTests((stage) => {
+      if (stage !== 'after-live' || interleaved > 0) return
+      interleaved += 1
+      // the runtime rolls the file back and drops the window between this read's steps
+      writeFileSync(config, trusted)
+      rmSync(window)
+    })
+
+    // when: a host process reads typeclaw.json across that rollback
+    const read = readValidatedConfigFileSync(config)
+
+    // then: it re-reads and returns the rolled-back file, never the rejected bytes
+    expect(interleaved).toBe(1)
+    expect(read).toBe(trusted)
+  } finally {
+    __setConfigReadHookForTests(undefined)
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'a fresh start restores a regular file without writing through a symlink bash swapped in',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-restore-symlink-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const decoy = path.join(agentDir, 'workspace', 'decoy.json')
+    try {
+      // given: bash swapped typeclaw.json for a link to a workspace file, and the restore failed
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      await mkdir(path.dirname(decoy), { recursive: true })
+      await writeFile(decoy, '{"alias":["decoy"]}\n')
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => 'Guard `aliasLock` blocked write')
+      await rm(config)
+      await symlink(decoy, config)
+      await chmod(agentDir, 0o555)
+      const notices = await recheckManagedConfigAfterBash(snapshot)
+      await chmod(agentDir, 0o755)
+      expect(notices.join('\n')).toContain('could not be restored')
+
+      // when: the agent starts again
+      const started = await freshStart(agentDir)
+
+      // then: the workspace file is untouched and typeclaw.json is a regular file again
+      expect(started.code).toBe(0)
+      expect(await readFile(decoy, 'utf8')).toBe('{"alias":["decoy"]}\n')
+      expect((await lstat(config)).isFile()).toBe(true)
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    } finally {
+      await chmod(agentDir, 0o755).catch(() => {})
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)
+
+test('a fresh start refuses invalid leftover window state', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-restore-invalid-'))
+  try {
+    await writeFile(path.join(agentDir, 'typeclaw.json'), '{"alias":["atlas"]}\n')
+    const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+    await mkdir(staging, { recursive: true })
+    await writeFile(path.join(staging, 'typeclaw.json.window.json'), 'null')
+
+    const started = await freshStart(agentDir, { hostRead: false })
+
+    expect(started.code).not.toBe(0)
+    expect(started.err).toContain('refusing to load it')
+    expect(started.err).toContain('is invalid')
   } finally {
     await rm(agentDir, { recursive: true, force: true })
   }
