@@ -290,9 +290,16 @@ export async function closeConfigWindow(file: string, call: symbol): Promise<voi
     return
   }
   // The record is removed only after the epoch advances under the lock.
-  await withConfigFileLock(file, async () => settleWindow(file, window)).catch((error: unknown) =>
-    keepRecord(file, window, `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`),
-  )
+  await withConfigFileLock(file, async () => settleWindow(file, window)).catch((error: unknown) => {
+    // Another call may have joined meanwhile: the window stays in force for it.
+    if (evictWindow(file, window)) {
+      warnKeptRecord(
+        file,
+        window,
+        `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`,
+      )
+    }
+  })
 }
 
 // Bumped when a window opens, closes, or rolls a change back, and kept when the
@@ -425,7 +432,13 @@ export function readValidatedConfigFileSync(file: string): string {
     try {
       withConfigFileLockSync(file, () => settleWindow(file, window))
     } catch (error) {
-      keepRecord(file, window, `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`)
+      if (evictWindow(file, window)) {
+        warnKeptRecord(
+          file,
+          window,
+          `the ${basename(file)} lock could not be taken to close the window: ${errorText(error)}`,
+        )
+      }
     }
   }
   return textOf(file, live)
@@ -641,29 +654,38 @@ function settleWindow(file: string, window: Window): void {
     publishWindow(file, window)
     return
   }
-  windows.delete(resolve(file))
+  if (!evictWindow(file, window)) return
   // Callers hold the config lock. Only this window's own record is removed, and
   // only once the epoch has advanced; otherwise a host read could miss the whole
   // window, so the record stays and host readers keep its trusted bytes.
   if (!window.published || recordOwner(file) !== window.owner) return
   if (window.keepRecord === true) {
-    keepRecord(file, window, `the ${basename(file)} window epoch could not be advanced during a rollback`)
+    warnKeptRecord(file, window, `the ${basename(file)} window epoch could not be advanced during a rollback`)
     return
   }
   const bumped = bumpConfigEpochSync(file)
   if (!bumped.ok) {
-    keepRecord(file, window, bumped.reason)
+    warnKeptRecord(file, window, bumped.reason)
     return
   }
   try {
     rmSync(windowPath(file), { force: true })
   } catch (error) {
-    keepRecord(file, window, `the record could not be removed: ${errorText(error)}`)
+    warnKeptRecord(file, window, `the record could not be removed: ${errorText(error)}`)
   }
 }
 
-function keepRecord(file: string, window: Window, reason: string): void {
-  windows.delete(resolve(file))
+// The only way a window leaves memory: it must still be the window registered
+// for the file, with no call in flight and no unrecovered rollback. Runtime
+// readers fall back to the file itself once it is gone.
+function evictWindow(file: string, window: Window): boolean {
+  const key = resolve(file)
+  if (windows.get(key) !== window || window.calls.size > 0 || window.recovery) return false
+  windows.delete(key)
+  return true
+}
+
+function warnKeptRecord(file: string, window: Window, reason: string): void {
   if (!window.published) return
   console.warn(
     `[typeclaw] ${reason}; the agent's ${basename(file)} state at ${windowPath(file)} stays published until the agent restarts, so host typeclaw commands keep using the last authorized ${basename(file)}`,

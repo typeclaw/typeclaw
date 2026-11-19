@@ -605,3 +605,62 @@ test('under coordination failure a hard-linked typeclaw.json refuses the call', 
     await rm(agentDir, { recursive: true, force: true })
   }
 })
+
+test('a close that times out on the lock keeps the window for a call still in flight', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-close-lock-timeout-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  try {
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    // The runtime, in its own process so it owns the in-memory windows. The first
+    // call closes while a holder keeps the lock past its bound; the second joins
+    // the window during that wait, then edits; a reload runs; then the second
+    // closes normally.
+    const runtime = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { loadConfigSync } from './src/config/config.ts'
+import { markRuntimeOwnsConfigWindows } from './src/config/config-commits.ts'
+import { recheckManagedConfigAfterBash, snapshotManagedConfigFiles } from './src/agent/tool-file-safety.ts'
+markRuntimeOwnsConfigWindows()
+const dir = ${JSON.stringify(agentDir)}
+const config = ${JSON.stringify(config)}
+const block = async () => 'Guard \`aliasLock\` blocked write'
+const first = await snapshotManagedConfigFiles(dir, block)
+writeFileSync(config + '.lock', '')
+const started = Date.now()
+const closing = recheckManagedConfigAfterBash(first)
+const second = await snapshotManagedConfigFiles(dir, block)
+await closing
+console.log('waited:' + (Date.now() - started >= 4000))
+writeFileSync(config, '{"alias":["unchecked"]}\\n')
+console.log('reload:' + JSON.stringify(loadConfigSync(dir).alias))
+rmSync(config + '.lock')
+const notices = await recheckManagedConfigAfterBash(second)
+console.log('reverted:' + notices.some((notice) => notice.includes('was reverted')))
+console.log('record:' + existsSync(dir + '/.typeclaw/credential-staging/typeclaw.json.window.json'))
+console.log('file:' + JSON.stringify(readFileSync(config, 'utf8')))`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    const [code, out, err] = await Promise.all([
+      runtime.exited,
+      new Response(runtime.stdout).text(),
+      new Response(runtime.stderr).text(),
+    ])
+
+    // then: the reload during the second call used the trusted bytes, and the
+    // second call's close then checked, reverted, and settled the window
+    expect({ code, err: code === 0 ? '' : err }).toEqual({ code: 0, err: '' })
+    expect(out).toContain('waited:true')
+    expect(out).toContain('reload:["atlas"]')
+    expect(out).toContain('reverted:true')
+    expect(out).toContain('record:false')
+    expect(out).toContain(`file:${JSON.stringify('{"alias":["atlas"]}\n')}`)
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+}, 30_000)
