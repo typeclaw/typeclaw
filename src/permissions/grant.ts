@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { tryRecordConfigCommitSync } from '@/config/config-commits'
 import { withConfigFileLockSync } from '@/config/config-file-lock'
 import { commitSystemFileSync } from '@/git/system-commit'
 
@@ -160,11 +161,13 @@ function loadConfigObject(cwd: string, roleName: string): LoadedConfig | { ok: f
 
 function writeConfigObject(cwd: string, obj: Record<string, unknown>): GrantResult {
   const path = join(cwd, CONFIG_FILE)
+  const bytes = `${JSON.stringify(obj, null, 2)}\n`
   try {
-    writeAtomic(path, `${JSON.stringify(obj, null, 2)}\n`)
+    writeAtomic(path, bytes)
   } catch (error) {
     return { ok: false, reason: `failed to write ${CONFIG_FILE}: ${describeError(error)}` }
   }
+  tryRecordConfigCommitSync(path, bytes)
   return { ok: true, added: true }
 }
 

@@ -1,17 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { constants, createWriteStream, lstatSync, type BigIntStats, type Stats } from 'node:fs'
+import { constants, createWriteStream, lstatSync, statSync, type Stats } from 'node:fs'
 import {
   chmod,
-  lstat,
   mkdir,
   mkdtemp,
   open,
   readdir,
-  readlink,
   realpath,
   rm,
   stat,
-  symlink,
   unlink,
   writeFile,
   type FileHandle,
@@ -27,6 +24,25 @@ import {
   createPrivateSurfaceReadIdentityVerifier,
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
+import {
+  closeConfigWindow,
+  contentOf,
+  equalBytes,
+  identityOf,
+  MANAGED_CONFIG_FILES,
+  newerConfigCommit,
+  openConfigWindowSync,
+  readConfigEntrySync,
+  recordConfigCommitSync,
+  restoreConfigEntrySync,
+  runWithConfigBaseline,
+  sameConfigContent,
+  setValidatedConfigEntry,
+  validatedConfigState,
+  withContent,
+  type ConfigFileEntry,
+  type ConfigFileIdentity,
+} from '@/config/config-commits'
 import { withConfigFileLock } from '@/config/config-file-lock'
 import type { ToolFileOperands, ToolLogger, ToolProvenance, ToolResult } from '@/plugin'
 import { CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
@@ -870,7 +886,6 @@ export type ManagedConfigCommitCheck = {
 // and hand edits, can still land between a check and its write and then be
 // overwritten; see #1718. Bash is checked after the fact instead, by
 // recheckManagedConfigAfterBash below.
-const MANAGED_CONFIG_FILES = ['typeclaw.json', 'cron.json'] as const
 const managedConfigCommitCheck = new AsyncLocalStorage<ManagedConfigCommitCheck | undefined>()
 let checkedWrites: Promise<unknown> = Promise.resolve()
 
@@ -895,6 +910,7 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
       // check above must not write; nothing is awaited between here and the write.
       commit.signal?.throwIfAborted()
       await writeOutputNoFollow(targetPath, content)
+      recordConfigCommitSync(destination, content)
     })
   })
   checkedWrites = write.catch(() => {})
@@ -918,98 +934,94 @@ async function managedConfigDestination(agentDir: string, targetPath: string): P
   return undefined
 }
 
-// What a managed config path held before a bash call. A regular file's bytes
-// are kept so a blocked change can be put back.
-export type ManagedConfigEntry =
-  | { kind: 'missing' }
-  | { kind: 'file'; bytes: Buffer; mode: number; identity: EntryIdentity }
-  | { kind: 'symlink'; target: string; identity: EntryIdentity }
-  | { kind: 'other'; identity: EntryIdentity }
+// Per bash call: what each managed path looked like (lstat identity, plus the
+// identity of the file a symlink names) when the call started. An unchanged
+// identity after the call costs nothing more than these stats.
+export type ManagedConfigSnapshot = ReadonlyMap<string, CallIdentity>
 
-type EntryIdentity = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint }
-
-export type ManagedConfigSnapshot = ReadonlyMap<string, ManagedConfigEntry>
+type CallIdentity = { link: ConfigFileIdentity | undefined; resolved: ConfigFileIdentity | undefined }
 
 // Returns the guard's denial reason, or undefined when the content may land.
 export type ManagedConfigGuardCheck = (content: string, destination: string) => Promise<string | undefined>
 
-export async function snapshotManagedConfigFiles(agentDir: string): Promise<ManagedConfigSnapshot> {
-  const destinations = MANAGED_CONFIG_FILES.map((file) => path.join(path.resolve(agentDir), file))
-  const entries = await Promise.all(destinations.map(readManagedEntry))
-  return new Map(destinations.map((destination, index) => [destination, entries[index] as ManagedConfigEntry]))
+export type RecheckSeams = { writeInPlace?: (path: string, bytes: Buffer) => void }
+
+export function snapshotManagedConfigFiles(agentDir: string): ManagedConfigSnapshot {
+  const snapshot = new Map<string, CallIdentity>()
+  try {
+    for (const file of MANAGED_CONFIG_FILES) {
+      const destination = path.join(path.resolve(agentDir), file)
+      openConfigWindowSync(destination)
+      snapshot.set(destination, callIdentity(destination))
+    }
+  } catch (error) {
+    for (const destination of snapshot.keys()) closeConfigWindow(destination)
+    throw error
+  }
+  return snapshot
 }
 
 // Model bash for roles that keep agent-root writes can rewrite typeclaw.json and
 // cron.json directly, past the write/edit guards. bwrap runs every bash call
 // with --die-with-parent in its own PID namespace, so each of its writes has
-// landed by the time the call returns. This re-runs the write/edit commit check
-// on whatever the call left, as a `write` of those bytes, and puts the file
-// back when a guard blocks it. Guards read their baseline from disk, so the
-// pre-call state is written back first, the check runs against it, and the
-// call's bytes are written again only if it passes. Files are rewritten in
-// place on their current inode, keeping ACLs, groups, and sandbox masks bound
-// to it. A deleted file is left deleted: no guard evaluates a deletion. A file
-// the call created is removed when blocked. A symlink at a managed path is
-// reverted, because reload would follow it while the guards and write/edit
-// refuse to check through it. Returns one model-facing notice per reverted file.
+// landed by the time the call returns. A changed file is checked under the
+// config lock, in the checked-write queue, against state only authorized
+// writers can produce (src/config/config-commits.ts):
+//
+// - bytes equal to the validated state, or to a commit an authorized writer
+//   recorded during the call, are left as they are;
+// - anything else is a bash change: this session's guards run on it as a
+//   `write`, against the validated bytes passed as their baseline, so the live
+//   file is never rewritten to run them. A change that passes is recorded as
+//   the new authorized commit. A blocked one is put back to the latest
+//   authorized state, in place, only if the file still holds the checked bytes.
+//
+// A symlinked path is followed, as loaders and the guards follow it, so a change
+// to the file it names is caught too. A deleted file is left deleted: no guard
+// evaluates a deletion. A directory or FIFO is never opened and is left alone.
+// Returns one model-facing notice per reverted (or unrevertable) file.
 export async function recheckManagedConfigAfterBash(
-  before: ManagedConfigSnapshot,
+  snapshot: ManagedConfigSnapshot,
   check: ManagedConfigGuardCheck,
+  seams: RecheckSeams = {},
 ): Promise<string[]> {
   const notices: string[] = []
-  for (const [destination, pre] of before) {
-    if (!(await entryChanged(destination, pre))) continue
-    const notice = await recheckManagedEntry(destination, pre, check).catch(
-      (error: unknown) =>
-        `[TypeClaw config guard] Could not re-check ${path.basename(destination)} after this command: ${errorMessage(error)}`,
-    )
-    if (notice !== undefined) notices.push(notice)
+  try {
+    for (const [destination, before] of snapshot) {
+      if (sameCallIdentity(before, callIdentity(destination))) continue
+      const notice = await recheckManagedEntry(destination, check, seams).catch(
+        (error: unknown) =>
+          `[TypeClaw config guard] Could not re-check ${path.basename(destination)} after this command: ${errorMessage(error)}`,
+      )
+      if (notice !== undefined) notices.push(notice)
+    }
+  } finally {
+    for (const destination of snapshot.keys()) closeConfigWindow(destination)
   }
   return notices
 }
 
-async function entryChanged(destination: string, pre: ManagedConfigEntry): Promise<boolean> {
-  const current = await lstatEntry(destination)
-  if (current === undefined || pre.kind === 'missing') return current !== undefined || pre.kind !== 'missing'
-  const { identity } = pre
-  return (
-    current.dev !== identity.dev ||
-    current.ino !== identity.ino ||
-    current.size !== identity.size ||
-    current.mtimeNs !== identity.mtimeNs ||
-    current.ctimeNs !== identity.ctimeNs
-  )
-}
-
 async function recheckManagedEntry(
   destination: string,
-  pre: ManagedConfigEntry,
   check: ManagedConfigGuardCheck,
+  seams: RecheckSeams,
 ): Promise<string | undefined> {
-  const name = path.basename(destination)
-  // What this call left, read outside the lock: only those exact bytes are ever
-  // put back or kept, so a later writer's change is never clobbered.
-  const left = await readManagedEntry(destination)
-  if (sameContent(left, pre) || left.kind === 'missing' || left.kind === 'other' || pre.kind === 'other') {
-    return undefined
-  }
   let locked = false
   const recheck = checkedWrites.then(() =>
     withConfigFileLock(destination, async () => {
       locked = true
-      if (!sameContent(await readManagedEntry(destination), left)) return undefined
-      if (left.kind === 'symlink') {
-        await replaceEntry(destination, left, pre)
-        return revertNotice(name, `${name} was replaced by a symlink, which the config guards cannot check`)
+      const live = readConfigEntrySync(destination)
+      const pending = unauthorizedChange(destination, live)
+      if (pending === undefined) return undefined
+      const baseline = contentOf(pending.validated)
+      const reason = await runWithConfigBaseline(destination, baseline, () =>
+        check(live.kind === 'missing' || live.kind === 'other' ? '' : live.bytes.toString('utf8'), destination),
+      ).catch((error: unknown) => `the config guard check failed: ${errorMessage(error)}`)
+      if (reason === undefined) {
+        recordConfigCommitSync(destination, contentOf(live))
+        return undefined
       }
-      await replaceEntry(destination, left, pre)
-      const reason = await check(left.bytes.toString('utf8'), destination).catch(
-        (error: unknown) => `the config guard check failed: ${errorMessage(error)}`,
-      )
-      if (reason !== undefined) return revertNotice(name, reason)
-      // A lockless writer that changed the file during the check wins.
-      if (sameContent(await readManagedEntry(destination), pre)) await replaceEntry(destination, pre, left)
-      return undefined
+      return revert(destination, live, pending.revertTo, reason, seams)
     }),
   )
   checkedWrites = recheck.catch(() => {})
@@ -1019,16 +1031,63 @@ async function recheckManagedEntry(
     // The lock file sits in the agent root, which this bash call could write, so
     // an unavailable lock must not leave an unchecked change in place.
     if (locked) throw error
-    if (!sameContent(await readManagedEntry(destination), left)) throw error
-    await replaceEntry(destination, left, pre)
-    return revertNotice(
-      name,
+    const live = readConfigEntrySync(destination)
+    const pending = unauthorizedChange(destination, live)
+    if (pending === undefined) throw error
+    return revert(
+      destination,
+      live,
+      pending.revertTo,
       `the config file lock was unavailable, so the change could not be checked: ${errorMessage(error)}`,
+      seams,
     )
   }
 }
 
-function revertNotice(name: string, reason: string): string {
+// What a bash change is checked against and put back to, or undefined when the
+// file holds state an authorized writer produced (or a change no guard can
+// evaluate: a deletion, or something that is not a regular file).
+function unauthorizedChange(
+  destination: string,
+  live: ConfigFileEntry,
+): { validated: ConfigFileEntry; revertTo: ConfigFileEntry } | undefined {
+  const { entry: validated, generation } = validatedConfigState(destination)
+  if (sameConfigContent(live, validated)) return undefined
+  const commit = newerConfigCommit(destination, generation)
+  if (commit !== undefined && equalBytes(contentOf(live), commit.bytes)) return undefined
+  if (live.kind === 'missing') {
+    setValidatedConfigEntry(destination, live)
+    return undefined
+  }
+  if (live.kind === 'other') return undefined
+  return { validated, revertTo: commit === undefined ? validated : withContent(validated, commit.bytes) }
+}
+
+function revert(
+  destination: string,
+  live: ConfigFileEntry,
+  revertTo: ConfigFileEntry,
+  reason: string,
+  seams: RecheckSeams,
+): string {
+  const name = path.basename(destination)
+  const now = readConfigEntrySync(destination)
+  if (!sameConfigContent(now, live)) {
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} changed again before it could be reverted, so it was left as it is now; that change is checked on its own.`,
+    ].join('\n')
+  }
+  try {
+    restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
+  } catch (error) {
+    return [
+      `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+      `blocked: ${reason}`,
+      `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content: restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
+    ].join('\n')
+  }
   return [
     `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
     `blocked: ${reason}`,
@@ -1036,83 +1095,25 @@ function revertNotice(name: string, reason: string): string {
   ].join('\n')
 }
 
-// Moves the managed path from `current` (what is on disk now) to `next`. A
-// regular file that stays a regular file is rewritten in place on its inode.
-async function replaceEntry(destination: string, current: ManagedConfigEntry, next: ManagedConfigEntry): Promise<void> {
-  if (current.kind === 'file' && next.kind === 'file') {
-    await writeExistingInPlace(destination, next.bytes)
-    return
-  }
-  if (current.kind === 'file' || current.kind === 'symlink') await unlink(destination)
-  if (next.kind === 'file') {
-    const output = await open(
-      destination,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      next.mode,
-    )
-    try {
-      await output.writeFile(next.bytes)
-    } finally {
-      await output.close()
-    }
-  } else if (next.kind === 'symlink') {
-    await symlink(next.target, destination)
-  }
+function callIdentity(destination: string): CallIdentity {
+  return { link: statIdentity(destination, false), resolved: statIdentity(destination, true) }
 }
 
-async function writeExistingInPlace(destination: string, bytes: Buffer): Promise<void> {
-  const output = await open(destination, constants.O_RDWR | constants.O_NOFOLLOW)
+function statIdentity(destination: string, follow: boolean): ConfigFileIdentity | undefined {
   try {
-    await output.truncate(0)
-    await output.writeFile(bytes)
-  } finally {
-    await output.close()
+    return identityOf(follow ? statSync(destination, { bigint: true }) : lstatSync(destination, { bigint: true }))
+  } catch {
+    return undefined
   }
 }
 
-function sameContent(a: ManagedConfigEntry, b: ManagedConfigEntry): boolean {
-  if (a.kind === 'file' && b.kind === 'file') return a.bytes.equals(b.bytes)
-  if (a.kind === 'symlink' && b.kind === 'symlink') return a.target === b.target
-  if (a.kind === 'other' && b.kind === 'other')
-    return a.identity.dev === b.identity.dev && a.identity.ino === b.identity.ino
-  return a.kind === 'missing' && b.kind === 'missing'
+function sameCallIdentity(a: CallIdentity, b: CallIdentity): boolean {
+  return sameIdentity(a.link, b.link) && sameIdentity(a.resolved, b.resolved)
 }
 
-async function readManagedEntry(destination: string): Promise<ManagedConfigEntry> {
-  const input = await open(destination, constants.O_RDONLY | constants.O_NOFOLLOW).catch((error: unknown) => {
-    if (isNotFoundError(error) || isErrorCode(error, 'ELOOP')) return undefined
-    throw error
-  })
-  if (input === undefined) {
-    const identity = await lstatEntry(destination)
-    if (identity === undefined) return { kind: 'missing' }
-    const target = await readlink(destination).catch(() => undefined)
-    return target === undefined ? { kind: 'other', identity } : { kind: 'symlink', target, identity }
-  }
-  try {
-    const opened = await input.stat({ bigint: true })
-    const identity = toIdentity(opened)
-    if (!opened.isFile()) return { kind: 'other', identity }
-    return { kind: 'file', bytes: await input.readFile(), mode: Number(opened.mode & 0o7777n), identity }
-  } finally {
-    await input.close()
-  }
-}
-
-async function lstatEntry(destination: string): Promise<EntryIdentity | undefined> {
-  const inspected = await lstat(destination, { bigint: true }).catch((error: unknown) => {
-    if (isNotFoundError(error)) return undefined
-    throw error
-  })
-  return inspected === undefined ? undefined : toIdentity(inspected)
-}
-
-function toIdentity(stats: BigIntStats): EntryIdentity {
-  return { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeNs: stats.mtimeNs, ctimeNs: stats.ctimeNs }
-}
-
-function isErrorCode(error: unknown, code: string): boolean {
-  return error instanceof Error && 'code' in error && error.code === code
+function sameIdentity(a: ConfigFileIdentity | undefined, b: ConfigFileIdentity | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
 }
 
 function errorMessage(error: unknown): string {

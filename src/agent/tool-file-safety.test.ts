@@ -1,9 +1,15 @@
 import { expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { openSync, writeSync, closeSync } from 'node:fs'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { enforceAndPinToolFiles, enforceCanonicalSecretDenial } from './tool-file-safety'
+import {
+  enforceAndPinToolFiles,
+  enforceCanonicalSecretDenial,
+  recheckManagedConfigAfterBash,
+  snapshotManagedConfigFiles,
+} from './tool-file-safety'
 
 test('enforceCanonicalSecretDenial ignores non-file declarations for canonical credentials', async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-canonical-denial-'))
@@ -79,6 +85,40 @@ test('plugin handoff lookalikes cannot exempt remote-looking or credential opera
         }),
       ).rejects.toThrow(/blocked:|ambiguous local file operand/)
     }
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a blocked bash change whose restore fails partway is reported with its recovery', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-restore-fault-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  try {
+    // given: a blocked bash change, and a restore write that fails after writing half
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const snapshot = snapshotManagedConfigFiles(agentDir)
+    await writeFile(config, '{"alias":["blocked-change"]}\n')
+    const failingWrite = (target: string, bytes: Buffer) => {
+      const fd = openSync(target, 'r+')
+      try {
+        writeSync(fd, bytes, 0, Math.floor(bytes.length / 2), 0)
+      } finally {
+        closeSync(fd)
+      }
+      throw new Error('disk full')
+    }
+
+    // when: the post-call check blocks it
+    const notices = await recheckManagedConfigAfterBash(snapshot, async () => 'Guard `aliasLock` blocked write', {
+      writeInPlace: failingWrite,
+    })
+
+    // then: the notice names the file, the block, the failure, and the recovery
+    expect(notices).toHaveLength(1)
+    expect(notices[0]).toContain('blocked: Guard `aliasLock` blocked write')
+    expect(notices[0]).toContain('typeclaw.json could not be restored to its state before this command (disk full)')
+    expect(notices[0]).toContain('`git checkout -- typeclaw.json`')
+    expect(await readFile(config, 'utf8')).not.toBe('')
   } finally {
     await rm(agentDir, { recursive: true, force: true })
   }
