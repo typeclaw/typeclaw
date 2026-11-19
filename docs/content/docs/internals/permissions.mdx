@@ -86,7 +86,7 @@ Legacy five-field channel principals implicitly belong to the target adapter's n
 
 ## Wiring
 
-1. **Config**: top-level `roles?` parsed by `rolesConfigSchema`. **`roles` is restart-required**.
+1. **Config**: top-level `roles?` parsed by `rolesConfigSchema`. **`roles.<name>.match` applies on reload** (the config reloadable updates the live permission service); **`roles.<name>.permissions` is restart-required**.
 2. **Plugin registration**: `definePlugin({ permissions: [...] })`. Read at boot before any factory runs; the union expands the owner wildcard and powers the boot-time typo warning.
 3. **`PluginContext.permissions: PermissionService`** is constructed once at plugin load and lives for the plugin's lifetime.
 4. **`ToolBeforeEvent.origin` carries the LIVE origin** via a mutable `originRef` on `CreateSessionOptions`. Channel sessions update the holder per-turn in `src/channels/router.ts` so the event sees current-turn `lastInboundAuthorId`. TUI/cron/subagent sessions pass `origin` directly.
