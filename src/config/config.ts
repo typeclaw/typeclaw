@@ -1,4 +1,4 @@
-import { accessSync, constants as fsConstants, statSync, writeFileSync } from 'node:fs'
+import { accessSync, constants as fsConstants, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, posix, resolve } from 'node:path'
 
@@ -20,7 +20,12 @@ import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { secretFieldSchema } from '@/secrets/resolve'
 
-import { readConfigForWriteSync, readValidatedConfigFileSync, tryRecordConfigCommitSync } from './config-commits'
+import {
+  readConfigForWriteSync,
+  readValidatedConfigFileSync,
+  tryRecordConfigCommitSync,
+  writeBackConfigSync,
+} from './config-commits'
 import { withConfigFileLockSync } from './config-file-lock'
 import {
   DEFAULT_MODEL_REF,
@@ -1564,10 +1569,17 @@ function persistMigratedConfig(cwd: string): void {
     // Migrate the file as it is under the lock, not the caller's earlier read,
     // so a write that landed in between is not rolled back.
     applied = withConfigFileLockSync(file, () => {
-      const migrated = migrateLegacyConfigShape(JSON.parse(readConfigForWriteSync(file)))
+      const base = readConfigForWriteSync(file)
+      const migrated = migrateLegacyConfigShape(JSON.parse(base))
       if (migrated.changed) {
         const bytes = `${JSON.stringify(migrated.json, null, 2)}\n`
-        writeFileSync(file, bytes)
+        // Only onto the verified regular file it was built from; otherwise the
+        // migration stays in memory and the write-back retries on a later load.
+        const deferred = writeBackConfigSync(file, base, bytes)
+        if (deferred !== undefined) {
+          console.warn(`[typeclaw] deferred the ${CONFIG_FILE} migration write-back: ${deferred}`)
+          return []
+        }
         tryRecordConfigCommitSync(file, bytes)
       }
       return migrated.applied

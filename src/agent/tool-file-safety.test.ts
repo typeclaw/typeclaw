@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import { loadConfigSync } from '@/config'
+import { __resetConfigForTesting, getConfig } from '@/config/config'
 import {
   __failConfigEpochWritesForTests,
   closeConfigWindow,
@@ -13,6 +14,7 @@ import {
   recordConfigCommitSync,
   reconcileLeftoverConfigWindowsSync,
 } from '@/config/config-commits'
+import { createConfigReloadable } from '@/config/reloadable'
 
 import {
   enforceAndPinToolFiles,
@@ -881,3 +883,65 @@ test('a window never releases its trusted view while the live file holds uncheck
     await rm(agentDir, { recursive: true, force: true })
   }
 })
+
+// Trusted bytes that still carry the dropped memory.vector config, so a reload
+// migrates them and tries to write the migration back.
+const needsMigration = '{"alias":["atlas"],"memory":{"vector":{"enabled":true}}}\n'
+
+test.skipIf(process.platform === 'win32')(
+  'a reload during a bash call that left a FIFO at typeclaw.json never writes the migration into it',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-migrate-fifo-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    try {
+      // given: a bash call is in flight and has replaced typeclaw.json with a FIFO
+      await writeFile(config, needsMigration)
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      await rm(config)
+      expect(await Bun.spawn(['mkfifo', config]).exited).toBe(0)
+
+      // when: the config reloads (opening the FIFO to write would hang here)
+      const result = await createConfigReloadable({ cwd: agentDir }).reload()
+
+      // then: it loads the migrated trusted bytes and leaves the FIFO alone
+      expect(result.ok).toBe(true)
+      expect(getConfig().alias).toEqual(['atlas'])
+      expect((await lstat(config)).isFIFO()).toBe(true)
+      await recheckManagedConfigAfterBash(snapshot)
+    } finally {
+      __resetConfigForTesting()
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)
+
+test.skipIf(process.platform === 'win32')(
+  'a reload during a bash call that swapped typeclaw.json for a symlink never writes through the link',
+  async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-migrate-link-'))
+    const config = path.join(agentDir, 'typeclaw.json')
+    const target = path.join(agentDir, 'workspace', 'notes.json')
+    try {
+      // given: a bash call is in flight and has swapped typeclaw.json for a link to a workspace file
+      await writeFile(config, needsMigration)
+      const snapshot = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+      await mkdir(path.dirname(target), { recursive: true })
+      await writeFile(target, '{"notes":"keep me"}\n')
+      await rm(config)
+      await symlink(target, config)
+
+      // when: the config reloads
+      const result = await createConfigReloadable({ cwd: agentDir }).reload()
+
+      // then: it loads the migrated trusted bytes and the workspace file is untouched
+      expect(result.ok).toBe(true)
+      expect(getConfig().alias).toEqual(['atlas'])
+      expect(await readFile(target, 'utf8')).toBe('{"notes":"keep me"}\n')
+      expect((await lstat(config)).isSymbolicLink()).toBe(true)
+      await recheckManagedConfigAfterBash(snapshot)
+    } finally {
+      __resetConfigForTesting()
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  },
+)

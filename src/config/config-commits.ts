@@ -256,6 +256,29 @@ export function readConfigForWriteSync(file: string): string {
   return textOf(file, trusted)
 }
 
+// A guard-free write-back (a config migration) under the config lock, with
+// `base` the bytes it built on (readConfigForWriteSync). It writes only when the
+// live entry is one regular file, not a link or a hard link, holding exactly
+// `base`: while a bash window or recovery holds unchecked bytes, live differs
+// from the trusted base and the write-back waits. Returns why it was deferred.
+export function writeBackConfigSync(file: string, base: string, bytes: string): string | undefined {
+  const name = basename(file)
+  try {
+    const live = readConfigEntrySync(file)
+    if (live.kind !== 'file') return `${name} is not a regular file`
+    if (lstatOrUndefined(file)?.nlink !== 1n) return `${name} has more than one link`
+    if (live.bytes.toString('utf8') !== base) return `${name} holds bytes that have not been checked`
+    writeConfigInPlaceSync(file, Buffer.from(bytes), live.id)
+    return undefined
+  } catch (error) {
+    return errorText(error)
+  } finally {
+    // Nothing replaced a bash candidate unless the write landed, and a landed
+    // write had live equal to its base, so there was no candidate either way.
+    supersededCandidates.delete(resolve(file))
+  }
+}
+
 // A checked write/edit lands `bytes`: if the file held a bash candidate that
 // these bytes replace, the bash call is told its change was discarded.
 export function noteConfigWriteSync(file: string, bytes: string | Buffer): void {
@@ -577,10 +600,15 @@ export function restoreConfigEntrySync(
   else throw new Error(`${to.resolved} is no longer a regular file`)
 }
 
-export function writeConfigInPlaceSync(path: string, bytes: Buffer): void {
+// `expected`: the entry the caller verified; the descriptor must still be it.
+export function writeConfigInPlaceSync(path: string, bytes: Buffer, expected?: ConfigFileIdentity): void {
   const fd = openSync(path, constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
   try {
-    if (!fstatSync(fd).isFile()) throw new Error(`${path} is not a regular file`)
+    const opened = fstatSync(fd, { bigint: true })
+    if (!opened.isFile()) throw new Error(`${path} is not a regular file`)
+    if (expected !== undefined && (opened.dev !== expected.dev || opened.ino !== expected.ino)) {
+      throw new Error(`${path} was replaced after it was checked`)
+    }
     let written = 0
     while (written < bytes.length) written += writeSync(fd, bytes, written, bytes.length - written, written)
     ftruncateSync(fd, bytes.length)
