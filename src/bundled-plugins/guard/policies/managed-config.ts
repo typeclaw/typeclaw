@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { normalizeFileReference } from '@/agent/file-reference'
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 import { validateCronEdit } from '@/cron'
 import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
 
@@ -92,7 +93,7 @@ function validateManagedContent(
 
 async function readExisting(targetPath: string): Promise<string | undefined> {
   try {
-    return await readFile(targetPath, 'utf8')
+    return await readConfigBaseline(targetPath)
   } catch {
     return undefined
   }

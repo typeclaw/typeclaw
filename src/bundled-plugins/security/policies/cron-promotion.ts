@@ -1,6 +1,7 @@
 import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
+import { readConfigBaseline } from '@/config/config-commits'
 import { parseCronJson, type ParsedCronJob } from '@/cron'
 
 import type { SecuritySeverity } from '../permissions'
@@ -216,7 +217,7 @@ function parseJobsFromContent(content: string): readonly ParsedCronJob[] | undef
 async function readExistingJobs(targetPath: string): Promise<readonly ParsedCronJob[]> {
   let raw: string
   try {
-    raw = await readFile(targetPath, 'utf8')
+    raw = await readConfigBaseline(targetPath)
   } catch {
     return []
   }

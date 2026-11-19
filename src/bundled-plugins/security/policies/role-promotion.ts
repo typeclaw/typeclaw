@@ -2,6 +2,7 @@ import { readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 
 import { parseConfigJson } from '@/config'
+import { readConfigBaseline } from '@/config/config-commits'
 import { isBuiltinRoleName, type RoleConfig, type RolesConfig } from '@/permissions'
 
 import type { SecuritySeverity } from '../permissions'
@@ -231,7 +232,7 @@ function parseRolesFromContent(content: string): RolesConfig | undefined {
 async function readExistingRoles(targetPath: string): Promise<RolesConfig> {
   let raw: string
   try {
-    raw = await readFile(targetPath, 'utf8')
+    raw = await readConfigBaseline(targetPath)
   } catch {
     // No existing file (first write) — treat every role as a new grant.
     return {}
