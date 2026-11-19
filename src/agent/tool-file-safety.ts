@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { constants, createWriteStream, lstatSync, statSync, type Stats } from 'node:fs'
+import { constants, createWriteStream, lstatSync, realpathSync, statSync, type Stats } from 'node:fs'
 import {
   chmod,
   mkdir,
@@ -25,6 +25,7 @@ import {
   type PrivateSurfaceIdentityVerifier,
 } from '@/bundled-plugins/security/policies/private-surface-read'
 import {
+  bumpConfigEpochSync,
   closeConfigWindow,
   concurrentCallGuards,
   contentOf,
@@ -964,6 +965,15 @@ export async function snapshotManagedConfigFiles(
   const files = new Map<string, { identity: CallIdentity; generation: number | undefined }>()
   const readOnlyFiles: string[] = []
   const reasons: string[] = []
+  const refusals: string[] = []
+  // A call that cannot be coordinated with host typeclaw commands gets the file
+  // read-only, so it cannot leave a change no host writer or restart can see.
+  const makeReadOnly = (destination: string, reason: string): void => {
+    reasons.push(reason)
+    const target = readOnlyTarget(agentDir, destination)
+    if ('path' in target) readOnlyFiles.push(target.path)
+    else refusals.push(target.refuse)
+  }
   try {
     for (const file of MANAGED_CONFIG_FILES) {
       const destination = path.join(path.resolve(agentDir), file)
@@ -971,23 +981,53 @@ export async function snapshotManagedConfigFiles(
       try {
         opened = await openConfigWindow(destination, call, guard)
       } catch (error) {
-        // The check could not be set up: never fail the call over it, run it
-        // with the file read-only instead.
-        reasons.push(`the ${file} check could not be prepared: ${errorMessage(error)}`)
-        if (isRegularFile(destination)) readOnlyFiles.push(destination)
+        makeReadOnly(destination, `the ${file} check could not be prepared: ${errorMessage(error)}`)
         continue
       }
       files.set(destination, { identity: callIdentity(destination), generation: opened.generation })
-      if (opened.uncoordinated !== undefined) {
-        reasons.push(opened.uncoordinated)
-        if (isRegularFile(destination)) readOnlyFiles.push(destination)
-      }
+      if (opened.uncoordinated !== undefined) makeReadOnly(destination, opened.uncoordinated)
     }
   } catch (error) {
-    for (const destination of files.keys()) closeConfigWindow(destination, call)
+    for (const destination of files.keys()) await closeConfigWindow(destination, call)
     throw error
   }
+  if (refusals.length > 0) {
+    // Rare and scoped to this one call: the file cannot be held read-only, and
+    // running it unchecked could leave a change nothing can coordinate.
+    for (const destination of files.keys()) await closeConfigWindow(destination, call)
+    throw new Error(
+      `[TypeClaw config guard] This command was not run: the agent could not coordinate config writes with host typeclaw commands (${reasons.join('; ')}), and ${refusals.join('; ')}. Retry the command once that is cleared.`,
+    )
+  }
   return { call, guard, files, ...(reasons.length > 0 ? { readOnly: { files: readOnlyFiles, reasons } } : {}) }
+}
+
+// The path a read-only bind must cover for a managed file: the file itself, or
+// for a symlink the regular file it resolves to inside the agent folder (a bind
+// on that file is what makes a write through the link fail).
+function readOnlyTarget(agentDir: string, destination: string): { path: string } | { refuse: string } {
+  const name = path.basename(destination)
+  let entry: Stats
+  try {
+    entry = lstatSync(destination)
+  } catch {
+    return { refuse: `${name} does not exist, so it cannot be made read-only for it` }
+  }
+  if (entry.isFile()) return { path: destination }
+  if (!entry.isSymbolicLink()) return { refuse: `${name} is not a regular file, so it cannot be made read-only for it` }
+  let resolved: string
+  try {
+    resolved = realpathSync(destination)
+  } catch {
+    return { refuse: `${name} is a symlink to nothing, so it cannot be made read-only for it` }
+  }
+  const root = realpathSync(path.resolve(agentDir))
+  if (!resolved.startsWith(`${root}${path.sep}`)) {
+    return { refuse: `${name} links outside the agent folder, so it cannot be made read-only for it` }
+  }
+  return isRegularFile(resolved)
+    ? { path: resolved }
+    : { refuse: `${name} links to something that is not a regular file, so it cannot be made read-only for it` }
 }
 
 // Prepended to the result of a call that ran with the config files read-only.
@@ -1045,7 +1085,7 @@ export async function recheckManagedConfigAfterBash(
       if (notice !== undefined) notices.push(notice)
     }
   } finally {
-    for (const destination of snapshot.files.keys()) closeConfigWindow(destination, snapshot.call)
+    for (const destination of snapshot.files.keys()) await closeConfigWindow(destination, snapshot.call)
   }
   return notices
 }
@@ -1155,6 +1195,7 @@ function revert(
   try {
     restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
   } catch (error) {
+    bumpConfigEpochSync(destination)
     setConfigRecovery(destination, true)
     return [
       `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
@@ -1162,6 +1203,7 @@ function revert(
       `${name} could not be restored to its state before this command (${errorMessage(error)}). It may still hold the blocked or partly written content; the agent keeps using the last authorized ${name} until it is fixed. Restore it with \`git checkout -- ${name}\` in the agent folder, then redo the allowed changes with the write or edit tool.`,
     ].join('\n')
   }
+  bumpConfigEpochSync(destination)
   return [
     `[TypeClaw config guard] ${name} was reverted to its state before this command. The change this command made to it was blocked:`,
     `blocked: ${reason}`,

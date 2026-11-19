@@ -61,7 +61,14 @@ export type ConfigFileEntry =
     }
   | { kind: 'other'; id: ConfigFileIdentity }
 
-export type ConfigCommit = { generation: number; bytes: Buffer | undefined; superseded: boolean }
+// `entry` is the kind of entry the writer left (file or link, with its mode and
+// link target), so restoring a commit never reuses an older window's entry.
+export type ConfigCommit = {
+  generation: number
+  bytes: Buffer | undefined
+  superseded: boolean
+  entry: ConfigFileEntry | undefined
+}
 
 // A bash call's guard check: the denial reason, or undefined when content may land.
 export type ConfigCallGuard = (content: string, destination: string) => Promise<string | undefined>
@@ -150,7 +157,18 @@ export function readConfigCommitSync(file: string): ConfigCommit | undefined {
   }
   if (parsed === undefined || typeof parsed.generation !== 'number') return undefined
   const bytes = typeof parsed.content === 'string' ? Buffer.from(parsed.content, 'base64') : undefined
-  return { generation: parsed.generation, bytes, superseded: parsed.superseded === true }
+  return {
+    generation: parsed.generation,
+    bytes,
+    superseded: parsed.superseded === true,
+    entry: trustedEntryFromRecord(parsed),
+  }
+}
+
+// The state a commit restores to: its own recorded entry, or for a commit
+// recorded before entries were, its bytes in the given entry.
+export function commitEntry(commit: ConfigCommit, fallback: ConfigFileEntry): ConfigFileEntry {
+  return commit.entry ?? withContent(fallback, commit.bytes)
 }
 
 // Records `content` as the last authorized commit of `file`. Callers hold the
@@ -160,15 +178,17 @@ export function recordConfigCommitSync(file: string, content: string | Buffer | 
   const bytes = content === undefined ? undefined : Buffer.from(content)
   const generation = (readConfigCommitSync(file)?.generation ?? 0) + 1
   const superseded = supersededCandidates.delete(key)
+  const live = readConfigEntrySync(file)
+  const committed = equalBytes(contentOf(live), bytes) ? live : withContent({ kind: 'missing' }, bytes)
   writeStateFileSync(commitPath(file), {
     generation,
     content: bytes === undefined ? null : bytes.toString('base64'),
     superseded,
+    entry: describeEntry(committed),
   })
   const window = windows.get(key)
   if (window !== undefined) {
-    const live = readConfigEntrySync(file)
-    window.trusted = equalBytes(contentOf(live), bytes) ? live : withContent(window.trusted, bytes)
+    window.trusted = committed
     window.generation = generation
     window.recovery = false
     settleWindow(file, window)
@@ -254,11 +274,48 @@ export function markRuntimeOwnsConfigWindows(): void {
   runtimeOwnsWindows = true
 }
 
-export function closeConfigWindow(file: string, call: symbol): void {
+export async function closeConfigWindow(file: string, call: symbol): Promise<void> {
   const window = windows.get(resolve(file))
   if (window === undefined) return
   window.calls.delete(call)
-  settleWindow(file, window)
+  if (window.calls.size > 0 || window.recovery) {
+    settleWindow(file, window)
+    return
+  }
+  // The close bumps the epoch under the lock, as the open did.
+  await withConfigFileLock(file, async () => settleWindow(file, window)).catch(() => settleWindow(file, window))
+}
+
+// Bumped when a window opens, closes, or rolls a change back, and kept when the
+// window is gone, so a cross-process read can tell that a whole window came and
+// went between its samples.
+export function bumpConfigEpochSync(file: string): void {
+  try {
+    writeStateFileSync(epochPath(file), { epoch: readConfigEpochSync(file) + 1 })
+  } catch (error) {
+    console.warn(`[typeclaw] could not advance the ${basename(file)} window epoch (${errorText(error)})`)
+  }
+}
+
+function readConfigEpochSync(file: string): number {
+  const path = epochPath(file)
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0
+    throw invalidWindowState(file, path, errorText(error))
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (error) {
+    throw invalidWindowState(file, path, errorText(error))
+  }
+  if (!isRecord(parsed) || typeof parsed.epoch !== 'number') {
+    throw invalidWindowState(file, path, 'it is not a valid window epoch')
+  }
+  return parsed.epoch
 }
 
 // The newest authorized state: the trusted state, advanced to any commit an
@@ -275,7 +332,7 @@ export function trustedConfigState(file: string): {
   const newer = commit !== undefined && (window.generation === undefined || commit.generation > window.generation)
   if (newer && window.coordinated) {
     const live = readConfigEntrySync(file)
-    window.trusted = equalBytes(contentOf(live), commit.bytes) ? live : withContent(window.trusted, commit.bytes)
+    window.trusted = equalBytes(contentOf(live), commit.bytes) ? live : commitEntry(commit, window.trusted)
     window.generation = commit.generation
     publishWindow(file, window)
   }
@@ -377,6 +434,7 @@ export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
           reverted = true
         }
         rmSync(windowPath(file), { force: true })
+        bumpConfigEpochSync(file)
       })
     } catch (error) {
       throw new Error(
@@ -516,8 +574,10 @@ function captureWindow(file: string, uncoordinatedReason?: string): void {
     ...(uncoordinatedReason === undefined ? {} : { uncoordinatedReason }),
   }
   windows.set(key, window)
-  if (window.coordinated) publishWindow(file, window)
-  else
+  if (window.coordinated) {
+    bumpConfigEpochSync(file)
+    publishWindow(file, window)
+  } else
     console.warn(`[typeclaw] a bash command could not coordinate with host typeclaw commands (${uncoordinatedReason})`)
 }
 
@@ -527,6 +587,7 @@ function settleWindow(file: string, window: Window): void {
     return
   }
   windows.delete(resolve(file))
+  bumpConfigEpochSync(file)
   try {
     rmSync(windowPath(file), { force: true })
   } catch (error) {
@@ -573,7 +634,7 @@ function readAcrossProcessesSync(file: string): { live: ConfigFileEntry; trusted
     const live = readConfigEntrySync(file)
     configReadHook?.('after-live')
     const after = windowStamp(file)
-    if (before.raw === after.raw && before.generation === after.generation) {
+    if (before.raw === after.raw && before.generation === after.generation && before.epoch === after.epoch) {
       return { live, trusted: parseWindowRecord(file, before.raw) }
     }
   }
@@ -583,8 +644,12 @@ function readAcrossProcessesSync(file: string): { live: ConfigFileEntry; trusted
   }))
 }
 
-function windowStamp(file: string): { raw: string | undefined; generation: number | undefined } {
-  return { raw: readWindowRawSync(file), generation: readConfigCommitSync(file)?.generation }
+function windowStamp(file: string): { raw: string | undefined; generation: number | undefined; epoch: number } {
+  return {
+    raw: readWindowRawSync(file),
+    generation: readConfigCommitSync(file)?.generation,
+    epoch: readConfigEpochSync(file),
+  }
 }
 
 // Only a missing record means no window; anything else that is not valid
@@ -613,7 +678,7 @@ function parseWindowRecord(file: string, raw: string | undefined): ConfigFileEnt
     throw invalidWindowState(file, path, 'it is not valid window state')
   }
   const commit = readConfigCommitSync(file)
-  return commit !== undefined && commit.generation > record.generation ? withContent(entry, commit.bytes) : entry
+  return commit !== undefined && commit.generation > record.generation ? commitEntry(commit, entry) : entry
 }
 
 function invalidWindowState(file: string, path: string, detail: string): Error {
@@ -771,7 +836,11 @@ function windowPath(file: string): string {
   return statePath(file, 'window')
 }
 
-function statePath(file: string, kind: 'commit' | 'window'): string {
+function epochPath(file: string): string {
+  return statePath(file, 'epoch')
+}
+
+function statePath(file: string, kind: 'commit' | 'window' | 'epoch'): string {
   const absolute = resolve(file)
   return join(dirname(absolute), CREDENTIAL_STAGING_RELATIVE_DIR, `${basename(absolute)}.${kind}.json`)
 }

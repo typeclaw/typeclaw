@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
-import { closeSync, openSync, rmSync, writeFileSync, writeSync } from 'node:fs'
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { closeSync, existsSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -342,6 +342,147 @@ test('a fresh start refuses invalid leftover window state', async () => {
     expect(started.code).not.toBe(0)
     expect(started.err).toContain('refusing to load it')
     expect(started.err).toContain('is invalid')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('under coordination failure a symlinked config binds its target read-only and a missing one refuses the call', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-readonly-targets-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const real = path.join(agentDir, 'workspace', 'tc.json')
+  const staging = path.join(agentDir, '.typeclaw', 'credential-staging')
+  try {
+    // given: typeclaw.json links into workspace and its window cannot be published
+    await mkdir(path.dirname(real), { recursive: true })
+    await writeFile(real, '{"alias":["atlas"]}\n')
+    await symlink(real, config)
+    await writeFile(path.join(agentDir, 'cron.json'), '{"jobs":[]}\n')
+    await mkdir(path.join(staging, 'typeclaw.json.window.json', 'occupied'), { recursive: true })
+
+    // when / then: the link's target is what gets bound read-only
+    const linked = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await recheckManagedConfigAfterBash(linked)
+    expect(linked.readOnly?.files).toEqual([await realpath(real)])
+
+    // given: cron.json is missing and its window cannot be published either
+    await rm(path.join(agentDir, 'cron.json'))
+    await mkdir(path.join(staging, 'cron.json.window.json', 'occupied'), { recursive: true })
+
+    // when / then: the call is refused with the cause, not run unprotected
+    const refused = snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await expect(refused).rejects.toThrow(/This command was not run: the agent could not coordinate config writes/)
+    await expect(snapshotManagedConfigFiles(agentDir, async () => undefined)).rejects.toThrow(
+      /cron\.json does not exist, so it cannot be made read-only/,
+    )
+    await expect(snapshotManagedConfigFiles(agentDir, async () => undefined)).rejects.toThrow(
+      /cron\.json\.window\.json/,
+    )
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('a host read across a whole window lifecycle between its samples retries and returns trusted bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-epoch-read-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const go = path.join(agentDir, 'go.fifo')
+  const trusted = '{"alias":["atlas"]}\n'
+  try {
+    await writeFile(config, trusted)
+    expect(await Bun.spawn(['mkfifo', go]).exited).toBe(0)
+    // A runtime in its own process: on the first `go` it opens a window and
+    // edits typeclaw.json as bash would; on the second its check blocks the edit,
+    // rolls it back, and closes the window. Each step leaves a marker file.
+    const runtime = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { readFileSync, writeFileSync } from 'node:fs'
+import { recheckManagedConfigAfterBash, snapshotManagedConfigFiles } from './src/agent/tool-file-safety.ts'
+const dir = ${JSON.stringify(agentDir)}
+readFileSync(${JSON.stringify(go)})
+const snapshot = await snapshotManagedConfigFiles(dir, async () => 'Guard \`aliasLock\` blocked write')
+writeFileSync(${JSON.stringify(config)}, '{"alias":["rejected"]}\\n')
+writeFileSync(dir + '/edited', '')
+readFileSync(${JSON.stringify(go)})
+await recheckManagedConfigAfterBash(snapshot)
+writeFileSync(dir + '/closed', '')`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+    const step = (marker: string) => {
+      writeFileSync(go, 'go\n')
+      const deadline = Date.now() + 20_000
+      while (!existsSync(path.join(agentDir, marker))) {
+        if (Date.now() > deadline) throw new Error(`runtime did not reach ${marker}`)
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+      }
+    }
+    let sawRejected = false
+    __setConfigReadHookForTests((stage) => {
+      if (stage === 'after-window' && !existsSync(path.join(agentDir, 'edited'))) step('edited')
+      if (stage === 'after-live' && !existsSync(path.join(agentDir, 'closed'))) {
+        sawRejected = readFileSync(config, 'utf8').includes('rejected')
+        step('closed')
+      }
+    })
+
+    // when: a host read samples, the whole window lifecycle runs between its samples
+    const read = readValidatedConfigFileSync(config)
+
+    // then: the epoch moved, so it re-read and returns the rolled-back file
+    expect(sawRejected).toBe(true)
+    expect(read).toBe(trusted)
+    expect(await runtime.exited).toBe(0)
+  } finally {
+    __setConfigReadHookForTests(undefined)
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test("a newer commit's own entry wins at startup over the window's older symlink entry", async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-commit-entry-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const oldTarget = path.join(agentDir, 'workspace', 'tc.json')
+  try {
+    // given: typeclaw.json was a link when the window opened; a blocked edit through it could not be reverted
+    await mkdir(path.dirname(oldTarget), { recursive: true })
+    await writeFile(oldTarget, '{"alias":["atlas"]}\n')
+    await symlink(oldTarget, config)
+    const snapshot = await snapshotManagedConfigFiles(agentDir, async () => 'Guard `aliasLock` blocked write')
+    await writeFile(oldTarget, '{"alias":["rejected"]}\n')
+    await recheckManagedConfigAfterBash(snapshot, {
+      writeInPlace: () => {
+        throw new Error('disk full')
+      },
+    })
+
+    // when: a host grant then renames a regular file over the path, and the agent starts again
+    const grant = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { grantRole } from './src/permissions/grant.ts'
+const r = grantRole({ cwd: ${JSON.stringify(agentDir)}, roleName: 'trusted', matchRule: 'discord:user:9' })
+if (!r.ok) { console.error(r.reason); process.exit(1) }`,
+      ],
+      cwd: path.resolve(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+    expect(await grant.exited).toBe(0)
+    const granted = await readFile(config, 'utf8')
+    const started = await freshStart(agentDir, { hostRead: false })
+
+    // then: the grant's regular file stays, and the old link target is untouched
+    expect(started.code).toBe(0)
+    expect((await lstat(config)).isFile()).toBe(true)
+    expect(await readFile(config, 'utf8')).toBe(granted)
+    expect(JSON.parse(granted)).toMatchObject({ alias: ['atlas'], roles: { trusted: { match: ['discord:user:9'] } } })
+    expect(await readFile(oldTarget, 'utf8')).toBe('{"alias":["rejected"]}\n')
   } finally {
     await rm(agentDir, { recursive: true, force: true })
   }

@@ -8678,39 +8678,106 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
     })
   })
 
+  // Real bwrap bash for the read-only fallback, which the kernel enforces. Each
+  // run returns the result or error text; `argv` holds each run's bwrap argv.
+  function bwrapBash(agentDir: string) {
+    const { hooks } = guardHooks(agentDir)
+    const argv: string[][] = []
+    const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+    if (bash === undefined) throw new Error('bash tool definition not found')
+    const sandboxed = wrapBuiltinToolDefinition(bash, {
+      agentDir,
+      sessionId: 'bash-recheck-bwrap',
+      hooks,
+      guards: buildInternalGuards(agentDir),
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        verifyRuntime: async () => {},
+        cleanupRuntime: async () => {},
+        buildCommand: (command, options) => {
+          const built = buildSandboxedCommand(command, options ?? {})
+          argv.push(built.argv)
+          return built
+        },
+      },
+    })
+    const run = async (command: string): Promise<string> => {
+      try {
+        const result = await sandboxed.execute('c', { command } as never, undefined, undefined, {} as never)
+        return result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error)
+      }
+    }
+    return { run, argv }
+  }
+
+  test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
+    'under coordination failure a write through a symlinked typeclaw.json fails, and the command still runs',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: typeclaw.json links into workspace and its window cannot be published
+        const real = path.join(agentDir, 'workspace', 'tc.json')
+        await mkdir(path.dirname(real), { recursive: true })
+        await writeFile(real, '{"alias":["atlas"]}\n')
+        await symlink(real, config)
+        await mkdir(path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json', 'occupied'), {
+          recursive: true,
+        })
+        const { run, argv } = bwrapBash(agentDir)
+
+        // when: the command writes through the link
+        const text = await run(`printf '%s\\n' '{"alias":["renamed"]}' > typeclaw.json; echo still-ran`)
+
+        // then: the link's target was bound read-only, so the write failed and the rest ran
+        const target = await realpath(real)
+        expect(argv.at(-1)?.join(' ')).toContain(`--ro-bind ${target} ${target}`)
+        expect(text.startsWith('[TypeClaw config guard] typeclaw.json and cron.json were read-only')).toBe(true)
+        expect(text).toMatch(/Read-only file system/i)
+        expect(text).toContain('still-ran')
+        expect(await readFile(real, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      })
+    },
+  )
+
+  test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
+    'under coordination failure a missing cron.json refuses that one call and nothing runs',
+    async () => {
+      await withAgentDir(async (agentDir, config) => {
+        // given: cron.json is missing and its window cannot be published
+        await writeFile(config, '{"alias":["atlas"]}\n')
+        const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'cron.json.window.json')
+        await mkdir(path.join(blocker, 'occupied'), { recursive: true })
+        const { run } = bwrapBash(agentDir)
+
+        // when: a command runs
+        const text = await run('touch ran-marker')
+
+        // then: it was refused with the cause and did not run
+        expect(text).toContain('This command was not run: the agent could not coordinate config writes')
+        expect(text).toContain(blocker)
+        expect(text).toContain('Retry the command')
+        expect(await Bun.file(path.join(agentDir, 'ran-marker')).exists()).toBe(false)
+
+        // and: once that is cleared, the same command runs normally
+        await rm(blocker, { recursive: true })
+        await run('touch ran-marker')
+        expect(await Bun.file(path.join(agentDir, 'ran-marker')).exists()).toBe(true)
+      })
+    },
+  )
+
   // Real bwrap: the read-only fallback is a bind the kernel enforces.
   test.skipIf(process.platform !== 'linux' || !Bun.which('bwrap'))(
     'a call that cannot be coordinated gets the config read-only in its sandbox; a normal call can still edit',
     async () => {
       await withAgentDir(async (agentDir, config) => {
         await writeFile(config, '{"alias":["atlas"]}\n')
-        const { hooks } = guardHooks(agentDir)
-        const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
-        if (bash === undefined) throw new Error('bash tool definition not found')
-        const sandboxed = wrapBuiltinToolDefinition(bash, {
-          agentDir,
-          sessionId: 'bash-recheck-bwrap',
-          hooks,
-          guards: buildInternalGuards(agentDir),
-          getOrigin: () => tui,
-          permissions: createPermissionService(),
-          bashSandboxBoundary: {
-            ensureAvailable: async () => {},
-            resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
-            resolveRuntime: async () => ({ env: {}, mounts: [] }),
-            verifyRuntime: async () => {},
-            cleanupRuntime: async () => {},
-            buildCommand: (command, options) => buildSandboxedCommand(command, options ?? {}),
-          },
-        })
-        const run = async (command: string): Promise<string> => {
-          try {
-            const result = await sandboxed.execute('c', { command } as never, undefined, undefined, {} as never)
-            return result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
-          } catch (error) {
-            return error instanceof Error ? error.message : String(error)
-          }
-        }
+        const { run } = bwrapBash(agentDir)
 
         // given: window state cannot be published, so this call is uncoordinated
         const blocker = path.join(agentDir, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json')
