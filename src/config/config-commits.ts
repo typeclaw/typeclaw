@@ -81,9 +81,12 @@ type Window = {
   calls: Map<symbol, ConfigCallGuard>
   trusted: ConfigFileEntry
   generation: number | undefined
-  // A blocked change whose rollback failed: the trusted view stays in force,
-  // even with no call in flight, until the file is back to an authorized state.
+  // A blocked change whose rollback failed, or a file left unreadable: the
+  // trusted view stays in force, even with no call in flight, until the file is
+  // back to an authorized state. `recoveryGuards` are the checks of the calls
+  // that left those unverified bytes; a later re-check must pass them too.
   recovery: boolean
+  recoveryGuards: ConfigCallGuard[]
   // False once the window could not be captured under the config lock or
   // published: a host command may then have built on unchecked bytes, so its
   // commits are not trusted to skip the post-bash check, and bash calls that
@@ -129,8 +132,13 @@ export function readConfigEntrySync(file: string): ConfigFileEntry {
   try {
     target = readlinkSync(file)
     resolved = realpathSync(file)
-  } catch {
-    return { kind: 'other', id: identityOf(link) }
+  } catch (error) {
+    // A dangling link or a link loop is confirmed not to be a regular file; any
+    // other failure (permissions, I/O) leaves what it names unknown.
+    const code = (error as NodeJS.ErrnoException).code
+    return code === 'ENOENT' || code === 'ELOOP'
+      ? { kind: 'other', id: identityOf(link) }
+      : { kind: 'other', id: identityOf(link), unreadable: true }
   }
   const resolvedStats = lstatOrUndefined(resolved)
   const read = resolvedStats === undefined ? undefined : readRegularSync(resolved, resolvedStats)
@@ -208,6 +216,7 @@ export function recordConfigCommitSync(file: string, content: string | Buffer | 
     window.trusted = committed
     window.generation = generation
     window.recovery = false
+    window.recoveryGuards = []
     settleWindow(file, window)
   }
   return generation
@@ -409,13 +418,19 @@ export function setTrustedConfigEntry(file: string, entry: ConfigFileEntry): voi
   publishWindow(file, window)
 }
 
-export function setConfigRecovery(file: string, recovery: boolean): void {
+export function setConfigRecovery(file: string, recovery: boolean, guards: readonly ConfigCallGuard[] = []): void {
   const window = windows.get(resolve(file))
-  if (window !== undefined) window.recovery = recovery
+  if (window === undefined) return
+  window.recovery = recovery
+  window.recoveryGuards = recovery ? [...new Set([...window.recoveryGuards, ...guards])] : []
 }
 
 export function configRecoveryPending(file: string): boolean {
   return windows.get(resolve(file))?.recovery === true
+}
+
+export function configRecoveryGuards(file: string): readonly ConfigCallGuard[] {
+  return windows.get(resolve(file))?.recoveryGuards ?? []
 }
 
 export function withContent(entry: ConfigFileEntry, bytes: Buffer | undefined): ConfigFileEntry {
@@ -443,6 +458,7 @@ export function readValidatedConfigFileSync(file: string): string {
   if (!sameConfigContent(live, trusted)) return textOf(file, trusted)
   if (window.recovery) {
     window.recovery = false
+    window.recoveryGuards = []
     try {
       withConfigFileLockSync(file, () => settleWindow(file, window))
     } catch (error) {
@@ -641,6 +657,7 @@ function captureWindow(file: string, uncoordinatedReason?: string): void {
     trusted: readConfigEntrySync(file),
     generation: readConfigCommitSync(file)?.generation,
     recovery: false,
+    recoveryGuards: [],
     coordinated: uncoordinatedReason === undefined,
     ...(uncoordinatedReason === undefined ? {} : { uncoordinatedReason }),
     owner: randomUUID(),
@@ -780,9 +797,21 @@ function readWindowRawSync(file: string): string | undefined {
   try {
     return readFileSync(path, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
-    throw invalidWindowState(file, path, errorText(error))
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw invalidWindowState(file, path, errorText(error))
+    // Windows reports a path through a regular file as ENOENT, where POSIX says
+    // ENOTDIR: a record is only absent when its directories are directories or missing.
+    const blocker = nonDirectoryAncestor(dirname(path), dirname(resolve(file)))
+    if (blocker !== undefined) throw invalidWindowState(file, path, `${blocker} is not a directory`)
+    return undefined
   }
+}
+
+function nonDirectoryAncestor(directory: string, root: string): string | undefined {
+  for (let current = directory; current.startsWith(root) && current !== root; current = dirname(current)) {
+    const stats = lstatOrUndefined(current)
+    if (stats !== undefined && !stats.isDirectory()) return current
+  }
+  return undefined
 }
 
 function parseWindowRecord(file: string, raw: string | undefined): ConfigFileEntry | undefined {

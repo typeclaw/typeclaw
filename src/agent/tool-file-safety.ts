@@ -26,6 +26,7 @@ import {
 } from '@/bundled-plugins/security/policies/private-surface-read'
 import {
   closeConfigWindow,
+  configRecoveryGuards,
   configRecoveryPending,
   concurrentCallGuards,
   contentOf,
@@ -1116,13 +1117,16 @@ async function recheckManagedEntry(
         setTrustedConfigEntry(destination, live)
         return undefined
       }
-      if (live.kind === 'other') return live.unreadable === true ? holdUnreadable(destination) : undefined
+      if (live.kind === 'other')
+        return live.unreadable === true
+          ? holdUnreadable(destination, producingGuards(destination, snapshot))
+          : undefined
       const reason = await checkUnderEveryCall(destination, snapshot, live.bytes, contentOf(trusted))
       if (reason === undefined) {
         recordConfigCommitSync(destination, live.bytes)
         return undefined
       }
-      return revert(destination, live, trusted, reason, seams, coordinated)
+      return revert(destination, live, trusted, reason, seams, coordinated, producingGuards(destination, snapshot))
     }),
   )
   checkedWrites = recheck.catch(() => {})
@@ -1134,7 +1138,8 @@ async function recheckManagedEntry(
     if (locked) throw error
     const live = readLiveEntry(destination)
     const { entry: trusted } = trustedConfigState(destination)
-    if (live.kind === 'other' && live.unreadable === true) return holdUnreadable(destination)
+    if (live.kind === 'other' && live.unreadable === true)
+      return holdUnreadable(destination, producingGuards(destination, snapshot))
     if (sameConfigContent(live, trusted) || live.kind === 'missing' || live.kind === 'other') throw error
     return revert(
       destination,
@@ -1165,15 +1170,27 @@ async function checkUnderEveryCall(
       return 'a concurrent command from a session without permission to make this change was running, and config changes made while it runs must pass its checks too'
     }
   }
+  // Bytes still unverified from an earlier call (left unreadable, or a failed
+  // rollback) may be that call's change, so they must pass its checks too.
+  for (const guard of configRecoveryGuards(destination)) {
+    if ((await run(guard)) !== undefined) {
+      return "the command that left this change ran in a session without permission to make it, and its change must pass that session's checks too"
+    }
+  }
   return undefined
+}
+
+// The calls whose bytes this check is about: this call and every other call in flight.
+function producingGuards(destination: string, snapshot: ManagedConfigSnapshot): ManagedConfigGuardCheck[] {
+  return [snapshot.guard, ...concurrentCallGuards(destination, snapshot.call)]
 }
 
 // A regular file whose bytes cannot be read (permissions, I/O) is not a FIFO: it
 // may hold an unchecked change. The window stays in recovery, so readers keep
 // the trusted bytes and its record stays published until a later check verifies
 // the file or an authorized commit replaces it.
-function holdUnreadable(destination: string): string {
-  setConfigRecovery(destination, true)
+function holdUnreadable(destination: string, producers: readonly ManagedConfigGuardCheck[]): string {
+  setConfigRecovery(destination, true, producers)
   const name = path.basename(destination)
   return `[TypeClaw config guard] ${name} could not be read after this command, so the agent keeps using the last checked ${name} until it is readable and checked again.`
 }
@@ -1200,6 +1217,7 @@ function revert(
   reason: string,
   seams: RecheckSeams,
   coordinated = true,
+  producers: readonly ManagedConfigGuardCheck[] = [],
 ): string {
   const name = path.basename(destination)
   const uncoordinated = coordinated
@@ -1219,7 +1237,7 @@ function revert(
     restoreConfigEntrySync(destination, now, revertTo, seams.writeInPlace)
   } catch (error) {
     noteConfigRollbackSync(destination)
-    setConfigRecovery(destination, true)
+    setConfigRecovery(destination, true, producers)
     return [
       `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
       `blocked: ${reason}`,
