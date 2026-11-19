@@ -1137,7 +1137,7 @@ async function recheckManagedEntry(
     // an unavailable lock must not leave an unchecked change in place.
     if (locked) throw error
     const live = readLiveEntry(destination)
-    const { entry: trusted } = trustedConfigState(destination)
+    const { entry: trusted, coordinated } = trustedConfigState(destination)
     if (live.kind === 'other' && live.unreadable === true)
       return holdUnreadable(destination, producingGuards(destination, snapshot))
     if (sameConfigContent(live, trusted) || live.kind === 'missing' || live.kind === 'other') throw error
@@ -1147,6 +1147,8 @@ async function recheckManagedEntry(
       trusted,
       `the config file lock was unavailable, so the change could not be checked: ${errorMessage(error)}`,
       seams,
+      coordinated,
+      producingGuards(destination, snapshot),
     )
   }
 }
@@ -1216,8 +1218,10 @@ function revert(
   revertTo: ConfigFileEntry,
   reason: string,
   seams: RecheckSeams,
-  coordinated = true,
-  producers: readonly ManagedConfigGuardCheck[] = [],
+  coordinated: boolean,
+  // The guards of the calls that left these bytes: a failed restore keeps them
+  // with the recovery state so a later permissive call cannot approve the bytes.
+  producers: readonly ManagedConfigGuardCheck[],
 ): string {
   const name = path.basename(destination)
   const uncoordinated = coordinated

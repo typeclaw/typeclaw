@@ -775,3 +775,41 @@ test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     }
   },
 )
+
+test('a blocked change left by a failed restore under an unavailable lock keeps its session guard for a later call', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-fallback-recovery-guards-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const pending = '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}\n'
+  const withoutBypass = async (content: string) =>
+    content.includes('discord:user:1') ? 'Guard `rolePromotion` blocked write' : undefined
+  try {
+    // given: a session without the bypass adds a role rule; at its post-check a
+    // holder keeps the config lock past the bound and the in-place restore fails
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    const first = await snapshotManagedConfigFiles(agentDir, withoutBypass)
+    await writeFile(config, pending)
+    writeFileSync(`${config}.lock`, '')
+    const failed = await recheckManagedConfigAfterBash(first, {
+      writeInPlace: () => {
+        throw new Error('disk full')
+      },
+    })
+    expect(failed.join('\n')).toContain('typeclaw.json could not be restored to its state before this command')
+    expect(await readFile(config, 'utf8')).toBe(pending)
+    expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+    rmSync(`${config}.lock`)
+    expect(loadConfigSync(agentDir).roles).toBeUndefined()
+
+    // when: an owner session's later call re-checks the file in recovery
+    const later = await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    const notices = await recheckManagedConfigAfterBash(later)
+
+    // then: the original session's guard still blocks it, and the trusted bytes are restored
+    expect(notices.join('\n')).toContain('the command that left this change ran in a session without permission')
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    expect(loadConfigSync(agentDir).roles).toBeUndefined()
+  } finally {
+    rmSync(`${config}.lock`, { force: true })
+    await rm(agentDir, { recursive: true, force: true })
+  }
+}, 30_000)
