@@ -8,6 +8,7 @@ import { loadConfigSync } from '@/config'
 import { __resetConfigForTesting, getConfig } from '@/config/config'
 import {
   __failConfigEpochWritesForTests,
+  __setConfigWriteSyncForTests,
   closeConfigWindow,
   __setConfigReadHookForTests,
   readConfigCommitSync,
@@ -1070,3 +1071,47 @@ test.skipIf(process.platform === 'win32')(
     }
   },
 )
+
+// A write call that writes half of what it is given, then fails.
+const failingHalfway = (fd: number, buffer: Buffer, offset: number, length: number, position: number): number => {
+  writeSync(fd, buffer, offset, Math.floor(length / 2), position)
+  throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' })
+}
+
+test('a host config write that fails partway restores the old config and records no commit', async () => {
+  const { agentDir, config, share, cleanup } = await hostWriterFixture()
+  let failed = false
+  __setConfigWriteSyncForTests((fd, buffer, offset, length, position) => {
+    if (failed) return writeSync(fd, buffer, offset, length, position)
+    failed = true
+    return failingHalfway(fd, buffer, offset, length, position)
+  })
+  try {
+    const result = addMount(agentDir, 'data', share)
+
+    expect(result.ok).toBe(false)
+    expect(result.ok ? '' : result.reason).toContain('EIO')
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+    expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+    expect(readConfigCommitSync(config)).toBeUndefined()
+  } finally {
+    __setConfigWriteSyncForTests(undefined)
+    await cleanup()
+  }
+})
+
+test('a host config write whose restore also fails names the file and its recovery', async () => {
+  const { agentDir, config, share, cleanup } = await hostWriterFixture()
+  __setConfigWriteSyncForTests(failingHalfway)
+  try {
+    const result = addMount(agentDir, 'data', share)
+
+    expect(result.ok).toBe(false)
+    expect(result.ok ? '' : result.reason).toContain('typeclaw.json could not be restored')
+    expect(result.ok ? '' : result.reason).toContain('`git checkout -- typeclaw.json`')
+    expect(readConfigCommitSync(config)).toBeUndefined()
+  } finally {
+    __setConfigWriteSyncForTests(undefined)
+    await cleanup()
+  }
+})
