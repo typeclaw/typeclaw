@@ -10,7 +10,6 @@ import {
   __failConfigEpochWritesForTests,
   __setConfigWriteSyncForTests,
   closeConfigWindow,
-  leftoverConfigRecoveryWarnings,
   __setConfigReadHookForTests,
   readConfigCommitSync,
   readValidatedConfigFileSync,
@@ -1188,7 +1187,7 @@ test('an edit made while the agent was stopped survives a leftover recovery that
   }
 })
 
-test('a leftover recovery with no recorded held-back bytes restores the last checked file and warns', async () => {
+test('runtime startup restores a leftover recovery with no recorded held-back bytes and says so', async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-stopped-mid-call-'))
   const config = path.join(agentDir, 'typeclaw.json')
   try {
@@ -1197,19 +1196,14 @@ test('a leftover recovery with no recorded held-back bytes restores the last che
     await snapshotManagedConfigFiles(agentDir, async () => undefined)
     await writeFile(config, '{"alias":["changed"]}\n')
 
-    // when: `typeclaw start` checks for leftover recovery, then the runtime starts
-    const warnings = leftoverConfigRecoveryWarnings(agentDir)
+    // when: the runtime starts again
     const started = await freshStart(agentDir)
 
-    // then: the host warns, and startup restores the last checked file and says so
-    expect(warnings.join('\n')).toContain(
-      'typeclaw.json: a leftover recovery from an interrupted agent command restores the last checked typeclaw.json',
-    )
-    expect(warnings.join('\n')).toContain('re-apply that edit, then run `typeclaw start` again')
+    // then: startup restores the last checked file and says so in the operator log
     expect(started.code).toBe(0)
     expect(started.out).toContain('runtime:["atlas"]')
     expect(started.err).toContain(
-      'a leftover recovery from an interrupted agent command restores the last checked typeclaw.json',
+      'typeclaw.json was restored to the last checked version because the agent stopped in the middle of a command',
     )
     expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
   } finally {

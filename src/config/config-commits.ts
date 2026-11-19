@@ -641,55 +641,75 @@ export async function readConfigBaseline(file: string): Promise<string> {
 // rather than load bytes no check passed. Only then is the window state cleared.
 export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
   for (const name of MANAGED_CONFIG_FILES) {
-    const file = join(resolve(agentDir), name)
-    // Only the runtime creates window state, and it is not running yet, so an
-    // absent record cannot appear meanwhile; everything else is decided under
-    // the lock, so a host commit that lands while startup waits is kept.
-    if (readWindowRawSync(file) === undefined) continue
-    let outcome: 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown'
-    try {
-      outcome = withConfigFileLockSync(file, () => {
-        const raw = readWindowRawSync(file)
-        const trusted = parseWindowRecord(file, raw)
-        if (trusted === undefined) return 'unchanged'
-        const live = readConfigEntrySync(file)
-        let decided: 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown' = 'unchanged'
-        if (editedWhileStopped(raw, live, trusted)) {
-          // Edited after the agent stopped: the operator's bytes are authorized.
-          recordConfigCommitSync(file, contentOf(live))
-          decided = 'kept-edit'
-        } else if (!matchesTrustedEntry(file, trusted)) {
-          restoreTrustedEntrySync(file, trusted)
-          recordConfigCommitSync(file, contentOf(trusted))
-          decided = recordCandidate(raw) === undefined ? 'reverted-unknown' : 'reverted'
-        }
-        // The epoch advances before the record goes; if it cannot, the record
-        // stays, so host readers keep using its trusted bytes.
-        const bumped = bumpConfigEpochSync(file)
-        if (bumped.ok) rmSync(windowPath(file), { force: true })
-        else {
-          console.warn(
-            `[typeclaw] ${bumped.reason}; the agent's ${name} state at ${windowPath(file)} stays published, so host typeclaw commands keep using the last authorized ${name}`,
-          )
-        }
-        return decided
-      })
-    } catch (error) {
-      throw new Error(
-        `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
-      )
-    }
+    const outcome = reconcileLeftoverWindowSync(join(resolve(agentDir), name))
     if (outcome === 'kept-edit') {
       console.warn(
         `[typeclaw] the leftover ${name} recovery from an interrupted agent command was dropped because ${name} was edited while the agent was stopped; the edited ${name} is kept`,
       )
     } else if (outcome === 'reverted-unknown') {
-      console.warn(`[typeclaw] ${name}: ${leftoverRecoveryNotice(name)}`)
+      console.warn(`[typeclaw] ${leftoverRecoveryNotice(name)}`)
     } else if (outcome === 'reverted') {
       console.warn(
         `[typeclaw] ${name} held a bash change that was never checked or that was blocked and could not be reverted before the agent stopped; it was reverted to the last authorized ${name} at startup`,
       )
     }
+  }
+}
+
+// Host stage (`typeclaw start`, container down): settles each leftover window
+// that recorded no held-back bytes (the agent stopped mid-command), with the
+// same reconciliation as runtime startup, and returns the files it restored to
+// the last checked version, so start can stop before launching on them.
+// Windows that recorded their bytes are left to runtime startup, which keeps an
+// edit made while the agent was stopped.
+export function settleLeftoverConfigRecoverySync(agentDir: string): string[] {
+  const restored: string[] = []
+  for (const name of MANAGED_CONFIG_FILES) {
+    const file = join(resolve(agentDir), name)
+    const raw = readWindowRawSync(file)
+    if (raw === undefined || recordCandidate(raw) !== undefined) continue
+    if (reconcileLeftoverWindowSync(file) === 'reverted-unknown') restored.push(name)
+  }
+  return restored
+}
+
+// Settles one leftover window under the config lock. Only the runtime creates
+// window state, and it is not running, so an absent record cannot appear
+// meanwhile; a host commit that lands while this waits on the lock is kept.
+function reconcileLeftoverWindowSync(file: string): 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown' {
+  const name = basename(file)
+  if (readWindowRawSync(file) === undefined) return 'unchanged'
+  try {
+    return withConfigFileLockSync(file, () => {
+      const raw = readWindowRawSync(file)
+      const trusted = parseWindowRecord(file, raw)
+      if (trusted === undefined) return 'unchanged'
+      const live = readConfigEntrySync(file)
+      let decided: 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown' = 'unchanged'
+      if (editedWhileStopped(raw, live, trusted)) {
+        // Edited after the agent stopped: the operator's bytes are authorized.
+        recordConfigCommitSync(file, contentOf(live))
+        decided = 'kept-edit'
+      } else if (!matchesTrustedEntry(file, trusted)) {
+        restoreTrustedEntrySync(file, trusted)
+        recordConfigCommitSync(file, contentOf(trusted))
+        decided = recordCandidate(raw) === undefined ? 'reverted-unknown' : 'reverted'
+      }
+      // The epoch advances before the record goes; if it cannot, the record
+      // stays, so host readers keep using its trusted bytes.
+      const bumped = bumpConfigEpochSync(file)
+      if (bumped.ok) rmSync(windowPath(file), { force: true })
+      else {
+        console.warn(
+          `[typeclaw] ${bumped.reason}; the agent's ${name} state at ${windowPath(file)} stays published, so host typeclaw commands keep using the last authorized ${name}`,
+        )
+      }
+      return decided
+    })
+  } catch (error) {
+    throw new Error(
+      `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
+    )
   }
 }
 
@@ -1082,28 +1102,10 @@ function liveCandidate(file: string): string | undefined {
   }
 }
 
-function leftoverRecoveryNotice(name: string): string {
-  return `a leftover recovery from an interrupted agent command restores the last checked ${name}, so changes made to ${name} since are not applied. If you edited ${name} while the agent was stopped, re-apply that edit, then run \`typeclaw start\` again.`
-}
-
-// Host stage (`typeclaw start`, container down): the leftover windows whose
-// held-back bytes are unknown (the agent stopped mid-command) and whose file
-// differs from the trusted bytes, so startup will restore the last checked file.
-export function leftoverConfigRecoveryWarnings(agentDir: string): string[] {
-  const warnings: string[] = []
-  for (const name of MANAGED_CONFIG_FILES) {
-    const file = join(resolve(agentDir), name)
-    try {
-      const raw = readWindowRawSync(file)
-      if (raw === undefined || recordCandidate(raw) !== undefined) continue
-      const trusted = parseWindowRecord(file, raw)
-      if (trusted !== undefined && !matchesTrustedEntry(file, trusted))
-        warnings.push(`${name}: ${leftoverRecoveryNotice(name)}`)
-    } catch {
-      // Invalid window state is reported by the config load itself.
-    }
-  }
-  return warnings
+// The agent stopped mid-command, so the bytes it held back are unknown and the
+// last checked file was restored; an edit made while it was stopped is lost.
+export function leftoverRecoveryNotice(name: string): string {
+  return `${name} was restored to the last checked version because the agent stopped in the middle of a command; an edit made to ${name} while the agent was stopped was not kept. Re-apply that edit, then run \`typeclaw start\` again.`
 }
 
 // A cross-process read without the lock: the window state, then the file, then

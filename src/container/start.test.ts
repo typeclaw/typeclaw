@@ -2300,6 +2300,102 @@ describe('start (composition)', () => {
     expect(originAtRun).toBe('https://example.com/acme/agent.git')
   })
 
+  // A bash call's window left behind with no recorded held-back bytes, as when
+  // the agent stopped mid-command: opened in its own process, never closed.
+  async function leaveWindowMidCommand(agentDir: string): Promise<void> {
+    const proc = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { snapshotManagedConfigFiles } from './src/agent/tool-file-safety.ts'
+await snapshotManagedConfigFiles(${JSON.stringify(agentDir)}, async () => undefined)
+process.exit(0)`,
+      ],
+      cwd: join(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+    expect(await proc.exited).toBe(0)
+  }
+
+  test('stops when a leftover recovery restores typeclaw.json, and launches with the edit re-applied', async () => {
+    // given: the agent stopped mid-command, then the operator retargeted origin by hand
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    const config = join(root, 'typeclaw.json')
+    const checked = `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/old.git' } } })}\n`
+    const edited = `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/new.git' } } })}\n`
+    await writeFile(config, checked)
+    await leaveWindowMidCommand(root)
+    await writeFile(config, edited)
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let originAtRun = ''
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') originAtRun = (await runGit(root, ['remote', 'get-url', 'origin'])).trim()
+      return docker.exec(args, options)
+    }
+    const startOnce = () =>
+      start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+      })
+
+    // when: start runs
+    const first = await startOnce()
+
+    // then: it restores the last checked file, clears the window, and does not launch
+    expect(first.ok).toBe(false)
+    if (!first.ok) {
+      expect(first.reason).toContain(
+        'typeclaw.json was restored to the last checked version because the agent stopped in the middle of a command',
+      )
+      expect(first.reason).toContain('Re-apply that edit, then run `typeclaw start` again')
+    }
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(false)
+    expect(await readFile(config, 'utf8')).toBe(checked)
+    expect(existsSync(join(root, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json'))).toBe(false)
+
+    // when: the operator re-applies the edit and starts again
+    await writeFile(config, edited)
+    const second = await startOnce()
+
+    // then: it launches, and the remote sync used the new origin
+    expect(second.ok).toBe(true)
+    expect(originAtRun).toBe('https://example.com/new.git')
+  })
+
+  test('launches when a leftover recovery has nothing to restore', async () => {
+    // given: the agent stopped mid-command without changing typeclaw.json
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(join(root, 'typeclaw.json'), `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    await leaveWindowMidCommand(root)
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the window is cleared and start launches normally
+    expect(result.ok).toBe(true)
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(true)
+    expect(existsSync(join(root, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json'))).toBe(false)
+  })
+
   test('refuses to launch when a git.remotes retarget cannot be applied', async () => {
     // given: origin must move, but another git writer holds the config lock
     await writeDockerfile(root)
