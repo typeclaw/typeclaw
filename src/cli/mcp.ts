@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
 import { isCancel, log, note, text } from '@clack/prompts'
@@ -12,6 +11,7 @@ import { findAgentDir, isInitialized } from '@/init'
 import { createFileMcpOAuthStore, TypeClawMcpOAuthProvider, listMcpCredentials } from '@/mcp'
 import { SecretsBackend } from '@/secrets'
 
+import { openBrowserBestEffort } from './open-browser'
 import { c, done, errorLine } from './ui'
 
 const DEFAULT_CALLBACK_PORT = 1456
@@ -184,14 +184,6 @@ function renderAuthorizationUrl(serverName: string, url: URL): void {
   )
   console.log(url.toString())
   console.log('')
-}
-
-function openBrowserBestEffort(url: URL): void {
-  const command = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open'
-  const args = process.platform === 'win32' ? ['/c', 'start', '', url.toString()] : [url.toString()]
-  const child = spawn(command, args, { stdio: 'ignore', detached: true })
-  child.on('error', () => undefined)
-  child.unref()
 }
 
 async function promptForCodeOrUrl(): Promise<{ code: string; state?: string }> {

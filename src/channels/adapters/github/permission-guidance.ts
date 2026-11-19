@@ -13,6 +13,21 @@ export type OutboundEndpointKind =
   | 'issue-reaction'
   | 'pr-review-comment-reaction'
 
+// The repository permissions a GitHub App created from a manifest asks for.
+// Keys are GitHub's manifest/REST permission names; they must stay in sync with
+// githubRequiredPermissionsNote below and the App permissions table in
+// docs/content/docs/reference/github.mdx.
+export const GITHUB_APP_MANIFEST_PERMISSIONS = {
+  actions: 'write',
+  checks: 'write',
+  contents: 'read',
+  discussions: 'write',
+  issues: 'write',
+  metadata: 'read',
+  pull_requests: 'write',
+  repository_hooks: 'write',
+} as const
+
 // The required-permissions checklist shown verbatim during interactive GitHub
 // channel setup (both `typeclaw init` and `typeclaw channel add github`). Kept
 // here — the single owner of GitHub permission copy — so the init and

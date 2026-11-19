@@ -47,6 +47,7 @@ import { SecretsKakaoCredentialStore } from '@/secrets/kakao-store'
 import type { TeamsAccountType } from '@/secrets/schema'
 import { SecretsWebexCredentialStore } from '@/secrets/webex-store'
 
+import { promptGithubAppAuth } from './github-app-auth'
 import { CANCEL_SYMBOL, promptPrivateKeyPem } from './prompt-pem'
 import { displayQR } from './qr'
 import { c, done, errorLine, printDiscordInviteHint, printSlackAppManifestSetup, successLine } from './ui'
@@ -991,7 +992,7 @@ async function runSetGithub(cwd: string): Promise<void> {
   const patch: GithubCredentialPatch = {}
 
   if (choice === 'auth' || choice === 'both') {
-    patch.auth = await promptGithubAuthUpdate(authType)
+    patch.auth = await promptGithubAuthUpdate(cwd, authType)
   }
 
   if (choice === 'webhook' || choice === 'both') {
@@ -1162,7 +1163,12 @@ async function promptGithubCredentials(cwd: string): Promise<{
     cancel('Aborted.')
     process.exit(0)
   }
-  const auth = authType === 'pat' ? await promptGithubPatAuth() : await promptGithubAppAuth()
+  const appAuth = authType === 'app' ? await promptGithubAppAuth(cwd) : undefined
+  if (appAuth === null) {
+    cancel('Aborted.')
+    process.exit(0)
+  }
+  const auth = appAuth === undefined ? await promptGithubPatAuth() : appAuth.auth
   note('GitHub webhooks need a public URL. TypeClaw can manage a tunnel for you.', 'GitHub webhook tunnel')
   const tunnelProvider = await select<GithubTunnelProvider>({
     message: 'Tunnel provider',
@@ -1219,9 +1225,12 @@ async function promptGithubCredentials(cwd: string): Promise<{
   // validate guard and never coerces to ''), so we normalize before the
   // length checks below to avoid a TypeError on the "leave blank" path.
   const enteredSecret = typeof secret === 'string' ? secret : ''
-  const reposRaw = await text({
-    message: 'Repositories to allow (comma-separated owner/repo, leave blank to skip)',
-  })
+  const reposRaw =
+    appAuth?.repos === undefined
+      ? await text({
+          message: 'Repositories to allow (comma-separated owner/repo, leave blank to skip)',
+        })
+      : undefined
   if (isCancel(reposRaw)) {
     cancel('Aborted.')
     process.exit(0)
@@ -1233,7 +1242,7 @@ async function promptGithubCredentials(cwd: string): Promise<{
     ...(webhookUrl !== undefined ? { webhookUrl } : {}),
     webhookPort: Number(port),
     ...(namedCreds !== undefined ? namedCreds : {}),
-    repos: parseRepos(reposRaw ?? ''),
+    repos: appAuth?.repos ?? parseRepos(reposRaw ?? ''),
     auth,
   }
 }
@@ -1278,7 +1287,7 @@ async function promptCloudflareNamedTunnel(
 
 type GithubAuthUpdateAction = 'rotate' | 'switch'
 
-async function promptGithubAuthUpdate(currentType: 'pat' | 'app'): Promise<GithubCredentialPatch['auth']> {
+async function promptGithubAuthUpdate(cwd: string, currentType: 'pat' | 'app'): Promise<GithubCredentialPatch['auth']> {
   const rotateLabel =
     currentType === 'pat'
       ? 'Rotate the PAT (replace the current personal access token)'
@@ -1339,16 +1348,12 @@ async function promptGithubAuthUpdate(currentType: 'pat' | 'app'): Promise<Githu
     return { type: 'app', privateKey }
   }
 
-  note(
-    [
-      'Create a GitHub App at https://github.com/settings/apps/new and install it on your repositories.',
-      githubRequiredPermissionsNote(false),
-      'Then collect the App ID, generate a private key (.pem), and grab the Installation ID from the URL',
-      'of the installation page (https://github.com/settings/installations/<installation-id>).',
-    ].join('\n'),
-    'Switch to GitHub App auth',
-  )
-  return await promptGithubAppAuth()
+  const appAuth = await promptGithubAppAuth(cwd, { pickRepos: false })
+  if (appAuth === null) {
+    cancel('Aborted.')
+    process.exit(0)
+  }
+  return appAuth.auth
 }
 
 async function promptGithubPatAuth(): Promise<{ type: 'pat'; pat: string }> {
@@ -1361,31 +1366,6 @@ async function promptGithubPatAuth(): Promise<{ type: 'pat'; pat: string }> {
     process.exit(0)
   }
   return { type: 'pat', pat }
-}
-
-async function promptGithubAppAuth(): Promise<{
-  type: 'app'
-  appId: number
-  privateKey: string
-}> {
-  const appId = await text({
-    message: 'GitHub App ID',
-    validate: (value) => validatePositiveInteger(value ?? '', 'App ID is required'),
-  })
-  if (isCancel(appId)) {
-    cancel('Aborted.')
-    process.exit(0)
-  }
-  const privateKey = await promptPrivateKeyPem('GitHub App private key PEM, escaped PEM, or path to .pem file')
-  if (privateKey === CANCEL_SYMBOL) {
-    cancel('Aborted.')
-    process.exit(0)
-  }
-  return {
-    type: 'app',
-    appId: Number(appId),
-    privateKey,
-  }
 }
 
 function parseRepos(input: string): string[] {
@@ -1403,12 +1383,6 @@ function validateUrl(value: string, requiredMessage: string): string | undefined
   } catch {
     return 'Must be a valid URL'
   }
-}
-
-function validatePositiveInteger(value: string, requiredMessage: string): string | undefined {
-  if (!value || value.length === 0) return requiredMessage
-  const parsed = Number(value)
-  return Number.isInteger(parsed) && parsed > 0 ? undefined : 'Must be a positive integer'
 }
 
 async function promptDiscordToken(): Promise<string> {

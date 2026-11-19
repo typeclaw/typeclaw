@@ -90,6 +90,17 @@ After changing permissions on an installed App, the install owner must accept th
 
 Instead of clicking through every permission above, you can register the App from a [manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest) that already has them set. GitHub still asks you to confirm once in the browser; it has no API that creates an App without that click.
 
+`typeclaw channel add github`, `typeclaw init`, and the switch-to-App option of `typeclaw channel set github` do this for you when you choose **Create a new GitHub App for me**:
+
+1. Enter the organization that will own the App, or leave it blank for your personal account. The App is private, so pick the account that owns the repositories the agent should watch.
+2. Accept or change the suggested App name. The CLI checks it with GitHub and asks again if it is taken.
+3. Your browser opens a page on `127.0.0.1` that posts the manifest to GitHub. Click **Create GitHub App**, and GitHub redirects back to the CLI, which fetches the App ID and private key and stores them in `secrets.json`. The key is never written anywhere else. That page exists only on the machine running the CLI: over SSH with a browser elsewhere, forward the port the CLI prints (`ssh -L <port>:127.0.0.1:<port> <host>`) before opening the URL, or register the App by hand with the steps below. If the redirect does not reach the CLI, paste the URL the browser ended on; the prompt hides what you paste.
+4. The CLI opens the App's install page and waits until you install it. `channel add` and `init` then offer the repositories you granted as the repos to allow. If you don't install within 15 minutes, setup continues and asks for the repos by hand; install the App later from the URL the CLI prints.
+
+`channel set github` only replaces credentials. When it creates an App, it skips the repository picker and leaves `channels.github.repos` unchanged, so grant the new App access to those repositories on the install page.
+
+To do the same by hand, follow the steps below.
+
 The manifest sets no App webhook, because TypeClaw installs its own repository webhooks. Its `redirect_url` points at an unused port on `127.0.0.1`, so no public callback server is needed: the browser shows a connection error, and the one-time code you need is in the address bar. Pick a port nothing on your machine listens on, because a local service there would receive the code. Share the code only with GitHub's conversion endpoint in step 3.
 
 Run all steps in the same shell, with `curl` and [`jq`](https://jqlang.org/) installed. They keep their files in a private temporary directory that only your user can read.

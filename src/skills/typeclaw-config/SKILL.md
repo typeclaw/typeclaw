@@ -231,7 +231,7 @@ If neither exists, say so plainly: the repo is configured but events won't arriv
 
 ### Initial setup and auth — this is a host-stage step, not yours
 
-The **first-time** GitHub channel setup (creating the `channels.github` block, supplying the GitHub auth — a PAT or App private key — and the webhook secret, and optionally provisioning the tunnel) is done by the operator on the host with `typeclaw channel add github`. You cannot run that: it is a host-stage CLI, and the credentials live in `secrets.json` / `.env`, which you must never write. So:
+The **first-time** GitHub channel setup (creating the `channels.github` block, supplying the GitHub auth — a PAT, an existing App's private key, or a new GitHub App the CLI creates from a manifest — and the webhook secret, and optionally provisioning the tunnel) is done by the operator on the host with `typeclaw channel add github`. You cannot run that: it is a host-stage CLI, and the credentials live in `secrets.json` / `.env`, which you must never write. So:
 
 - If there is **no `channels.github` block yet**, do not try to bootstrap it by hand. Tell the operator to run `typeclaw channel add github` from the agent folder, which collects the auth + webhook secret and wires the tunnel.
 - Once the block exists, **repo and review changes are yours** — they are plain `typeclaw.json` edits (above), no secrets involved.
