@@ -43,6 +43,53 @@ export function createGitAuthLoginResolver(
   }
 }
 
+// git's own protocol message when GitHub asked for a login and no askpass or
+// credential helper could answer it.
+const GITHUB_LOGIN_PROMPT_FAILURE = /could not read Username for 'https:\/\/github\.com'/
+
+const UNBROKERED_GIT_HINT =
+  '[github-cli-auth:gitCredential] TypeClaw gave this command no GitHub credential, so git could not answer ' +
+  "GitHub's login prompt. This alone does not mean GitHub access is missing. The broker funds clone, fetch, pull, " +
+  'push, and ls-remote only when the remote step runs as its own bare command, such as ' +
+  '`git -C <dir> fetch origin main` or `cd <dir> && git pull --rebase origin main`. Chained or grouped commands, ' +
+  'unrecognized flags, and env prefixes other than GIT_TERMINAL_PROMPT run without one. Run the remote step by ' +
+  'itself, then run the local steps separately.'
+
+const UNBROKERED_MULTI_REPO_GIT_HINT =
+  '[github-cli-auth:gitCredential] TypeClaw gave this command no GitHub credential because it reads more than one ' +
+  'GitHub repository, and one GitHub App token covers a single repository. This alone does not mean GitHub access ' +
+  'is missing. Fetch each remote in its own command, such as `git -C <dir> fetch origin` and then ' +
+  '`git -C <dir> fetch upstream`.'
+
+export function appendUnbrokeredGitHint(result: ToolResult, options: { multiRepo: boolean }): void {
+  // Only authoritative status counts: the tool wrapper reports a failed bash as
+  // details.error, while a successful `cat` of an old log can print the same text.
+  if (structuredFailure(result) !== true) return
+  const text = resultText(result)
+  if (GITHUB_LOGIN_PROMPT_FAILURE.test(text)) {
+    result.content.push({
+      type: 'text',
+      text: options.multiRepo ? UNBROKERED_MULTI_REPO_GIT_HINT : UNBROKERED_GIT_HINT,
+    })
+  }
+}
+
+function resultText(result: ToolResult): string {
+  return result.content
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('\n')
+}
+
+// undefined when the result carries no structured status at all.
+function structuredFailure(result: ToolResult): boolean | undefined {
+  const details = result.details
+  if (details === null || typeof details !== 'object') return undefined
+  if ('error' in details && typeof details.error === 'string') return true
+  if ('exitCode' in details && typeof details.exitCode === 'number') return details.exitCode !== 0
+  return undefined
+}
+
 export async function appendGitAuthDiagnostic(options: {
   result: ToolResult
   credentials: readonly GitAuthCredential[]
@@ -51,17 +98,8 @@ export async function appendGitAuthDiagnostic(options: {
   resolveLogin: GitAuthLoginResolver
 }): Promise<void> {
   const { result } = options
-  const text = result.content
-    .filter((part) => part.type === 'text')
-    .map((part) => part.text)
-    .join('\n')
-  const details = result.details
-  const failed =
-    (details !== null &&
-      typeof details === 'object' &&
-      (('error' in details && typeof details.error === 'string') ||
-        ('exitCode' in details && typeof details.exitCode === 'number' && details.exitCode !== 0))) ||
-    /Command (?:failed|exited) with (?:exit )?code [1-9]\d*/i.test(text)
+  const text = resultText(result)
+  const failed = structuredFailure(result) ?? /Command (?:failed|exited) with (?:exit )?code [1-9]\d*/i.test(text)
   if (!failed) return
   // These are git/GitHub protocol errors, not natural-language intent matching.
   if (

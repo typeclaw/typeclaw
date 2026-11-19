@@ -16,6 +16,8 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { Type } from 'typebox'
+
 import {
   defaultBuiltinPiToolDefinitions,
   type DeferredBashPreparationResult,
@@ -25,6 +27,7 @@ import {
   TYPECLAW_INTERNAL_BASH_WITHHOLD_ENV,
   wrapBuiltinToolDefinition,
 } from '@/agent/plugin-tools'
+import type { SessionOrigin } from '@/agent/session-origin'
 import { githubReviewChecks, type ReviewCheckOutcome } from '@/channels/github-review-check'
 import {
   __resetReviewObserverForTest,
@@ -39,6 +42,7 @@ import {
 } from '@/channels/github-review-verdict-coordinator'
 import type { GithubTokenResolveResult } from '@/channels/github-token-bridge'
 import { noopPermissionService, type PermissionService } from '@/permissions'
+import { createPermissionService } from '@/permissions/permissions'
 import {
   createHookBus,
   type PluginContext,
@@ -169,6 +173,9 @@ const unavailableResolver = async (): Promise<GithubTokenResolveResult> => ({
 })
 
 const hookCtx = { agentDir: '/agent', pluginName: 'github-cli-auth', logger: noopLogger }
+
+const GIT_LOGIN_FAILURE =
+  "fatal: could not read Username for 'https://github.com': terminal prompts disabled\n\nCommand exited with code 128"
 
 test.each([
   ['-f ', 51],
@@ -696,6 +703,31 @@ describe('github-cli-auth plugin', () => {
     await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
 
     expect(result.content[0]?.text).toContain('gh api graphql -R owner/repo')
+  })
+
+  test('App auth: a refused mint leaves a newly brokered flagged read tokenless', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const hook = await hookFor(unavailableResolver)
+    const event = bashEvent('git ls-remote --heads https://github.com/acme/widgets.git')
+
+    expect(await hook(event, hookCtx)).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+
+  test('PAT: an unbrokered git login failure gets no run-it-standalone hint', async () => {
+    process.env.GH_TOKEN = 'github_pat_xyz'
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'), false, { permissions: privilegedPermissions })
+    const event = bashEvent('git -C /tmp/x fetch --all')
+    const result = {
+      content: [{ type: 'text' as const, text: GIT_LOGIN_FAILURE }],
+      details: { error: GIT_LOGIN_FAILURE },
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content).toEqual([{ type: 'text', text: GIT_LOGIN_FAILURE }])
   })
 
   test('App auth: a graphql call with -R is minted and its output is left alone', async () => {
@@ -2449,5 +2481,102 @@ describe.skipIf(process.platform === 'win32')('github-cli-auth plugin — host g
     expect(result).toMatchObject({ block: true })
     expect((result as { reason: string }).reason).toContain('repo `example/project` is not in repos[]')
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toBeUndefined()
+  })
+})
+
+// Drives the production bash wrapper with this plugin's hooks registered, so the
+// note is judged on the result shape the wrapper actually hands tool.after.
+describe('unbrokered git login failures through the bash wrapper', () => {
+  const tui: SessionOrigin = { kind: 'tui', sessionId: 's' }
+  type BashDefinition = Parameters<typeof wrapBuiltinToolDefinition>[0]
+
+  async function runWrappedBash(agentDir: string, command: string, bash: BashDefinition) {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const exports = await githubCliAuthPlugin.plugin(pluginContext(tokenResolver('ghs_minted'), true, { agentDir }))
+    const hooks = createHookBus()
+    hooks.registerAll('github-cli-auth', agentDir, noopLogger, exports.hooks ?? {})
+    // Real bash runs unsandboxed through the boundary seam, as in plugin-tools.test.ts.
+    const wrapped = wrapBuiltinToolDefinition(bash, {
+      agentDir,
+      sessionId: 's-unbrokered',
+      hooks,
+      getOrigin: () => tui,
+      permissions: createPermissionService(),
+      bashSandboxBoundary: {
+        ensureAvailable: async () => {},
+        resolveProcStrategy: async () => ({ strategy: 'proc-bind' as const }),
+        resolveRuntime: async () => ({ env: {}, mounts: [] }),
+        buildCommand: (sandboxed, options) => ({
+          ...buildSandboxedCommand(sandboxed, options ?? {}),
+          commandString: sandboxed,
+        }),
+      },
+    })
+    return wrapped.execute('c-unbrokered', { command }, undefined, undefined, {} as never)
+  }
+
+  function realBash(agentDir: string): BashDefinition {
+    const bash = defaultBuiltinPiToolDefinitions(agentDir).find((tool) => tool.name === 'bash')
+    if (bash === undefined) throw new Error('bash builtin was not registered')
+    return bash
+  }
+
+  function agentWithFailureLog(prefix: string): string {
+    const agentDir = mkdtempSync(join(tmpdir(), prefix))
+    writeFileSync(join(agentDir, 'git-failure.log'), `${GIT_LOGIN_FAILURE}\n`)
+    return agentDir
+  }
+
+  test('a real nonzero exit that prints the login-prompt failure gets the note, and it reaches the caller', async () => {
+    const agentDir = agentWithFailureLog('tc-unbrokered-fail-')
+    try {
+      const run = runWrappedBash(agentDir, 'cat git-failure.log >&2; exit 128', realBash(agentDir))
+      await expect(run).rejects.toThrow('[github-cli-auth:gitCredential]')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a real successful read of the same failure log gets no note', async () => {
+    const agentDir = agentWithFailureLog('tc-unbrokered-ok-')
+    try {
+      const result = await runWrappedBash(agentDir, 'cat git-failure.log', realBash(agentDir))
+      const text = result.content.map((part) => (part.type === 'text' ? part.text : '')).join('\n')
+      expect(text).toContain(GIT_LOGIN_FAILURE)
+      expect(text).not.toContain('[github-cli-auth:gitCredential]')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  // The fetch itself would need the network, so this fixture returns the failed
+  // result the wrapper sees from real bash (shape covered by the two tests above).
+  test('a failed flagged multi-repo fetch is told to fetch each remote separately', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'tc-unbrokered-multi-'))
+    const repo = join(agentDir, 'repo')
+    try {
+      mkdirSync(repo)
+      for (const args of [
+        ['init', '-q'],
+        ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'],
+        ['remote', 'add', 'upstream', 'https://github.com/other/gadgets.git'],
+      ]) {
+        expect(spawnSync('git', ['-C', repo, ...args]).status).toBe(0)
+      }
+      const failedFetch: BashDefinition = {
+        name: 'bash',
+        label: 'bash',
+        description: '',
+        parameters: Type.Object({ command: Type.String() }),
+        async execute() {
+          return { content: [{ type: 'text' as const, text: GIT_LOGIN_FAILURE }], details: undefined, isError: true }
+        },
+      }
+      const run = runWrappedBash(agentDir, 'git -C repo fetch -q --multiple origin upstream', failedFetch)
+      await expect(run).rejects.toThrow('git -C <dir> fetch upstream')
+    } finally {
+      rmSync(agentDir, { recursive: true, force: true })
+    }
   })
 })
