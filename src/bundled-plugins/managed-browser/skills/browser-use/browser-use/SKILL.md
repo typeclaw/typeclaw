@@ -21,7 +21,7 @@ Never run `browser-use --update`, `browser-use auth login`, or remote/cloud daem
 
 ## Shared browser rules
 
-- One TypeClaw-managed Chrome serves every engine and every session that has `browser.shared`. Logins and tabs persist across bash calls and sessions.
+- One TypeClaw-managed Chrome serves every engine and every session that has `browser.shared`. Logins persist across bash calls and sessions. Tabs your session opens persist across its bash calls and close when the session ends, so reopen the page in a later session instead of looking for an old tab.
 - Work only in tabs you opened. Never navigate or close a tab another engine or session is using.
 - Files: downloads land in `$TYPECLAW_BROWSER_FILES`; to upload a file, copy it there first and pass that path. Chrome cannot see other paths.
 - The browser runs in its own sandbox with no view of the agent folder, so `file://` URLs outside `$TYPECLAW_BROWSER_FILES` fail by design.
