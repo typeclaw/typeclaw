@@ -1,25 +1,34 @@
 ---
 title: Web search
-description: The keyless engine chain (Exa, then DDG), engine cooldowns, why DDG goes through curl-impersonate, failure modes
+description: The engine chain (provider search on subscription logins, then Exa, then DDG), engine cooldowns, why DDG goes through curl-impersonate, failure modes
 icon: Search
 ---
 
-`src/agent/tools/websearch.ts` exposes general web search to the agent. `wikipedia` is a separate narrower path; the default `web` source walks a chain of keyless engines.
+`src/agent/tools/websearch.ts` exposes general web search to the agent. `wikipedia` is a separate narrower path; the default `web` source walks a chain of engines.
 
 ## The engine chain
 
-TypeClaw only uses search services that need no API key or account. `web` tries, in order, and stops at the first engine that answers with results:
+TypeClaw uses no search API key or account of its own. `web` tries, in order, and stops at the first engine that answers with results:
 
-1. **Exa** (`src/agent/tools/exa.ts`) — the anonymous tier of Exa's hosted MCP server (`POST https://mcp.exa.ai/mcp?tools=web_search_exa`, JSON-RPC `tools/call`). It is a JSON API that does not fingerprint the client, so it uses plain `fetch`. Its anonymous tier answers about three requests per second per source IP and rejects bursts beyond that with a 429, so `exaSearch` spaces every outbound request by `EXA_MIN_REQUEST_INTERVAL_MS` (500ms, process-wide, via the shared `request-pacer.ts` that DDG also uses). A 429 or 403 body (an invitation to create an API key) is not passed to the model.
-2. **DuckDuckGo** (`src/agent/tools/ddg.ts`) — the `lite.duckduckgo.com/lite/` SERP through curl-impersonate (below).
+1. **Provider search** (`src/agent/tools/native-search.ts`) — only when the session model runs on a subscription login; see [Provider search](#provider-search). Every other session starts at Exa.
+2. **Exa** (`src/agent/tools/exa.ts`) — the anonymous tier of Exa's hosted MCP server (`POST https://mcp.exa.ai/mcp?tools=web_search_exa`, JSON-RPC `tools/call`). It is a JSON API that does not fingerprint the client, so it uses plain `fetch`. Its anonymous tier answers about three requests per second per source IP and rejects bursts beyond that with a 429, so `exaSearch` spaces every outbound request by `EXA_MIN_REQUEST_INTERVAL_MS` (500ms, process-wide, via the shared `request-pacer.ts` that DDG also uses). A 429 or 403 body (an invitation to create an API key) is not passed to the model.
+3. **DuckDuckGo** (`src/agent/tools/ddg.ts`) — the `lite.duckduckgo.com/lite/` SERP through curl-impersonate (below).
 
-Each query is sent to Exa first, and to DuckDuckGo only when Exa fails, is cooling down, or returns nothing. Neither receives a key, an account, a session id, or any other part of the conversation.
+On a subscription login a query goes to the model provider first; otherwise it goes to Exa first, and to DuckDuckGo only when Exa fails, is cooling down, or returns nothing. Exa and DuckDuckGo receive no key, account, session id, or any other part of the conversation; the provider search receives only the query, on the login the session already uses.
+
+## Provider search
+
+When the session model is a ChatGPT subscription model (`openai-codex-responses`, not a `-spark` realtime model) or a Claude model on a Claude OAuth login to `api.anthropic.com`, the first engine is that provider's own hosted web search: `ChatGPT search` or `Claude search` in the routing line. Both are covered by the subscription with no per-search charge; each search counts against the subscription's usage limits. Pay-per-use API keys (OpenAI or Anthropic API, other providers, gateways) bill per search, so those sessions skip this engine.
+
+The search is a standalone one-turn request on the session model, sent through pi's own transport (`ctx.modelRegistry.complete`). The credential, its OAuth identity headers, and token refresh stay inside the runtime exactly as for the main turn; the search never sees a token. `onPayload` adds the hosted tool — OpenAI's Responses `web_search`, declared alone with the official Codex client's `tool_choice: "auto"` and `include: web_search_call.action.sources`, on the Codex backend, or Claude's `web_search_20250305` server tool — and `onProviderStreamEvent` reads the raw stream, because pi's normalized message drops search sources and citations. Results are the cited pages first (with the cited passage as the snippet), then the remaining search sources. Only a reply that actually ran a search counts: URLs the model typed in its answer are never returned.
+
+Failures fall through to Exa. The HTTP status is read from the response itself through pi's `onResponse` hook, because the transport can drop it from the error it raises (a Codex 502 surfaces as its bare `Bad Gateway` body). A 429 or a recognizable usage limit pauses that route in the engine cooldowns below; a 5xx or a 90s timeout is transient without a pause; any other 4xx (a model or account that does not accept the tool) pauses the route, so a route that cannot search stops adding latency to every query. A known status decides on its own, whatever the body says; the text is consulted only when no status is available, and a failure with no status and no recognizable text fails only that attempt. Claude's in-reply search errors are classified the same way: `too_many_requests` pauses the route, `unavailable` is transient, and query errors (`query_too_long`, `invalid_tool_input`) fail only that query, so the next query still tries Claude.
 
 When the answer comes from a fallback, the result text carries a `Routing attempts:` line naming what happened to each earlier engine (for example `Exa skipped (cooling down for 42s after a rate limit) -> DuckDuckGo 10 results`); `details.engine` and `details.attempts` carry the same information. Every result list ends with a one-line reminder to cite the URLs used. When no engine produced results and every failure was transient (rate limit, CAPTCHA, network timeout, cooldown skip), the tool returns a terminal "do not retry this tool now" message instead, so the model reports what it has rather than looping the tool with rephrased queries.
 
 ## Engine cooldowns
 
-`src/agent/tools/search-cooldown.ts` keeps one process-wide cooldown per engine, because every session, subagent, and cron in the agent shares one egress IP. A block — a DDG CAPTCHA on every profile, an Exa HTTP 429 or 403, or an Exa network failure — pauses that engine:
+`src/agent/tools/search-cooldown.ts` keeps one process-wide cooldown per engine, because every session, subagent, and cron in the agent shares one egress IP. A block — a DDG CAPTCHA on every profile, an Exa HTTP 429 or 403, an Exa network failure, or a provider-search usage limit or rejection — pauses that engine:
 
 - the first block pauses it for 1 minute (`ENGINE_COOLDOWN_BASE_MS`);
 - each further block in a row doubles the pause, up to 15 minutes (`ENGINE_COOLDOWN_MAX_MS`);

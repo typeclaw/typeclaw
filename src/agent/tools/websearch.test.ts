@@ -3,6 +3,8 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { AssistantMessage } from '@earendil-works/pi-ai'
+
 import { isWindows } from '@/shared'
 
 import { _setCurlBinaryForTest, _setDdgPacingForTest, _setSearchRetryForTest } from './ddg'
@@ -51,6 +53,133 @@ function exaResponse(text: string): Response {
 }
 
 const EXA_HIT = 'Title: Bun docs\nURL: https://bun.sh/docs\nPublished: N/A\nAuthor: N/A\nHighlights:\nBun is a runtime.'
+
+function nativeCtx(oauth: boolean, reply: () => Partial<AssistantMessage>, events: unknown[] = []) {
+  const registry = {
+    isUsingOAuth: () => oauth,
+    async complete(_model: unknown, _context: unknown, options: { onProviderStreamEvent?: (event: unknown) => void }) {
+      for (const event of events) options.onProviderStreamEvent?.(event)
+      return { role: 'assistant', content: [], stopReason: 'stop', ...reply() }
+    },
+  }
+  const model = {
+    id: 'claude-test',
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    baseUrl: 'https://api.anthropic.com',
+  }
+  return { model, modelRegistry: registry } as unknown as Parameters<typeof webSearchTool.execute>[4]
+}
+
+const CLAUDE_SEARCH_EVENTS = [
+  {
+    type: 'content_block_start',
+    index: 1,
+    content_block: {
+      type: 'web_search_tool_result',
+      content: [{ type: 'web_search_result', url: 'https://bun.sh/docs', title: 'Bun docs' }],
+    },
+  },
+]
+
+describe('websearch tool: provider search first', () => {
+  test('a subscription session answers from its own provider search without touching Exa', async () => {
+    // given
+    fetchResponse = () => new Response('should not be called', { status: 500 })
+
+    // when
+    const result = await webSearchTool.execute(
+      'id',
+      { query: 'bun' },
+      undefined,
+      undefined,
+      nativeCtx(true, () => ({}), CLAUDE_SEARCH_EVENTS),
+    )
+
+    // then
+    expect(fetchCalls).toHaveLength(0)
+    expect(textOf(result)).toContain('Search results for "bun" (web via Claude search, 1)')
+    expect((result.details as { engine?: string }).engine).toBe('Claude search')
+  })
+
+  test('a provider search failure falls through to Exa and names it in the routing line', async () => {
+    // given
+    fetchResponse = () => exaResponse(EXA_HIT)
+
+    // when
+    const result = await webSearchTool.execute(
+      'id',
+      { query: 'bun' },
+      undefined,
+      undefined,
+      nativeCtx(true, () => ({ stopReason: 'error', errorMessage: '429 usage limit reached' })),
+    )
+
+    // then
+    expect(textOf(result)).toContain('Routing attempts: Claude search failed: 429 usage limit reached -> Exa 1 result')
+    expect(activeCooldown('native-claude')?.reason).toBe('rate_limited')
+  })
+
+  test('an invalid Claude query falls through to Exa and the next query still tries Claude', async () => {
+    // given: the first search reports a query error, the second succeeds
+    const replies = [
+      [
+        {
+          type: 'content_block_start',
+          index: 1,
+          content_block: {
+            type: 'web_search_tool_result',
+            content: { type: 'web_search_tool_result_error', error_code: 'query_too_long' },
+          },
+        },
+      ],
+      CLAUDE_SEARCH_EVENTS,
+    ]
+    const ctx = {
+      model: {
+        id: 'claude-test',
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+      },
+      modelRegistry: {
+        isUsingOAuth: () => true,
+        async complete(_m: unknown, _c: unknown, options: { onProviderStreamEvent?: (event: unknown) => void }) {
+          for (const event of replies.shift() ?? []) options.onProviderStreamEvent?.(event)
+          return { role: 'assistant', content: [], stopReason: 'stop' }
+        },
+      },
+    } as unknown as Parameters<typeof webSearchTool.execute>[4]
+    fetchResponse = () => exaResponse(EXA_HIT)
+
+    // when
+    const first = await webSearchTool.execute('id', { query: 'x'.repeat(500) }, undefined, undefined, ctx)
+    const second = await webSearchTool.execute('id', { query: 'bun' }, undefined, undefined, ctx)
+
+    // then
+    expect((first.details as { engine?: string }).engine).toBe('Exa')
+    expect(textOf(first)).toContain('Claude search failed: search tool error: query_too_long -> Exa 1 result')
+    expect((second.details as { engine?: string }).engine).toBe('Claude search')
+  })
+
+  test('a pay-per-use API-key session skips provider search and starts at Exa', async () => {
+    // given
+    let completed = false
+    const ctx = nativeCtx(false, () => {
+      completed = true
+      return {}
+    })
+    fetchResponse = () => exaResponse(EXA_HIT)
+
+    // when
+    const result = await webSearchTool.execute('id', { query: 'bun' }, undefined, undefined, ctx)
+
+    // then
+    expect(completed).toBe(false)
+    expect((result.details as { engine?: string }).engine).toBe('Exa')
+    expect(textOf(result)).not.toContain('Routing attempts')
+  })
+})
 
 describe('websearch tool: web (Exa first)', () => {
   test('answers from Exa without touching DuckDuckGo, and reminds the model to cite sources', async () => {
