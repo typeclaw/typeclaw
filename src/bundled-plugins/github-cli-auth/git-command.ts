@@ -28,7 +28,8 @@ export type GitPushProvenance =
     }
 
 export type GitCommandDecision =
-  | { kind: 'pass-through' }
+  // multiRepo: one repo-scoped token could never fund it, even as a standalone command.
+  | { kind: 'pass-through'; multiRepo?: true }
   | { kind: 'block'; reason: string }
   | {
       kind: 'inject'
@@ -187,6 +188,9 @@ type MintableInvocation = {
   cwd: string
   dashCCount: number
   target: TargetSpec
+  // Uses a flag or prefix that ran tokenless before it was brokered, so a refused
+  // mint must not turn a working anonymous read into a block.
+  anonymousFallback: boolean
 }
 
 type RepoEvidence = {
@@ -235,7 +239,10 @@ export async function analyzeGitCommand(
       if (decision.kind !== 'inject') return decision
       return {
         ...decision,
-        rewrittenCommand: safeCd.rest.replace(/^git\b/, `git -C ${posixSingleQuote(safeCd.cwd)}`),
+        rewrittenCommand: safeCd.rest.replace(
+          SAFE_ENV_PREFIXED_GIT_RE,
+          (_match, env: string) => `${env}git -C ${posixSingleQuote(safeCd.cwd)}`,
+        ),
       }
     }
 
@@ -263,6 +270,9 @@ async function decideStandalone(invocation: MintableInvocation, resolvers: GitRe
   if (repos.size === 0) return { kind: 'pass-through' }
   if (!evidence.complete) return { kind: 'pass-through' }
   if (repos.size > 1 && evidence.pushProvenance?.kind !== 'configured-remote') {
+    // One repo token cannot fund it, and a newly accepted flagged read ran
+    // tokenless before, so it keeps running anonymously instead of blocking.
+    if (invocation.anonymousFallback) return { kind: 'pass-through', multiRepo: true }
     return { kind: 'block', reason: MULTI_OWNER_REASON }
   }
   return {
@@ -270,7 +280,7 @@ async function decideStandalone(invocation: MintableInvocation, resolvers: GitRe
     repoSlug: [...repos][0] as string,
     access: remoteAccess(invocation.subcommand),
     ...(evidence.pushProvenance === undefined ? {} : { pushProvenance: evidence.pushProvenance }),
-    ...(isNamedRemoteLsRemote(invocation) ? { credentialOptional: true } : {}),
+    ...(isNamedRemoteLsRemote(invocation) || invocation.anonymousFallback ? { credentialOptional: true } : {}),
   }
 }
 
@@ -290,10 +300,17 @@ function remoteAccess(subcommand: RemoteSubcommand): GitRemoteAccess {
 }
 
 function parseMintableGitInvocation(command: string, baseCwd: string): MintableInvocation | null {
+  // The prefix and command word are matched on the raw text, not quote-stripped
+  // words: Bash recognizes an assignment before quote removal, so
+  // `"GIT_TERMINAL_PROMPT=0" git` or `GIT_TERMINAL_PROMPT="0" git` would run as a
+  // different invocation than the one analyzed. The cd rewrite uses the same regex.
+  const head = SAFE_ENV_PREFIXED_GIT_RE.exec(command)
   const words = tokenizeStandalone(command)
-  if (words === null || words[0] !== 'git') return null
+  if (head === null || words === null) return null
+  const envCount = (head[1] as string).split(/[ \t]+/).filter((word) => word !== '').length
+  if (words[envCount] !== 'git') return null
 
-  let cursor = 1
+  let cursor = envCount + 1
   let cwd = baseCwd
   let dashCCount = 0
   while (words[cursor] === '-C') {
@@ -308,14 +325,18 @@ function parseMintableGitInvocation(command: string, baseCwd: string): MintableI
   if (!isRemoteSubcommand(subcommand)) return null
   const args = words.slice(cursor + 1)
   const target = parseMintableTarget(subcommand, args)
-  return target === null ? null : { subcommand, cwd, dashCCount, target }
+  if (target === null) return null
+  const anonymousFallback =
+    envCount > 0 ||
+    (subcommand !== 'push' && subcommand !== 'clone' && args.some((arg) => arg.startsWith('-') && arg !== '--multiple'))
+  return { subcommand, cwd, dashCCount, target, anonymousFallback }
 }
 
 function parseMintableTarget(subcommand: RemoteSubcommand, args: readonly string[]): TargetSpec | null {
   if (subcommand === 'push') return parseMintablePush(args)
   if (subcommand === 'fetch') return parseMintableFetch(args)
   if (subcommand === 'clone') return parseCloneTarget(args)
-  return parseSimpleRemote(args, false)
+  return parseSimpleRemote(args, subcommand === 'pull' ? SAFE_PULL_FLAGS : SAFE_LS_REMOTE_FLAGS)
 }
 
 // Value-less clone flags that cannot redirect the fetch to another repo/host, run a
@@ -341,6 +362,89 @@ const SAFE_CLONE_VALUE_FLAGS = new Set(['--depth', '-b', '--branch'])
 
 // `--flag=value` forms whose value is inert (a count, ref, date, or filter spec).
 const SAFE_CLONE_INLINE_PREFIXES = ['--depth=', '--branch=', '--filter=', '--shallow-since=', '--shallow-exclude=']
+
+// The same opaque "could not read Username" failure hit fetch/pull/ls-remote, which
+// rejected every flag: `git fetch -q origin main` or `git pull --rebase origin main`
+// on a private repo ran tokenless. These flags only shape what is read or how the
+// local branch moves. Deliberately EXCLUDED: --upload-pack (command execution),
+// --recurse-submodules (fetches other repos with the token live), --all (fans out to
+// every remote), and -o/--server-option. Any other flag still runs tokenless.
+type SafeFlagPolicy = {
+  flags: ReadonlySet<string>
+  valueFlags: ReadonlySet<string>
+  inlinePrefixes: readonly string[]
+}
+
+const SAFE_FETCH_FLAG_NAMES = [
+  '-q',
+  '--quiet',
+  '-v',
+  '--verbose',
+  '--progress',
+  '--no-progress',
+  '-p',
+  '--prune',
+  '-P',
+  '--prune-tags',
+  '-t',
+  '--tags',
+  '-n',
+  '--no-tags',
+  '-f',
+  '--force',
+  '--dry-run',
+  '--unshallow',
+  '--update-shallow',
+  '--no-write-fetch-head',
+  '--atomic',
+]
+
+const SAFE_FETCH_FLAGS: SafeFlagPolicy = {
+  flags: new Set(SAFE_FETCH_FLAG_NAMES),
+  valueFlags: new Set(['--depth', '--deepen']),
+  inlinePrefixes: ['--depth=', '--deepen=', '--shallow-since=', '--shallow-exclude='],
+}
+
+const SAFE_PULL_FLAGS: SafeFlagPolicy = {
+  ...SAFE_FETCH_FLAGS,
+  flags: new Set([
+    ...SAFE_FETCH_FLAG_NAMES,
+    '-r',
+    '--rebase',
+    '--no-rebase',
+    '--ff',
+    '--ff-only',
+    '--no-ff',
+    '--no-edit',
+    '--autostash',
+    '--no-autostash',
+    '--stat',
+    '--no-stat',
+  ]),
+}
+
+const SAFE_LS_REMOTE_FLAGS: SafeFlagPolicy = {
+  flags: new Set(['-q', '--quiet', '--heads', '--branches', '-t', '--tags', '--refs', '--symref', '--exit-code']),
+  valueFlags: new Set(),
+  inlinePrefixes: [],
+}
+
+// Only a fixed-value prompt switch is accepted before `git`: an assignment that can
+// steer credentials or transport (GIT_ASKPASS, GIT_SSH_COMMAND, GIT_CONFIG_*) keeps
+// the command tokenless.
+const SAFE_ENV_PREFIXED_GIT_RE = /^[ \t]*((?:GIT_TERMINAL_PROMPT=[01][ \t]+)*)git(?=[ \t]|$)/
+
+// How many argv words the known-inert flag at args[index] consumes; 0 when unknown.
+function safeFlagWidth(args: readonly string[], index: number, policy: SafeFlagPolicy): number {
+  const arg = args[index] as string
+  if (policy.flags.has(arg)) return 1
+  if (policy.valueFlags.has(arg)) {
+    const value = args[index + 1]
+    return value !== undefined && SAFE_CLONE_FLAG_VALUE_RE.test(value) ? 2 : 0
+  }
+  const prefix = policy.inlinePrefixes.find((candidate) => arg.startsWith(candidate))
+  return prefix !== undefined && SAFE_CLONE_FLAG_VALUE_RE.test(arg.slice(prefix.length)) ? 1 : 0
+}
 
 // git clone's URL is a POSITIONAL, so the previous fixed-index parse rejected every
 // flagged clone — `--depth 1`, the most common shape in code-analysis workflows, got
@@ -412,14 +516,17 @@ function parseMintablePush(args: readonly string[]): TargetSpec | null {
 function parseMintableFetch(args: readonly string[]): TargetSpec | null {
   let multiple = false
   const positionals: string[] = []
-  for (const arg of args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string
     if (arg === '--multiple') {
       if (multiple) return null
       multiple = true
-    } else if (!isOptionValue(arg)) {
-      return null
-    } else {
+    } else if (isOptionValue(arg)) {
       positionals.push(arg)
+    } else {
+      const width = safeFlagWidth(args, i, SAFE_FETCH_FLAGS)
+      if (width === 0) return null
+      i += width - 1
     }
   }
   if (positionals.length === 0) return null
@@ -428,9 +535,20 @@ function parseMintableFetch(args: readonly string[]): TargetSpec | null {
     : { kind: 'single', value: positionals[0] as string, forPush: false }
 }
 
-function parseSimpleRemote(args: readonly string[], forPush: boolean): TargetSpec | null {
-  if (args.length === 0 || args.some((arg) => !isOptionValue(arg))) return null
-  return { kind: 'single', value: args[0] as string, forPush }
+function parseSimpleRemote(args: readonly string[], policy: SafeFlagPolicy): TargetSpec | null {
+  const positionals: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string
+    if (isOptionValue(arg)) {
+      positionals.push(arg)
+      continue
+    }
+    const width = safeFlagWidth(args, i, policy)
+    if (width === 0) return null
+    i += width - 1
+  }
+  if (positionals.length === 0) return null
+  return { kind: 'single', value: positionals[0] as string, forPush: false }
 }
 
 function tokenizeStandalone(command: string): string[] | null {

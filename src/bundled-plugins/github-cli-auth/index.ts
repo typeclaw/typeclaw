@@ -27,7 +27,12 @@ import {
 } from './gh-command'
 import { detectReviewDismissal } from './gh-review-detect'
 import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
-import { appendGitAuthDiagnostic, createGitAuthLoginResolver, type GitAuthCredential } from './git-auth-diagnostic'
+import {
+  appendGitAuthDiagnostic,
+  appendUnbrokeredGitHint,
+  createGitAuthLoginResolver,
+  type GitAuthCredential,
+} from './git-auth-diagnostic'
 import {
   analyzeGitCommand,
   createSessionTmpGitResolvers,
@@ -95,6 +100,13 @@ export default definePlugin({
         push: boolean
       }
     >()
+    // Git commands the broker passed through without a credential, so a GitHub login
+    // failure can name the cause instead of looking like missing access. A call the
+    // tool wrapper rejects after tool.before never reaches tool.after, so the map is
+    // capped and drops its oldest entries. The value records whether the command
+    // reads several repos, which no single repo token can fund.
+    const unbrokeredGitCalls = new Map<string, { multiRepo: boolean }>()
+    const UNBROKERED_GIT_CALLS_CAP = 256
 
     // Every model-driven bash masks the canonical credential files. A role may
     // still USE a PAT through this runtime-owned overlay, which injects one
@@ -542,7 +554,17 @@ export default definePlugin({
       if (grantedPush !== undefined && (!hasAppTokenResolver() || !matchesGrantedPush(decision, grantedPush))) {
         return { block: true, reason: grantedPushMismatchReason }
       }
-      if (decision.kind === 'pass-through') return
+      if (decision.kind === 'pass-through') {
+        // Only App auth funds standalone reads, so only there is "run it standalone" true advice.
+        if (hasAppTokenResolver()) {
+          unbrokeredGitCalls.set(event.callId, { multiRepo: decision.multiRepo === true })
+          for (const callId of unbrokeredGitCalls.keys()) {
+            if (unbrokeredGitCalls.size <= UNBROKERED_GIT_CALLS_CAP) break
+            unbrokeredGitCalls.delete(callId)
+          }
+        }
+        return
+      }
       if (decision.kind === 'block') return { block: true, reason: decision.reason }
 
       const buildGitCredentialOverlay = async (
@@ -731,6 +753,9 @@ export default definePlugin({
           if (event.tool === 'bash' && gitAuth !== undefined) {
             await appendGitAuthDiagnostic({ result: event.result, ...gitAuth, resolveLogin: resolveGitAuthLogin })
           }
+          const unbrokered = unbrokeredGitCalls.get(event.callId)
+          unbrokeredGitCalls.delete(event.callId)
+          if (unbrokered !== undefined && event.tool === 'bash') appendUnbrokeredGitHint(event.result, unbrokered)
           const graphqlCommand = passThroughGraphqlCommands.get(event.callId)
           passThroughGraphqlCommands.delete(event.callId)
           checkGraphqlAuthNudge({ tool: event.tool, command: graphqlCommand, result: event.result })
