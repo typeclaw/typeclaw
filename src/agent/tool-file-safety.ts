@@ -1259,10 +1259,21 @@ function revert(
       ]
   const now = readConfigEntrySync(destination)
   if (!sameConfigContent(now, live)) {
+    // Only a newer authorized commit is trusted as it stands. Any other change may
+    // still carry the blocked content, so the window keeps the trusted bytes in
+    // recovery and the next check also runs the guards of the calls that left it.
+    if (sameConfigContent(now, trustedConfigState(destination).entry)) {
+      return [
+        `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
+        `blocked: ${reason}`,
+        `${name} changed again before it could be reverted, so it was left as it is now; that change is checked on its own.`,
+      ].join('\n')
+    }
+    setConfigRecovery(destination, true, producers)
     return [
       `[TypeClaw config guard] The change this command made to ${name} was blocked:`,
       `blocked: ${reason}`,
-      `${name} changed again before it could be reverted, so it was left as it is now; that change is checked on its own.`,
+      `${name} changed again before it could be reverted, so it was left as it is now. Until a later check verifies it, the agent keeps using the last authorized ${name}, and that check also applies the checks this command failed.`,
     ].join('\n')
   }
   try {

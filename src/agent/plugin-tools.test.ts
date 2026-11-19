@@ -9105,6 +9105,71 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
     })
   })
 
+  test('an unauthorized change during a rollback keeps the trusted bytes and the blocking guard', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: while a blocked role rule is checked, another writer that records no
+      // commit changes the file in place, keeping the rule and adding another field
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const concurrent = '{"alias":["other-writer"],"roles":{"trusted":{"match":["discord:user:1"]}}}\n'
+      let changed = false
+      const { hooks } = guardHooks(agentDir, async () => {
+        if (changed) return
+        changed = true
+        await writeFile(config, concurrent)
+      })
+
+      // when: the bash call of a session without the bypass adds the rule
+      const text = await runBash(
+        agentDir,
+        hooks,
+        `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`,
+      )
+
+      // then: the file is left alone, but a reload keeps the trusted bytes
+      expect(text).toContain('changed again before it could be reverted')
+      expect(await readFile(config, 'utf8')).toBe(concurrent)
+      expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+      expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
+
+      // when: an owner session's later call re-checks the file
+      const owner = guardHooks(agentDir, undefined, { bypassRolePromotion: true }).hooks
+      const later = await runBash(agentDir, owner, 'true')
+
+      // then: the original session's guard still blocks the rule, and the file is reverted
+      expect(later).toContain('the command that left this change ran in a session without permission')
+      expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+      expect(JSON.stringify(loadConfigSync(agentDir))).not.toContain('discord:user:1')
+    })
+  })
+
+  test('an authorized commit during a rollback is accepted as it stands', async () => {
+    await withAgentDir(async (agentDir, config) => {
+      // given: while a blocked role rule is checked, an authorized writer commits in place
+      await writeFile(config, '{"alias":["atlas"]}\n')
+      const committed = '{"alias":["other-writer"]}\n'
+      let changed = false
+      const { hooks } = guardHooks(agentDir, async () => {
+        if (changed) return
+        changed = true
+        // The check runs under the config lock, as an authorized commit does.
+        writeFileSync(config, committed)
+        recordConfigCommitSync(config, committed)
+      })
+
+      // when: the bash call adds the rule
+      const text = await runBash(
+        agentDir,
+        hooks,
+        `printf '%s' '{"alias":["atlas"],"roles":{"trusted":{"match":["discord:user:1"]}}}' > typeclaw.json`,
+      )
+
+      // then: the commit stands and is what a reload loads
+      expect(text).toContain('that change is checked on its own')
+      expect(await readFile(config, 'utf8')).toBe(committed)
+      expect(loadConfigSync(agentDir).alias).toEqual(['other-writer'])
+    })
+  })
+
   test('never clobbers a writer that changes the file while its change is checked', async () => {
     await withAgentDir(async (agentDir, config) => {
       // given: another writer lands its own bytes while the guard check runs
