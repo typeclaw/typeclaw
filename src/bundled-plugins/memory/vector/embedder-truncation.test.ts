@@ -7,12 +7,12 @@ import { estimateTokens, TEXT_TOKEN_BUDGET } from './truncation'
 let lastExtractorInput: string[] | undefined
 let lastExtractorOptions: Record<string, unknown> | undefined
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
 async function freshEmbedderModule(): Promise<EmbedderModule> {
-  const mod = await import(`./embedder?truncation=${crypto.randomUUID()}`)
+  const mod = await import(`./embedder-inference?truncation=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   const pipeline = (async () => {
     return (texts: string[], options?: Record<string, unknown>) => {

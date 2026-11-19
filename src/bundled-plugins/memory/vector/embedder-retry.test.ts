@@ -9,7 +9,7 @@ import { describe, expect, test } from 'bun:test'
 let pipelineCalls = 0
 let failNextPipeline = false
 
-type EmbedderModule = typeof import('./embedder')
+type EmbedderModule = typeof import('./embedder-inference')
 type TransformersImporter = NonNullable<Parameters<EmbedderModule['__setTransformersImporterForTests']>[0]>
 type TransformersModule = Awaited<ReturnType<TransformersImporter>>
 
@@ -72,8 +72,8 @@ describe('embedder reuse and retry', () => {
 // Bun's module registry memoizes embedder.ts across tests, so its singleton
 // would leak between the cases above. A cache-busting query string forces a
 // fresh module instance (and thus a fresh embedderInstance) per test.
-async function freshEmbedderModule(): Promise<typeof import('./embedder')> {
-  const mod = await import(`./embedder?retry=${crypto.randomUUID()}`)
+async function freshEmbedderModule(): Promise<EmbedderModule> {
+  const mod = await import(`./embedder-inference?retry=${crypto.randomUUID()}`)
   mod.__setModelCacheCheckForTests(() => Promise.resolve())
   mod.__setTransformersImporterForTests(fakeTransformersModule())
   return mod
