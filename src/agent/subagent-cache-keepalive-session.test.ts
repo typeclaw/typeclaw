@@ -12,12 +12,12 @@ import { invalidateProviderAuthCache } from './auth'
 import { createSessionWithDispose } from './index'
 import { LiveSubagentRegistry } from './live-subagents'
 
-function completion(): Response {
+function completion(id: string): Response {
   const events = [
     {
       type: 'message_start',
       message: {
-        id: 'test-message',
+        id,
         type: 'message',
         role: 'assistant',
         model: 'claude-sonnet-4-5',
@@ -36,11 +36,15 @@ function completion(): Response {
   })
 }
 
-test('session lifecycle replays the final wire payload without appending messages or emitting replies', async () => {
+test('session keepalive replays the payload without changing the transcript, events or thread', async () => {
   // Given a real SDK session and a running child owned by that parent.
   const previousCwd = process.cwd()
   const previousFetch = globalThis.fetch
-  const previousKey = process.env.ANTHROPIC_API_KEY
+  const previousEnv = {
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL,
+    PI_CACHE_RETENTION: process.env.PI_CACHE_RETENTION,
+  }
   const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-cache-keepalive-'))
   let clock: ReturnType<typeof install> | undefined
   let created: Awaited<ReturnType<typeof createSessionWithDispose>> | undefined
@@ -52,6 +56,8 @@ test('session lifecycle replays the final wire payload without appending message
     )
     reloadConfig(agentDir)
     process.env.ANTHROPIC_API_KEY = 'test-anthropic-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
+    process.env.PI_CACHE_RETENTION = 'short'
     invalidateProviderAuthCache()
     const manager = SessionManager.inMemory(agentDir)
     const registry = new LiveSubagentRegistry()
@@ -76,7 +82,7 @@ test('session lifecycle replays the final wire payload without appending message
     globalThis.fetch = Object.assign(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         bodies.push(await new Request(input, init).json())
-        return completion()
+        return completion(`msg_fixture_${bodies.length}`)
       },
       { preconnect: previousFetch.preconnect },
     )
@@ -95,11 +101,13 @@ test('session lifecycle replays the final wire payload without appending message
     // When idle time reaches the pre-expiry deadline.
     await clock.tickAsync(270_000)
 
-    // Then the real Anthropic adapter sends only an output-budget change, and
-    // the response bypasses all agent/session/tool/channel dispatch.
+    // Then the replay preserves the original payload except for output budget
+    // and threading, and its reply bypasses all agent/session/tool/channel dispatch.
     expect(bodies).toHaveLength(2)
-    const { max_tokens: originalMax, ...originalPrefix } = bodies[0] ?? {}
+    const { max_tokens: originalMax, thread: originalThread, ...originalPrefix } = bodies[0] ?? {}
     const { max_tokens: pingMax, ...pingPrefix } = bodies[1] ?? {}
+    expect(originalThread).toEqual({ type: 'create' })
+    expect(bodies[1]).not.toHaveProperty('thread')
     expect(originalPrefix.tools).toBeArray()
     expect(pingPrefix).toEqual(originalPrefix)
     expect(typeof pingMax).toBe('number')
@@ -108,10 +116,15 @@ test('session lifecycle replays the final wire payload without appending message
     expect(created.session.messages).toEqual(messages)
     expect(messageEvents).toBe(eventCount)
 
+    // A subsequent real request continues from the first real reply, not the ping.
+    await created.session.prompt('follow-up fixture')
+    expect(bodies).toHaveLength(3)
+    expect(bodies[2]?.thread).toEqual({ type: 'continue', previous_message_id: 'msg_fixture_1' })
+
     // Completion and actual session disposal both stop future provider calls.
     registry.recordCompletionIfRunning('child', { ok: true, durationMs: 270_000 })
     await clock.tickAsync(270_000)
-    expect(bodies).toHaveLength(2)
+    expect(bodies).toHaveLength(3)
     registry.register({
       taskId: 'sibling',
       sessionId: 'sibling-session',
@@ -124,14 +137,16 @@ test('session lifecycle replays the final wire payload without appending message
     })
     created.session.dispose()
     await clock.tickAsync(270_000)
-    expect(bodies).toHaveLength(2)
+    expect(bodies).toHaveLength(3)
   } finally {
     created?.session.dispose()
     await created?.dispose()
     clock?.uninstall()
     globalThis.fetch = previousFetch
-    if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
-    else process.env.ANTHROPIC_API_KEY = previousKey
+    for (const [key, previousValue] of Object.entries(previousEnv)) {
+      if (previousValue === undefined) delete process.env[key]
+      else process.env[key] = previousValue
+    }
     invalidateProviderAuthCache()
     __resetConfigForTesting()
     process.chdir(previousCwd)

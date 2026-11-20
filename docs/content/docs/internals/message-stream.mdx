@@ -66,10 +66,12 @@ The session's final `onPayload` hook snapshots the provider payload after prompt
 cache-key handling, along with the model and normalized context. Replay goes
 straight through the authenticated model runtime, not the agent loop: system,
 tools and their order, conversation, thinking settings and cache keys stay
-identical. Only the output budget changes to one token (or the existing legacy
-thinking budget plus one, the API minimum); the request aborts at Anthropic
-`message_start`, after prefill. Responses are discarded, never persisted or sent
-to channels, and diagnostics go only to the operator's debug output.
+identical. The ping opts out of Anthropic message threads so its reply or
+rejection cannot change where the next real turn continues. The output budget
+drops to one token (or the existing legacy thinking budget plus one, the API
+minimum); the request aborts at Anthropic `message_start`, after prefill.
+Responses are discarded, never persisted or sent to channels, and diagnostics
+go only to the operator's debug output.
 
 Only `anthropic-messages` requests with actual five-minute cache markers qualify.
 OpenAI, disabled caching and one-hour caches are excluded. Pings run at 4m30s,

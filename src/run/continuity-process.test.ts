@@ -38,28 +38,50 @@ const korean = scenario.endsWith('-ko');
 const ask = korean ? '빌드 상태 확인해 줄 수 있어?' : 'Can you check the build status?';
 const progress = korean ? '확인해볼게요.' : 'Let me check that.';
 const welcome = "You're welcome.";
-const sse = (block, stop) => new Response([
- 'event: message_start','data: '+JSON.stringify({type:'message_start',message:{id:'msg_'+Date.now(),type:'message',role:'assistant',model:'claude-sonnet-4-6',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:0}}}),'',
- 'event: content_block_start','data: '+JSON.stringify({type:'content_block_start',index:0,content_block:block.type==='text'?{type:'text',text:''}:{type:'tool_use',id:'tool_'+Date.now(),name:block.name,input:{}}}),'',
+const threadReplies = new Map();
+let replySequence = 0;
+const sse = (id, block, stop) => new Response([
+ 'event: message_start','data: '+JSON.stringify({type:'message_start',message:{id,type:'message',role:'assistant',model:'claude-sonnet-4-6',content:[],stop_reason:null,stop_sequence:null,usage:{input_tokens:1,output_tokens:0}}}),'',
+ 'event: content_block_start','data: '+JSON.stringify({type:'content_block_start',index:0,content_block:block.type==='text'?{type:'text',text:''}:{type:'tool_use',id:block.id,name:block.name,input:{}}}),'',
  'event: content_block_delta','data: '+JSON.stringify({type:'content_block_delta',index:0,delta:block.type==='text'?{type:'text_delta',text:block.text}:{type:'input_json_delta',partial_json:JSON.stringify(block.input)}}),'',
  'event: content_block_stop','data: {"type":"content_block_stop","index":0}','',
  'event: message_delta','data: '+JSON.stringify({type:'message_delta',delta:{stop_reason:stop,stop_sequence:null},usage:{output_tokens:1}}),'',
  'event: message_stop','data: {"type":"message_stop"}',''].join('\\n'),{headers:{'content-type':'text/event-stream'}});
-const reply = (text, more) => sse({ type: 'tool_use', name: 'channel_reply', input: { text, continue_after_reply: more } }, 'tool_use');
 globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (!url.includes('/v1/messages')) { record('foreign-fetch', { mode, url }); throw new TypeError('network disabled in continuity proof') }
   const raw = typeof init?.body === 'string' ? init.body : input instanceof Request ? await input.clone().text() : '';
-  const body = JSON.parse(raw || '{}');
-  // Plugin/background model calls are not channel turns; they never answer a user.
-  if (!(body.tools ?? []).some((tool) => tool.name === 'channel_reply')) { record('aux-provider-calls', { mode }); return sse({ type: 'text', text: 'NO_REPLY' }, 'end_turn') }
-  const conversation = JSON.stringify(body.messages ?? []);
+  const { thread, messages: suffix = [], tools: requestTools = [] } = JSON.parse(raw || '{}');
+  let messages = suffix, tools = requestTools;
+  // Pi runs payload hooks on the full body, then drops system and tools and sends
+  // only the suffix when continuing. Rebuild the conversation before routing it.
+  if (thread?.type === 'continue') {
+    const parent = threadReplies.get(thread.previous_message_id);
+    if (!parent) return Response.json({ type: 'error', error: { type: 'not_found_error', message: 'Unknown continuation parent: ' + thread.previous_message_id } }, { status: 404 });
+    threadReplies.delete(thread.previous_message_id);
+    tools = parent.tools;
+    messages = [...parent.messages, ...suffix];
+  }
+  const respond = (block, stop) => {
+    const sequence = ++replySequence;
+    const id = 'msg_' + sequence;
+    const content = block.type === 'tool_use' ? { ...block, id: 'tool_' + sequence } : block;
+    if (thread?.type === 'create' || thread?.type === 'continue') {
+      threadReplies.set(id, { tools, messages: [...messages, { role: 'assistant', content: [content] }] });
+    }
+    return sse(id, content, stop);
+  };
+  const reply = (text, more) => respond({ type: 'tool_use', name: 'channel_reply', input: { text, continue_after_reply: more } }, 'tool_use');
+  const noReply = () => respond({ type: 'text', text: 'NO_REPLY' }, 'end_turn');
+  // Plugin/background model calls never answer a user and have their own reply IDs.
+  if (!tools.some((tool) => tool.name === 'channel_reply')) { record('aux-provider-calls', { mode }); return noReply() }
+  const conversation = JSON.stringify(messages);
   record('provider-calls', { mode, thanks: conversation.includes('Thanks!') });
-  if (!live || scenario === 'maintenance') return sse({ type: 'text', text: 'NO_REPLY' }, 'end_turn');
-  if (conversation.includes('Thanks!')) return conversation.includes(welcome) ? sse({ type: 'text', text: 'NO_REPLY' }, 'end_turn') : reply(welcome, false);
+  if (!live || scenario === 'maintenance') return noReply();
+  if (conversation.includes('Thanks!')) return conversation.includes(welcome) ? noReply() : reply(welcome, false);
   if (!conversation.includes(progress)) return reply(progress, true);
   if (scenario.startsWith('provider-error')) return new Response(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'controlled provider outage' } }), { status: 401, headers: { 'content-type': 'application/json' } });
-  return sse({ type: 'text', text: 'NO_REPLY' }, 'end_turn');
+  return noReply();
 };
 const key = { adapter: 'discord-bot', workspace: 'guild', chat: 'room', thread: null };
 const event = (id, text, ts) => ({ ...key, accountIdentity: 'proof-account', text, externalMessageId: id, eventKind: 'message', revision: '0', authorId: 'alice', authorName: 'alice', authorIsBot: false, isBotMention: false, isDm: true, mentionsOthers: false, replyToBotMessageId: null, replyToOtherMessageId: null, ts });

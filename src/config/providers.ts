@@ -517,7 +517,7 @@ export const KNOWN_PROVIDERS = {
         contextWindow: 1000000,
         maxTokens: 128000,
         thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
-        compat: { forceAdaptiveThinking: true },
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false },
       },
       // Sonnet 5.5 (Sep 28 2026) succeeds Sonnet 5 at $2/$10 with a 5% cache
       // read. Like Opus 5.5 it rejects disabled thinking and sampling params,

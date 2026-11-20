@@ -161,6 +161,9 @@ export class SubagentCacheKeepalive {
     try {
       const events = await this.stream(request.model, request.context, {
         ...request.options,
+        // Pi adds `thread` after onPayload; a rejected ping could turn off the
+        // real session's continuation before the response stream even starts.
+        disableContinuation: true,
         signal: controller.signal,
         maxTokens,
         maxRetries: 0,
