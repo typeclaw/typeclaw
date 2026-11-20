@@ -39,7 +39,7 @@ export {
   type SystemPromptComposition,
 } from './system-prompt-composition'
 import { effectiveModels } from '@/config/model-overrides'
-import { defaultThinkingLevelForRef, isOpenAiFamilyRef, providerForModelRef, type ModelRef } from '@/config/providers'
+import { defaultThinkingLevelForRef, providerForModelRef, type ModelRef } from '@/config/providers'
 import { trackTurnActivity } from '@/last-words/activity'
 import { renderMcpCatalog } from '@/mcp/catalog'
 import type { McpManager } from '@/mcp/manager'
@@ -80,7 +80,6 @@ import {
   wrapSystemTool,
   zodToToolParameters,
 } from './plugin-tools'
-import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
 import { promptCacheKeyForOrigin, sharedSessionIdForOrigin, withPromptCacheKey } from './prompt-cache-key'
 import { wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { createReloadTool } from './reload-tool'
@@ -616,7 +615,6 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           ...(options.runtimeVersion !== undefined ? { runtimeVersion: options.runtimeVersion } : {}),
           ...(options.mcpManager !== undefined ? { mcpManager: options.mcpManager } : {}),
           ...(options.subagentRegistry !== undefined ? { subagentRegistry: options.subagentRegistry } : {}),
-          ...(isOpenAiFamilyRef(activeRef) ? { proactiveNextStepNudge: true } : {}),
           ...(detachSessionTail
             ? {
                 onSessionTail: (tail: string) => {
@@ -1352,7 +1350,6 @@ export type CreateResourceLoaderOptions = {
   // 'full' to add the interactive context to an unattended origin (rarely
   // useful; mostly an escape hatch for ad-hoc debugging).
   mode?: SystemPromptMode
-  proactiveNextStepNudge?: boolean
   evalEnabled?: boolean
   // When set, the origin/role/git suffix is left out of the preamble and handed
   // here instead, for the session to append after pi's sections.
@@ -1454,7 +1451,6 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     ...(mcpCatalog !== undefined ? { mcpCatalog } : {}),
     gitNudge: detached ? '' : gitNudge,
     ...(options.evalEnabled ? { evalHint: EVAL_PROMPT_HINT } : {}),
-    ...(options.proactiveNextStepNudge === true ? { proactiveNextStepNudge: PROACTIVE_NEXT_STEP_NUDGE } : {}),
   })
 
   const additionalSkillPaths = [getBundledSkillsDir()]

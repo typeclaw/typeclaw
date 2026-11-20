@@ -75,7 +75,6 @@ export type SystemPromptComposition = {
   roleContext?: SessionRoleContext
   mcpCatalog?: string
   gitNudge: string
-  proactiveNextStepNudge?: string
   evalHint?: string
 }
 
@@ -99,7 +98,6 @@ export type SystemPromptComposition = {
 // 6. gitNudge — rare changes; agent folders force-commit sessions/ and
 //    memory/ after every turn, so the dirty-files list is empty most of
 //    the time.
-// 7. proactive next-step nudge — deterministic per model family.
 //
 // The wall-clock anchor that used to live here as `## Now` moved out
 // entirely. It is now injected into the user turn at each `session.prompt`
@@ -139,9 +137,6 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   }
   if (parts.gitNudge !== '') {
     prompt = `${prompt}\n\n${parts.gitNudge}`
-  }
-  if (parts.proactiveNextStepNudge !== undefined && parts.proactiveNextStepNudge !== '') {
-    prompt = `${prompt}\n\n${parts.proactiveNextStepNudge}`
   }
   if (parts.evalHint) prompt = `${prompt}\n\n${parts.evalHint}`
   return prompt

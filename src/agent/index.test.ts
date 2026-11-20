@@ -39,7 +39,6 @@ import {
 } from './index'
 import { LiveSubagentRegistry } from './live-subagents'
 import { resetSharedLoopGuardSession, wrapSystemTool } from './plugin-tools'
-import { PROACTIVE_NEXT_STEP_NUDGE } from './proactive-next-step-nudge'
 import { detectProviderError, wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { renderInteractiveSessionContext, type SessionOrigin } from './session-origin'
 import type { CreateSessionForSubagent, SubagentRegistry } from './subagents'
@@ -448,26 +447,6 @@ describe('createResourceLoader', () => {
     expect(prompt).not.toContain('## Now')
     expect(prompt).not.toContain('Session started at')
     expect(prompt).not.toContain('<current-time>')
-  })
-
-  test('composeSystemPrompt omits proactive next-step nudge by default for non-GPT callers', () => {
-    const prompt = composeSystemPrompt({
-      self: '# Identity\n\nfoo',
-      gitNudge: '',
-    })
-
-    expect(prompt).not.toContain('## Proactive and requested next-step guidance')
-    expect(prompt).not.toContain('do not ask for permission or confirmation')
-  })
-
-  test('composeSystemPrompt places GPT proactive next-step nudge after git nudge', () => {
-    const prompt = composeSystemPrompt({
-      self: '# Identity\n\nfoo',
-      gitNudge: '## Git nudge\n\ncommit things',
-      proactiveNextStepNudge: PROACTIVE_NEXT_STEP_NUDGE,
-    })
-
-    expect(prompt.indexOf('## Git nudge')).toBeLessThan(prompt.indexOf('## Proactive and requested next-step guidance'))
   })
 
   test('composeSystemPrompt places MCP catalog after origin and before git nudge', () => {
@@ -978,10 +957,9 @@ describe('composeSystemPrompt shared policy', () => {
     roleContext: { role: 'ROLE-SENTINEL', permissions: [] },
     mcpCatalog: '## MCP servers\n\nMCP-SENTINEL',
     gitNudge: '## Git nudge\n\nGIT-SENTINEL',
-    proactiveNextStepNudge: 'PROACTIVE-SENTINEL',
   }
 
-  test('orders sections least- to most-volatile: policy, identity, runtime, interactive context, origin, role, MCP, git, proactive', () => {
+  test('orders sections least- to most-volatile: policy, identity, runtime, interactive context, origin, role, MCP, git', () => {
     // when
     const prompt = composeSystemPrompt({ mode: 'full', ...sessionParts })
 
@@ -994,7 +972,6 @@ describe('composeSystemPrompt shared policy', () => {
       'ROLE-SENTINEL',
       'MCP-SENTINEL',
       'GIT-SENTINEL',
-      'PROACTIVE-SENTINEL',
     ].map((sentinel) => prompt.indexOf(sentinel))
     expect(prompt.startsWith(`${buildSystemPolicy()}\n\n${self}`)).toBe(true)
     expect(positions.every((position) => position > 0)).toBe(true)
