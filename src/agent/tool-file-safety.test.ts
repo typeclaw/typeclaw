@@ -18,6 +18,7 @@ import {
 } from '@/config/config-commits'
 import { addMount } from '@/config/mounts-mutation'
 import { createConfigReloadable } from '@/config/reloadable'
+import { syncConfiguredGitRemotes } from '@/git/configured-remotes'
 
 import {
   enforceAndPinToolFiles,
@@ -1113,5 +1114,99 @@ test('a host config write whose restore also fails names the file and its recove
   } finally {
     __setConfigWriteSyncForTests(undefined)
     await cleanup()
+  }
+})
+
+// A fresh host read, then runtime startup reconciliation and load, as for
+// `typeclaw start` followed by `typeclaw run`, reporting git.remotes.
+async function freshStartRemotes(agentDir: string): Promise<{ code: number; out: string; err: string }> {
+  const proc = Bun.spawn({
+    cmd: [
+      process.execPath,
+      '-e',
+      `import { loadConfigSync } from './src/config/config.ts'
+import { markRuntimeOwnsConfigWindows, reconcileLeftoverConfigWindowsSync } from './src/config/config-commits.ts'
+const dir = ${JSON.stringify(agentDir)}
+console.log('host:' + JSON.stringify(loadConfigSync(dir).git.remotes ?? null))
+reconcileLeftoverConfigWindowsSync(dir)
+markRuntimeOwnsConfigWindows()
+console.log('runtime:' + JSON.stringify(loadConfigSync(dir).git.remotes ?? null))`,
+    ],
+    cwd: path.resolve(import.meta.dir, '../..'),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const [code, out, err] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ])
+  return { code, out, err }
+}
+
+async function gitIn(cwd: string, args: string[]): Promise<string> {
+  const proc = Bun.spawn({
+    cmd: ['git', ...args],
+    cwd,
+    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  })
+  const out = await new Response(proc.stdout).text()
+  expect(await proc.exited).toBe(0)
+  return out.trim()
+}
+
+test('an edit made while the agent was stopped survives a leftover recovery that recorded its held-back bytes', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-stopped-edit-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  const edited = '{"alias":["atlas"],"git":{"remotes":{"origin":"https://example.com/new.git"}}}\n'
+  try {
+    // given: a failed restore left a recovery window (with its held-back bytes
+    // recorded), the agent stopped, and the operator then retargets origin by hand
+    await gitIn(agentDir, ['init', '-q'])
+    await leaveFailedRestore(agentDir, config)
+    await writeFile(config, edited)
+
+    // when: the host reads the config and the runtime starts again
+    const started = await freshStartRemotes(agentDir)
+
+    // then: both use the edit, startup keeps it and records it, and says why
+    expect(started.code).toBe(0)
+    expect(started.out).toContain('host:{"origin":"https://example.com/new.git"}')
+    expect(started.out).toContain('runtime:{"origin":"https://example.com/new.git"}')
+    expect(started.err).toContain('was edited while the agent was stopped; the edited typeclaw.json is kept')
+    expect(await readFile(config, 'utf8')).toBe(edited)
+    expect(readConfigCommitSync(config)?.bytes?.toString('utf8')).toBe(edited)
+
+    // and: the remote sync points origin at the new URL
+    await syncConfiguredGitRemotes(agentDir, { origin: 'https://example.com/new.git' })
+    expect(await gitIn(agentDir, ['remote', 'get-url', 'origin'])).toBe('https://example.com/new.git')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
+  }
+})
+
+test('runtime startup restores a leftover recovery with no recorded held-back bytes and says so', async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-stopped-mid-call-'))
+  const config = path.join(agentDir, 'typeclaw.json')
+  try {
+    // given: the agent stopped while a bash call that changed typeclaw.json was in flight
+    await writeFile(config, '{"alias":["atlas"]}\n')
+    await snapshotManagedConfigFiles(agentDir, async () => undefined)
+    await writeFile(config, '{"alias":["changed"]}\n')
+
+    // when: the runtime starts again
+    const started = await freshStart(agentDir)
+
+    // then: startup restores the last checked file and says so in the operator log
+    expect(started.code).toBe(0)
+    expect(started.out).toContain('runtime:["atlas"]')
+    expect(started.err).toContain(
+      'typeclaw.json was restored to the last checked version because the agent stopped in the middle of a command',
+    )
+    expect(await readFile(config, 'utf8')).toBe('{"alias":["atlas"]}\n')
+  } finally {
+    await rm(agentDir, { recursive: true, force: true })
   }
 })

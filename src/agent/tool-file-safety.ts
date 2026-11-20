@@ -46,6 +46,7 @@ import {
   setConfigRecovery,
   setTrustedConfigEntry,
   trustedConfigState,
+  writeConfigInPlaceSync,
   type ConfigCallGuard,
   type ConfigFileEntry,
   type ConfigFileIdentity,
@@ -936,18 +937,50 @@ export async function writeToolOutputNoFollow(targetPath: string, content: strin
           `${name} changed after this edit read it, so the edit was not applied. Read ${name} again and retry the edit.`,
         )
       }
+      // Guards authorize against the trusted bytes (during a bash window, not
+      // the call's pending ones), but a write conflict is judged on the file
+      // itself: an unlocked in-place edit (an operator's hand edit keeps the
+      // inode) that lands while the guards run must not be overwritten. The live
+      // bytes before the check are compared with the bytes on the descriptor
+      // the write then goes through; an absent file must still be absent.
+      const before = readConfigEntrySync(destination)
       await commit.check(content, destination)
       await assertPinnedEntry(targetPath, destination)
+      const name = path.basename(destination)
+      const conflict = () =>
+        new Error(
+          `${name} changed while this ${base === undefined ? 'write' : 'edit'} was being checked, so it was not applied. Read ${name} again and retry.`,
+        )
       // A call cancelled while queued, while its guards ran, or during the entry
       // check above must not write; nothing is awaited between here and the write.
       commit.signal?.throwIfAborted()
-      noteConfigWriteSync(destination, content)
-      await writeOutputNoFollow(targetPath, content)
+      if (before.kind === 'missing') {
+        noteConfigWriteSync(destination, content)
+        await writeOutputNoFollow(targetPath, content).catch((error: unknown) => {
+          throw (error as NodeJS.ErrnoException).code === 'EEXIST' ? conflict() : error
+        })
+      } else {
+        const live = readConfigEntrySync(destination)
+        if (live.kind !== 'file' && live.kind !== 'link') throw conflict()
+        noteConfigWriteSync(destination, content)
+        writeConfigInPlaceSync(
+          live.kind === 'link' ? live.resolved : destination,
+          Buffer.from(content),
+          pinnedIdentity(targetPath) ?? (live.kind === 'link' ? live.resolvedId : live.id),
+          undefined,
+          { bytes: contentOf(before) ?? Buffer.alloc(0), conflict },
+        )
+      }
       recordConfigCommitSync(destination, content)
     })
   })
   checkedWrites = write.catch(() => {})
   return write
+}
+
+// The identity of the file a pinned descriptor path names, if it is one.
+function pinnedIdentity(targetPath: string): ConfigFileIdentity | undefined {
+  return /^\/proc\/self\/fd\/\d+$/.test(targetPath) ? identityOf(statSync(targetPath, { bigint: true })) : undefined
 }
 
 async function assertPinnedEntry(targetPath: string, destination: string): Promise<void> {

@@ -69,7 +69,7 @@ import {
 import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
 import { trackGithubGitIdentityEnv } from '@/git/resolve-identity'
 import { CLI_VERSION } from '@/init/cli-version'
-import { readEnvFile } from '@/init/env-file'
+import { declaredEnvNames } from '@/init/env-file'
 import { sendLastWordsNotice, startLastWordsRecorder } from '@/last-words'
 import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
@@ -283,13 +283,10 @@ async function startAgentRuntime(
   reconcileLeftoverConfigWindowsSync(cwd)
   markRuntimeOwnsConfigWindows()
   const { config: cwdConfig, pluginConfigs: pluginConfigsByName } = loadConfigBundleSync(cwd)
-  const githubTokenBridge = createGithubTokenBridge({
-    // Only names the operator declared in .env: the runtime-exported identity
-    // also counts as exposable to bash, and it is exactly what this replaces.
-    onSelfChange: trackGithubGitIdentityEnv(
-      new Set([...readEnvFile(cwd)].filter(([, value]) => value.length > 0).map(([name]) => name)),
-    ),
-  })
+  // Only names the operator declared in .env: the runtime-exported identity
+  // also counts as exposable to bash, and it is exactly what this replaces.
+  const gitIdentityEnv = trackGithubGitIdentityEnv(declaredEnvNames(cwd), process.env, () => getConfig().git.user)
+  const githubTokenBridge = createGithubTokenBridge({ onSelfChange: gitIdentityEnv })
   const mcpOAuthStore = resolveContainerMcpOAuthStore(process.env, join(cwd, 'secrets.json'))
   const mcpManager =
     cwdConfig.mcpServers.length > 0
@@ -382,6 +379,7 @@ async function startAgentRuntime(
       permissions: pluginsLoaded.permissions,
       onRolesChanged: () => channelManager.router.tearDownAllLive(),
       skipMountValidation: containerName !== undefined,
+      onGitUserChanged: () => gitIdentityEnv.refresh(),
     }),
   )
   const pluginRegistry = pluginsLoaded.registry

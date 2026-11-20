@@ -6,7 +6,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
-import { ensureGitIdentity } from '@/git/resolve-identity'
+import { ensureGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { startDaemon, type Daemon } from '@/hostd/daemon'
 import { buildDockerfile, BUN_BASE_IMAGE } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
@@ -284,6 +284,30 @@ describe('planStart', () => {
       expect(index).toBeGreaterThan(envFileIndex)
       expect(index).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
     }
+  })
+
+  test('exports typeclaw.json#git.user even when a worktree override shadows the repo identity', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await runGit(root, ['config', 'extensions.worktreeConfig', 'true'])
+    await runGit(root, ['config', '--worktree', 'user.name', 'Worktree Override'])
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { user: { name: 'Configured', email: 'configured@example.com' } } })}\n`,
+    )
+
+    // when
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    // then
+    expect(plan.runArgs.filter((arg) => /^GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)=/.test(arg))).toEqual([
+      'GIT_AUTHOR_NAME=Configured',
+      'GIT_AUTHOR_EMAIL=configured@example.com',
+      'GIT_COMMITTER_NAME=Configured',
+      'GIT_COMMITTER_EMAIL=configured@example.com',
+    ])
   })
 
   test('omits Git identity variables when the agent repository has no complete identity', async () => {
@@ -2212,6 +2236,227 @@ describe('start (composition)', () => {
 
     expect(result.ok).toBe(true)
     expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(true)
+  })
+
+  test('copies typeclaw.json#git.user into the agent repo and exports it to the container', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { user: { name: '현무', email: 'hyeonmu@typeclaw.local' } } })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(result.ok).toBe(true)
+    expect(await resolveGitIdentity(root)).toEqual({ name: '현무', email: 'hyeonmu@typeclaw.local' })
+    const runCall = docker.calls.find((call) => call.args[0] === 'run')
+    expect(runCall?.args).toContain('GIT_AUTHOR_NAME=현무')
+    expect(runCall?.args).toContain('GIT_COMMITTER_EMAIL=hyeonmu@typeclaw.local')
+  })
+
+  test('copies typeclaw.json#git.remotes into the agent repo before launch', async () => {
+    // given
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/acme/agent.git' } } })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let originAtRun = ''
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') originAtRun = (await runGit(root, ['remote', 'get-url', 'origin'])).trim()
+      return docker.exec(args, options)
+    }
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(result.ok).toBe(true)
+    expect(originAtRun).toBe('https://example.com/acme/agent.git')
+  })
+
+  // A bash call's window left behind with no recorded held-back bytes, as when
+  // the agent stopped mid-command: opened in its own process, never closed.
+  async function leaveWindowMidCommand(agentDir: string): Promise<void> {
+    const proc = Bun.spawn({
+      cmd: [
+        process.execPath,
+        '-e',
+        `import { snapshotManagedConfigFiles } from './src/agent/tool-file-safety.ts'
+await snapshotManagedConfigFiles(${JSON.stringify(agentDir)}, async () => undefined)
+process.exit(0)`,
+      ],
+      cwd: join(import.meta.dir, '../..'),
+      stdout: 'ignore',
+      stderr: 'inherit',
+    })
+    expect(await proc.exited).toBe(0)
+  }
+
+  test('stops when a leftover recovery restores typeclaw.json, and launches with the edit re-applied', async () => {
+    // given: the agent stopped mid-command, then the operator retargeted origin by hand
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    const config = join(root, 'typeclaw.json')
+    const checked = `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/old.git' } } })}\n`
+    const edited = `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/new.git' } } })}\n`
+    await writeFile(config, checked)
+    await leaveWindowMidCommand(root)
+    await writeFile(config, edited)
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    let originAtRun = ''
+    const exec: DockerExec = async (args, options) => {
+      if (args[0] === 'run') originAtRun = (await runGit(root, ['remote', 'get-url', 'origin'])).trim()
+      return docker.exec(args, options)
+    }
+    const startOnce = () =>
+      start({
+        cwd: root,
+        preferredHostPort: 8973,
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+      })
+
+    // when: start runs
+    const first = await startOnce()
+
+    // then: it restores the last checked file, clears the window, and does not launch
+    expect(first.ok).toBe(false)
+    if (!first.ok) {
+      expect(first.reason).toContain(
+        'typeclaw.json was restored to the last checked version because the agent stopped in the middle of a command',
+      )
+      expect(first.reason).toContain('Re-apply that edit, then run `typeclaw start` again')
+    }
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(false)
+    expect(await readFile(config, 'utf8')).toBe(checked)
+    expect(existsSync(join(root, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json'))).toBe(false)
+
+    // when: the operator re-applies the edit and starts again
+    await writeFile(config, edited)
+    const second = await startOnce()
+
+    // then: it launches, and the remote sync used the new origin
+    expect(second.ok).toBe(true)
+    expect(originAtRun).toBe('https://example.com/new.git')
+  })
+
+  test('launches when a leftover recovery has nothing to restore', async () => {
+    // given: the agent stopped mid-command without changing typeclaw.json
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(join(root, 'typeclaw.json'), `${JSON.stringify({ alias: ['atlas'] })}\n`)
+    await leaveWindowMidCommand(root)
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the window is cleared and start launches normally
+    expect(result.ok).toBe(true)
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(true)
+    expect(existsSync(join(root, '.typeclaw', 'credential-staging', 'typeclaw.json.window.json'))).toBe(false)
+  })
+
+  test('refuses to launch when a git.remotes retarget cannot be applied', async () => {
+    // given: origin must move, but another git writer holds the config lock
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await runGit(root, ['remote', 'add', 'origin', 'https://example.com/old.git'])
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({ git: { remotes: { origin: 'https://example.com/new.git' } } })}\n`,
+    )
+    await writeFile(join(root, '.git', 'config.lock'), '')
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: nothing launches with the stale destination
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('config.lock')
+    expect(docker.calls.some((call) => call.args[0] === 'run')).toBe(false)
+  })
+
+  test('leaves the agent repo identity and remotes alone while the container is already running', async () => {
+    // given: a running agent whose sandboxes hold the read-only .git/config bind
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await gitInit(root)
+    await writeFile(
+      join(root, 'typeclaw.json'),
+      `${JSON.stringify({
+        git: {
+          user: { name: 'New Name', email: 'new@example.com' },
+          remotes: { origin: 'https://example.com/new.git' },
+        },
+      })}\n`,
+    )
+    const docker = fakeDockerExec({ imageExists: true, container: { exists: true, running: true } })
+
+    // when
+    await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec: docker.exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then
+    expect(await resolveGitIdentity(root)).toEqual({ name: 'Test User', email: 'test@example.com' })
+    expect(existsSync(join(root, '.git', 'refs', 'remotes'))).toBe(false)
+    await expect(runGit(root, ['remote'])).resolves.toBe('')
   })
 
   test('migrates legacy agent-messenger data before docker run and injects the canonical container path', async () => {

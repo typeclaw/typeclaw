@@ -61,6 +61,12 @@ function parseEnvLine(rawLine: string, index: number): { key: string; value: str
   return { key, value: line.slice(eq + 1) }
 }
 
+// Names the operator declared with a non-empty value; an empty assignment does
+// not reach the container as a value, so it declares nothing.
+export function declaredEnvNames(cwd: string): Set<string> {
+  return new Set([...readEnvFile(cwd)].filter(([, value]) => value.length > 0).map(([name]) => name))
+}
+
 export function hasEnvKey(cwd: string, key: string): boolean {
   const value = readEnvFile(cwd).get(key)
   return value !== undefined && value.length > 0

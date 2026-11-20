@@ -1381,6 +1381,61 @@ describe('git.ignore schema', () => {
   })
 })
 
+describe('git.user schema', () => {
+  test('is absent unless configured', () => {
+    expect(configSchema.parse({ models: { default: VALID_MODEL } }).git.user).toBeUndefined()
+  })
+
+  test('accepts a non-Latin name and trims both fields', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      git: { user: { name: ' 현무 ', email: ' hyeonmu@typeclaw.local ' } },
+    })
+    expect(parsed.git.user).toEqual({ name: '현무', email: 'hyeonmu@typeclaw.local' })
+  })
+
+  test.each([
+    [{ name: '', email: 'a@b.c' }],
+    [{ name: 'Two\nLines', email: 'a@b.c' }],
+    [{ name: 'Eve <eve@b.c>', email: 'a@b.c' }],
+    [{ name: 'Eve', email: 'not-an-email' }],
+    [{ name: 'Eve', email: 'a@b.c other@d.e' }],
+    [{ name: 'Eve', email: 'eve\u0000@b.c' }],
+    [{ name: 'Eve', email: 'eve@b.c\u0007' }],
+  ])('rejects %j because it would corrupt the git ident line', (user) => {
+    expect(() => configSchema.parse({ models: { default: VALID_MODEL }, git: { user } })).toThrow()
+  })
+})
+
+describe('git.remotes schema', () => {
+  test('is absent unless configured', () => {
+    expect(configSchema.parse({ models: { default: VALID_MODEL } }).git.remotes).toBeUndefined()
+  })
+
+  test('accepts named remotes and trims URLs', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      git: {
+        remotes: { origin: ' https://github.com/acme/agent.git ', 'mirror.v2': 'git@example.com:acme/agent.git' },
+      },
+    })
+    expect(parsed.git.remotes).toEqual({
+      origin: 'https://github.com/acme/agent.git',
+      'mirror.v2': 'git@example.com:acme/agent.git',
+    })
+  })
+
+  test.each([
+    [{ '-origin': 'https://example.com/a.git' }],
+    [{ 'has space': 'https://example.com/a.git' }],
+    [{ origin: '--upload-pack=touch /tmp/x' }],
+    [{ origin: 'https://example.com/a.git\nhttps://evil.example/b.git' }],
+    [{ origin: '' }],
+  ])('rejects %j so no name or URL can act as a git option or a second line', (remotes) => {
+    expect(() => configSchema.parse({ models: { default: VALID_MODEL }, git: { remotes } })).toThrow()
+  })
+})
+
 describe('migrateLegacyConfigShape', () => {
   test('returns input unchanged when seeded github eventAllowlist is absent', () => {
     const input = { models: { default: VALID_MODEL }, port: 9001 }

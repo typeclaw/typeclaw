@@ -6,9 +6,17 @@ import { isAbsolute, join, posix, relative, resolve } from 'node:path'
 
 import { migrateAgentMessengerConfigDir, resolveAgentMessengerConfigPolicy } from '@/agent-messenger/config-dir'
 import { expandMountPath, loadConfigSync, withDefaultPlugins, type Config, type PortForward } from '@/config'
+import { leftoverRecoveryNotice, settleLeftoverConfigRecoverySync } from '@/config/config-commits'
 import { applyBoundGcConfig } from '@/git/bound-gc-config'
+import { syncConfiguredGitRemotes } from '@/git/configured-remotes'
 import { commitGitignoreWithUntracks, untrackTrulyIgnoredFiles } from '@/git/reconcile-ignored'
-import { ensureGitIdentity, resolveGitIdentity, isFallbackGitIdentity, type GitIdentity } from '@/git/resolve-identity'
+import {
+  ensureGitIdentity,
+  resolveGitIdentity,
+  isFallbackGitIdentity,
+  syncConfiguredGitIdentity,
+  type GitIdentity,
+} from '@/git/resolve-identity'
 import { commitSystemFile as commitSystemFileShared } from '@/git/system-commit'
 import { send as sendToDaemon } from '@/hostd/client'
 import { ensureModels as ensureHostModels } from '@/hostd/models'
@@ -418,7 +426,37 @@ async function runStart({
       }
     }
 
+    // A leftover recovery whose held-back bytes are unknown restores the last
+    // checked config; launching on it would apply stale remotes and identity
+    // while the operator's edit is silently gone, so this start stops and says so.
+    let restored: string[]
+    try {
+      restored = settleLeftoverConfigRecoverySync(cwd)
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
+    if (restored.length > 0) return { ok: false, reason: restored.map(leftoverRecoveryNotice).join(' ') }
     const githubCliConfig = await loadTypeclawConfig(cwd)
+    // The container is confirmed down here, so no sandbox holds the read-only
+    // .git/config bind that git's rename-based config writes below would detach.
+    if (!(await syncConfiguredGitIdentity(cwd, githubCliConfig.git.user))) {
+      const warning =
+        'typeclaw: could not copy typeclaw.json#git.user into the agent repo, or a repo-level override such as config.worktree still shadows it; the container still uses git.user.'
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
+    const remotesSync = await syncConfiguredGitRemotes(cwd, githubCliConfig.git.remotes)
+    if (remotesSync.failed !== undefined) {
+      return {
+        ok: false,
+        reason: `${remotesSync.failed}, so start stopped rather than let backups push to the previous destination. If no git process is running, remove a stale .git/config.lock in the agent folder, then run typeclaw start again.`,
+      }
+    }
+    for (const problem of remotesSync.warnings) {
+      const warning = `typeclaw: ${problem}.`
+      if (streamOutput) process.stderr.write(`${warning}\n`)
+      else onWarning?.(warning)
+    }
     // Before anything else touches secrets.json, so the GitHub CLI refresh
     // below already writes to whichever store this start settles on.
     const typevaultReconcile = await reconcileTypevault(cwd, githubCliConfig.typevault.enabled)
@@ -1187,8 +1225,15 @@ export async function planStart({
   if (existsSync(join(cwd, ENV_FILE))) {
     runArgs.push('--env-file', join(cwd, ENV_FILE))
   }
-  const resolvedGitIdentity = gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity
-  if (resolvedGitIdentity !== null && !(await isFallbackGitIdentity(cwd, resolvedGitIdentity))) {
+  // typeclaw.json#git.user is exported as-is, so a repo-level override such as
+  // config.worktree cannot pair its name with the configured email.
+  const configuredGitIdentity = gitIdentity === undefined ? cfg.git.user : undefined
+  const resolvedGitIdentity =
+    configuredGitIdentity ?? (gitIdentity === undefined ? await resolveGitIdentity(cwd) : gitIdentity)
+  if (
+    resolvedGitIdentity !== null &&
+    (configuredGitIdentity !== undefined || !(await isFallbackGitIdentity(cwd, resolvedGitIdentity)))
+  ) {
     // A name the operator declared in .env wins, so it is not exported over it.
     const declared = readEnvFile(cwd)
     for (const [name, field] of [

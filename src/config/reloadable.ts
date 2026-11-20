@@ -21,6 +21,9 @@ export type CreateConfigReloadableOptions = {
   // is `restart-required` anyway, so reload never applies mount changes. Set
   // this when wiring the reloadable from a container-stage context.
   skipMountValidation?: boolean
+  // Fired when a reload changes `git.user`; the run stage re-applies the runtime
+  // git identity env so runtime commits follow it, including its removal.
+  onGitUserChanged?: () => void
 }
 
 export function createConfigReloadable({
@@ -28,11 +31,12 @@ export function createConfigReloadable({
   permissions,
   onRolesChanged,
   skipMountValidation = false,
+  onGitUserChanged,
 }: CreateConfigReloadableOptions): Reloadable {
   return {
     scope: 'config',
     description: 'typeclaw.json runtime config',
-    reload: async () => doReload(cwd, permissions, onRolesChanged, skipMountValidation),
+    reload: async () => doReload(cwd, permissions, onRolesChanged, skipMountValidation, onGitUserChanged),
   }
 }
 
@@ -41,6 +45,7 @@ async function doReload(
   permissions: PermissionService | undefined,
   onRolesChanged: (() => void | Promise<void>) | undefined,
   skipMountValidation: boolean,
+  onGitUserChanged: (() => void) | undefined,
 ): Promise<ReloadResult> {
   // Mount accessibility belongs to the validation surface, not loadConfigSync —
   // validateConfig is the single gate that every host-side caller goes through.
@@ -69,6 +74,8 @@ async function doReload(
     permissions?.replaceRoles(getConfig().roles)
     await onRolesChanged?.()
   }
+
+  if (diff.applied.some((c) => c.path === 'git.user')) onGitUserChanged?.()
 
   return {
     scope: 'config',

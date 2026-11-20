@@ -5,7 +5,22 @@
 // removing one full round-trip removes one full unit of provider TTFT
 // variance, which can be tens of seconds on a busy backend.
 
-function renderInstructions(typeclawJsonContent: string | undefined): string {
+function renderInstructions(typeclawJsonContent: string | undefined, setGitIdentity: boolean): string {
+  // An operator-configured identity is kept; only a missing or synthesized one
+  // is replaced by the name the agent is given.
+  const finishingSteps = [
+    `Flesh out all four markdown files to a short but complete first draft. \`write\` replaces the partial versions. First person. Specific and genuine, not generic.`,
+    ...(setGitIdentity
+      ? [
+          `Record your git identity: \`edit\` \`typeclaw.json\` to set \`git.user\` to \`{ "name": "<your name>", "email": "<your-name-in-ascii>@typeclaw.local" }\` (use the user's email instead if they gave one), then call \`reload\` with scope \`config\` so the commit below already uses it. Do not use \`git config\` or \`-c user.*\` in \`bash\`; neither changes your identity.`,
+        ]
+      : []),
+    `Stage and commit **only the files you authored** with commit message \`Hatched 🐣\`. This is the hatching-specific commit message — it overrides the normal version-control style guidance for this one commit.`,
+    `Send **one final short message** — two sentences at most — telling the user hatching is complete and they can leave the TUI with \`/quit\` (or Ctrl+C). Do not ask further questions. Do not offer more work. The container keeps running once they quit; keeping the TUI open here wastes time.`,
+  ]
+    .map((step, index) => `${index + 1}. ${step}`)
+    .join('\n')
+
   const q1AliasStep =
     typeclawJsonContent === undefined
       ? `Read \`typeclaw.json\`, add the answered name to the \`alias\` array (create the field as \`["<name>"]\` if absent; otherwise append, deduped).`
@@ -54,9 +69,7 @@ Routing answers:
 
 Do these in order. Do **not** ask further questions.
 
-1. Flesh out all four markdown files to a short but complete first draft. \`write\` replaces the partial versions. First person. Specific and genuine, not generic.
-2. Stage and commit **only the files you authored** with commit message \`Hatched 🐣\`. This is the hatching-specific commit message — it overrides the normal version-control style guidance for this one commit. TypeClaw already provides your git identity, so do not set one: \`bash\` cannot write \`.git/config\`, and the identity variables TypeClaw sets take precedence over \`-c user.*\`.
-3. Send **one final short message** — two sentences at most — telling the user hatching is complete and they can leave the TUI with \`/quit\` (or Ctrl+C). Do not ask further questions. Do not offer more work. The container keeps running once they quit; keeping the TUI open here wastes time.
+${finishingSteps}
 
 After that final message, stop. If the user keeps talking, answer briefly and remind them they can \`/quit\` (or Ctrl+C) whenever they are ready.
 
@@ -71,9 +84,9 @@ export const HATCHING_GREETING = `Wake up, my friend!`
 // runs in parallel with the `write IDENTITY.md` call. Pass `undefined` only
 // when reading the file failed at host stage; the agent will fall back to
 // reading it itself.
-export function buildHatchingPrompt(options?: { typeclawJsonContent?: string }): string {
+export function buildHatchingPrompt(options?: { typeclawJsonContent?: string; setGitIdentity?: boolean }): string {
   const content = options?.typeclawJsonContent
-  const instructions = renderInstructions(content)
+  const instructions = renderInstructions(content, options?.setGitIdentity ?? false)
   const currentJsonBlock =
     content === undefined ? '' : `\n<current-typeclaw-json>\n${content}\n</current-typeclaw-json>\n`
 

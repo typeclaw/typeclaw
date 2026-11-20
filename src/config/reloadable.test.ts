@@ -233,6 +233,35 @@ describe('createConfigReloadable', () => {
     expect(diff.restartRequired.map((c) => c.path)).toEqual(['git.ignore'])
   })
 
+  test('git.user applies on reload and asks the runtime to re-apply its git identity', async () => {
+    // given
+    let refreshed = 0
+    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A }))
+    const reloadable = createConfigReloadable({ cwd, onGitUserChanged: () => refreshed++ })
+    await reloadable.reload()
+
+    // when: git.user is added
+    await writeFile(
+      join(cwd, 'typeclaw.json'),
+      JSON.stringify({ model: VALID_MODEL_A, git: { user: { name: '현무', email: 'hyeonmu@typeclaw.local' } } }),
+    )
+    const added = await reloadable.reload()
+
+    // then
+    expect(added.ok).toBe(true)
+    if (!added.ok) return
+    expect((added.details as { applied: { path: string }[] }).applied.map((c) => c.path)).toEqual(['git.user'])
+    expect(refreshed).toBe(1)
+
+    // when / then: removing it re-applies too, while an unrelated change does not
+    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A }))
+    await reloadable.reload()
+    expect(refreshed).toBe(2)
+    await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, alias: ['atlas'] }))
+    await reloadable.reload()
+    expect(refreshed).toBe(2)
+  })
+
   test('field fence: sandbox.apparmorProfile changes land in `restartRequired`', async () => {
     await writeFile(
       join(cwd, 'typeclaw.json'),
@@ -382,7 +411,8 @@ function shouldRecurse(path: string): boolean {
   return path === 'docker' || path === 'git' || path === 'permissions'
 }
 
-// `roles.match` / `roles.permissions` are optional virtual paths: absent from a
-// bare-`{}` parse (so they never show up in the enumerated default-config
-// paths) but classified in FIELD_EFFECTS.
-const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions'])
+// `roles.match` / `roles.permissions` are optional virtual paths and `git.user`
+// / `git.remotes` are optional blocks: absent from a bare-`{}` parse (so they
+// never show up in the enumerated default-config paths) but classified in
+// FIELD_EFFECTS.
+const KNOWN_OPTIONAL_PATHS = new Set<string>(['roles.match', 'roles.permissions', 'git.user', 'git.remotes'])

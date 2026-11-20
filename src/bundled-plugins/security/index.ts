@@ -15,6 +15,7 @@ import {
   isPushOnlyGitExfilMatch,
   recordGitRemoteTaintIfAny,
 } from './policies/git-exfil'
+import { checkGitRemotesConfigGuard } from './policies/git-remotes-config'
 import { GUARD_NOTICE_TARGET_SEVERITY, checkNoticeTargetGuard } from './policies/notice-target'
 import { GUARD_OUTBOUND_SECRET_SEVERITY, checkOutboundSecretGuard } from './policies/outbound-secret-scan'
 import { GUARD_PLUGIN_ADDITION_SEVERITY, checkPluginAdditionGuard } from './policies/plugin-addition'
@@ -241,6 +242,20 @@ export default definePlugin({
                 GUARD_NOTICE_TARGET_SEVERITY,
               )
           if (noticeTargetResult) return noticeTargetResult
+
+          // Same authority as pushing to a model-retargeted remote: the backup
+          // runner pushes to the configured origin after the next start.
+          const gitRemotesConfigResult = canBypass(
+            GUARD_GIT_REMOTE_TAINTED_SEVERITY,
+            SECURITY_PERMISSIONS.bypassGitRemoteTainted,
+          )
+            ? undefined
+            : withPermissionHint(
+                await checkGitRemotesConfigGuard({ tool: event.tool, args: event.args, agentDir: ctx.agentDir }),
+                SECURITY_PERMISSIONS.bypassGitRemoteTainted,
+                GUARD_GIT_REMOTE_TAINTED_SEVERITY,
+              )
+          if (gitRemotesConfigResult) return gitRemotesConfigResult
 
           // Taint-recording runs FIRST, independently of the gitExfil guard.
           // The gitRemoteTainted defense depends on it. We pass through

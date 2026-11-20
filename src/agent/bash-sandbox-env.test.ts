@@ -66,6 +66,28 @@ describe('resolveAgentGitIdentityEnv', () => {
     expect(env['GIT_COMMITTER_NAME']).toBe('Agent Smith')
   })
 
+  test('prefers typeclaw.json#git.user over the repo identity and the GitHub account', async () => {
+    // given
+    const agentDir = await agentRepo()
+    await ensureGitIdentity(agentDir)
+    const configured = { name: '현무', email: 'hyeonmu@typeclaw.local' }
+
+    // when
+    const env = await resolveAgentGitIdentityEnv(
+      agentDir,
+      ['GIT_COMMITTER_EMAIL'],
+      { login: 'octocat', id: 1 },
+      configured,
+    )
+
+    // then: .env-exposed names still come from .env
+    expect(env).toEqual({
+      GIT_AUTHOR_NAME: '현무',
+      GIT_AUTHOR_EMAIL: 'hyeonmu@typeclaw.local',
+      GIT_COMMITTER_NAME: '현무',
+    })
+  })
+
   test('pins the GitHub identity even if the adapter stops before the command is built', async () => {
     // given: the runtime env carries the identity the tracker set from the adapter
     const agentDir = await agentRepo()

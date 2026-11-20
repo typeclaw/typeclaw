@@ -1,4 +1,6 @@
-import { basename } from 'node:path'
+import { mkdtemp, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
 
 import { resolveAgentGit } from './resolve-agent-git'
 import { runGit } from './run'
@@ -37,6 +39,8 @@ export async function resolveGitIdentity(cwd: string): Promise<GitIdentity | nul
 // Commits by the runtime (backup, dreaming, system files) need an identity, and
 // repository-local config is lost on clone or by hand edits. Fill only the
 // missing keys from the agent folder name; an identity the user set is kept.
+// Only a pair synthesized in full is marked as fallback: a half the operator set
+// is explicit even when its value happens to equal the folder-derived one.
 export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null> {
   const repo = resolveAgentGit(cwd)
   if (repo === null) return null
@@ -50,7 +54,9 @@ export async function ensureGitIdentity(cwd: string): Promise<GitIdentity | null
   const identity = { name: name ?? fallback.name, email: email ?? fallback.email }
   if (name === null && !(await writeLocalConfig(cwd, repo.gitArgs, 'user.name', identity.name))) return null
   if (email === null && !(await writeLocalConfig(cwd, repo.gitArgs, 'user.email', identity.email))) return null
-  await writeLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY, formatIdentity(identity))
+  if (name === null && email === null) {
+    await writeLocalConfig(cwd, repo.gitArgs, FALLBACK_MARKER_KEY, formatIdentity(identity))
+  }
   return identity
 }
 
@@ -66,23 +72,104 @@ const GIT_IDENTITY_ENV = [
   ['GIT_COMMITTER_EMAIL', 'email'],
 ] as const
 
-// Runtime commits (backup, dreaming, system files) inherit the runtime env, which
-// `typeclaw start` seeds with the repo identity. While the GitHub adapter runs,
-// its account replaces that seed; when it stops, the seed comes back. Names the
-// operator declared in .env are left alone, matching model bash.
+export type GitIdentityEnvTracker = ((self: { login: string; id: number } | null) => void) & {
+  // Re-applies the identity after typeclaw.json#git.user changes.
+  refresh(): void
+}
+
+// The single owner of the runtime's git identity env. Runtime commits (backup,
+// dreaming, system files) inherit it, and `typeclaw start` seeds it. The
+// identity is, in order: typeclaw.json#git.user, the running GitHub adapter's
+// account, then the start-time seed. It is re-applied when the adapter's
+// account changes and when git.user changes, so removing git.user falls back
+// right away. Names the operator declared in .env are left alone, matching
+// model bash.
 export function trackGithubGitIdentityEnv(
   operatorNames: ReadonlySet<string>,
   env: NodeJS.ProcessEnv = process.env,
-): (self: { login: string; id: number } | null) => void {
-  const seed = Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]]))
-  return (self) => {
-    const identity = self === null ? null : githubGitIdentity(self)
+  configured: () => GitIdentity | undefined = () => undefined,
+): GitIdentityEnvTracker {
+  // When git.user was set at start, start exported it, so the env holds git.user
+  // rather than a fallback. Removing it must then leave these names unset, so
+  // runtime Git reads the repo identity, as model bash does.
+  const seed: Record<string, string | undefined> =
+    configured() === undefined ? Object.fromEntries(GIT_IDENTITY_ENV.map(([name]) => [name, env[name]])) : {}
+  let self: { login: string; id: number } | null = null
+  const apply = () => {
+    const identity = configured() ?? (self === null ? null : githubGitIdentity(self))
     for (const [name, field] of GIT_IDENTITY_ENV) {
       if (operatorNames.has(name)) continue
       const value = identity === null ? seed[name] : identity[field]
       if (value === undefined) delete env[name]
       else env[name] = value
     }
+  }
+  const track = (next: { login: string; id: number } | null) => {
+    self = next
+    apply()
+  }
+  return Object.assign(track, { refresh: apply })
+}
+
+// Copies typeclaw.json#git.user into the agent repo so host-side Git agrees
+// with it. Host stage only, and only while the container is down, because the
+// commit renames config.lock over .git/config and would detach the read-only
+// bind of any sandbox still running. Both keys and the fallback marker change in
+// one transaction. Returns false, without writing, when a config.worktree
+// identity would shadow the copy, and false when the copy failed.
+export async function syncConfiguredGitIdentity(cwd: string, user: GitIdentity | undefined): Promise<boolean> {
+  if (user === undefined) return true
+  const repo = resolveAgentGit(cwd)
+  if (repo === null) return true
+  const values = await readRepositoryIdentity(cwd, repo.gitArgs)
+  const matches = (identity: GitIdentity | null) => identity?.name === user.name && identity?.email === user.email
+  const marked = values.has(FALLBACK_MARKER_KEY)
+  if (matches(await resolveGitIdentity(cwd)) && !marked) return true
+  if (await hasWorktreeIdentity(cwd, repo.gitArgs)) return false
+  const committed = await editLocalConfigAtomically(cwd, [
+    ['--replace-all', 'user.name', user.name],
+    ['--replace-all', 'user.email', user.email],
+    ...(marked ? [['--unset-all', FALLBACK_MARKER_KEY]] : []),
+  ])
+  return committed && matches(await resolveGitIdentity(cwd))
+}
+
+// Applies `git config --file` edits to a private scratch copy, then installs
+// the result through git's own config.lock with the original file mode, so
+// every edit lands or none does and a private config stays private. Callers
+// must run while no sandbox holds the read-only config bind.
+export async function editLocalConfigAtomically(cwd: string, edits: readonly (readonly string[])[]): Promise<boolean> {
+  const repo = resolveAgentGit(cwd)
+  if (repo === null) return false
+  const configPath = await localConfigPath(cwd, repo.gitArgs)
+  if (configPath === null) return false
+  const lockPath = `${configPath}.lock`
+  const lock = await open(lockPath, 'wx', 0o600).catch(() => null)
+  if (lock === null) return false
+  let scratch: string | undefined
+  let committed = false
+  try {
+    const { mode } = await stat(configPath)
+    scratch = await mkdtemp(join(tmpdir(), 'typeclaw-git-config-'))
+    const draft = join(scratch, 'config')
+    await writeFile(draft, await readFile(configPath), { mode: 0o600 })
+    for (const edit of edits) {
+      const result = await runGit(Bun, cwd, ['config', '--file', draft, ...edit], { env: localGitConfigEnv() })
+      // `--unset-all` exits 5 when the key is already absent, the desired end state.
+      if (result.exitCode !== 0 && !(edit[0] === '--unset-all' && result.exitCode === 5)) return false
+    }
+    await lock.writeFile(await readFile(draft))
+    await lock.chmod(mode & 0o7777)
+    await lock.close()
+    await rename(lockPath, configPath)
+    committed = true
+    return true
+  } catch {
+    return false
+  } finally {
+    await lock.close().catch(() => {})
+    if (!committed) await rm(lockPath, { force: true })
+    if (scratch !== undefined) await rm(scratch, { recursive: true, force: true })
   }
 }
 
@@ -93,6 +180,11 @@ export async function isFallbackGitIdentity(cwd: string, identity: GitIdentity):
   if (repo === null) return false
   const marker = (await readRepositoryIdentity(cwd, repo.gitArgs)).get(FALLBACK_MARKER_KEY)?.at(-1)
   return marker === formatIdentity(identity)
+}
+
+export async function hasExplicitGitIdentity(cwd: string): Promise<boolean> {
+  const identity = await resolveGitIdentity(cwd)
+  return identity !== null && !(await isFallbackGitIdentity(cwd, identity))
 }
 
 function formatIdentity(identity: GitIdentity): string {
@@ -111,11 +203,37 @@ function fallbackGitIdentity(cwd: string): GitIdentity {
 async function writeLocalConfig(cwd: string, gitArgs: readonly string[], key: string, value: string): Promise<boolean> {
   try {
     const result = await runGit(Bun, cwd, [...gitArgs, 'config', '--local', key, value], {
-      env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+      env: localGitConfigEnv(),
     })
     return result.exitCode === 0
   } catch {
     return false
+  }
+}
+
+async function hasWorktreeIdentity(cwd: string, gitArgs: readonly string[]): Promise<boolean> {
+  try {
+    const result = await runGit(
+      Bun,
+      cwd,
+      [...gitArgs, 'config', '--show-scope', '--get-regexp', '^user\\.(name|email)$'],
+      {
+        env: localGitConfigEnv(),
+      },
+    )
+    return result.exitCode === 0 && result.stdout.split('\n').some((line) => line.startsWith('worktree\t'))
+  } catch {
+    return false
+  }
+}
+
+async function localConfigPath(cwd: string, gitArgs: readonly string[]): Promise<string | null> {
+  try {
+    const result = await runGit(Bun, cwd, [...gitArgs, 'rev-parse', '--git-common-dir'], { env: localGitConfigEnv() })
+    if (result.exitCode !== 0) return null
+    return join(resolve(cwd, result.stdout.trim()), 'config')
+  } catch {
+    return null
   }
 }
 
@@ -126,7 +244,7 @@ async function readRepositoryIdentity(cwd: string, gitArgs: readonly string[]): 
       cwd,
       [...gitArgs, 'config', '--null', '--get-regexp', '^(user\\.(name|email)|typeclaw\\.fallbackidentity)$'],
       {
-        env: { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV },
+        env: localGitConfigEnv(),
       },
     )
     if (result.exitCode !== 0) return new Map()
@@ -149,6 +267,12 @@ function parseNullConfigEntries(output: string): Map<string, string[]> {
     else existing.push(value)
   }
   return values
+}
+
+// Reads and writes the agent repo's own config only: ambient GIT_CONFIG_* and
+// repository-redirecting variables are dropped, and global/system config is off.
+export function localGitConfigEnv(): NodeJS.ProcessEnv {
+  return { ...withoutGitOverrides(process.env), ...GIT_CONFIG_ENV }
 }
 
 function withoutGitOverrides(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

@@ -420,6 +420,33 @@ describe('security plugin wiring', () => {
     expect(await privileged(toolEvent('bash', { command: 'git push origin main' }), ctx)).toBeUndefined()
   })
 
+  test('permissions: only a session that may push to a re-pointed remote may add git.remotes', async () => {
+    // given: owner (TUI) and a trusted channel author under production roles
+    const svc = prodPermissionService({
+      trusted: { match: [{ kind: 'channel', platform: 'slack', author: 'U_TRUSTED' }] },
+    } as unknown as RolesConfig)
+    const hook = await toolBeforeHookWith(svc)
+    const edit = toolEvent('write', {
+      path: 'typeclaw.json',
+      content: JSON.stringify({ git: { remotes: { origin: 'https://attacker.example/x.git' } } }),
+    })
+    const tui: SessionOrigin = { kind: 'tui', sessionId: 's' }
+    const trusted: SessionOrigin = {
+      kind: 'channel',
+      adapter: 'slack-bot',
+      workspace: 'T0123',
+      chat: 'C_TEAM',
+      thread: null,
+      lastInboundAuthorId: 'U_TRUSTED',
+    }
+
+    // when / then: trusted is blocked, owner is allowed
+    const blocked = await hook({ ...edit, origin: trusted }, hookContext('/agent'))
+    expect(blocked?.block).toBe(true)
+    expect(blocked?.reason).toContain('gitRemotesConfig')
+    expect(await hook({ ...edit, origin: tui }, hookContext('/agent'))).toBeUndefined()
+  })
+
   test('permissions: TUI owner bypasses secretExfilBash (medium tier) on `bash env`', async () => {
     const svc = prodPermissionService()
     const hook = await toolBeforeHookWith(svc)

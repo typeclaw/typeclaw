@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   closeSync,
   constants,
@@ -429,6 +429,9 @@ export async function openConfigWindow(
   if (window !== undefined) {
     window.calls.set(call, guard)
     if (!window.touched.includes(guard)) window.touched.push(guard)
+    // While a call runs, the file may change again: the record must not vouch
+    // for the bytes recovery recorded (see publishWindow).
+    if (window.recovery) publishWindow(file, window)
   }
   return {
     generation: trustedConfigState(file).generation,
@@ -638,41 +641,75 @@ export async function readConfigBaseline(file: string): Promise<string> {
 // rather than load bytes no check passed. Only then is the window state cleared.
 export function reconcileLeftoverConfigWindowsSync(agentDir: string): void {
   for (const name of MANAGED_CONFIG_FILES) {
-    const file = join(resolve(agentDir), name)
-    // Only the runtime creates window state, and it is not running yet, so an
-    // absent record cannot appear meanwhile; everything else is decided under
-    // the lock, so a host commit that lands while startup waits is kept.
-    if (readWindowRawSync(file) === undefined) continue
-    let reverted = false
-    try {
-      withConfigFileLockSync(file, () => {
-        const trusted = publishedTrustedEntry(file)
-        if (trusted === undefined) return
-        if (!matchesTrustedEntry(file, trusted)) {
-          restoreTrustedEntrySync(file, trusted)
-          recordConfigCommitSync(file, contentOf(trusted))
-          reverted = true
-        }
-        // The epoch advances before the record goes; if it cannot, the record
-        // stays, so host readers keep using its trusted bytes.
-        const bumped = bumpConfigEpochSync(file)
-        if (bumped.ok) rmSync(windowPath(file), { force: true })
-        else {
-          console.warn(
-            `[typeclaw] ${bumped.reason}; the agent's ${name} state at ${windowPath(file)} stays published, so host typeclaw commands keep using the last authorized ${name}`,
-          )
-        }
-      })
-    } catch (error) {
-      throw new Error(
-        `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
+    const outcome = reconcileLeftoverWindowSync(join(resolve(agentDir), name))
+    if (outcome === 'kept-edit') {
+      console.warn(
+        `[typeclaw] the leftover ${name} recovery from an interrupted agent command was dropped because ${name} was edited while the agent was stopped; the edited ${name} is kept`,
       )
-    }
-    if (reverted) {
+    } else if (outcome === 'reverted-unknown') {
+      console.warn(`[typeclaw] ${leftoverRecoveryNotice(name)}`)
+    } else if (outcome === 'reverted') {
       console.warn(
         `[typeclaw] ${name} held a bash change that was never checked or that was blocked and could not be reverted before the agent stopped; it was reverted to the last authorized ${name} at startup`,
       )
     }
+  }
+}
+
+// Host stage (`typeclaw start`, container down): settles each leftover window
+// that recorded no held-back bytes (the agent stopped mid-command), with the
+// same reconciliation as runtime startup, and returns the files it restored to
+// the last checked version, so start can stop before launching on them.
+// Windows that recorded their bytes are left to runtime startup, which keeps an
+// edit made while the agent was stopped.
+export function settleLeftoverConfigRecoverySync(agentDir: string): string[] {
+  const restored: string[] = []
+  for (const name of MANAGED_CONFIG_FILES) {
+    const file = join(resolve(agentDir), name)
+    const raw = readWindowRawSync(file)
+    if (raw === undefined || recordCandidate(raw) !== undefined) continue
+    if (reconcileLeftoverWindowSync(file) === 'reverted-unknown') restored.push(name)
+  }
+  return restored
+}
+
+// Settles one leftover window under the config lock. Only the runtime creates
+// window state, and it is not running, so an absent record cannot appear
+// meanwhile; a host commit that lands while this waits on the lock is kept.
+function reconcileLeftoverWindowSync(file: string): 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown' {
+  const name = basename(file)
+  if (readWindowRawSync(file) === undefined) return 'unchanged'
+  try {
+    return withConfigFileLockSync(file, () => {
+      const raw = readWindowRawSync(file)
+      const trusted = parseWindowRecord(file, raw)
+      if (trusted === undefined) return 'unchanged'
+      const live = readConfigEntrySync(file)
+      let decided: 'unchanged' | 'kept-edit' | 'reverted' | 'reverted-unknown' = 'unchanged'
+      if (editedWhileStopped(raw, live, trusted)) {
+        // Edited after the agent stopped: the operator's bytes are authorized.
+        recordConfigCommitSync(file, contentOf(live))
+        decided = 'kept-edit'
+      } else if (!matchesTrustedEntry(file, trusted)) {
+        restoreTrustedEntrySync(file, trusted)
+        recordConfigCommitSync(file, contentOf(trusted))
+        decided = recordCandidate(raw) === undefined ? 'reverted-unknown' : 'reverted'
+      }
+      // The epoch advances before the record goes; if it cannot, the record
+      // stays, so host readers keep using its trusted bytes.
+      const bumped = bumpConfigEpochSync(file)
+      if (bumped.ok) rmSync(windowPath(file), { force: true })
+      else {
+        console.warn(
+          `[typeclaw] ${bumped.reason}; the agent's ${name} state at ${windowPath(file)} stays published, so host typeclaw commands keep using the last authorized ${name}`,
+        )
+      }
+      return decided
+    })
+  } catch (error) {
+    throw new Error(
+      `${name} holds a bash change that was never checked or that was blocked and could not be reverted (${errorText(error)}); refusing to load it. Restore it with \`git checkout -- ${name}\` in the agent folder, delete ${windowPath(file)}, then start the agent again.`,
+    )
   }
 }
 
@@ -729,6 +766,9 @@ export function writeConfigInPlaceSync(
   bytes: Buffer,
   expected?: ConfigFileIdentity,
   assertManaged?: (opened: { dev: bigint; ino: bigint }) => void,
+  // The bytes the caller saw in this file: read again on the descriptor, any
+  // difference refuses the write with `conflict()` before a byte is written.
+  expectedPrior?: { bytes: Buffer; conflict: () => Error },
 ): void {
   let fd: number
   try {
@@ -753,6 +793,7 @@ export function writeConfigInPlaceSync(
     }
     assertManaged?.(opened)
     const prior = readFileSync(fd)
+    if (expectedPrior !== undefined && !prior.equals(expectedPrior.bytes)) throw expectedPrior.conflict()
     try {
       writeAllSync(fd, bytes)
       assertManaged?.(opened)
@@ -987,12 +1028,17 @@ function recordOwner(file: string): string | undefined {
 function publishWindow(file: string, window: Window): void {
   if (!window.coordinated) return
   const bytes = contentOf(window.trusted)
+  // A window in recovery with no call in flight records which unverified bytes
+  // it holds back, so a later start can tell them from an edit made after the
+  // agent stopped. While a call runs (or recovery has not begun) there is none.
+  const candidate = window.recovery && window.calls.size === 0 ? liveCandidate(file) : undefined
   try {
     writeStateFileSync(windowPath(file), {
       generation: window.generation ?? 0,
       content: bytes === undefined ? null : bytes.toString('base64'),
       entry: describeEntry(window.trusted),
       owner: window.owner,
+      ...(candidate === undefined ? {} : { candidate }),
     })
     window.published = true
   } catch (error) {
@@ -1008,7 +1054,58 @@ function publishWindow(file: string, window: Window): void {
 // newer commit, or undefined when no window is open. Published state that exists
 // but cannot be read is an error, never a reason to trust the file as it is.
 function publishedTrustedEntry(file: string): ConfigFileEntry | undefined {
-  return parseWindowRecord(file, readWindowRawSync(file))
+  const raw = readWindowRawSync(file)
+  return leftoverTrusted(file, raw, raw === undefined ? undefined : readConfigEntrySync(file))
+}
+
+// The trusted entry a window record holds, unless the live file was edited
+// after the agent stopped (editedWhileStopped): that edit is then authoritative.
+function leftoverTrusted(
+  file: string,
+  raw: string | undefined,
+  live: ConfigFileEntry | undefined,
+): ConfigFileEntry | undefined {
+  const trusted = parseWindowRecord(file, raw)
+  return trusted !== undefined && live !== undefined && editedWhileStopped(raw, live, trusted) ? undefined : trusted
+}
+
+// A record that names the unverified bytes it held back: live bytes that are
+// neither those nor the trusted (or a newer committed) ones were written after
+// the agent stopped recording, so they are an operator's edit, not bash's.
+function editedWhileStopped(raw: string | undefined, live: ConfigFileEntry, trusted: ConfigFileEntry): boolean {
+  const candidate = recordCandidate(raw)
+  if (candidate === undefined || live.kind === 'other' || sameConfigContent(live, trusted)) return false
+  return candidateOf(live) !== candidate
+}
+
+function recordCandidate(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  try {
+    const record = JSON.parse(raw) as unknown
+    return isRecord(record) && typeof record.candidate === 'string' ? record.candidate : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function candidateOf(entry: ConfigFileEntry): string | undefined {
+  if (entry.kind === 'missing') return 'missing'
+  const bytes = contentOf(entry)
+  return bytes === undefined ? undefined : `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+}
+
+function liveCandidate(file: string): string | undefined {
+  try {
+    return candidateOf(readConfigEntrySync(file))
+  } catch {
+    return undefined
+  }
+}
+
+// The agent stopped mid-command, so the bytes it held back are unknown and the
+// last checked file was restored; an edit made while it was stopped is lost.
+export function leftoverRecoveryNotice(name: string): string {
+  return `${name} was restored to the last checked version because the agent stopped in the middle of a command; an edit made to ${name} while the agent was stopped was not kept. Re-apply that edit, then run \`typeclaw start\` again.`
 }
 
 // A cross-process read without the lock: the window state, then the file, then
@@ -1024,7 +1121,7 @@ function readAcrossProcessesSync(file: string): { live: ConfigFileEntry; trusted
     configReadHook?.('after-live')
     const after = windowStamp(file)
     if (before.raw === after.raw && before.generation === after.generation && before.epoch === after.epoch) {
-      return { live, trusted: parseWindowRecord(file, before.raw) }
+      return { live, trusted: leftoverTrusted(file, before.raw, live) }
     }
   }
   return withConfigFileLockSync(file, () => ({

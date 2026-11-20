@@ -49,6 +49,8 @@ The runner stages the selected paths in a temporary private Git index for its di
 
 ## What it pushes
 
+The agent declares that remote in `typeclaw.json` as `git.remotes.origin`; `typeclaw start` adds it to the agent repo (model bash cannot run `git remote add`, since `.git/config` is read-only there).
+
 When `pushToOrigin: true`, the runner picks a push plan after committing:
 
 - **Branch has an upstream** (`git rev-parse --abbrev-ref --symbolic-full-name @{upstream}` succeeds): run `git push`.
