@@ -1,6 +1,6 @@
 import type { Stream, Unsubscribe } from '@/stream'
 
-import type { LiveSubagentRegistry } from './live-subagents'
+import type { LiveSubagent, LiveSubagentRegistry } from './live-subagents'
 import { parseSubagentCompletedPayload, renderSubagentCompletionReminder } from './subagent-completion-reminder'
 
 // Presence of this capability is the single signal that background spawning is
@@ -16,10 +16,15 @@ export type SubagentBackgroundDrain = {
 
 // Backstop ceiling for the background drain: a running child that never settles
 // is abandoned after this so the parent can synthesize partial results instead
-// of hanging forever. Deliberately larger than the per-child `timeoutMs`
-// (scout = 5 min) so that a child's own timeout is the primary release and this
-// only catches children that declare none.
+// of hanging forever. A child's own `timeoutMs` is the primary release: one that
+// declares a longer deadline (browser = 15 min) is waited on until that deadline
+// plus `DRAIN_CHILD_TIMEOUT_GRACE_MS`, so this only bounds children that declare
+// a shorter deadline or none.
 export const DRAIN_MAX_CHILD_WAIT_MS = 600_000
+
+// Time for a child's own timeout to settle and broadcast before the drain
+// abandons it.
+const DRAIN_CHILD_TIMEOUT_GRACE_MS = 30_000
 
 export type DrainPrompt = (text: string) => Promise<void>
 
@@ -94,12 +99,12 @@ function expireOverdueChildren(
   now: () => number,
 ): void {
   if (maxChildWaitMs === undefined) return
-  const deadline = now() - maxChildWaitMs
   for (const child of drain.liveRegistry.list({ parentSessionId: drain.sessionId })) {
     if (child.background !== true || child.status !== 'running') continue
-    if (child.startedAt > deadline) continue
+    const waitMs = childWaitMs(child, maxChildWaitMs)
+    if (child.startedAt > now() - waitMs) continue
     const durationMs = now() - child.startedAt
-    const error = `subagent ${child.subagentName} exceeded the ${maxChildWaitMs}ms drain wait and was abandoned`
+    const error = `subagent ${child.subagentName} exceeded the ${waitMs}ms drain wait and was abandoned`
     const finalMessage = drain.liveRegistry.getCapturedFinalMessage(child.taskId)
     // Claim the settlement BEFORE aborting. If the child's real completion
     // already won, skip — no double-settle, no broadcast. Awaiting abort here
@@ -146,8 +151,13 @@ function nextExpiryDelayMs(
     .list({ parentSessionId: drain.sessionId })
     .filter((c) => c.background === true && c.status === 'running')
   if (running.length === 0) return undefined
-  const oldestStart = Math.min(...running.map((c) => c.startedAt))
-  return Math.max(0, oldestStart + maxChildWaitMs - now())
+  const soonestDeadline = Math.min(...running.map((c) => c.startedAt + childWaitMs(c, maxChildWaitMs)))
+  return Math.max(0, soonestDeadline - now())
+}
+
+function childWaitMs(child: LiveSubagent, maxChildWaitMs: number): number {
+  if (child.timeoutMs === undefined) return maxChildWaitMs
+  return Math.max(maxChildWaitMs, child.timeoutMs + DRAIN_CHILD_TIMEOUT_GRACE_MS)
 }
 
 type PendingReminder = { taskId: string; text: string }

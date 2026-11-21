@@ -365,6 +365,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         // reviewer's head/base/kind-aware coalescing key.
         ...(workKey !== undefined ? { workKey } : {}),
         startedAt,
+        ...(subagent.timeoutMs !== undefined ? { timeoutMs: subagent.timeoutMs } : {}),
         status: 'running' as const,
         // Every cancel path (subagent_cancel, draft/work-key cancellation) goes
         // through this handle, which is how the review check tells an accepted
