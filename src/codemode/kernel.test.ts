@@ -3,13 +3,13 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import FakeTimers from '@sinonjs/fake-timers'
 
 import { testKernel } from './fixtures.test'
-import type { EvalKernel } from './kernel'
-import { EVAL_LIMITS, EvalError } from './protocol'
+import type { CodemodeKernel } from './kernel'
+import { CODEMODE_LIMITS, CodemodeError } from './protocol'
 
 // These exercise the real subprocess and Bun interpreter, NOT sandbox claims.
-// Boundary tests use createSandboxedEvalKernel and require real Linux bwrap.
-const kernels: EvalKernel[] = []
-function kernel(): EvalKernel {
+// Boundary tests use createSandboxedCodemodeKernel and require real Linux bwrap.
+const kernels: CodemodeKernel[] = []
+function kernel(): CodemodeKernel {
   const instance = testKernel(process.cwd())
   kernels.push(instance)
   return instance
@@ -19,10 +19,10 @@ afterEach(async () => {
 })
 
 const dispatch = async () => {
-  throw new EvalError('refused', 'test has no tools')
+  throw new CodemodeError('refused', 'test has no tools')
 }
 
-// The kernel spawns bash and kills POSIX process groups; eval only runs in the
+// The kernel spawns bash and kills POSIX process groups; codemode only runs in the
 // Linux container stage.
 describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
   test('top-level bindings survive subsequent cells including awaited declarations', async () => {
@@ -84,10 +84,10 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
 
   test('large printed output is capped by the host', async () => {
     const instance = kernel()
-    const result = await instance.run(`print("x".repeat(${EVAL_LIMITS.outputBytes * 2}))`, { dispatch })
+    const result = await instance.run(`print("x".repeat(${CODEMODE_LIMITS.outputBytes * 2}))`, { dispatch })
     expect(result.isError).toBe(false)
     expect(result.truncated).toBe(true)
-    expect(Buffer.byteLength(result.text)).toBeLessThan(EVAL_LIMITS.outputBytes + 100)
+    expect(Buffer.byteLength(result.text)).toBeLessThan(CODEMODE_LIMITS.outputBytes + 100)
   })
 
   test('raw stdout without a newline cannot swallow control frames', async () => {
@@ -125,7 +125,7 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
       {
         dispatch: async ({ name }) => {
           seen.push(name)
-          if (name === 'grep') throw new EvalError('refused', 'bad regex')
+          if (name === 'grep') throw new CodemodeError('refused', 'bad regex')
           return 'late'
         },
       },
@@ -142,7 +142,7 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
       'await Promise.all([tool.grep({}), (async () => { await Bun.sleep(100); print("stale"); return tool.read({path:"old-cell"}) })()])',
       {
         dispatch: async () => {
-          throw new EvalError('refused', 'bad regex')
+          throw new CodemodeError('refused', 'bad regex')
         },
       },
     )
@@ -188,7 +188,7 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(valid).toMatchObject({ isError: false, text: '1\n' })
   })
 
-  test('a top-level declaration cannot shadow eval helpers', async () => {
+  test('a top-level declaration cannot shadow codemode helpers', async () => {
     const instance = kernel()
     const shadowing = await instance.run('const [old, tool] = [1, 2]', { dispatch })
     const nested = await instance.run('function f() { const text = "inner"; return text } print(f())', { dispatch })
@@ -212,11 +212,11 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
   test('output past the warning size gets a trailing notice; smaller output does not', async () => {
     const instance = kernel()
     const small = await instance.run('print("x".repeat(100))', { dispatch })
-    const large = await instance.run(`print("x".repeat(${EVAL_LIMITS.outputWarnBytes + 1}))`, { dispatch })
+    const large = await instance.run(`print("x".repeat(${CODEMODE_LIMITS.outputWarnBytes + 1}))`, { dispatch })
     expect(small.text).toBe('x'.repeat(100) + '\n')
     expect(large.truncated).toBe(false)
-    expect(large.text.startsWith('x'.repeat(EVAL_LIMITS.outputWarnBytes + 1) + '\n')).toBe(true)
-    expect(large.text.trimEnd().split('\n').at(-1)).toStartWith('[eval printed')
+    expect(large.text.startsWith('x'.repeat(CODEMODE_LIMITS.outputWarnBytes + 1) + '\n')).toBe(true)
+    expect(large.text.trimEnd().split('\n').at(-1)).toStartWith('[codemode printed')
   })
 
   test('text() caps at 2000 chars by default', async () => {
@@ -233,7 +233,7 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     const clock = FakeTimers.install({ toFake: ['setTimeout', 'clearTimeout'] })
     try {
       await instance.run('const idleValue = 7', { dispatch })
-      await clock.tickAsync(EVAL_LIMITS.idleMs)
+      await clock.tickAsync(CODEMODE_LIMITS.idleMs)
       const result = await instance.run('print(typeof idleValue)', { dispatch })
       expect(result.isError).toBe(false)
       expect(result.restarted).toBe(true)
@@ -256,12 +256,12 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
   test('errors after large output still respect the output budget', async () => {
     const instance = kernel()
     const result = await instance.run(
-      `print("x".repeat(${EVAL_LIMITS.outputBytes})); throw new Error("y".repeat(4096))`,
+      `print("x".repeat(${CODEMODE_LIMITS.outputBytes})); throw new Error("y".repeat(4096))`,
       { dispatch },
     )
     expect(result.isError).toBe(true)
     expect(result.truncated).toBe(true)
-    expect(Buffer.byteLength(result.text)).toBeLessThan(EVAL_LIMITS.outputBytes + 200)
+    expect(Buffer.byteLength(result.text)).toBeLessThan(CODEMODE_LIMITS.outputBytes + 200)
   })
 
   test('cancellation aborts in-flight bridge work before a fresh cell', async () => {
@@ -300,6 +300,6 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     const instance = kernel()
     await instance.run('const retained = 1', { dispatch })
     await instance.dispose()
-    await expect(instance.run('print(retained)', { dispatch })).rejects.toThrow(EvalError)
+    await expect(instance.run('print(retained)', { dispatch })).rejects.toThrow(CodemodeError)
   })
 })

@@ -113,7 +113,7 @@ export type BashSandboxRequest = {
   readonly network?: SandboxNetwork
 }
 
-// Shared preparation for model bash and eval. The caller owns verification
+// Shared preparation for model bash and codemode. The caller owns verification
 // immediately before spawn and cleanup after the process has exited.
 export async function prepareBashSandbox(options: BashSandboxRequest): Promise<PreparedBashSandbox> {
   const {

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 
-import { CellOutput, EVAL_LIMITS, EvalError, FrameLines, encodeFrame, kernelFrameSchema } from './protocol'
+import { CellOutput, CODEMODE_LIMITS, CodemodeError, FrameLines, encodeFrame, kernelFrameSchema } from './protocol'
 
-describe('eval bridge boundary', () => {
+describe('codemode bridge boundary', () => {
   test('reassembles split UTF-8 JSON lines', () => {
     const reader = new FrameLines()
     const bytes = Buffer.from(encodeFrame({ type: 'output', cellId: 'one', text: '한글' }))
@@ -15,7 +15,7 @@ describe('eval bridge boundary', () => {
 
   test('rejects an unterminated frame flood', () => {
     const reader = new FrameLines()
-    expect(() => reader.push(Buffer.alloc(EVAL_LIMITS.frameBytes + 1, 65))).toThrow(EvalError)
+    expect(() => reader.push(Buffer.alloc(CODEMODE_LIMITS.frameBytes + 1, 65))).toThrow(CodemodeError)
   })
 
   test.each([
@@ -28,12 +28,12 @@ describe('eval bridge boundary', () => {
   })
 
   test('rejects oversized host replies before writing them', () => {
-    const frame = { type: 'tool-result', id: 'one', value: 'x'.repeat(EVAL_LIMITS.frameBytes) } as const
-    expect(() => encodeFrame(frame)).toThrow(EvalError)
+    const frame = { type: 'tool-result', id: 'one', value: 'x'.repeat(CODEMODE_LIMITS.frameBytes) } as const
+    expect(() => encodeFrame(frame)).toThrow(CodemodeError)
   })
 })
 
-describe('eval output limits', () => {
+describe('codemode output limits', () => {
   test('retains filtered output below the limit', () => {
     const output = new CellOutput()
     output.append('selected: 42\n')
@@ -43,16 +43,16 @@ describe('eval output limits', () => {
 
   test('caps multibyte output without splitting a code point', () => {
     const output = new CellOutput()
-    output.append('한'.repeat(EVAL_LIMITS.outputBytes))
+    output.append('한'.repeat(CODEMODE_LIMITS.outputBytes))
     expect(output.truncated).toBe(true)
     expect(output.render()).not.toContain('�')
-    expect(Buffer.byteLength(output.render())).toBeLessThan(EVAL_LIMITS.outputBytes + 100)
+    expect(Buffer.byteLength(output.render())).toBeLessThan(CODEMODE_LIMITS.outputBytes + 100)
   })
 
   test('caps repeated short lines as well as bytes', () => {
     const output = new CellOutput()
-    output.append('x\n'.repeat(EVAL_LIMITS.outputLines + 1))
+    output.append('x\n'.repeat(CODEMODE_LIMITS.outputLines + 1))
     expect(output.truncated).toBe(true)
-    expect(output.render().split('x\n')).toHaveLength(EVAL_LIMITS.outputLines + 1)
+    expect(output.render().split('x\n')).toHaveLength(CODEMODE_LIMITS.outputLines + 1)
   })
 })

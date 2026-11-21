@@ -43,6 +43,40 @@ describe('managedConfig guard — typeclaw.json', () => {
     expect(result?.reason).toContain('typeclaw.json is invalid')
   })
 
+  test('accepts a valid legacy eval block, which the next load renames to codemode', async () => {
+    const agentDir = await makeAgentDir()
+    const result = await checkManagedConfigGuard({
+      tool: 'write',
+      args: { path: 'typeclaw.json', content: JSON.stringify({ eval: { enabled: true, origins: ['cron'] } }) },
+      agentDir,
+    })
+    expect(result).toBeUndefined()
+  })
+
+  test('rejects an invalid legacy eval block the next load would reject as codemode', async () => {
+    const agentDir = await makeAgentDir()
+    const result = await checkManagedConfigGuard({
+      tool: 'write',
+      args: { path: 'typeclaw.json', content: JSON.stringify({ eval: { enabled: true, origins: ['nowhere'] } }) },
+      agentDir,
+    })
+    expect(result?.block).toBe(true)
+    expect(result?.reason).toContain('codemode')
+  })
+
+  test('an explicit codemode block wins over an invalid leftover eval block', async () => {
+    const agentDir = await makeAgentDir()
+    const result = await checkManagedConfigGuard({
+      tool: 'write',
+      args: {
+        path: 'typeclaw.json',
+        content: JSON.stringify({ codemode: { enabled: true }, eval: { origins: ['nowhere'] } }),
+      },
+      agentDir,
+    })
+    expect(result).toBeUndefined()
+  })
+
   test('rejects an empty-string write (parse error)', async () => {
     const agentDir = await makeAgentDir()
     const result = await checkManagedConfigGuard({

@@ -4,12 +4,12 @@ import { SessionManager, type ExtensionToolContext } from '@earendil-works/pi-co
 
 import { shellQuote } from '@/sandbox/quote'
 
-import { EvalKernel } from './kernel'
+import { CodemodeKernel } from './kernel'
 import type { KernelLaunch } from './process'
-import { EvalError } from './protocol'
+import { CodemodeError } from './protocol'
 
-export function testKernel(cwd: string): EvalKernel {
-  return new EvalKernel(async () => testLaunch(cwd))
+export function testKernel(cwd: string): CodemodeKernel {
+  return new CodemodeKernel(async () => testLaunch(cwd))
 }
 
 export function testLaunch(cwd: string, fingerprint = 'test'): KernelLaunch {
@@ -24,7 +24,7 @@ export function testLaunch(cwd: string, fingerprint = 'test'): KernelLaunch {
 
 export function testContext(cwd: string): ExtensionToolContext {
   const unsupported = (): never => {
-    throw new EvalError('refused', 'unexpected UI or model access in tool test')
+    throw new CodemodeError('refused', 'unexpected UI or model access in tool test')
   }
   return {
     get ui() {

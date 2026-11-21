@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto'
 
-import { CellOutput, EVAL_LIMITS, EvalError, type HostFrame, type KernelFrame } from './protocol'
+import { CellOutput, CODEMODE_LIMITS, CodemodeError, type HostFrame, type KernelFrame } from './protocol'
 import { assertNever } from './wire'
 
-export type EvalDispatch = (
+export type CodemodeDispatch = (
   request: {
     readonly name: string
     readonly args: Extract<KernelFrame, { type: 'tool-call' }>['args']
@@ -12,7 +12,7 @@ export type EvalDispatch = (
   signal: AbortSignal,
 ) => Promise<unknown>
 
-export class EvalCell {
+export class CodemodeCell {
   readonly id = randomUUID()
   readonly output = new CellOutput()
   readonly completed = Promise.withResolvers<void>()
@@ -21,14 +21,14 @@ export class EvalCell {
   private finished = false
 
   constructor(
-    private readonly dispatch: EvalDispatch,
+    private readonly dispatch: CodemodeDispatch,
     private readonly signal: AbortSignal,
   ) {}
 
   receive(frame: KernelFrame, send: (frame: HostFrame) => void): void {
     switch (frame.type) {
       case 'ready':
-        throw new EvalError('protocol', 'unexpected ready frame')
+        throw new CodemodeError('protocol', 'unexpected ready frame')
       case 'output':
         this.assertActive(frame.cellId)
         this.output.append(frame.text)
@@ -38,17 +38,17 @@ export class EvalCell {
         this.finished = true
         void Promise.all(this.pending).then(() => {
           if (frame.error === undefined) this.completed.resolve()
-          else this.completed.reject(new EvalError('cell', frame.error))
+          else this.completed.reject(new CodemodeError('cell', frame.error))
         }, this.completed.reject)
         return
       case 'tool-call': {
         this.assertActive(frame.cellId)
         if (
           this.ids.has(frame.id) ||
-          this.ids.size >= EVAL_LIMITS.calls ||
-          this.pending.size >= EVAL_LIMITS.concurrency
+          this.ids.size >= CODEMODE_LIMITS.calls ||
+          this.pending.size >= CODEMODE_LIMITS.concurrency
         ) {
-          throw new EvalError('protocol', 'eval tool-call id, count, or concurrency limit exceeded')
+          throw new CodemodeError('protocol', 'codemode tool-call id, count, or concurrency limit exceeded')
         }
         this.ids.add(frame.id)
         const task = this.invoke(frame, send)
@@ -63,7 +63,7 @@ export class EvalCell {
 
   private assertActive(cellId: string): void {
     if (this.finished || this.signal.aborted || cellId !== this.id) {
-      throw new EvalError('protocol', 'eval frame is outside its active cell')
+      throw new CodemodeError('protocol', 'codemode frame is outside its active cell')
     }
   }
 
@@ -76,7 +76,7 @@ export class EvalCell {
         {
           name: frame.name,
           args: frame.args,
-          callId: `eval:${this.id}:${frame.id}`,
+          callId: `codemode:${this.id}:${frame.id}`,
         },
         this.signal,
       )

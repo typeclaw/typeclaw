@@ -10,17 +10,17 @@ import { createBudgetState, wrapToolDefinitionWithBudget } from '@/agent/tool-re
 import { createPermissionService } from '@/permissions/permissions'
 import { createHookBus } from '@/plugin'
 
-import { createEvalDispatch } from './dispatch'
+import { createCodemodeDispatch } from './dispatch'
 import { testContext, testKernel } from './fixtures.test'
-import type { EvalKernel } from './kernel'
+import type { CodemodeKernel } from './kernel'
 
-// The kernel spawns bash and kills POSIX process groups; eval only runs in the
+// The kernel spawns bash and kills POSIX process groups; codemode only runs in the
 // Linux container stage.
-describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () => {
+describe.skipIf(process.platform === 'win32')('codemode wrapped tool routing', () => {
   let dir: string
-  let kernel: EvalKernel
+  let kernel: CodemodeKernel
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'typeclaw-eval-'))
+    dir = await mkdtemp(join(tmpdir(), 'typeclaw-codemode-'))
     await mkdir(join(dir, 'workspace'))
     await writeFile(join(dir, 'workspace', 'one.txt'), 'selected line\n')
     await writeFile(join(dir, '.env'), 'HIDDEN=canary')
@@ -42,7 +42,7 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
   }
 
   test('a cell batches real wrapped reads and grep while suppressing intermediate data', async () => {
-    const dispatch = createEvalDispatch({
+    const dispatch = createCodemodeDispatch({
       tools: tools(),
       getActiveNames: () => ['read', 'grep'],
       context: testContext(dir),
@@ -67,7 +67,7 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     }
     expect(directError).not.toBe('')
     const result = await kernel.run('try { await tool.read({path:".env"}) } catch (error) { print(error.message) }', {
-      dispatch: createEvalDispatch({ tools: wrapped, getActiveNames: () => ['read'], context }),
+      dispatch: createCodemodeDispatch({ tools: wrapped, getActiveNames: () => ['read'], context }),
     })
     expect(result.isError).toBe(false)
     expect(result.text.trim()).toBe(directError)
@@ -79,7 +79,11 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     const wrapped = tools().map((tool) =>
       wrapToolDefinitionWithBudget(tool, { maxTotalBytes: 1, toolNames: ['read'] }, state),
     )
-    const dispatch = createEvalDispatch({ tools: wrapped, getActiveNames: () => ['read'], context: testContext(dir) })
+    const dispatch = createCodemodeDispatch({
+      tools: wrapped,
+      getActiveNames: () => ['read'],
+      context: testContext(dir),
+    })
     const result = await kernel.run(
       'await tool.read({path:"workspace/one.txt"}); const second = await tool.read({path:"workspace/one.txt"}); print(second.details.budgetExhausted)',
       { dispatch },
@@ -89,26 +93,37 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     expect(state.exhausted).toBe(true)
   })
 
-  test.each(['eval', 'spawn_subagent', 'coding_agent', 'channel_send', 'mcp_call', 'not_registered'])(
+  test.each(['codemode', 'spawn_subagent', 'coding_agent', 'channel_send', 'mcp_call', 'not_registered'])(
     'refuses %s before executing any target',
     async (name) => {
-      const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => [name], context: testContext(dir) })
+      const dispatch = createCodemodeDispatch({
+        tools: tools(),
+        getActiveNames: () => [name],
+        context: testContext(dir),
+      })
       await expect(dispatch({ name, args: {}, callId: 'test' }, new AbortController().signal)).rejects.toThrow()
     },
   )
 
   test('a registered but inactive tool remains inaccessible', async () => {
-    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => [], context: testContext(dir) })
+    const dispatch = createCodemodeDispatch({ tools: tools(), getActiveNames: () => [], context: testContext(dir) })
     await expect(
       dispatch({ name: 'read', args: { path: 'workspace/one.txt' }, callId: 'test' }, new AbortController().signal),
     ).rejects.toThrow()
   })
 
   test('recursion is refused through the real cell bridge', async () => {
-    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['eval'], context: testContext(dir) })
-    const result = await kernel.run('try { await tool.eval({code:"print(42)"}) } catch (error) { print(error.kind) }', {
-      dispatch,
+    const dispatch = createCodemodeDispatch({
+      tools: tools(),
+      getActiveNames: () => ['codemode'],
+      context: testContext(dir),
     })
+    const result = await kernel.run(
+      'try { await tool.codemode({code:"print(42)"}) } catch (error) { print(error.kind) }',
+      {
+        dispatch,
+      },
+    )
     expect(result.isError).toBe(false)
     expect(result.text.trim()).toBe('refused')
   })
@@ -120,7 +135,7 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
     async () => {
       await mkdir(join(dir, 'workspace', 'nested'))
       await writeFile(join(dir, 'workspace', 'nested', 'deep.txt'), 'needle body\n')
-      const dispatch = createEvalDispatch({
+      const dispatch = createCodemodeDispatch({
         tools: tools(),
         getActiveNames: () => ['grep', 'read'],
         context: testContext(dir),
@@ -142,7 +157,11 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
   )
 
   test('a grep regex parse failure names the JS string escape cause', async () => {
-    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['grep'], context: testContext(dir) })
+    const dispatch = createCodemodeDispatch({
+      tools: tools(),
+      getActiveNames: () => ['grep'],
+      context: testContext(dir),
+    })
     const broken = await kernel.run('await tool.grep({pattern:"Text\\(|Label(",path:"workspace/one.txt"})', {
       dispatch,
     })
@@ -157,7 +176,11 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
   })
 
   test('tool argument validation happens before wrapped execution', async () => {
-    const dispatch = createEvalDispatch({ tools: tools(), getActiveNames: () => ['read'], context: testContext(dir) })
+    const dispatch = createCodemodeDispatch({
+      tools: tools(),
+      getActiveNames: () => ['read'],
+      context: testContext(dir),
+    })
     await expect(dispatch({ name: 'read', args: {}, callId: 'test' }, new AbortController().signal)).rejects.toThrow()
   })
 
@@ -184,7 +207,7 @@ describe.skipIf(process.platform === 'win32')('eval wrapped tool routing', () =>
       { pluginName: 'test', toolName: 'plugin_echo', agentDir: dir, sessionId: crypto.randomUUID(), logger, hooks },
     )
     const result = await kernel.run('const response = await tool.plugin_echo({}); print(response.content.length)', {
-      dispatch: createEvalDispatch({
+      dispatch: createCodemodeDispatch({
         tools: [wrapped],
         getActiveNames: () => ['plugin_echo'],
         context: testContext(dir),

@@ -14,6 +14,7 @@ import { adapterNamespace } from '@/channels/adapter-namespace'
 import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import type { ChannelRouter } from '@/channels/router'
 import type { ReactionRef } from '@/channels/types'
+import { registerCodemodeTool, CODEMODE_PROMPT_HINT } from '@/codemode/tool'
 import { createCodingAgentTool } from '@/coding-agent/tool'
 import {
   getConfig,
@@ -24,7 +25,6 @@ import {
   type ThinkingLevel,
 } from '@/config'
 import { config } from '@/config/config'
-import { registerEvalTool, EVAL_PROMPT_HINT } from '@/eval/tool'
 
 import {
   composeSessionTail,
@@ -573,8 +573,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   ]
 
   let activeSession: AgentSession | undefined
-  const evalRuntime = registerEvalTool({
-    settings: config.eval,
+  const codemodeRuntime = registerCodemodeTool({
+    settings: config.codemode,
     tools: customTools,
     activeNames: intendedActiveToolNames,
     getActiveNames: () => activeSession?.getActiveToolNames() ?? intendedActiveToolNames,
@@ -602,13 +602,13 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   const resourceLoader =
     options.systemPromptOverride !== undefined
       ? await createOverrideResourceLoader(
-          options.systemPromptOverride + (evalRuntime ? `\n\n${EVAL_PROMPT_HINT}` : ''),
+          options.systemPromptOverride + (codemodeRuntime ? `\n\n${CODEMODE_PROMPT_HINT}` : ''),
           options.origin,
           options.permissions,
           options.runtimeVersion,
         )
       : await createResourceLoader({
-          evalEnabled: evalRuntime !== undefined,
+          codemodeEnabled: codemodeRuntime !== undefined,
           ...(options.plugins ? { plugins: options.plugins, materializedSkills } : {}),
           ...(options.origin ? { origin: options.origin } : {}),
           ...(options.permissions ? { permissions: options.permissions } : {}),
@@ -659,7 +659,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   const untrackTurnActivity = trackTurnActivity(session, getOrigin)
   const innerDispose = session.dispose.bind(session)
   session.dispose = () => {
-    void evalRuntime?.dispose()
+    void codemodeRuntime?.dispose()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
     untrackTurnActivity()
@@ -780,7 +780,7 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
         )
       : undefined
   const dispose = async () => {
-    await evalRuntime?.dispose()
+    await codemodeRuntime?.dispose()
     stopIdleCompaction()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
@@ -1350,7 +1350,7 @@ export type CreateResourceLoaderOptions = {
   // 'full' to add the interactive context to an unattended origin (rarely
   // useful; mostly an escape hatch for ad-hoc debugging).
   mode?: SystemPromptMode
-  evalEnabled?: boolean
+  codemodeEnabled?: boolean
   // When set, the origin/role/git suffix is left out of the preamble and handed
   // here instead, for the session to append after pi's sections.
   onSessionTail?: (tail: string) => void
@@ -1450,7 +1450,7 @@ export async function createResourceLoader(options: CreateResourceLoaderOptions 
     ...(roleContext !== undefined && !detached ? { roleContext } : {}),
     ...(mcpCatalog !== undefined ? { mcpCatalog } : {}),
     gitNudge: detached ? '' : gitNudge,
-    ...(options.evalEnabled ? { evalHint: EVAL_PROMPT_HINT } : {}),
+    ...(options.codemodeEnabled ? { codemodeHint: CODEMODE_PROMPT_HINT } : {}),
   })
 
   const additionalSkillPaths = [getBundledSkillsDir()]

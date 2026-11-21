@@ -16,7 +16,7 @@
 export const TOOLS_WITHOUT_LOCAL_FILE_OPERANDS: ReadonlySet<string> = new Set([
   // Source code is not a host-side path operand. Raw I/O is confined by the
   // shared bash sandbox; tool.* operands enter their own wrapped definitions.
-  'eval',
+  'codemode',
   'channel_read',
   'channel_history',
   'channel_handoff',

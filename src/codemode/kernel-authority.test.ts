@@ -5,20 +5,20 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { testLaunch } from './fixtures.test'
-import { EvalKernel } from './kernel'
+import { CodemodeKernel } from './kernel'
 
-// Needs bash, POSIX process groups, and SIGUSR2; eval only runs in the Linux
+// Needs bash, POSIX process groups, and SIGUSR2; codemode only runs in the Linux
 // container stage.
 test.skipIf(process.platform === 'win32')(
   'raw output from an old kernel cannot enter a new authority cell during preparation',
   async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-eval-authority-'))
+    const dir = await mkdtemp(join(tmpdir(), 'typeclaw-codemode-authority-'))
     const entered = Promise.withResolvers<void>()
     const resume = Promise.withResolvers<void>()
     const acknowledged = Promise.withResolvers<void>()
     const ack = join(dir, 'ack')
     let changed = false
-    const kernel = new EvalKernel(async () => {
+    const kernel = new CodemodeKernel(async () => {
       if (changed) {
         entered.resolve()
         await resume.promise

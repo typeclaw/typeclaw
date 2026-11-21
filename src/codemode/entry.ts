@@ -7,7 +7,7 @@ import { format } from 'node:util'
 
 import type { HostFrame, KernelFrame } from './protocol'
 import { rewriteCell } from './redeclare'
-import { EVAL_LIMITS, EvalError, FrameLines, FRAME_PREFIX, encodeFrame, assertNever } from './wire'
+import { CODEMODE_LIMITS, CodemodeError, FrameLines, FRAME_PREFIX, encodeFrame, assertNever } from './wire'
 
 const write = process.stdout.write.bind(process.stdout)
 // A leading delimiter also terminates ordinary stdout writes that omitted a
@@ -52,7 +52,8 @@ const tool = new Proxy<Record<string, (args: ToolArgs) => Promise<unknown>>>(
       if (typeof name !== 'string' || name === 'then') return undefined
       return (args: ToolArgs) => {
         const activeCellId = currentCell()
-        if (activeCellId === undefined) return Promise.reject(new EvalError('closed', 'eval cell has already ended'))
+        if (activeCellId === undefined)
+          return Promise.reject(new CodemodeError('closed', 'codemode cell has already ended'))
         const id = String(++sequence)
         const result = new Promise<unknown>((resolve, reject) => {
           pending.set(id, { resolve, reject })
@@ -83,7 +84,7 @@ async function parallel<T>(thunks: readonly (() => Promise<T>)[]): Promise<T[]> 
   // failure propagates; a still-sleeping worker would otherwise dispatch tool
   // calls under the next cell's id.
   await Promise.all(
-    Array.from({ length: Math.min(EVAL_LIMITS.concurrency, thunks.length) }, async () => {
+    Array.from({ length: Math.min(CODEMODE_LIMITS.concurrency, thunks.length) }, async () => {
       while (next < thunks.length && failures.length === 0) {
         const index = next++
         const thunk = thunks[index]
@@ -128,7 +129,7 @@ const replOptions = {
   terminal: false,
   prompt: '',
   // Bun's Node-compatible REPL routes uncaught awaited errors here instead of
-  // invoking eval's completion callback. Subscribe before executing each cell.
+  // invoking codemode's completion callback. Subscribe before executing each cell.
   handleError(error: unknown) {
     if (rejectEvaluation === undefined) process.exit(1)
     rejectEvaluation(error)
@@ -171,13 +172,13 @@ function rejectFunctionItems(promise: PromiseConstructor): void {
 }
 
 async function run(id: string, code: string): Promise<void> {
-  if (cellId !== undefined) throw new EvalError('busy', 'eval kernel is busy')
+  if (cellId !== undefined) throw new CodemodeError('busy', 'codemode kernel is busy')
   cellId = id
   const cell = rewriteCell(code)
   const shadowed = cell.declared.filter((name) => Object.hasOwn(helpers, name))
   const failure =
     shadowed.length > 0
-      ? `${shadowed.map((name) => `\`${name}\``).join(', ')} is an eval helper and cannot be declared at top level; rename the variable`
+      ? `${shadowed.map((name) => `\`${name}\``).join(', ')} is a codemode helper and cannot be declared at top level; rename the variable`
       : await origin.run(id, () => evaluate(cell.code))
   // A forgotten await must not detach tool work from the foreground cell.
   await Promise.allSettled(outstanding)
@@ -189,7 +190,7 @@ async function evaluate(code: string): Promise<string | undefined> {
   try {
     await new Promise<void>((resolve, reject) => {
       rejectEvaluation = reject
-      repl.eval(code + '\n', repl.context, 'eval-cell', (error: Error | null) => {
+      repl.eval(code + '\n', repl.context, 'codemode-cell', (error: Error | null) => {
         if (error !== null && error !== undefined) reject(error)
         else resolve()
       })
@@ -209,7 +210,7 @@ const lines = new FrameLines()
 function parseHostFrame(line: string): HostFrame {
   const value: unknown = JSON.parse(line)
   if (typeof value !== 'object' || value === null || !('type' in value)) {
-    throw new EvalError('protocol', 'invalid host frame')
+    throw new CodemodeError('protocol', 'invalid host frame')
   }
   switch (value.type) {
     case 'run':
@@ -228,11 +229,11 @@ function parseHostFrame(line: string): HostFrame {
       }
       break
   }
-  throw new EvalError('protocol', 'invalid host frame')
+  throw new CodemodeError('protocol', 'invalid host frame')
 }
 process.stdin.on('data', (chunk: Buffer) => {
   for (const line of lines.push(chunk)) {
-    if (!line.startsWith(FRAME_PREFIX)) throw new EvalError('protocol', 'invalid host frame')
+    if (!line.startsWith(FRAME_PREFIX)) throw new CodemodeError('protocol', 'invalid host frame')
     const frame = parseHostFrame(line.slice(FRAME_PREFIX.length))
     switch (frame.type) {
       case 'run':
@@ -243,7 +244,7 @@ process.stdin.on('data', (chunk: Buffer) => {
         pending.delete(frame.id)
         break
       case 'tool-error':
-        pending.get(frame.id)?.reject(new EvalError('refused', frame.error))
+        pending.get(frame.id)?.reject(new CodemodeError('refused', frame.error))
         pending.delete(frame.id)
         break
       default:
@@ -254,7 +255,7 @@ process.stdin.on('data', (chunk: Buffer) => {
 process.stdin.on('end', () => process.exit(0))
 // Cells run in the REPL's own realm, whose Promise is reachable only from
 // inside it; patch that one before accepting the first cell.
-repl.eval('Promise\n', repl.context, 'eval-init', (error: Error | null, value: unknown) => {
+repl.eval('Promise\n', repl.context, 'codemode-init', (error: Error | null, value: unknown) => {
   if (error !== null && error !== undefined) throw error
   rejectFunctionItems(value as PromiseConstructor)
   send({ type: 'ready' })
