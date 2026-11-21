@@ -5,7 +5,7 @@ import type { SessionOrigin } from '@/agent/session-origin'
 
 const origins = ['tui', 'channel', 'cron', 'subagent', 'system'] as const
 
-export const evalConfigSchema = z
+export const codemodeConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
     origins: z.array(z.enum(origins)).default([...origins]),
@@ -13,8 +13,8 @@ export const evalConfigSchema = z
   .strict()
   .default({ enabled: false, origins: [...origins] })
 
-export function evalEnabledForSession(options: {
-  readonly settings: z.infer<typeof evalConfigSchema>
+export function codemodeEnabledForSession(options: {
+  readonly settings: z.infer<typeof codemodeConfigSchema>
   readonly origin: SessionOrigin | undefined
   readonly tools: readonly string[]
   readonly bashPolicy?: WrapSystemToolOptions['bashPolicy']

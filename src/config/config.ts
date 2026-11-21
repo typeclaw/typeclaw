@@ -14,7 +14,7 @@ import {
   channelsSchema,
   SEEDED_GITHUB_EVENT_ALLOWLISTS,
 } from '@/channels/schema'
-import { evalConfigSchema } from '@/eval/config'
+import { codemodeConfigSchema } from '@/codemode/config'
 import { commitSystemFileSync } from '@/git/system-commit'
 import { parseMatchRule } from '@/permissions/match-rule'
 import { rolesConfigSchema } from '@/permissions/schema'
@@ -980,7 +980,7 @@ export const configSchema = z
     portForward: portForwardSchema,
     network: networkSchema,
     sandbox: sandboxSchema,
-    eval: evalConfigSchema,
+    codemode: codemodeConfigSchema,
     docker: dockerSchema,
     browser: browserSchema,
     git: gitSchema,
@@ -1274,7 +1274,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   portForward: 'restart-required',
   network: 'restart-required',
   sandbox: 'restart-required',
-  eval: 'restart-required',
+  codemode: 'restart-required',
   tunnels: 'restart-required',
   'docker.file': 'restart-required', // Includes omoCli; installation changes rebuild the image.
   browser: 'restart-required',

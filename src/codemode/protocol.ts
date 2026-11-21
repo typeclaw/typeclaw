@@ -1,7 +1,7 @@
 import { z } from 'zod'
 
-import { EVAL_LIMITS } from './wire'
-export { EVAL_LIMITS, FRAME_PREFIX, EvalError, encodeFrame, FrameLines, CellOutput } from './wire'
+import { CODEMODE_LIMITS } from './wire'
+export { CODEMODE_LIMITS, FRAME_PREFIX, CodemodeError, encodeFrame, FrameLines, CellOutput } from './wire'
 
 const id = z.string().min(1).max(128)
 export const kernelFrameSchema = z.discriminatedUnion('type', [
@@ -19,7 +19,7 @@ export const kernelFrameSchema = z.discriminatedUnion('type', [
 
 export type KernelFrame = z.infer<typeof kernelFrameSchema>
 export const hostFrameSchema = z.discriminatedUnion('type', [
-  z.strictObject({ type: z.literal('run'), cellId: id, code: z.string().max(EVAL_LIMITS.codeBytes) }),
+  z.strictObject({ type: z.literal('run'), cellId: id, code: z.string().max(CODEMODE_LIMITS.codeBytes) }),
   z.strictObject({ type: z.literal('tool-result'), id, value: z.unknown() }),
   z.strictObject({ type: z.literal('tool-error'), id, error: z.string() }),
 ])

@@ -1,6 +1,6 @@
 import type { HostFrame, KernelFrame } from './protocol'
 
-export const EVAL_LIMITS = {
+export const CODEMODE_LIMITS = {
   codeBytes: 64 * 1024,
   frameBytes: 1024 * 1024,
   outputBytes: 64 * 1024,
@@ -13,9 +13,9 @@ export const EVAL_LIMITS = {
   concurrency: 8,
 } as const
 
-export const FRAME_PREFIX = '@typeclaw-eval '
-export class EvalError extends Error {
-  override readonly name = 'EvalError'
+export const FRAME_PREFIX = '@typeclaw-codemode '
+export class CodemodeError extends Error {
+  override readonly name = 'CodemodeError'
   constructor(
     readonly kind: 'protocol' | 'closed' | 'timeout' | 'busy' | 'refused' | 'cell',
     message: string,
@@ -25,13 +25,13 @@ export class EvalError extends Error {
 }
 
 export function assertNever(value: never): never {
-  throw new EvalError('protocol', `unexpected eval frame: ${String(value)}`)
+  throw new CodemodeError('protocol', `unexpected codemode frame: ${String(value)}`)
 }
 
 export function encodeFrame(frame: HostFrame | KernelFrame): string {
   const line = FRAME_PREFIX + JSON.stringify(frame) + '\n'
-  if (Buffer.byteLength(line) > EVAL_LIMITS.frameBytes) {
-    throw new EvalError('protocol', 'eval bridge frame exceeds its byte limit')
+  if (Buffer.byteLength(line) > CODEMODE_LIMITS.frameBytes) {
+    throw new CodemodeError('protocol', 'codemode bridge frame exceeds its byte limit')
   }
   return line
 }
@@ -46,13 +46,14 @@ export class FrameLines {
     let start = 0
     let end = bytes.indexOf(10)
     while (end !== -1) {
-      if (end - start > EVAL_LIMITS.frameBytes) throw new EvalError('protocol', 'eval bridge line is too large')
+      if (end - start > CODEMODE_LIMITS.frameBytes)
+        throw new CodemodeError('protocol', 'codemode bridge line is too large')
       lines.push(bytes.subarray(start, end).toString('utf8'))
       start = end + 1
       end = bytes.indexOf(10, start)
     }
-    if (bytes.length - start > EVAL_LIMITS.frameBytes) {
-      throw new EvalError('protocol', 'eval bridge unterminated line is too large')
+    if (bytes.length - start > CODEMODE_LIMITS.frameBytes) {
+      throw new CodemodeError('protocol', 'codemode bridge unterminated line is too large')
     }
     this.pending = Buffer.from(bytes.subarray(start))
     return lines
@@ -71,7 +72,7 @@ export class CellOutput {
     if (this.truncated) return
     for (const character of text) {
       const size = Buffer.byteLength(character)
-      if (this.bytes + size > EVAL_LIMITS.outputBytes || this.lines >= EVAL_LIMITS.outputLines) {
+      if (this.bytes + size > CODEMODE_LIMITS.outputBytes || this.lines >= CODEMODE_LIMITS.outputLines) {
         this.truncated = true
         return
       }
@@ -84,9 +85,9 @@ export class CellOutput {
   render(): string {
     // Everything printed lands in the model's context; past the warning size
     // the cell is no longer saving tokens over a direct tool call.
-    if (this.truncated) return `${this.text}\n[eval output truncated: limit reached; ${FILTER_ADVICE}]\n`
-    if (this.bytes > EVAL_LIMITS.outputWarnBytes) {
-      return `${this.text}\n[eval printed ${Math.round(this.bytes / 1024)} KB; ${FILTER_ADVICE}]\n`
+    if (this.truncated) return `${this.text}\n[codemode output truncated: limit reached; ${FILTER_ADVICE}]\n`
+    if (this.bytes > CODEMODE_LIMITS.outputWarnBytes) {
+      return `${this.text}\n[codemode printed ${Math.round(this.bytes / 1024)} KB; ${FILTER_ADVICE}]\n`
     }
     return this.text
   }

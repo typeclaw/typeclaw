@@ -3,7 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { withToolOomPriorityCommand } from '@/container/tool-oom-priority'
 
 import {
-  EvalError,
+  CodemodeError,
   FrameLines,
   FRAME_PREFIX,
   encodeFrame,
@@ -79,7 +79,7 @@ export class KernelProcess {
           }
         }
       } catch (error) {
-        fail(error instanceof Error ? error : new EvalError('protocol', String(error)))
+        fail(error instanceof Error ? error : new CodemodeError('protocol', String(error)))
       }
     })
     this.child.stderr.on('data', (chunk: Buffer) => this.onOutput(chunk.toString('utf8')))
@@ -88,7 +88,7 @@ export class KernelProcess {
     this.exited = new Promise((resolve) => {
       this.child.on('close', () => {
         this.alive = false
-        const error = new EvalError('closed', 'eval kernel exited; bindings lost')
+        const error = new CodemodeError('closed', 'codemode kernel exited; bindings lost')
         ready.reject(error)
         callbacks.failure(error)
         resolve()

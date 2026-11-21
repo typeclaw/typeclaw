@@ -9,7 +9,7 @@ import type { GetGithubSelf } from '@/channels/github-token-bridge'
 import type { PermissionService } from '@/permissions/permissions'
 import { shellQuote } from '@/sandbox/quote'
 
-import { EvalKernel } from './kernel'
+import { CodemodeKernel } from './kernel'
 
 // Retained bindings survive while the principal and audience are unchanged.
 // A channel origin also carries conversational state (participant counters,
@@ -39,14 +39,14 @@ export function authorityOrigin(origin: SessionOrigin | undefined): unknown {
   }
 }
 
-export function createSandboxedEvalKernel(options: {
+export function createSandboxedCodemodeKernel(options: {
   readonly getGithubSelf?: GetGithubSelf
   readonly agentDir: string
   readonly sessionId: string
   readonly permissions: PermissionService
   readonly getOrigin: () => SessionOrigin | undefined
-}): EvalKernel {
-  return new EvalKernel(async () => {
+}): CodemodeKernel {
+  return new CodemodeKernel(async () => {
     const origin = options.getOrigin()
     const entry = fileURLToPath(new URL('./entry.ts', import.meta.url))
     const prepared = await prepareBashSandbox({

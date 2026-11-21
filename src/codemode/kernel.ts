@@ -1,8 +1,8 @@
-import { EvalCell, type EvalDispatch } from './cell'
+import { CodemodeCell, type CodemodeDispatch } from './cell'
 import { KernelProcess, type KernelLaunch } from './process'
-import { EVAL_LIMITS, EvalError } from './protocol'
+import { CODEMODE_LIMITS, CodemodeError } from './protocol'
 
-export type EvalResult = {
+export type CodemodeResult = {
   readonly text: string
   readonly isError: boolean
   readonly truncated: boolean
@@ -12,9 +12,9 @@ export type EvalResult = {
 // Owns one serial, foreground-only process. Preparing again before each cell
 // rechecks bash's live masks and environment; changed authority loses bindings
 // rather than reusing a kernel with an earlier principal's capabilities.
-export class EvalKernel {
+export class CodemodeKernel {
   private worker: { process: KernelProcess; launch: KernelLaunch } | undefined
-  private active: EvalCell | undefined
+  private active: CodemodeCell | undefined
   private controller: AbortController | undefined
   private idle: ReturnType<typeof setTimeout> | undefined
   private closed = false
@@ -24,26 +24,27 @@ export class EvalKernel {
 
   constructor(
     private readonly prepare: () => Promise<KernelLaunch>,
-    private readonly idleMs: number = EVAL_LIMITS.idleMs,
+    private readonly idleMs: number = CODEMODE_LIMITS.idleMs,
   ) {}
 
   async run(
     code: string,
     options: {
-      readonly dispatch: EvalDispatch
+      readonly dispatch: CodemodeDispatch
       readonly signal?: AbortSignal
       readonly timeoutMs?: number
     },
-  ): Promise<EvalResult> {
-    if (this.closed) throw new EvalError('closed', 'eval session has ended')
-    if (this.controller !== undefined) throw new EvalError('busy', 'another eval cell is running')
-    if (Buffer.byteLength(code) > EVAL_LIMITS.codeBytes) throw new EvalError('refused', 'eval code exceeds 64 KiB')
+  ): Promise<CodemodeResult> {
+    if (this.closed) throw new CodemodeError('closed', 'codemode session has ended')
+    if (this.controller !== undefined) throw new CodemodeError('busy', 'another codemode cell is running')
+    if (Buffer.byteLength(code) > CODEMODE_LIMITS.codeBytes)
+      throw new CodemodeError('refused', 'codemode code exceeds 64 KiB')
     clearTimeout(this.idle)
     const controller = new AbortController()
     this.controller = controller
     const signal =
       options.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, options.signal])
-    const cell = new EvalCell(options.dispatch, signal)
+    const cell = new CodemodeCell(options.dispatch, signal)
     this.active = cell
     // Attach rejection handling before any startup event can fail the cell.
     const failure = new Promise<never>((_resolve, reject) => {
@@ -52,8 +53,8 @@ export class EvalKernel {
       else signal.addEventListener('abort', abort, { once: true })
     })
     const timeout = setTimeout(
-      () => controller.abort(new EvalError('timeout', 'eval cell timed out; kernel killed and bindings lost')),
-      Math.min(Math.max(options.timeoutMs ?? EVAL_LIMITS.timeoutMs, 1), EVAL_LIMITS.maxTimeoutMs),
+      () => controller.abort(new CodemodeError('timeout', 'codemode cell timed out; kernel killed and bindings lost')),
+      Math.min(Math.max(options.timeoutMs ?? CODEMODE_LIMITS.timeoutMs, 1), CODEMODE_LIMITS.maxTimeoutMs),
     )
     let restarted = false
     const execute = async () => {
@@ -61,7 +62,7 @@ export class EvalKernel {
       if (signal.aborted || this.closed) {
         await launch.cleanup()
         signal.throwIfAborted()
-        throw new EvalError('closed', 'eval session has ended')
+        throw new CodemodeError('closed', 'codemode session has ended')
       }
       if (this.worker?.process.alive === false || this.worker?.launch.fingerprint !== launch.fingerprint) {
         await this.stopWorker()
@@ -69,7 +70,7 @@ export class EvalKernel {
       if (signal.aborted || this.closed) {
         await launch.cleanup()
         signal.throwIfAborted()
-        throw new EvalError('closed', 'eval session has ended')
+        throw new CodemodeError('closed', 'codemode session has ended')
       }
       if (this.worker === undefined) {
         restarted = this.used
@@ -101,7 +102,7 @@ export class EvalKernel {
     try {
       await Promise.race([running, failure])
       return {
-        text: (restarted ? '[eval kernel restarted; previous bindings lost]\n' : '') + cell.output.render(),
+        text: (restarted ? '[codemode kernel restarted; previous bindings lost]\n' : '') + cell.output.render(),
         isError: false,
         truncated: cell.output.truncated,
         restarted,
@@ -110,13 +111,15 @@ export class EvalKernel {
       controller.abort(error)
       // The child reported a thrown or rejected cell after settling its tool
       // calls, so the process is healthy and its bindings are still valid.
-      const cellFailed = error instanceof EvalError && error.kind === 'cell'
+      const cellFailed = error instanceof CodemodeError && error.kind === 'cell'
       if (!cellFailed) await this.stopWorker()
       cell.output.append('\n' + (error instanceof Error ? error.message : String(error)))
       return {
         text:
           cell.output.render() +
-          (cellFailed ? '\n[eval cell failed; kernel and bindings kept]' : '\n[eval kernel stopped; bindings lost]'),
+          (cellFailed
+            ? '\n[codemode cell failed; kernel and bindings kept]'
+            : '\n[codemode kernel stopped; bindings lost]'),
         isError: true,
         truncated: cell.output.truncated,
         restarted,
@@ -137,7 +140,7 @@ export class EvalKernel {
     if (this.disposal !== undefined) return await this.disposal
     this.closed = true
     clearTimeout(this.idle)
-    this.controller?.abort(new EvalError('closed', 'eval session ended; bindings lost'))
+    this.controller?.abort(new CodemodeError('closed', 'codemode session ended; bindings lost'))
     this.disposal = this.stopWorker()
     await this.disposal
   }

@@ -75,7 +75,7 @@ export type SystemPromptComposition = {
   roleContext?: SessionRoleContext
   mcpCatalog?: string
   gitNudge: string
-  evalHint?: string
+  codemodeHint?: string
 }
 
 // Section-order contract for the system prompt. Kept as a pure string→string
@@ -138,7 +138,7 @@ export function composeSystemPrompt(parts: SystemPromptComposition): string {
   if (parts.gitNudge !== '') {
     prompt = `${prompt}\n\n${parts.gitNudge}`
   }
-  if (parts.evalHint) prompt = `${prompt}\n\n${parts.evalHint}`
+  if (parts.codemodeHint) prompt = `${prompt}\n\n${parts.codemodeHint}`
   return prompt
 }
 

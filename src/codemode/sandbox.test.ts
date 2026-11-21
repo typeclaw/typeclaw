@@ -8,21 +8,21 @@ import { createPermissionService } from '@/permissions/permissions'
 import { createHookBus } from '@/plugin'
 import { sessionTmpDir } from '@/sandbox/session-tmp'
 
-import { createEvalDispatch } from './dispatch'
+import { createCodemodeDispatch } from './dispatch'
 import { testContext } from './fixtures.test'
-import type { EvalKernel } from './kernel'
-import { createSandboxedEvalKernel } from './sandbox'
-import { registerEvalTool } from './tool'
+import type { CodemodeKernel } from './kernel'
+import { createSandboxedCodemodeKernel } from './sandbox'
+import { registerCodemodeTool } from './tool'
 
 const bwrapAvailable = process.platform === 'linux' && Bun.which('bwrap') !== null
 const dispatch = async () => {
   throw new Error('no tool dispatch in raw boundary test')
 }
 
-describe.skipIf(!bwrapAvailable)('eval real bwrap boundary', () => {
+describe.skipIf(!bwrapAvailable)('codemode real bwrap boundary', () => {
   let dir: string
   let sessionId: string
-  let kernel: EvalKernel
+  let kernel: CodemodeKernel
   let origin: SessionOrigin
   const permissions = createPermissionService()
   const savedEnv = new Map<string, string | undefined>()
@@ -30,7 +30,7 @@ describe.skipIf(!bwrapAvailable)('eval real bwrap boundary', () => {
   beforeEach(async () => {
     // Keep the agent outside /tmp: the production /tmp bind intentionally hides
     // its host parent. Source is mounted through the real dev-source resolver.
-    dir = await mkdtemp(join(process.cwd(), '.eval-boundary-'))
+    dir = await mkdtemp(join(process.cwd(), '.codemode-boundary-'))
     sessionId = crypto.randomUUID()
     origin = { kind: 'subagent', subagent: 'operator', parentSessionId: 'test', spawnedByRole: 'guest' }
     await mkdir(join(dir, 'public'), { recursive: true })
@@ -60,7 +60,7 @@ describe.skipIf(!bwrapAvailable)('eval real bwrap boundary', () => {
       savedEnv.set(key, process.env[key])
       process.env[key] = value
     }
-    kernel = createSandboxedEvalKernel({ agentDir: dir, sessionId, permissions, getOrigin: () => origin })
+    kernel = createSandboxedCodemodeKernel({ agentDir: dir, sessionId, permissions, getOrigin: () => origin })
   })
 
   afterEach(async () => {
@@ -154,31 +154,31 @@ describe.skipIf(!bwrapAvailable)('eval real bwrap boundary', () => {
     })
     const result = await kernel.run(
       'const rows = await parallel([() => tool.read({path:"public/input.txt"}), () => tool.read({path:"public/input.txt"})]); print(rows.length)',
-      { dispatch: createEvalDispatch({ tools, getActiveNames: () => ['read'], context: testContext(dir) }) },
+      { dispatch: createCodemodeDispatch({ tools, getActiveNames: () => ['read'], context: testContext(dir) }) },
     )
     expect(result.isError).toBe(false)
     expect(result.text.trim()).toBe('2')
   }, 60_000)
 
-  test('the registered eval tool denies a guarded read then completes authorized work', async () => {
+  test('the registered codemode tool denies a guarded read then completes authorized work', async () => {
     const wrappers = { agentDir: dir, sessionId, hooks: createHookBus(), permissions, getOrigin: () => origin }
     const tools = buildBuiltinPiToolOverrides(wrappers)
     const activeNames = ['bash', 'read']
-    const runtime = registerEvalTool({
+    const runtime = registerCodemodeTool({
       settings: { enabled: true, origins: ['subagent'] },
       tools,
       activeNames,
       getActiveNames: () => activeNames,
       wrappers,
     })
-    if (runtime === undefined) throw new Error('eval did not register')
+    if (runtime === undefined) throw new Error('codemode did not register')
     try {
-      const tool = tools.find((definition) => definition.name === 'eval')
-      if (tool === undefined) throw new Error('missing eval definition')
+      const tool = tools.find((definition) => definition.name === 'codemode')
+      if (tool === undefined) throw new Error('missing codemode definition')
       const result = await tool.execute(
-        'eval-test',
+        'codemode-test',
         {
-          code: 'let denied = false; try { await tool.read({path:".env"}) } catch { denied = true }; const result = await tool.read({path:"public/input.txt"}); print(denied); print(result.content[0].text); await tool.bash({command:"printf shared > /tmp/eval-bridge"}); print(await Bun.file("/tmp/eval-bridge").text())',
+          code: 'let denied = false; try { await tool.read({path:".env"}) } catch { denied = true }; const result = await tool.read({path:"public/input.txt"}); print(denied); print(result.content[0].text); await tool.bash({command:"printf shared > /tmp/codemode-bridge"}); print(await Bun.file("/tmp/codemode-bridge").text())',
         },
         undefined,
         undefined,

@@ -1,8 +1,8 @@
 import { validateToolArguments } from '@earendil-works/pi-ai'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 
-import type { EvalDispatch } from './cell'
-import { EvalError } from './protocol'
+import type { CodemodeDispatch } from './cell'
+import { CodemodeError } from './protocol'
 
 // These operations need their own model-visible call: recursion would re-enter
 // a busy kernel; orchestration/lifecycle tools can outlive or terminate its
@@ -10,7 +10,7 @@ import { EvalError } from './protocol'
 // MCP dispatch is excluded because its chosen target is not statically known.
 // Ordinary active plugin tools retain their normal wrapped execution path.
 const refused = new Set([
-  'eval',
+  'codemode',
   'spawn_subagent',
   'coding_agent',
   'subagent_cancel',
@@ -28,19 +28,19 @@ const refused = new Set([
   'mcp_call',
 ])
 
-export function createEvalDispatch(options: {
+export function createCodemodeDispatch(options: {
   readonly tools: readonly ToolDefinition[]
   readonly getActiveNames: () => readonly string[]
   readonly context: Parameters<ToolDefinition['execute']>[4]
-}): EvalDispatch {
+}): CodemodeDispatch {
   const tools = new Map(options.tools.map((tool) => [tool.name, tool]))
   return async (request, signal) => {
     signal.throwIfAborted()
     if (refused.has(request.name) || !options.getActiveNames().includes(request.name)) {
-      throw new EvalError('refused', `tool "${request.name}" is not active or is not batchable in eval`)
+      throw new CodemodeError('refused', `tool "${request.name}" is not active or is not batchable in codemode`)
     }
     const tool = tools.get(request.name)
-    if (tool === undefined) throw new EvalError('refused', `tool "${request.name}" is unavailable`)
+    if (tool === undefined) throw new CodemodeError('refused', `tool "${request.name}" is unavailable`)
     // Use Pi's direct-call validator, followed by the EXACT post-budget
     // definition supplied to createAgentSession. Never rebuild raw builtins.
     const args = validateToolArguments(tool, {
