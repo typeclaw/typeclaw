@@ -860,6 +860,7 @@ async function startAgentRuntime(
         session,
         ...(snap.hasAnyPluginContent ? { hooks: snap.hooks } : {}),
         getTranscriptPath: () => sessionManager.getSessionFile(),
+        backgroundDrain: { stream, sessionId, liveRegistry: liveSubagentRegistry },
       }
     },
   })

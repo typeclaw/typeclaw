@@ -52,7 +52,7 @@ function noopAbort(): Promise<void> {
 function registerChild(
   reg: LiveSubagentRegistry,
   taskId: string,
-  opts?: { startedAt?: number; abort?: () => Promise<void> },
+  opts?: { startedAt?: number; timeoutMs?: number; abort?: () => Promise<void> },
 ): void {
   reg.register({
     taskId,
@@ -61,6 +61,7 @@ function registerChild(
     parentSessionId: PARENT,
     background: true,
     startedAt: opts?.startedAt ?? 0,
+    ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
     status: 'running',
     abort: opts?.abort ?? noopAbort,
   })
@@ -345,6 +346,48 @@ describe('runSubagentDrain — maxChildWaitMs (wedged-child ceiling)', () => {
 
     // then
     expect(aborted).toBe(true)
+  })
+
+  test('waits past the ceiling for a child whose own timeout is longer', async () => {
+    // given: a child declaring a 15s timeout, 6s in, with a 5s drain ceiling
+    const { drain, reg } = makeDrain()
+    registerChild(reg, 'bg_slow', { startedAt: 0, timeoutMs: 15_000 })
+
+    // when: the drain runs its first (synchronous) expiry pass
+    const watch = beginSubagentDrainWatch(drain)
+    const prompts: string[] = []
+    const done = runSubagentDrain(watch, {
+      drain,
+      prompt: async (t) => void prompts.push(t),
+      maxChildWaitMs: 5000,
+      now: () => 6000,
+    })
+
+    // then: the child is left running for its own deadline
+    expect(reg.get('bg_slow')?.status).toBe('running')
+    watch.stop()
+    await done
+    expect(prompts).toEqual([])
+  })
+
+  test('abandons a long-timeout child once its own timeout plus grace has passed', async () => {
+    // given: a child declaring a 15s timeout, well past 15s + grace
+    const { drain, reg } = makeDrain()
+    registerChild(reg, 'bg_slow', { startedAt: 0, timeoutMs: 15_000 })
+
+    // when
+    const watch = beginSubagentDrainWatch(drain)
+    const prompts: string[] = []
+    await runSubagentDrain(watch, {
+      drain,
+      prompt: async (t) => void prompts.push(t),
+      maxChildWaitMs: 5000,
+      now: () => 60_000,
+    })
+
+    // then
+    expect(reg.get('bg_slow')?.status).toBe('failed')
+    expect(prompts[0]).toContain('FAILED')
   })
 
   test('does NOT expire a child still within the ceiling (parks on wakeup)', async () => {

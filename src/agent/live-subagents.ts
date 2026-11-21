@@ -30,6 +30,9 @@ export type LiveSubagent = {
   // tool result, so the drain MUST NOT re-prompt for them. See runSubagentDrain.
   background?: boolean
   startedAt: number
+  // The subagent's declared `timeoutMs`, after which it settles itself as
+  // failed. A parent drain waits at least this long before abandoning it.
+  timeoutMs?: number
   status: SubagentStatus
   completion?: SubagentCompletion
   abort: () => Promise<void>
