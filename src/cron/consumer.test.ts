@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import type { AgentSession } from '@/agent'
+import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import { createHookBus, type HookBus } from '@/plugin'
 import { createStream } from '@/stream'
 
@@ -1412,5 +1413,165 @@ describe('createCronConsumer count gate', () => {
 
       consumer.stop()
     })
+  })
+})
+
+// Signals the first registry read after `arm()`: the drain's whole first
+// iteration (expire, collect, running check, wait setup) is synchronous, so a
+// test resuming on this signal observes the drain parked on its wakeup.
+class ObservedRegistry extends LiveSubagentRegistry {
+  private onRead: (() => void) | undefined
+  arm(): Promise<void> {
+    const read = Promise.withResolvers<void>()
+    this.onRead = () => {
+      this.onRead = undefined
+      read.resolve()
+    }
+    return read.promise
+  }
+  override list(...args: Parameters<LiveSubagentRegistry['list']>): ReturnType<LiveSubagentRegistry['list']> {
+    this.onRead?.()
+    return super.list(...args)
+  }
+}
+
+function registerBackgroundChild(registry: LiveSubagentRegistry, parentSessionId: string): void {
+  registry.register({
+    taskId: 'bg_child',
+    sessionId: 'ses_child',
+    subagentName: 'browser',
+    parentSessionId,
+    background: true,
+    startedAt: Date.now(),
+    status: 'running',
+    abort: async () => {},
+  })
+}
+
+function completeBackgroundChild(
+  stream: ReturnType<typeof createStream>,
+  registry: LiveSubagentRegistry,
+  parentSessionId: string,
+): void {
+  registry.recordCompletion('bg_child', { ok: true, durationMs: 5 })
+  stream.publish({
+    target: { kind: 'broadcast' },
+    payload: {
+      kind: 'subagent.completed',
+      taskId: 'bg_child',
+      subagent: 'browser',
+      parentSessionId,
+      ok: true,
+      durationMs: 5,
+    },
+  })
+}
+
+describe('createCronConsumer background subagents', () => {
+  test('keeps the session live while a background child runs, then delivers its completion before disposing', async () => {
+    // given: a cron turn that spawns a background child and ends while it still runs
+    const stream = createStream()
+    const liveRegistry = new ObservedRegistry()
+    const sessionId = 'ses_cron'
+    const prompts: string[] = []
+    const events: string[] = []
+    // Nothing reads the registry before the drain's first iteration.
+    const drainParked = liveRegistry.arm()
+    const disposal = Promise.withResolvers<void>()
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      logger: silentLogger,
+      createSessionForCron: async () => ({
+        prompt: async (text) => {
+          prompts.push(text)
+          if (prompts.length > 1) return
+          registerBackgroundChild(liveRegistry, sessionId)
+        },
+        dispose: () => {
+          events.push('dispose')
+          disposal.resolve()
+        },
+        backgroundDrain: { stream, sessionId, liveRegistry },
+      }),
+    })
+    consumer.start()
+    publishCron(stream, promptJob('drain', 'check the results'))
+    await drainParked
+
+    // then: the turn has settled, but the session is live and the fire still in flight
+    expect(prompts).toHaveLength(1)
+    expect(events).toEqual([])
+    expect(consumer.inFlightCount()).toBe(1)
+
+    // when: the child completes
+    completeBackgroundChild(stream, liveRegistry, sessionId)
+    await disposal.promise
+
+    // then: the session got the completion reminder before it was disposed
+    expect(prompts).toHaveLength(2)
+    expect(prompts[1]).toContain('bg_child')
+    expect(events).toEqual(['dispose'])
+  })
+
+  test('a provider soft error on the reminder turn fails the cron run and still disposes the session', async () => {
+    // given: the initial turn succeeds and leaves a completed background child;
+    // only the reminder turn ends in a soft provider error
+    const stream = createStream()
+    const liveRegistry = new LiveSubagentRegistry()
+    const sessionId = 'ses_cron'
+    const info: string[] = []
+    const errors: string[] = []
+    const runEnded = Promise.withResolvers<void>()
+    let disposed = false
+    type Listener = (event: { type: string; message?: unknown }) => void
+    const listeners = new Set<Listener>()
+    const agentSession = {
+      subscribe: (cb: Listener) => {
+        listeners.add(cb)
+        return () => listeners.delete(cb)
+      },
+      prompt: async () => {
+        for (const cb of listeners) {
+          cb({
+            type: 'message_end',
+            message: { role: 'assistant', stopReason: 'error', errorMessage: 'insufficient credits' },
+          })
+        }
+      },
+    } as unknown as AgentSession
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      logger: {
+        ...silentLogger,
+        info: (m) => {
+          info.push(m)
+          if (m.includes('run ended')) runEnded.resolve()
+        },
+        error: (m) => errors.push(m),
+      },
+      createSessionForCron: async () => ({
+        prompt: async () => {
+          registerBackgroundChild(liveRegistry, sessionId)
+          completeBackgroundChild(stream, liveRegistry, sessionId)
+        },
+        dispose: () => {
+          disposed = true
+        },
+        session: agentSession,
+        backgroundDrain: { stream, sessionId, liveRegistry },
+      }),
+    })
+    consumer.start()
+
+    // when
+    publishCron(stream, promptJob('reminder-fails', 'check the results'))
+    await runEnded.promise
+
+    // then
+    expect(info.at(-1)).toContain('outcome=failed')
+    expect(errors.some((e) => e.includes('reminder turn failed') && e.includes('insufficient credits'))).toBe(true)
+    expect(disposed).toBe(true)
   })
 })

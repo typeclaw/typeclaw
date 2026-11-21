@@ -1,7 +1,15 @@
 import type { AgentSession } from '@/agent'
 import { applyTurnThinkingLevel } from '@/agent/attention-escalation'
 import { promptWithFallback, resolveFallbackChain } from '@/agent/model-fallback'
+import { promptWithSameRefRetryOnly } from '@/agent/retry-same-ref'
 import type { SessionOrigin } from '@/agent/session-origin'
+import {
+  beginSubagentDrainWatch,
+  DRAIN_MAX_CHILD_WAIT_MS,
+  runSubagentDrain,
+  type SubagentBackgroundDrain,
+  type SubagentDrainWatch,
+} from '@/agent/subagent-drain'
 import { getConfig } from '@/config'
 import type { ModelRef } from '@/config/providers'
 import { readOomEvents, toolOomNote } from '@/container/oom-events'
@@ -43,6 +51,11 @@ export type CronSession = {
   // instead of throwing, so the outer try/catch never sees them). Optional
   // so existing test fakes that only need `prompt` keep working.
   session?: AgentSession
+  // Background subagents the cron turn spawns report back by completion
+  // reminder. A cron session has no TUI or channel to receive one, so the
+  // consumer drains them into the session before disposing it; without this
+  // a turn that delegates its work and ends never sees the results.
+  backgroundDrain?: SubagentBackgroundDrain
 }
 
 export type CronConsumerLogger = {
@@ -249,12 +262,17 @@ async function runPromptOnce(
   // try/finally structure: idle inside the prompt try-block, end in the
   // outer finally).
   let lastSession: CronSession | null = null
+  let lastDrainWatch: SubagentDrainWatch | undefined
   const result = await promptWithFallback({
     refs,
     text: job.prompt,
     createSessionForRef: async (ref) => {
       const created = await createSessionForCron(job, ref)
       lastSession = created
+      // Started before the prompt so a child that completes mid-turn is latched.
+      const drainWatch =
+        created.backgroundDrain !== undefined ? beginSubagentDrainWatch(created.backgroundDrain) : undefined
+      lastDrainWatch = drainWatch
       const turnEvent =
         created.hooks && created.sessionId !== undefined && created.agentDir !== undefined
           ? {
@@ -300,6 +318,7 @@ async function runPromptOnce(
         // session created (success or failure), then disposes the underlying
         // resources. Hooks that throw are logged but don't prevent disposal.
         dispose: async () => {
+          drainWatch?.stop()
           if (created.hooks && turnEvent !== undefined) {
             try {
               await created.hooks.runSessionTurnEnd(turnEvent)
@@ -339,8 +358,32 @@ async function runPromptOnce(
   // returns the session+dispose so we can run post-prompt hooks against a
   // live session before tearing it down). Failed-chain disposal is already
   // handled by the helper's per-attempt dispose calls.
+  let reminderFailed = false
   if (result.success && lastSession !== null) {
     const finalSession: CronSession = lastSession
+    if (finalSession.backgroundDrain !== undefined && lastDrainWatch !== undefined) {
+      // A reminder turn is where the delegated work gets reported, so a
+      // provider failure there (thrown, or soft via message_end) fails the run.
+      // Retries stay on this session so the original cron prompt is not replayed.
+      const promptReminder = async (text: string): Promise<void> => {
+        try {
+          if (finalSession.session === undefined) {
+            await finalSession.prompt(text)
+            return
+          }
+          const turn = await promptWithSameRefRetryOnly(finalSession.session, text)
+          if (!turn.success) throw turn.lastError ?? new Error('reminder turn failed')
+        } catch (e) {
+          reminderFailed = true
+          logger.error(`[cron] ${job.id}: background subagent reminder turn failed: ${describe(e)}`)
+        }
+      }
+      await runSubagentDrain(lastDrainWatch, {
+        drain: finalSession.backgroundDrain,
+        prompt: promptReminder,
+        maxChildWaitMs: DRAIN_MAX_CHILD_WAIT_MS,
+      })
+    }
     if (finalSession.hooks && finalSession.sessionId !== undefined) {
       try {
         await finalSession.hooks.runSessionIdle({
@@ -355,7 +398,7 @@ async function runPromptOnce(
     }
     await result.dispose()
   }
-  return result.success
+  return result.success && !reminderFailed
 }
 
 function describe(err: unknown): string {
