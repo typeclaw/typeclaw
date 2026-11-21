@@ -14,6 +14,13 @@ export type SubagentBackgroundDrain = {
   liveRegistry: LiveSubagentRegistry
 }
 
+// Backstop ceiling for the background drain: a running child that never settles
+// is abandoned after this so the parent can synthesize partial results instead
+// of hanging forever. Deliberately larger than the per-child `timeoutMs`
+// (scout = 5 min) so that a child's own timeout is the primary release and this
+// only catches children that declare none.
+export const DRAIN_MAX_CHILD_WAIT_MS = 600_000
+
 export type DrainPrompt = (text: string) => Promise<void>
 
 export type RunSubagentDrainOptions = {
