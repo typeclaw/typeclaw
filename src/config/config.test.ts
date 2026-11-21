@@ -1554,6 +1554,26 @@ describe('migrateLegacyConfigShape', () => {
     }
   })
 
+  test('renames a legacy eval block to codemode', () => {
+    const result = migrateLegacyConfigShape({
+      models: { default: VALID_MODEL },
+      eval: { enabled: true, origins: ['cron'] },
+    })
+    expect(result.json).toEqual({ models: { default: VALID_MODEL }, codemode: { enabled: true, origins: ['cron'] } })
+    expect(result.applied).toEqual([{ kind: 'rename-eval-to-codemode' }])
+    expect(configSchema.parse(result.json).codemode).toEqual({ enabled: true, origins: ['cron'] })
+  })
+
+  test('keeps an explicit codemode block over a leftover eval block', () => {
+    const result = migrateLegacyConfigShape({
+      models: { default: VALID_MODEL },
+      eval: { enabled: false },
+      codemode: { enabled: true },
+    })
+    expect(result.json).toEqual({ models: { default: VALID_MODEL }, codemode: { enabled: true } })
+    expect(result.applied).toEqual([{ kind: 'rename-eval-to-codemode' }])
+  })
+
   test('returns applied: [] when nothing migrated', () => {
     const result = migrateLegacyConfigShape({ models: { default: VALID_MODEL }, port: 9001 })
     expect(result.applied).toEqual([])

@@ -1494,7 +1494,10 @@ export function loadConfigBundleSync(cwd: string): { config: Config; pluginConfi
 // `changed` is the boolean equivalent of `applied.length > 0` and is preserved
 // for back-compat with the many call sites that only care whether ANY rewrite
 // happened.
-export type MigrationStep = { kind: 'drop-github-seeded-event-allowlist' } | { kind: 'drop-memory-vector-config' }
+export type MigrationStep =
+  | { kind: 'drop-github-seeded-event-allowlist' }
+  | { kind: 'drop-memory-vector-config' }
+  | { kind: 'rename-eval-to-codemode' }
 
 export type MigrationResult = { json: unknown; changed: boolean; applied: MigrationStep[] }
 
@@ -1515,6 +1518,11 @@ export function migrateLegacyConfigShape(json: unknown): MigrationResult {
   if (hasLegacyMemoryVectorConfig(obj)) {
     dropMemoryVectorConfig(next)
     applied.push({ kind: 'drop-memory-vector-config' })
+  }
+
+  if (Object.prototype.hasOwnProperty.call(obj, 'eval')) {
+    renameEvalToCodemode(next)
+    applied.push({ kind: 'rename-eval-to-codemode' })
   }
 
   return { json: applied.length > 0 ? next : json, changed: applied.length > 0, applied }
@@ -1559,6 +1567,21 @@ function dropMemoryVectorConfig(next: Record<string, unknown>): void {
   next.memory = clone
 }
 
+// The tool and its config block were renamed from `eval` to `codemode`. An
+// explicit `codemode` block wins; a leftover `eval` key is dropped either way so
+// it cannot fall through to the plugin-config catchall.
+function renameEvalToCodemode(next: Record<string, unknown>): void {
+  if (!Object.prototype.hasOwnProperty.call(next, 'codemode')) next.codemode = next.eval
+  delete next.eval
+}
+
+function withLegacyEvalAsCodemode(json: unknown): unknown {
+  if (!isPlainObject(json) || !Object.prototype.hasOwnProperty.call(json, 'eval')) return json
+  const next = { ...json }
+  renameEvalToCodemode(next)
+  return next
+}
+
 function arraysEqual(a: readonly unknown[], b: readonly unknown[]): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) {
@@ -1585,6 +1608,8 @@ function shortStepLabel(step: MigrationStep): string {
       return 'drop seeded channels.github.eventAllowlist'
     case 'drop-memory-vector-config':
       return 'drop memory.vector config'
+    case 'rename-eval-to-codemode':
+      return 'rename eval to codemode'
   }
 }
 
@@ -1594,6 +1619,8 @@ function describeStep(step: MigrationStep): string {
       return 'drop seeded channels.github.eventAllowlist so it re-tracks the shipped default'
     case 'drop-memory-vector-config':
       return 'drop memory.vector config; vector memory is always on'
+    case 'rename-eval-to-codemode':
+      return 'rename the eval block to codemode; the tool was renamed'
   }
 }
 
@@ -1716,7 +1743,9 @@ export type ParseConfigJsonResult = { ok: true; config: Config } | { ok: false; 
 export type ParseConfigJsonOptions = {
   // Run `migrateLegacyConfigShape` before schema validation. Defaults to true
   // so callers don't reject content the agent could have written through
-  // legacy keys; pass false to validate the exact bytes (used in tests).
+  // legacy keys; pass false to validate the exact bytes (used in tests). A
+  // legacy `eval` block is still validated as `codemode` either way, because
+  // the next load renames it and would reject what the bytes alone accept.
   migrate?: boolean
   // When set, persist + commit the migrated shape to this agent dir if the
   // migration ran. Only `validateConfig` uses this; the guard's in-memory
@@ -1747,7 +1776,7 @@ export function parseConfigJson(raw: string, options: ParseConfigJsonOptions = {
     persistMigratedConfig(options.persistTarget)
   }
 
-  const result = configSchema.safeParse(migrated.json)
+  const result = configSchema.safeParse(shouldMigrate ? migrated.json : withLegacyEvalAsCodemode(json))
   if (!result.success) {
     return { ok: false, reason: `${CONFIG_FILE} is invalid: ${formatZodError(result.error)}` }
   }
