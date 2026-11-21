@@ -20,6 +20,6 @@
     "web-search",
     "xvfb",
     "sandbox",
-    "eval"
+    "codemode"
   ]
 }

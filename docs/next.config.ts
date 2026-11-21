@@ -10,6 +10,12 @@ const nextConfig: NextConfig = {
       'fumadocs-mdx:collections/server': './.source/server.ts',
     },
   },
+  async redirects() {
+    return [
+      { source: '/docs/internals/eval', destination: '/docs/internals/codemode', permanent: true },
+      { source: '/docs/internals/eval.md', destination: '/docs/internals/codemode.md', permanent: true },
+    ]
+  },
   async rewrites() {
     return [
       { source: '/docs.md', destination: '/llms.mdx/docs' },

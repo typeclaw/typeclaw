@@ -1,10 +1,10 @@
 ---
-title: Eval kernel
+title: Codemode kernel
 description: Opt-in persistent JavaScript cells with the model-bash sandbox and wrapped tool dispatch
 icon: Code
 ---
 
-`eval` batches independent tool calls into one model round trip and keeps intermediate results in a per-session Bun process. It is off by default.
+`codemode` batches independent tool calls into one model round trip and keeps intermediate results in a per-session Bun process. It is off by default.
 
 ## Configuration and eligibility
 
@@ -12,7 +12,7 @@ In the host-stage `typeclaw.json`:
 
 ```json
 {
-  "eval": {
+  "codemode": {
     "enabled": true,
     "origins": ["subagent", "cron"]
   }
@@ -21,9 +21,9 @@ In the host-stage `typeclaw.json`:
 
 The whole block is restart-required. Omitting `origins` permits all named origins: `tui`, `channel`, `cron`, `subagent`, and `system`. An empty list enables none. An unspecified session origin is excluded.
 
-Configuration is necessary but not sufficient. The session must already expose **unrestricted bash**. A session without active `bash`, or with a `bashPolicy` command fence, never gets `eval`. This comes from the same policy passed to the bash wrapper, not subagent names. In particular, the reviewer remains excluded even when `subagent` is enabled or the reviewer is renamed.
+Configuration is necessary but not sufficient. The session must already expose **unrestricted bash**. A session without active `bash`, or with a `bashPolicy` command fence, never gets `codemode`. This comes from the same policy passed to the bash wrapper, not subagent names. In particular, the reviewer remains excluded even when `subagent` is enabled or the reviewer is renamed.
 
-Raw JavaScript has native filesystem and subprocess capabilities, just like arbitrary bash. A command allowlist cannot constrain those APIs. The reviewer coverage loss is intentional in v1; eval does not bypass or remove its read-only fence.
+Raw JavaScript has native filesystem and subprocess capabilities, just like arbitrary bash. A command allowlist cannot constrain those APIs. The reviewer coverage loss is intentional in v1; codemode does not bypass or remove its read-only fence.
 
 ## Cells
 
@@ -46,7 +46,7 @@ const bodies = await parallel(files.map((f) => () => tool.read({ path: f })))
 for (const [i, b] of bodies.entries()) print(files[i], text(b, 1500))
 ```
 
-Independent reads alone gain nothing from a cell; the model already issues those as parallel tool calls in one step. The prompt hint (`EVAL_PROMPT_HINT` in `src/eval/tool.ts`) steers toward the filtering and dependent-chain cases.
+Independent reads alone gain nothing from a cell; the model already issues those as parallel tool calls in one step. The prompt hint (`CODEMODE_PROMPT_HINT` in `src/codemode/tool.ts`) steers toward the filtering and dependent-chain cases.
 
 Top-level bindings, including awaited declarations, persist between cells. A cell that throws or rejects (including a failed tool call) reports its error but keeps the kernel and its bindings; only timeouts, cancellation, process death, and authority changes replace the kernel. Top-level `const` and `let` run as `var`, so a later cell can reuse a name such as `const [a, b] = ...` instead of failing with a duplicate-declaration error. The helper names (`tool`, `parallel`, `print`, `text`, `display`, `console`) cannot be declared at top level: that `var` would replace the helper for the rest of the session, so such a cell is refused before it runs and the kernel keeps its bindings. Declarations inside functions still shadow normally. Use `await import(...)` for imports. `print(...)`, `display(...)`, and console output produce bounded text output. `text(result, maxChars = 2000)` extracts just the text parts of a tool result; print that rather than whole result objects, whose content arrays and details would otherwise land in the transcript. Tool results remain normal `{ content, details }` objects; image data is not automatically displayed. Unprinted intermediate values stay out of the model transcript; everything printed enters it, so output past 16 KiB ends with a notice to filter in the cell, and the truncation notice gives the same advice.
 
@@ -54,22 +54,22 @@ Top-level bindings, including awaited declarations, persist between cells. A cel
 
 ## Boundary and routing
 
-The container-stage kernel is a child process, never an in-process eval in the trusted agent runtime. Both bash and eval use `prepareBashSandbox` in `src/agent/bash-sandbox.ts`. It resolves the same:
+The container-stage kernel is a child process, never an in-process `eval` in the trusted agent runtime. Both bash and codemode use `prepareBashSandbox` in `src/agent/bash-sandbox.ts`. It resolves the same:
 
 - role-derived hidden paths and canonical masks;
 - writable and protected zones through `buildBashFilesystemPolicy`;
 - operator `.env` exposure and withheld tiers through `buildSandboxEnvPolicy` and `resolveExposableEnvNames`;
 - session `/tmp`, dependency-bin protection, source mounts, and proc probes.
 
-The current role-scoped agent-messenger visibility is unchanged. Eval inherits the actual shared resolver; it does not introduce a separate credential policy.
+The current role-scoped agent-messenger visibility is unchanged. Codemode inherits the actual shared resolver; it does not introduce a separate credential policy.
 
-Eval leaves the network namespace isolated. Network operations use wrapped tools such as `tool.bash` or `tool.web_fetch`. The bridge uses framed JSON lines on stdio, not loopback HTTP. The host validates each discriminated message before use, checks the active cell and unique call ID, and bounds framing, concurrency, and call count. Frames are untrusted; knowing the frame format grants no extra tool authority.
+Codemode leaves the network namespace isolated. Network operations use wrapped tools such as `tool.bash` or `tool.web_fetch`. The bridge uses framed JSON lines on stdio, not loopback HTTP. The host validates each discriminated message before use, checks the active cell and unique call ID, and bounds framing, concurrency, and call count. Frames are untrusted; knowing the frame format grants no extra tool authority.
 
-`src/eval/dispatch.ts` selects from the **final budget-wrapped tool definitions** passed to the session by `src/agent/index.ts`. It rechecks live active names, uses Pi's direct-call argument validator, and invokes that exact definition with the cell's cancellation signal. Permission hooks, live role resolution, security guards, file pinning, loop detection, result caps, and the bash sandbox therefore remain on the call path. Ordinary active plugin tools are supported.
+`src/codemode/dispatch.ts` selects from the **final budget-wrapped tool definitions** passed to the session by `src/agent/index.ts`. It rechecks live active names, uses Pi's direct-call argument validator, and invokes that exact definition with the cell's cancellation signal. Permission hooks, live role resolution, security guards, file pinning, loop detection, result caps, and the bash sandbox therefore remain on the call path. Ordinary active plugin tools are supported.
 
 These calls are refused inside a cell and must remain separate model-visible actions:
 
-- `eval` recursion;
+- `codemode` recursion;
 - `spawn_subagent`, `coding_agent`, and `subagent_cancel`;
 - channel send/reply/edit/react/handoff/disengage, `post_github_review`, and `skip_response`;
 - `restart`, `reload`, and `grant_role`;
@@ -94,6 +94,6 @@ Before every cell, sandbox preparation runs again. A principal or audience chang
 
 ## Tests and release
 
-`src/eval/` contains protocol, output-limit, real-process kernel, wrapped-dispatch, configuration, and actual session-registration tests. `sandbox.test.ts` uses real bwrap for raw `fs`, `Bun.file`, subprocess reads, environment withholding, normal reads, batching, timeout recovery, and authority changes. Those tests skip on non-Linux hosts or when bwrap is absent; they do not replace isolation with mocks.
+`src/codemode/` contains protocol, output-limit, real-process kernel, wrapped-dispatch, configuration, and actual session-registration tests. `sandbox.test.ts` uses real bwrap for raw `fs`, `Bun.file`, subprocess reads, environment withholding, normal reads, batching, timeout recovery, and authority changes. Those tests skip on non-Linux hosts or when bwrap is absent; they do not replace isolation with mocks.
 
 The new tool and configuration block are public surfaces and meet the release minor trigger.
