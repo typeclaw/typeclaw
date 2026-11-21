@@ -27,6 +27,8 @@ Brokered Claude Code and Codex runs use the existing background `operator` and c
 2. Cron with a `subagent` field → `target: { kind: 'new-session' }` → `SubagentConsumer` → `invokeSubagent`. The Stream path exists so the scheduler doesn't need to import the registry.
 3. `startSubagent` wraps `invokeSubagent` with a live handle and completion result for sync/background tool spawns. Background completions publish `subagent.completed`; failed runs can carry a captured final message as recoverable output without changing the failed lifecycle status.
 
+The TUI server and the channel completion bridge turn `subagent.completed` into a reminder for their live parent session. Cron prompt sessions and drain-capable subagents have no such listener, so they run `runSubagentDrain` (`src/agent/subagent-drain.ts`) after their turn: they re-prompt with each background child's reminder, and are disposed only once no child is running or undelivered. A child that never settles is abandoned after `DRAIN_MAX_CHILD_WAIT_MS`, or after its own declared `timeoutMs` plus a short grace when that is longer. A failed reminder turn fails the cron run.
+
 Production registry is built from plugin contributions. The bundled memory plugin is auto-loaded and contributes `memory-logger` + `dreaming`. Each plugin `Subagent` may declare `inFlightKey(payload)`; dispatch uses `${parentSessionId}:${name}:${key}` when a trusted parent exists and `${name}:${key}` for parentless scheduler work. `payloadSchema` is validated by the cron loader at parse time and on every `reloadAll()`.
 
 ### Background result continuity
