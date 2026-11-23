@@ -29,6 +29,7 @@ import { detectReviewDismissal } from './gh-review-detect'
 import { ensureGitAskPassHelper, resolveSandboxGitAskPassPath } from './git-askpass'
 import {
   appendGitAuthDiagnostic,
+  appendUnbrokeredGhHint,
   appendUnbrokeredGitHint,
   createGitAuthLoginResolver,
   type GitAuthCredential,
@@ -105,7 +106,10 @@ export default definePlugin({
     // tool wrapper rejects after tool.before never reaches tool.after, so the map is
     // capped and drops its oldest entries. The value records whether the command
     // reads several repos, which no single repo token can fund.
-    const unbrokeredGitCalls = new Map<string, { multiRepo: boolean }>()
+    const unbrokeredGitCalls = new Map<string, { multiRepo: boolean; command: string }>()
+    // The gh counterpart: under App auth a passed-through gh has no token, and gh's
+    // "gh auth login" / "not logged in" output reads as missing GitHub access.
+    const unbrokeredGhCalls = new Set<string>()
     const UNBROKERED_GIT_CALLS_CAP = 256
 
     // Every model-driven bash masks the canonical credential files. A role may
@@ -452,6 +456,13 @@ export default definePlugin({
           event.args[TYPECLAW_INTERNAL_BASH_ENV] = { ...overlay, ...patOverlay }
         }
         if (usesGhApiGraphqlEndpoint(command)) passThroughGraphqlCommands.set(event.callId, command)
+        else if (patOverlay === undefined && hasAppTokenResolver() && hasGhInvocation(command)) {
+          unbrokeredGhCalls.add(event.callId)
+          for (const callId of unbrokeredGhCalls) {
+            if (unbrokeredGhCalls.size <= UNBROKERED_GIT_CALLS_CAP) break
+            unbrokeredGhCalls.delete(callId)
+          }
+        }
         return 'fall-through'
       }
 
@@ -557,7 +568,7 @@ export default definePlugin({
       if (decision.kind === 'pass-through') {
         // Only App auth funds standalone reads, so only there is "run it standalone" true advice.
         if (hasAppTokenResolver()) {
-          unbrokeredGitCalls.set(event.callId, { multiRepo: decision.multiRepo === true })
+          unbrokeredGitCalls.set(event.callId, { multiRepo: decision.multiRepo === true, command })
           for (const callId of unbrokeredGitCalls.keys()) {
             if (unbrokeredGitCalls.size <= UNBROKERED_GIT_CALLS_CAP) break
             unbrokeredGitCalls.delete(callId)
@@ -756,6 +767,7 @@ export default definePlugin({
           const unbrokered = unbrokeredGitCalls.get(event.callId)
           unbrokeredGitCalls.delete(event.callId)
           if (unbrokered !== undefined && event.tool === 'bash') appendUnbrokeredGitHint(event.result, unbrokered)
+          if (unbrokeredGhCalls.delete(event.callId) && event.tool === 'bash') appendUnbrokeredGhHint(event.result)
           const graphqlCommand = passThroughGraphqlCommands.get(event.callId)
           passThroughGraphqlCommands.delete(event.callId)
           checkGraphqlAuthNudge({ tool: event.tool, command: graphqlCommand, result: event.result })
