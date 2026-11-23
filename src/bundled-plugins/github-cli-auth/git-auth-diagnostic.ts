@@ -61,10 +61,18 @@ const UNBROKERED_MULTI_REPO_GIT_HINT =
   'is missing. Fetch each remote in its own command, such as `git -C <dir> fetch origin` and then ' +
   '`git -C <dir> fetch upstream`.'
 
-export function appendUnbrokeredGitHint(result: ToolResult, options: { multiRepo: boolean }): void {
-  // Only authoritative status counts: the tool wrapper reports a failed bash as
-  // details.error, while a successful `cat` of an old log can print the same text.
-  if (structuredFailure(result) !== true) return
+// A git remote step anywhere in the command: `git` in command position (after a
+// separator or subshell opener, optional env assignments) and a remote verb as its
+// subcommand, past `-C <dir>`/`-c <k=v>` and long global flags. A failing
+// `git fetch ... | tail` or `git pull ...; ls` exits 0, so the exit status alone
+// would hide the failure; `cat git-fetch.log` never matches.
+const GIT_REMOTE_OPERATION =
+  /(?:^|[;&|\n(`]|\b(?:then|do|else)\s)\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*git(?:\s+(?:-[Cc]\s+\S+|--\S+))*\s+(?:push|fetch|pull|clone|ls-remote)(?=\s|$|[;&|)])/
+
+export function appendUnbrokeredGitHint(result: ToolResult, options: { multiRepo: boolean; command: string }): void {
+  // A successful `cat` of an old log can print the same text, so a zero exit (bash
+  // reports no details) counts only when the command itself ran a git remote step.
+  if (structuredFailure(result) !== true && !GIT_REMOTE_OPERATION.test(options.command)) return
   const text = resultText(result)
   if (GITHUB_LOGIN_PROMPT_FAILURE.test(text)) {
     result.content.push({
@@ -72,6 +80,22 @@ export function appendUnbrokeredGitHint(result: ToolResult, options: { multiRepo
       text: options.multiRepo ? UNBROKERED_MULTI_REPO_GIT_HINT : UNBROKERED_GIT_HINT,
     })
   }
+}
+
+// gh's own messages when it has no credential: the prompt every command prints, and
+// `gh auth status` reporting no logged-in host. A bare mention of `gh auth login`
+// (help text, a grep of docs) is not one.
+const GH_NO_CREDENTIAL_OUTPUT = /To get started with GitHub CLI, please run|You are not logged into any GitHub hosts/
+
+const UNBROKERED_GH_HINT =
+  '[github-cli-auth:ghCredential] TypeClaw gave this gh command no GitHub credential, so gh reported that it ' +
+  'is not logged in. This does not mean GitHub access is missing. This agent uses GitHub App auth: TypeClaw mints ' +
+  'a per-repo token only for a single bare repo-targeting gh command, such as `gh repo view owner/repo` or ' +
+  '`gh api /repos/owner/repo/...`. `gh auth status` and repo-less commands always run without one, so they are ' +
+  'not an access check. Run the repo-targeting gh command by itself.'
+
+export function appendUnbrokeredGhHint(result: ToolResult): void {
+  if (GH_NO_CREDENTIAL_OUTPUT.test(resultText(result))) result.content.push({ type: 'text', text: UNBROKERED_GH_HINT })
 }
 
 function resultText(result: ToolResult): string {

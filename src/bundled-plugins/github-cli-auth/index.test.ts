@@ -730,6 +730,101 @@ describe('github-cli-auth plugin', () => {
     expect(result.content).toEqual([{ type: 'text', text: GIT_LOGIN_FAILURE }])
   })
 
+  // A zero-exit bash result carries no details, which is the shape these use.
+  test('App auth: a tokenless gh that reports no login gets the gh credential hint, even with exit 0', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('gh auth status 2>&1 | head -5')
+    const result = {
+      content: [
+        { type: 'text' as const, text: 'You are not logged into any GitHub hosts. To log in, run: gh auth login' },
+      ],
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content[1]?.text).toContain('[github-cli-auth:ghCredential]')
+  })
+
+  test('App auth: a minted gh whose output mentions gh auth login gets no gh credential hint', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('gh issue view 1 -R acme/widgets')
+    const result = { content: [{ type: 'text' as const, text: 'docs: explain when to run gh auth login' }] }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content).toHaveLength(1)
+  })
+
+  test('App auth: a passed-through gh whose output only mentions gh auth login gets no gh credential hint', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent("gh auth status --help; grep -F 'gh auth login' docs/setup.md")
+    const result = { content: [{ type: 'text' as const, text: 'Run `gh auth login` once on the host.' }] }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content).toHaveLength(1)
+  })
+
+  test('no GitHub auth configured: gh reporting no login is left alone (it is the truth)', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'), false)
+    const event = bashEvent('gh auth status')
+    const result = {
+      content: [
+        { type: 'text' as const, text: 'You are not logged into any GitHub hosts. To log in, run: gh auth login' },
+      ],
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content).toHaveLength(1)
+  })
+
+  test('App auth: a tokenless git remote step whose failure a pipeline hides still gets the git hint', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('git -C /tmp/x pull --ff-only origin main 2>&1 | tail -3')
+    const result = {
+      content: [
+        { type: 'text' as const, text: "fatal: could not read Username for 'https://github.com': No such device" },
+      ],
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content[1]?.text).toContain('[github-cli-auth:gitCredential]')
+  })
+
+  test('App auth: a successful read of a saved git-fetch log gets no git hint', async () => {
+    delete process.env.GH_TOKEN
+    delete process.env.GITHUB_TOKEN
+    const { before, after } = await hooksFor(tokenResolver('ghs_minted'))
+    const event = bashEvent('cat git-fetch.log')
+    const result = {
+      content: [
+        { type: 'text' as const, text: "fatal: could not read Username for 'https://github.com': No such device" },
+      ],
+    }
+
+    expect(await before(event, hookCtx)).toBeUndefined()
+    await after({ tool: 'bash', sessionId: 's', callId: 'c', result } satisfies ToolAfterEvent, hookCtx)
+
+    expect(result.content).toHaveLength(1)
+  })
+
   test('App auth: a graphql call with -R is minted and its output is left alone', async () => {
     delete process.env.GH_TOKEN
     delete process.env.GITHUB_TOKEN
