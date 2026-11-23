@@ -72,6 +72,12 @@ describe('toSlackMrkdwn', () => {
       expect(toSlackMrkdwn('[Wiki](<https://example.com/Foo_(bar)>)')).toBe('<https://example.com/Foo_(bar)|Wiki>')
     })
 
+    it('percent-encodes spaces in an angle-bracket destination', () => {
+      expect(toSlackMrkdwn('[Report](<https://example.com/Q4 Report%E2%80%93final.pdf?a=1&b=2>)')).toBe(
+        '<https://example.com/Q4%20Report%E2%80%93final.pdf?a=1&b=2|Report>',
+      )
+    })
+
     it('leaves an autolink-style bare url untouched', () => {
       expect(toSlackMrkdwn('see https://example.com now')).toBe('see https://example.com now')
     })
