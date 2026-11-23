@@ -62,6 +62,16 @@ describe('toSlackMrkdwn', () => {
       expect(toSlackMrkdwn('[**Docs**](https://example.com)')).toBe('<https://example.com|*Docs*>')
     })
 
+    it('drops the delimiters of an angle-bracket destination', () => {
+      expect(toSlackMrkdwn('[Doc](<https://example.com/a?x=1&range=A1:B2>) · [Sheet](<https://example.com/b>)')).toBe(
+        '<https://example.com/a?x=1&range=A1:B2|Doc> · <https://example.com/b|Sheet>',
+      )
+    })
+
+    it('keeps parentheses inside an angle-bracket destination', () => {
+      expect(toSlackMrkdwn('[Wiki](<https://example.com/Foo_(bar)>)')).toBe('<https://example.com/Foo_(bar)|Wiki>')
+    })
+
     it('leaves an autolink-style bare url untouched', () => {
       expect(toSlackMrkdwn('see https://example.com now')).toBe('see https://example.com now')
     })
