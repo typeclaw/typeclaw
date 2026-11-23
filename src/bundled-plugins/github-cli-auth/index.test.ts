@@ -1340,6 +1340,44 @@ describe('github-cli-auth plugin', () => {
   })
 })
 
+test('App auth: a selector-less gh in a subshell is told to run gh as a single bare command', async () => {
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  const hook = await hookFor(tokenResolver('ghs_minted'))
+
+  const result = await hook(githubOriginBashEvent('(gh repo view)', 'acme/widgets'), hookCtx)
+
+  expect(result).toMatchObject({ block: true })
+  expect((result as { reason: string }).reason).toContain('Run each gh as its own single bare command')
+})
+
+test('App auth: a redirection before -R never swaps the explicit repo for the session repo', async () => {
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  const hook = await hookFor(tokenResolver('ghs_minted'))
+
+  for (const command of ['gh pr view 12 2>&1 -R acme/widgets', 'gh pr view 12 >|view.json -R acme/widgets']) {
+    const result = await hook(githubOriginBashEvent(command, 'acme/other'), hookCtx)
+
+    expect(result).toMatchObject({ block: true })
+    expect((result as { reason: string }).reason).not.toContain('acme/other')
+  }
+})
+
+test('App auth: a substitution argument never swaps the explicit repo for the session repo', async () => {
+  delete process.env.GH_TOKEN
+  delete process.env.GITHUB_TOKEN
+  const hook = await hookFor(tokenResolver('ghs_minted'))
+
+  const result = await hook(
+    githubOriginBashEvent('gh repo view --json "$(cat fields.txt)" acme/widgets', 'acme/other'),
+    hookCtx,
+  )
+
+  expect(result).toMatchObject({ block: true })
+  expect((result as { reason: string }).reason).not.toContain('acme/other')
+})
+
 describe('github-cli-auth plugin — .env PAT role gating (gh path)', () => {
   test('PAT (sandboxed) + App minter: mints a per-repo App token instead of the withheld PAT', async () => {
     process.env.GH_TOKEN = 'ghp_classic'
