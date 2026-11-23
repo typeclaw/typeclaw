@@ -135,6 +135,96 @@ function isSingleBareGhCommand(command: string): boolean {
   return quote === null
 }
 
+// tokenize() only sees a `gh` at a plain command position. A `gh` run inside a subshell,
+// group, or command/process substitution (`(gh ...)`, `{ gh ...; }`, `$(gh ...)`,
+// `<(gh ...)`, backticks, also inside double quotes) would pass through with no token,
+// and gh's "gh auth login" prompt reads as missing GitHub access. This finds one so
+// the command gets the composition block instead. It only adds that block: argument
+// parsing stays with tokenize(). A `gh` with no argument after the opener is skipped,
+// which keeps `case` patterns like `(gh|git)` and `gh)` out.
+function passThroughUnlessNestedGh(command: string): GhCommandDecision {
+  return containsNestedGhInvocation(command)
+    ? { kind: 'block', code: 'composition', reason: COMPOSITION_REASON }
+    : { kind: 'pass-through' }
+}
+
+const NESTED_GH_WITH_ARGUMENT = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*gh[ \t]+[^\s|&;)]/
+
+function containsNestedGhInvocation(command: string): boolean {
+  const ghAt = (index: number): boolean => NESTED_GH_WITH_ARGUMENT.test(command.slice(index))
+  let quote: '"' | "'" | null = null
+  // Each open `(` or backtick, with the quote to resume when it closes: a substitution
+  // inside double quotes has its own quoting, so `"$(sed 's/x/$(gh ...)/')"` is literal.
+  // A `)` that closes a plain `(`, or none at all, ends a `case` pattern (`gh)`,
+  // `(gh|git)`), so its arm body is a command; after `$(...)` a word is an argument.
+  const frames: Array<{ close: ')' | '`'; plain: boolean; resume: '"' | null }> = []
+  const open = (close: ')' | '`', plain: boolean): void => {
+    frames.push({ close, plain, resume: quote === '"' ? '"' : null })
+    quote = null
+  }
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    const previous = command[i - 1] ?? ''
+    if (quote === "'") {
+      if (ch === "'") quote = null
+      continue
+    }
+    if (ch === '\\') {
+      i += 1
+      continue
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null
+      else if (ch === '`') {
+        if (ghAt(i + 1)) return true
+        open('`', false)
+      } else if (ch === '$' && command[i + 1] === '(') {
+        if (ghAt(i + 2)) return true
+        i += 1
+        open(')', false)
+      }
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      continue
+    }
+    // A `#` that starts a word, including right after an unescaped operator, comments
+    // out the rest of the line.
+    if (ch === '#' && (i === 0 || /\s/.test(previous) || (/[;&|()]/.test(previous) && command[i - 2] !== '\\'))) {
+      while (i + 1 < command.length && command[i + 1] !== '\n') i++
+      continue
+    }
+    const frame = frames.at(-1)
+    if (ch === '`' && frame?.close === '`') {
+      frames.pop()
+      quote = frame.resume
+      continue
+    }
+    if (ch === ')') {
+      if (frame?.close === ')') {
+        frames.pop()
+        quote = frame.resume
+        if (frame.plain && ghAt(i + 1)) return true
+      } else if (ghAt(i + 1)) return true
+      continue
+    }
+    // A lone `&` backgrounds the command before it; `&&`, `2>&1`, and `&>` do not.
+    if (ch === '&' && !/[&<>]/.test(previous) && !/[&>]/.test(command[i + 1] ?? '') && ghAt(i + 1)) return true
+    if (ch === '`' || ch === '(') {
+      if (ghAt(i + 1) && !(ch === '(' && previous === '=')) return true
+      // `arr=(...)` is an array literal, not a subshell.
+      open(ch === '`' ? '`' : ')', ch === '(' && !/[$<>=]/.test(previous))
+      continue
+    }
+    // `{` opens a group only as its own word.
+    if (ch === '{' && (i === 0 || /[\s;&|(]/.test(previous)) && /\s/.test(command[i + 1] ?? '') && ghAt(i + 1)) {
+      return true
+    }
+  }
+  return false
+}
+
 function containsUnquotedPathnameExpansion(command: string): boolean {
   let quote: '"' | "'" | null = null
   for (const ch of command) {
@@ -198,7 +288,7 @@ export function analyzeGhCommand(command: string, fallbackRepo?: string): GhComm
   }
   const tokens = tokenize(command)
   const ghStarts = findGhInvocations(tokens)
-  if (ghStarts.length === 0) return { kind: 'pass-through' }
+  if (ghStarts.length === 0) return passThroughUnlessNestedGh(command)
   if (containsUnquotedPathnameExpansion(command)) {
     return { kind: 'block', code: 'pathname-expansion', reason: PATHNAME_EXPANSION_REASON }
   }
@@ -225,7 +315,7 @@ export function analyzeGhCommand(command: string, fallbackRepo?: string): GhComm
     }
   }
 
-  if (repoSlugs.length === 0) return { kind: 'pass-through' }
+  if (repoSlugs.length === 0) return passThroughUnlessNestedGh(command)
   const owners = new Set(repoSlugs.map((slug) => slug.split('/')[0]))
   if (owners.size > 1) return { kind: 'block', code: 'multi-owner', reason: MULTI_OWNER_REASON }
 
