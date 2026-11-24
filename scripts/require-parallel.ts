@@ -1,6 +1,6 @@
 // Preloaded by bunfig.toml `[test] preload` to deny `bun test` without
-// --parallel. The default timeout belongs in bunfig.toml, not this preload,
-// so an explicit CLI --timeout keeps its normal precedence.
+// --parallel. The default timeout belongs in scripts/test.ts, not this
+// preload, so an explicit CLI --timeout keeps its normal precedence.
 //
 // Why deny serial runs: Serial runs are ~3.4x slower (44s → 13s, see commit
 // 1c66d5e), and Bun has no bunfig knob for the flag yet (verified against
