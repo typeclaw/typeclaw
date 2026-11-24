@@ -11,7 +11,7 @@ import {
 import { applyTurnThinkingLevel, getQuestionSignal, type QuestionSignal } from '@/agent/attention-escalation'
 import { runPluginDoctorChecks, runPluginDoctorFix } from '@/agent/doctor'
 import type { LiveSessionRegistry } from '@/agent/live-sessions'
-import type { LiveSubagentRegistry } from '@/agent/live-subagents'
+import { type LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
 import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
@@ -229,6 +229,15 @@ type SessionState = {
   // continuation reads state.
   todoOutcomeWrite: Promise<boolean>
   todoContinuation: { recordTurnOutcome: typeof recordTurnOutcome; runIdleContinuation: typeof runIdleContinuation }
+  // Start time of the newest background child this session spawned that is
+  // still running, or null. Todo continuation waits for a child spawned during
+  // the turn: its completion, not a nudge, is what resumes that work.
+  newestRunningChildStartedAt: () => number | null
+  // Start of the turn whose todo continuation is held for a running child, or
+  // null. Lets a settlement that publishes no completion reminder (a work-key
+  // cancellation) still resume the session once.
+  heldForChildSince: number | null
+  unsubChildSettle: Unsubscribe | null
   // Latest turn's usage, captured from `message_end` by forwardSessionEvents and
   // read at the `done` send site (which lives outside that subscriber). Reset at
   // each turn start so a turn with no usage event sends a plain `done`.
@@ -588,6 +597,14 @@ export function createServer({
               unsubTurnOutcome: null,
               todoOutcomeWrite: Promise.resolve(true),
               todoContinuation: { recordTurnOutcome: todoOutcomeWriter, runIdleContinuation: todoIdleContinuation },
+              newestRunningChildStartedAt: () =>
+                liveSubagentRegistry === undefined
+                  ? null
+                  : newestRunningBackgroundChildStartedAt(
+                      liveSubagentRegistry.list({ parentSessionId: sessionFileId }),
+                    ),
+              heldForChildSince: null,
+              unsubChildSettle: null,
               lastUsage: null,
               dispose,
             }
@@ -603,6 +620,16 @@ export function createServer({
 
             if (agentDir !== undefined) {
               state.unsubTurnOutcome = subscribeTurnOutcome(state, agentDir, logger)
+            }
+            if (agentDir !== undefined && liveSubagentRegistry !== undefined) {
+              state.unsubChildSettle = liveSubagentRegistry.subscribe((parentSessionId) => {
+                if (parentSessionId !== sessionFileId || state.heldForChildSince === null) return
+                // Deferred past the settling code: a child that completes publishes
+                // its completion reminder synchronously after settling, which queues
+                // the turn that resumes the work. Only a settlement that publishes
+                // nothing finds the session still idle here.
+                queueMicrotask(() => void resumeTodosAfterChildSettled(ws, state, agentDir, logger, stream))
+              })
             }
 
             liveSessionRegistry?.register({
@@ -928,6 +955,10 @@ export function createServer({
           // Do not run session.end/dispose while session creation or session.start is pending.
           await initializingSessions.get(ws)
           const state = sessionStates.get(ws)
+          // Before any await: a child settling during teardown must not resume a
+          // closing session's todos.
+          state?.unsubChildSettle?.()
+          if (state) state.heldForChildSince = null
           try {
             state?.unsubBroadcast?.()
             state?.unsubPrompts?.()
@@ -1197,6 +1228,8 @@ async function drain(
     while (state.drainQueue.length > 0) {
       const item = state.drainQueue.shift()
       if (!item) break
+      const turnStartedAt = Date.now()
+      state.heldForChildSince = null
       pushQueueState(ws, state)
       send(ws, { type: 'prompt_started', messageId: item.streamMessageId, text: item.text })
       // Only a prompt typed in the TUI is a new request; continuations,
@@ -1214,7 +1247,15 @@ async function drain(
         }).catch((err) => logger.error(`[server] ${state.sessionFileId}: todo turn-start failed: ${describeErr(err)}`))
       }
 
+      // The socket can close while turn setup is awaited; that session is being
+      // torn down, so no model request may start on it. Turn-start hooks that
+      // already ran still get their matching turn-end.
+      if (ws.readyState !== WebSocket.OPEN) break
       const retrievalContext = await fireTurnStart(item.text)
+      if (ws.readyState !== WebSocket.OPEN) {
+        await fireTurnEnd()
+        break
+      }
       state.lastUsage = null
       try {
         const turnText =
@@ -1270,6 +1311,12 @@ async function drain(
       if (state.drainQueue.length === 0) {
         if (!(await awaitLatestTodoOutcomeWrite(state))) {
           logger.warn(`[server] ${state.sessionFileId}: skipping todo continuation after failed outcome write`)
+        } else if ((state.newestRunningChildStartedAt() ?? -Infinity) >= turnStartedAt) {
+          // The pending todo is usually the work this child was spawned for, so a
+          // nudge now would only make the model poll for a result it cannot have
+          // yet. The child's completion reminder resumes the session.
+          logger.info(`[server] ${state.sessionFileId}: skipping todo continuation while background child runs`)
+          state.heldForChildSince = turnStartedAt
         } else if (state.drainQueue.length === 0) {
           await maybeContinueTodos(state, agentDir, logger)
         }
@@ -1315,6 +1362,25 @@ async function maybeContinueTodos(
   })
   state.todoOutcomeWrite = decision
   await decision
+}
+
+// Runs the continuation decision a held turn skipped, once its child settles
+// without a completion reminder taking over.
+async function resumeTodosAfterChildSettled(
+  ws: Ws,
+  state: SessionState,
+  agentDir: string,
+  logger: ServerLogger,
+  stream: Stream | undefined,
+): Promise<void> {
+  const heldSince = state.heldForChildSince
+  if (heldSince === null || ws.readyState !== WebSocket.OPEN) return
+  if (state.draining || state.drainQueue.length > 0) return
+  if ((state.newestRunningChildStartedAt() ?? -Infinity) >= heldSince) return
+  state.heldForChildSince = null
+  await maybeContinueTodos(state, agentDir, logger)
+  if (ws.readyState !== WebSocket.OPEN) return
+  if (state.drainQueue.length > 0) void drain(ws, state, agentDir, logger, stream)
 }
 
 function describeErr(err: unknown): string {
