@@ -3,7 +3,7 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { type ContinuationLimits, DEFAULT_CONTINUATION_LIMITS, decideContinuation } from './continuation-policy'
 import { consumeRestartKickSuppression, readContinuationState, writeContinuationState } from './continuation-state'
 import { resolveTodoScope, type TodoScope } from './scope'
-import { readTodos } from './store'
+import { readTodoList } from './store'
 
 export const TODO_CONTINUATION_SOURCE = 'todo-continuation'
 
@@ -54,10 +54,10 @@ export async function maybeInjectContinuation(args: MaybeInjectContinuationArgs)
   const limits = args.limits ?? DEFAULT_CONTINUATION_LIMITS
   const newEpisodeId = args.newEpisodeId ?? (() => crypto.randomUUID())
 
-  const todos = await readTodos(args.agentDir, scope)
+  const { todos, updatedAt } = await readTodoList(args.agentDir, scope)
   const state = await readContinuationState(args.agentDir, scope)
 
-  const decision = decideContinuation({ state, todos, limits, now, newEpisodeId })
+  const decision = decideContinuation({ state, todos, listUpdatedAt: updatedAt, limits, now, newEpisodeId })
 
   if (decision.kind === 'skip') {
     if (state.suppressNextIdleNudgeReason !== null) {

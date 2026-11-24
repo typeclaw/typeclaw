@@ -6,12 +6,17 @@ export const DEFAULT_MAX_AUTO_TURNS = 3
 export const DEFAULT_MAX_CUMULATIVE_TOKENS = 20_000
 export const DEFAULT_MAX_WALL_CLOCK_MS = 30 * 60_000
 export const DEFAULT_STAGNATION_LIMIT = 2
+// Nearly every list that gets worked again is touched within an hour of its
+// last write; a list left untouched for days is abandoned, and nudging it would
+// revive old work in a conversation that has moved on.
+export const DEFAULT_MAX_LIST_AGE_MS = 72 * 60 * 60_000
 
 export type ContinuationLimits = {
   maxAutoTurns: number
   maxCumulativeTokens: number
   maxWallClockMs: number
   stagnationLimit: number
+  maxListAgeMs: number
 }
 
 export const DEFAULT_CONTINUATION_LIMITS: ContinuationLimits = {
@@ -19,6 +24,7 @@ export const DEFAULT_CONTINUATION_LIMITS: ContinuationLimits = {
   maxCumulativeTokens: DEFAULT_MAX_CUMULATIVE_TOKENS,
   maxWallClockMs: DEFAULT_MAX_WALL_CLOCK_MS,
   stagnationLimit: DEFAULT_STAGNATION_LIMIT,
+  maxListAgeMs: DEFAULT_MAX_LIST_AGE_MS,
 }
 
 // A continuation episode is the unit a budget applies to. It opens when the
@@ -199,6 +205,7 @@ export type ContinuationDecision =
 
 export type ContinuationSkipReason =
   | 'no-incomplete-todos'
+  | 'stale-list'
   | 'restart-kick-suppressed'
   | 'user-abort-blocked'
   | 'turn-not-safe'
@@ -216,13 +223,20 @@ export type ContinuationSkipReason =
 export function decideContinuation(args: {
   state: ContinuationState
   todos: readonly Todo[]
+  // When the list was last written; null for a list with no recorded write
+  // time, which is treated as stale.
+  listUpdatedAt: number | null
   limits: ContinuationLimits
   now: number
   newEpisodeId: () => string
 }): ContinuationDecision {
-  const { state, todos, limits, now } = args
+  const { state, todos, listUpdatedAt, limits, now } = args
 
   if (incompleteTodos(todos).length === 0) return { kind: 'skip', reason: 'no-incomplete-todos' }
+
+  if (listUpdatedAt === null || now - listUpdatedAt >= limits.maxListAgeMs) {
+    return { kind: 'skip', reason: 'stale-list' }
+  }
 
   if (state.suppressNextIdleNudgeReason === 'restart-kick') {
     return { kind: 'skip', reason: 'restart-kick-suppressed' }

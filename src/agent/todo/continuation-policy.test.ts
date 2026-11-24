@@ -22,8 +22,8 @@ function baseState(overrides: Partial<ContinuationState> = {}): ContinuationStat
   return { ...emptyContinuationState(), lastTurnOutcome: STOP, ...overrides }
 }
 
-function decide(state: ContinuationState, todos: Todo[] = INCOMPLETE, now = 2000) {
-  return decideContinuation({ state, todos, limits: DEFAULT_CONTINUATION_LIMITS, now, newEpisodeId })
+function decide(state: ContinuationState, todos: Todo[] = INCOMPLETE, now = 2000, listUpdatedAt: number | null = now) {
+  return decideContinuation({ state, todos, listUpdatedAt, limits: DEFAULT_CONTINUATION_LIMITS, now, newEpisodeId })
 }
 
 describe('hashIncomplete', () => {
@@ -287,6 +287,17 @@ describe('decideContinuation', () => {
       },
     })
     expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-auto-turns' })
+  })
+
+  test('skips a list untouched for longer than the age limit', () => {
+    const now = 10 * DEFAULT_CONTINUATION_LIMITS.maxListAgeMs
+    const old = now - DEFAULT_CONTINUATION_LIMITS.maxListAgeMs
+    expect(decide(baseState(), INCOMPLETE, now, old)).toEqual({ kind: 'skip', reason: 'stale-list' })
+    expect(decide(baseState(), INCOMPLETE, now, old + 1).kind).toBe('inject')
+  })
+
+  test('treats a list with no recorded write time as stale', () => {
+    expect(decide(baseState(), INCOMPLETE, 2000, null)).toEqual({ kind: 'skip', reason: 'stale-list' })
   })
 
   test('skips a turn that delivered a message after its last todo_write', () => {
