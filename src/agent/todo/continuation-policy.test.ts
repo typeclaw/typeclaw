@@ -143,6 +143,13 @@ describe('parseContinuationState (fail-closed validation)', () => {
     expect(parseContinuationState(state).lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'length', endedAt: 1 })
   })
 
+  test('the delivered-after-todo-write flag round-trips and a non-true value is dropped', () => {
+    const flagged = { lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, deliveredAfterTodoWrite: true } }
+    expect(parseContinuationState(flagged).lastTurnOutcome?.deliveredAfterTodoWrite).toBe(true)
+    const bogus = { lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, deliveredAfterTodoWrite: 'yes' } }
+    expect(parseContinuationState(bogus).lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'stop', endedAt: 1 })
+  })
+
   test('an unknown suppressor value is dropped', () => {
     const corrupt = { suppressNextIdleNudgeReason: 'something-else' }
     expect(parseContinuationState(corrupt).suppressNextIdleNudgeReason).toBeNull()
@@ -280,6 +287,15 @@ describe('decideContinuation', () => {
       },
     })
     expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-auto-turns' })
+  })
+
+  test('skips a turn that delivered a message after its last todo_write', () => {
+    const state = baseState({ lastTurnOutcome: { ...STOP, deliveredAfterTodoWrite: true } })
+    expect(decide(state)).toEqual({ kind: 'skip', reason: 'delivered-after-todo-write' })
+  })
+
+  test('still nudges a turn that stopped silently with work left', () => {
+    expect(decide(baseState()).kind).toBe('inject')
   })
 
   test('skips at the token ceiling', () => {

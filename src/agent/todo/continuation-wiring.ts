@@ -73,6 +73,21 @@ export async function recordTurnOutcome(args: {
   await writeContinuationState(args.agentDir, scope, onTurnOutcome(state, outcome))
 }
 
+// Mark the recorded outcome as a turn that handed output back to the person.
+// Called at idle rather than when the outcome is written, because a channel
+// turn can still deliver its final prose after its last assistant message
+// ends. No-op for scopeless origins or before any outcome exists.
+export async function recordTurnHandBack(args: { agentDir: string; origin: SessionOrigin }): Promise<void> {
+  const scope = resolveTodoScope(args.origin)
+  if (scope === null) return
+  const state = await readContinuationState(args.agentDir, scope)
+  if (state.lastTurnOutcome === null) return
+  await writeContinuationState(args.agentDir, scope, {
+    ...state,
+    lastTurnOutcome: { ...state.lastTurnOutcome, deliveredAfterTodoWrite: true },
+  })
+}
+
 // Reset the continuation episode at the start of a REAL user turn. Injected
 // continuation turns pass isRealUserTurn=false so the episode budget keeps
 // counting down. No-op for scopeless origins.

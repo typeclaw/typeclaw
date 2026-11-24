@@ -62,6 +62,14 @@ export type TurnOutcome = {
   // wakeup that happens to land inside an open episode, is not continuation
   // spend.
   continuationTurn?: true
+  // Set at idle when the channel turn delivered output (a message or a formal
+  // review) after its last todo_write (or, with no todo_write, at all) and that
+  // output did not renew a promise to keep working. Delivering output hands the
+  // turn back to the person;
+  // nudging after it mostly produced premature or repeated posts about work
+  // still waiting on something outside the turn. A silent stop is the case
+  // continuation exists for.
+  deliveredAfterTodoWrite?: true
 }
 
 export type ContinuationState = {
@@ -149,6 +157,7 @@ function parseOutcome(value: unknown): TurnOutcome | null {
     ...(o.termination === 'terminal-after-channel-reply' ? { termination: o.termination } : {}),
     ...(isFiniteNumber(o.tokens) ? { tokens: o.tokens } : {}),
     ...(o.continuationTurn === true ? { continuationTurn: true as const } : {}),
+    ...(o.deliveredAfterTodoWrite === true ? { deliveredAfterTodoWrite: true as const } : {}),
   }
 }
 
@@ -193,6 +202,7 @@ export type ContinuationSkipReason =
   | 'restart-kick-suppressed'
   | 'user-abort-blocked'
   | 'turn-not-safe'
+  | 'delivered-after-todo-write'
   | 'max-auto-turns'
   | 'max-tokens'
   | 'max-wall-clock'
@@ -235,6 +245,8 @@ export function decideContinuation(args: {
   ) {
     return { kind: 'skip', reason: 'turn-not-safe' }
   }
+
+  if (outcome.deliveredAfterTodoWrite === true) return { kind: 'skip', reason: 'delivered-after-todo-write' }
 
   const hash = hashIncomplete(todos)
   const base: ContinuationEpisode = state.episode ?? {
