@@ -20,8 +20,13 @@ import {
   type SubagentRegistry,
   startSubagent,
 } from '../subagents'
+import { resolveTodoScope } from '../todo/scope'
+import { incompleteTodos, readTodos } from '../todo/store'
 
 export const SPAWN_TASK_ID_PREFIX = 'bg_'
+
+export const SPAWN_TODO_REMINDER =
+  '[runtime note — not from a human] You started background work without a todo list. If anything remains to do after it finishes (collect results, report, follow up), call `todo_write` now with those steps so they survive a restart. Do not mention this note.'
 
 export type SpawnSubagentToolDetails =
   | {
@@ -490,13 +495,13 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
           sessionId: resolvedHandle.sessionId,
         }
         const baseText = `Spawned ${subagentName} in background. task_id=${taskId}. You will receive a system-reminder when it completes. Use subagent_output to check progress or fetch results.`
+        const parts = [
+          ...(overrideNote !== undefined ? [overrideNote] : []),
+          baseText,
+          ...((await lacksOpenTodos(agentDir, origin)) ? [SPAWN_TODO_REMINDER] : []),
+        ]
         return {
-          content: [
-            {
-              type: 'text' as const,
-              text: overrideNote !== undefined ? `${overrideNote}\n\n${baseText}` : baseText,
-            },
-          ],
+          content: [{ type: 'text' as const, text: parts.join('\n\n') }],
           details,
         }
       }
@@ -689,6 +694,23 @@ export function effectiveSpawnProfile(
   if (!parsed.success) return raw ?? subagent.profile
   const kept = (parsed.data as { profile?: unknown } | null | undefined)?.profile
   return typeof kept === 'string' && kept !== '' ? kept : subagent.profile
+}
+
+// Whether a background spawn should remind the caller to record what remains.
+// Delegated background work is the most common way a turn ends with steps still
+// owed, and those steps survive a restart only as todos. Sessions without a todo
+// scope (subagent, system) have nothing to write to; a list that already has
+// open items has already been written. The child is running by the time this
+// is asked, so an unreadable list skips the note rather than failing a launch
+// that succeeded.
+async function lacksOpenTodos(agentDir: string, origin: SessionOrigin | undefined): Promise<boolean> {
+  const scope = origin === undefined ? null : resolveTodoScope(origin)
+  if (scope === null) return false
+  try {
+    return incompleteTodos(await readTodos(agentDir, scope)).length === 0
+  } catch {
+    return false
+  }
 }
 
 // Resolve foreground vs background for a spawn, with the runtime free to

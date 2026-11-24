@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { z } from 'zod'
 
@@ -26,7 +29,9 @@ import type {
   Subagent,
   SubagentRegistry,
 } from '../subagents'
-import { createSpawnSubagentTool, resolveSpawnMode } from './spawn-subagent'
+import { resolveTodoScope } from '../todo/scope'
+import { type Todo, todoContentPath, writeTodos } from '../todo/store'
+import { createSpawnSubagentTool, resolveSpawnMode, SPAWN_TODO_REMINDER } from './spawn-subagent'
 import { createSubagentCancelTool } from './subagent-cancel'
 
 const ctx = {} as Parameters<ReturnType<typeof createSpawnSubagentTool>['execute']>[4]
@@ -2227,5 +2232,87 @@ describe('spawn_subagent GitHub review check', () => {
     } finally {
       checks.detach()
     }
+  })
+})
+
+describe('createSpawnSubagentTool — todo reminder on background spawns', () => {
+  async function backgroundSpawnText(
+    origin: SessionOrigin,
+    seed: Todo[] = [],
+    extra: { allowBackgroundFromSubagent?: boolean; run_in_foreground?: boolean; unreadableTodos?: boolean } = {},
+  ): Promise<string> {
+    const agentDir = await mkdtemp(join(tmpdir(), 'typeclaw-spawn-todo-'))
+    try {
+      const scope = resolveTodoScope(origin)
+      if (scope !== null && seed.length > 0) await writeTodos(agentDir, scope, seed)
+      // A directory where the scope's todo file belongs makes the read fail (EISDIR) on every platform.
+      if (extra.unreadableTodos === true && scope !== null)
+        await mkdir(todoContentPath(agentDir, scope), { recursive: true })
+      const tool = createSpawnSubagentTool({
+        registry: makeRegistry(),
+        liveRegistry: new LiveSubagentRegistry(),
+        createSessionForSubagent: async () => stubSession(),
+        agentDir,
+        parentSessionId: 'ses_parent',
+        getOrigin: () => origin,
+        generateTaskId: () => 'bg_todo1',
+        now: () => 1_000,
+        stream: createStream(),
+        ...(extra.allowBackgroundFromSubagent !== undefined
+          ? { allowBackgroundFromSubagent: extra.allowBackgroundFromSubagent }
+          : {}),
+      })
+      const result = await tool.execute(
+        'call_todo',
+        {
+          subagent_type: 'explorer',
+          prompt: '저장소 구조를 살펴봐 주세요.',
+          ...(extra.run_in_foreground !== undefined ? { run_in_foreground: extra.run_in_foreground } : {}),
+        },
+        undefined,
+        undefined,
+        ctx,
+      )
+      expect(result.details).toMatchObject({ ok: true, mode: 'background' })
+      return result.content[0]?.type === 'text' ? result.content[0].text : ''
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  }
+
+  const TUI: SessionOrigin = { kind: 'tui', sessionId: 'ses_parent' }
+
+  test('asks a session with no open todos to record what remains', async () => {
+    expect(await backgroundSpawnText(TUI)).toContain(SPAWN_TODO_REMINDER)
+  })
+
+  test('treats a list with only finished items as no list', async () => {
+    expect(await backgroundSpawnText(TUI, [{ content: 'done already', status: 'completed' }])).toContain(
+      SPAWN_TODO_REMINDER,
+    )
+  })
+
+  test('stays quiet when the session already tracks open todos', async () => {
+    const text = await backgroundSpawnText(TUI, [{ content: 'report the result', status: 'pending' }])
+    expect(text).toContain('in background')
+    expect(text).not.toContain(SPAWN_TODO_REMINDER)
+  })
+
+  test('an unreadable todo list skips the note and keeps the launch', async () => {
+    const text = await backgroundSpawnText(TUI, [], { unreadableTodos: true })
+    expect(text).toContain('in background')
+    expect(text).not.toContain(SPAWN_TODO_REMINDER)
+  })
+
+  test('stays quiet for a subagent, which owns no todo list', async () => {
+    const origin: SessionOrigin = {
+      kind: 'subagent',
+      subagent: 'planner',
+      parentSessionId: 'ses_parent',
+      spawnedByOrigin: TUI,
+    }
+    const text = await backgroundSpawnText(origin, [], { allowBackgroundFromSubagent: true, run_in_foreground: false })
+    expect(text).toContain('in background')
+    expect(text).not.toContain(SPAWN_TODO_REMINDER)
   })
 })
