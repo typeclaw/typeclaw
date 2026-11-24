@@ -16206,7 +16206,7 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     })
   })
 
-  test('preserves assistant token usage in the explicit terminal outcome', async () => {
+  test('preserves assistant output tokens in the explicit terminal outcome', async () => {
     const writes: Array<{ termination?: string; tokens?: number }> = []
     const { router, sessions } = makeRouter(await tempDir(), {
       recordTurnOutcome: async (args) => {
@@ -16221,7 +16221,7 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     const context = afterToolContext('channel_reply', { ok: true }, false)
     context.assistantMessage = {
       ...context.assistantMessage,
-      usage: { ...context.assistantMessage.usage, totalTokens: 73 },
+      usage: { ...context.assistantMessage.usage, output: 73, totalTokens: 40_073 },
     }
 
     await sessions[0]!.agent.afterToolCall!(context)

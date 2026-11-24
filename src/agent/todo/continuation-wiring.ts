@@ -26,17 +26,19 @@ export function classifyStopReason(raw: unknown): TurnOutcome['stopReason'] {
 
 // Extract the stopReason and token usage from a pi `message_end` event.
 // Returns null for any event that is not an assistant message_end. `tokens`
-// comes from the assistant message's `usage.totalTokens`; it is undefined when
-// the provider did not report usage.
+// is the assistant message's `usage.output`: the work the model did. Input and
+// cache counts re-bill the whole context on every request, so they track
+// context size and provider caching, not continuation cost. It is undefined
+// when the provider did not report usage.
 export function extractTurnUsage(event: unknown): { stopReason: TurnOutcome['stopReason']; tokens?: number } | null {
   if (typeof event !== 'object' || event === null) return null
   const e = event as { type?: unknown; message?: unknown }
   if (e.type !== 'message_end') return null
   const message = e.message as { role?: unknown; stopReason?: unknown; usage?: unknown } | undefined
   if (message?.role !== 'assistant') return null
-  const usage = message.usage as { totalTokens?: unknown } | undefined
-  const total = usage?.totalTokens
-  const tokens = typeof total === 'number' && Number.isFinite(total) ? total : undefined
+  const usage = message.usage as { output?: unknown } | undefined
+  const output = usage?.output
+  const tokens = typeof output === 'number' && Number.isFinite(output) ? output : undefined
   return { stopReason: classifyStopReason(message.stopReason), ...(tokens !== undefined ? { tokens } : {}) }
 }
 

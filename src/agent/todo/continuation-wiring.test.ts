@@ -12,6 +12,7 @@ import {
   clearAbortSuppressionForOrigin,
   clearTodosForOrigin,
   extractStopReason,
+  extractTurnUsage,
   recordTurnOutcome,
   recordTurnStart,
   runIdleContinuation,
@@ -52,6 +53,20 @@ describe('extractStopReason', () => {
 
   test('ignores non-message_end events', () => {
     expect(extractStopReason({ type: 'text_delta' })).toBeNull()
+  })
+})
+
+describe('extractTurnUsage', () => {
+  test('counts output tokens, not the re-billed context', () => {
+    const event = {
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        stopReason: 'stop',
+        usage: { input: 2590, output: 89, cacheRead: 40_000, cacheWrite: 0, totalTokens: 42_679 },
+      },
+    }
+    expect(extractTurnUsage(event)).toEqual({ stopReason: 'stop', tokens: 89 })
   })
 })
 

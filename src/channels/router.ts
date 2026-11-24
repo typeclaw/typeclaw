@@ -3994,7 +3994,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.lastTerminalReplyCompletion = {
           turnSeq: live.turnSeq,
           ...(typeof replyText === 'string' ? { text: replyText } : {}),
-          tokens: context.assistantMessage.usage.totalTokens,
+          tokens: context.assistantMessage.usage.output,
         }
         live.pendingTerminalReplyStop = {
           turnSeq: live.turnSeq,
