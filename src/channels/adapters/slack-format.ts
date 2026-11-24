@@ -229,6 +229,18 @@ function parseLink(text: string, start: number): { label: string; url: string; e
   if (text[i] !== ']' || text[i + 1] !== '(') return null
   const label = text.slice(labelStart, i)
   const urlStart = i + 2
+  // CommonMark angle-bracket destination `[label](<url>)`: the brackets are
+  // delimiters, not part of the URL. Left in place they would nest inside
+  // mrkdwn's own `<url|label>` and Slack would render the link as literal text.
+  // This form also permits literal spaces, which CommonMark percent-encodes and
+  // Slack cannot parse inside `<url|label>`, so encode them the same way.
+  if (text[urlStart] === '<') {
+    const close = text.indexOf('>', urlStart + 1)
+    if (close === -1 || text[close + 1] !== ')') return null
+    const url = text.slice(urlStart + 1, close)
+    if (url === '' || /[<\n]/.test(url)) return null
+    return { label, url: url.replaceAll(' ', '%20'), end: close + 2 }
+  }
   let j = urlStart
   while (j < text.length) {
     const c = text[j]!
