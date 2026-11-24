@@ -1,5 +1,7 @@
 import type { ReviewOutputState, ReviewVerdict } from '@/channels/github-review-turn-ledger'
 
+import { maskHeredocBodies } from './gh-command'
+
 // Extracts the formal-review verdict a successful `gh` command landed, so the
 // false-receipt ledger can credit it. Covers the three vectors the agent uses to
 // post a review: REST create-review via `--input <file>`, REST create-review via
@@ -401,11 +403,12 @@ function stripLeadingAssignments(args: readonly string[]): readonly string[] {
 }
 
 // Quote-aware split into shell segments AND tokens. Segments break on top-level
-// `&&`, `||`, `;`, `|`, and newlines (outside quotes). Heredoc bodies are NOT
-// modelled — a heredoc writes a payload file consumed by a later `gh … --input`
-// segment, and that file's contents are resolved separately (review-recorder
-// reads it off disk); detection here only needs the `gh` segment itself.
-function splitSegments(command: string): string[][] {
+// `&&`, `||`, `;`, `|`, and newlines (outside quotes). Heredoc bodies are masked
+// first, so a literal review example staged in a body is not a submission. A heredoc
+// that writes a payload file for a later `gh … --input` segment keeps that segment;
+// the file's contents are resolved separately (review-recorder reads it off disk).
+function splitSegments(rawCommand: string): string[][] {
+  const command = maskHeredocBodies(rawCommand)
   const segments: string[][] = []
   let cur: string[] = []
   let tok = ''

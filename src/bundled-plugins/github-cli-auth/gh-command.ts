@@ -150,7 +150,8 @@ function passThroughUnlessNestedGh(command: string): GhCommandDecision {
 
 const NESTED_GH_WITH_ARGUMENT = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*gh[ \t]+[^\s|&;)]/
 
-function containsNestedGhInvocation(command: string): boolean {
+function containsNestedGhInvocation(rawCommand: string): boolean {
+  const command = maskHeredocBodies(rawCommand)
   const ghAt = (index: number): boolean => NESTED_GH_WITH_ARGUMENT.test(command.slice(index))
   let quote: '"' | "'" | null = null
   // Each open `(` or backtick, with the quote to resume when it closes: a substitution
@@ -227,7 +228,7 @@ function containsNestedGhInvocation(command: string): boolean {
 
 function containsUnquotedPathnameExpansion(command: string): boolean {
   let quote: '"' | "'" | null = null
-  for (const ch of command) {
+  for (const ch of maskHeredocBodies(command)) {
     if (quote !== null) {
       if (ch === quote) quote = null
       continue
@@ -1820,8 +1821,10 @@ function isPlaceholderSegment(segment: string): boolean {
 // heredoc) is not seen at command position and escapes classification. Quote-
 // aware: operators inside quotes are literal. This is a command-position
 // detector, not a full shell parser — it does not interpret redirections,
-// subshells, heredoc bodies, or backgrounding semantics beyond boundary marking.
-function tokenize(command: string): string[] {
+// subshells, or backgrounding semantics beyond boundary marking. Heredoc bodies
+// are masked first (see maskHeredocBodies), so body text is never a command.
+function tokenize(rawCommand: string): string[] {
+  const command = maskHeredocBodies(rawCommand)
   const tokens: string[] = []
   let current = ''
   let quote: '"' | "'" | null = null
@@ -1874,3 +1877,35 @@ function tokenize(command: string): string[] {
   flush()
   return tokens
 }
+
+// A heredoc body is stdin data, so a `gh` line that `cat <<'X'` prints or stages
+// is not an invocation. The mask drops such bodies before the scanners run, but only
+// for one shape that provably runs nothing: every non-blank line belongs to a block
+// `cat [> path | >> path] <<'DELIM'` + body + a line that is exactly `DELIM`. The
+// delimiter is quoted, so the body never expands; the path is a plain literal; and
+// `cat` is the only command in the call, so neither a body nor a staged file can run.
+// Anything else returns the command unchanged and is scanned as before. The injection
+// gates read the raw command, where any `<` already rules injection out.
+export function maskHeredocBodies(command: string): string {
+  if (!command.includes('<<')) return command
+  const lines = command.split('\n')
+  const out: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string
+    if (line.trim() === '') {
+      out.push(line)
+      continue
+    }
+    // Only spaces and tabs separate words; a `\r` stays part of the delimiter word.
+    const opener = LITERAL_CAT_HEREDOC.exec(line.replace(/^[ \t]+|[ \t]+$/g, ''))
+    // A write to a file named `cat` could replace the program this shape runs.
+    if (opener === null || opener[1]?.split('/').at(-1) === 'cat') return command
+    const end = lines.indexOf(opener[3] as string, i + 1)
+    if (end === -1) return command
+    out.push(line)
+    i = end
+  }
+  return out.join('\n')
+}
+
+const LITERAL_CAT_HEREDOC = /^cat(?: +>>? *([A-Za-z0-9._/~+-]+))? +<<(['"])([A-Za-z_][A-Za-z0-9_]*)\2$/

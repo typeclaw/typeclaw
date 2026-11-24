@@ -4,6 +4,8 @@ import {
   analyzeGhCommand,
   canInjectPatIntoPassThroughGh,
   effectiveGhTokensForAuthenticatedUserEndpoint,
+  hasGhInvocation,
+  maskHeredocBodies,
   usesGhApiAuthenticatedUserEndpoint,
 } from './gh-command'
 
@@ -536,15 +538,65 @@ describe('analyzeGhCommand', () => {
     expect(analyzeGhCommand('(\ngh pr view -R acme/widgets\n)').kind).not.toBe('inject')
   })
 
-  // Intentional, documented false positive: tokenize() has no heredoc model, so
-  // a `gh ...` line INSIDE a heredoc body is read as a real invocation. This is
-  // safe by design — recognition may be conservative, injection must be strict:
-  // the worst outcome is a `block` (the command is never single-bare-`gh`, and
-  // a repo-less `gh` under multi-owner App auth has no single token), never a
-  // wrong token mint. We assert `block`, not `inject`, to pin that intent.
-  it('blocks (never injects) gh text inside a heredoc body — intentional false positive', () => {
-    expect(analyzeGhCommand("cat <<'X'\ngh secret list\nX").kind).toBe('block')
-    expect(analyzeGhCommand("cat <<'X'\ngh pr view -R acme/widgets\nX").kind).toBe('block')
+  // A heredoc body is stdin data, so printing or staging literal shell examples
+  // (docs, review bodies) must not read as a gh invocation.
+  it('passes through gh text inside a literal cat heredoc body', () => {
+    for (const command of [
+      "cat <<'X'\ngh secret list\nX",
+      "cat <<'X'\ngh pr view -R acme/widgets\nX",
+      "cat <<'EOF'\n(gh pr view -R acme/widgets)\nEOF",
+      'cat <<"EOF"\necho $(gh pr view -R acme/widgets) `gh repo view`\nEOF',
+      "cat > notes.md <<'EOF'\nRun `gh pr view -R acme/widgets` on *.md files\nPATH=/opt/bin:$PATH\nEOF",
+      "cat >> /tmp/review.md <<'EOF'\ngh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE\nEOF",
+      "cat <<'A'\ngh pr view -R acme/widgets\nA\n\ncat > b.md <<'B'\ngh repo view acme/widgets\nB",
+      "cat <<'X'\nnot X\n X\nX \ngh pr view -R acme/widgets\nX",
+      "cat <<'X'\ndéjà vu: gh pr view -R acme/widgets 한국어\nX",
+    ]) {
+      expect(analyzeGhCommand(command).kind).toBe('pass-through')
+      expect(hasGhInvocation(command)).toBe(false)
+    }
+  })
+
+  // Any other shape is scanned as before: it could expand the body, run it, or run a
+  // file it staged, and the mask cannot prove otherwise.
+  it('keeps every other heredoc shape unmasked', () => {
+    for (const command of [
+      'cat <<EOF\necho MARK\nEOF',
+      "cat <<-'X'\n\techo MARK\n\tX",
+      "cat <<\\'\necho MARK\n'",
+      "cat <<'X'\necho MARK",
+      "cat <<'X'\r\necho MARK\nX\r\nbash",
+      "bash <<'X'\necho MARK\nX",
+      "cat <<'X' | bash\necho MARK\nX",
+      "cat > s.sh <<'X'\necho MARK\nX\nbash s.sh",
+      "cat <<'X'\necho MARK\nX\necho done",
+      'cat > "$target" <<\'X\'\necho MARK\nX',
+      "cat > ~/bin/${tool} <<'X'\necho MARK\nX",
+      "cat <<'X'; echo hi\necho MARK\nX",
+      "cat <<'X' <<'Y'\necho MARK\nX\nY",
+      "# stage notes\ncat <<'X'\necho MARK\nX",
+      "/bin/cat <<'X'\necho MARK\nX",
+      // bash's delimiter is `X\r`, so the body ends before `echo MARK`
+      "cat <<'X'\r\nbody\nX\r\necho MARK\nX",
+      "cat > ~/.local/bin/cat <<'X'\necho MARK\nX",
+      // ANSI-C quoting and other shell text are never part of the shape
+      "echo $'it\\'s <<X'\necho MARK\nX",
+    ]) {
+      expect(maskHeredocBodies(command)).toBe(command)
+    }
+  })
+
+  it('still blocks a real gh command beside a heredoc', () => {
+    for (const command of [
+      "cat <<'X'\nnotes\nX\ngh pr view -R acme/widgets",
+      "bash <<'X'\ngh pr view -R acme/widgets\nX",
+      'cat <<EOF\n$(gh pr view -R acme/widgets)\nEOF',
+      "cat <<'X'\n(gh pr view -R acme/widgets)",
+    ]) {
+      const result = analyzeGhCommand(command)
+      expect(result.kind).toBe('block')
+      if (result.kind === 'block') expect(result.code).toBe('composition')
+    }
   })
 
   it('allows output-only gh jq filters but blocks environment readers and templates', () => {
