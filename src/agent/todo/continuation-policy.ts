@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { incompleteTodos, type Todo } from './store'
 
 export const DEFAULT_MAX_AUTO_TURNS = 3
-export const DEFAULT_MAX_CUMULATIVE_TOKENS = 25_000
+export const DEFAULT_MAX_CUMULATIVE_TOKENS = 20_000
 export const DEFAULT_MAX_WALL_CLOCK_MS = 30 * 60_000
 export const DEFAULT_STAGNATION_LIMIT = 2
 
@@ -52,11 +52,16 @@ export type TurnOutcome = {
   // continue. Optional so older state files remain valid.
   termination?: 'terminal-after-channel-reply'
   endedAt: number
-  // Total tokens the just-completed turn consumed (from the assistant
-  // message's usage). Accumulated into the episode's cumulativeTokens so the
-  // token ceiling reflects real spend. Optional for older state files and for
-  // turns whose usage was unavailable; missing counts as 0.
+  // Output tokens of the just-completed turn's final assistant message.
+  // Accumulated into an open episode's cumulativeTokens so the token ceiling
+  // reflects auto-turn spend. Optional for older state files and for turns
+  // whose usage was unavailable; missing counts as 0.
   tokens?: number
+  // Set when todo continuation itself started the turn. Only these turns are
+  // charged to the episode budget: a user turn, or a background-completion
+  // wakeup that happens to land inside an open episode, is not continuation
+  // spend.
+  continuationTurn?: true
 }
 
 export type ContinuationState = {
@@ -143,6 +148,7 @@ function parseOutcome(value: unknown): TurnOutcome | null {
     endedAt: o.endedAt,
     ...(o.termination === 'terminal-after-channel-reply' ? { termination: o.termination } : {}),
     ...(isFiniteNumber(o.tokens) ? { tokens: o.tokens } : {}),
+    ...(o.continuationTurn === true ? { continuationTurn: true as const } : {}),
   }
 }
 
@@ -241,14 +247,10 @@ export function decideContinuation(args: {
     lastIncompleteHash: null,
   }
 
-  // Fold the just-completed turn's token spend into the episode BEFORE checking
-  // the ceiling, so the budget reflects what the previous auto-turn actually
-  // cost. `lastTurnOutcome.tokens` is the spend of the turn that drove this
-  // idle; missing usage counts as 0.
-  const episode: ContinuationEpisode = {
-    ...base,
-    cumulativeTokens: base.cumulativeTokens + (outcome.tokens ?? 0),
-  }
+  // Continuation spend is charged to the open episode as each continuation
+  // turn's output is recorded (`onTurnOutcome`), so it counts even when an idle
+  // skips instead of injecting; the decision only checks it.
+  const episode = base
 
   if (episode.autoTurnCount >= limits.maxAutoTurns) return { kind: 'skip', reason: 'max-auto-turns' }
   if (episode.cumulativeTokens >= limits.maxCumulativeTokens) return { kind: 'skip', reason: 'max-tokens' }

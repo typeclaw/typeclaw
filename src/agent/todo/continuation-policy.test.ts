@@ -297,29 +297,18 @@ describe('decideContinuation', () => {
     expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-tokens' })
   })
 
-  test('accumulates the just-completed turn tokens into the episode', () => {
-    const state = baseState({ lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, tokens: 1234 } })
-    const d = decide(state)
-    expect(d.kind).toBe('inject')
-    if (d.kind === 'inject') expect(d.episode.cumulativeTokens).toBe(1234)
-  })
-
-  test('token spend across turns crosses the ceiling and stops continuation', () => {
-    const nearCeiling = DEFAULT_CONTINUATION_LIMITS.maxCumulativeTokens - 100
+  test('does not charge the user turn that opens the episode', () => {
     const state = baseState({
-      lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, tokens: 200 },
-      episode: {
-        episodeId: 'e',
-        startedAt: 1500,
-        autoTurnCount: 1,
-        cumulativeTokens: nearCeiling,
-        failureCount: 0,
-        stagnationCount: 0,
-        lastIncompleteHash: 'prev',
+      lastTurnOutcome: {
+        turnId: 't',
+        stopReason: 'stop',
+        endedAt: 1,
+        tokens: DEFAULT_CONTINUATION_LIMITS.maxCumulativeTokens * 3,
       },
     })
-    // nearCeiling + 200 >= maxCumulativeTokens → the folded spend trips the gate.
-    expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-tokens' })
+    const d = decide(state)
+    expect(d.kind).toBe('inject')
+    if (d.kind === 'inject') expect(d.episode.cumulativeTokens).toBe(0)
   })
 
   test('skips at the wall-clock ceiling', () => {

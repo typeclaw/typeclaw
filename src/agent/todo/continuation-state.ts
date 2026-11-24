@@ -79,8 +79,16 @@ export function onTurnStart(state: ContinuationState, isRealUserTurn: boolean): 
 // graceful-shutdown path sets restartAbortPending before aborting, so the
 // imminent 'aborted' outcome does NOT arm the block. The marker is one-shot —
 // consumed here regardless — so a later genuine user abort still arms D1.
+//
+// Output from a turn that todo continuation started is charged to the open
+// episode here, once per recorded assistant message, so continuation spend is
+// counted whether or not a later idle injects. The user turn that opens an
+// episode and wakeups that land inside one are not continuation spend.
 export function onTurnOutcome(state: ContinuationState, outcome: TurnOutcome): ContinuationState {
   const next: ContinuationState = { ...state, lastTurnOutcome: outcome, restartAbortPending: false }
+  if (outcome.continuationTurn === true && state.episode !== null && outcome.tokens !== undefined) {
+    next.episode = { ...state.episode, cumulativeTokens: state.episode.cumulativeTokens + outcome.tokens }
+  }
   const isSafeTerminalReplyAbort =
     outcome.stopReason === 'aborted' && outcome.termination === 'terminal-after-channel-reply'
   if (outcome.stopReason === 'aborted' && !state.restartAbortPending && !isSafeTerminalReplyAbort) {
