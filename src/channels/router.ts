@@ -20,11 +20,13 @@ import {
 import type { RestartHandoff } from '@/agent/restart-handoff'
 import type { ChannelParticipant, SessionOrigin } from '@/agent/session-origin'
 import { renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
+import { describeContinuationDecision } from '@/agent/todo/continuation'
 import {
   armRestartKickForOrigin,
   clearAbortSuppressionForOrigin,
   extractTurnUsage,
   markRestartAbortPendingForOrigin,
+  recordTurnHandBack,
   recordTurnOutcome,
   recordTurnStart,
   runIdleContinuation,
@@ -814,6 +816,9 @@ type PendingSystemReminder = {
   kind: 'retry' | 'wakeup'
   githubReviewRoundKey?: string
   backgroundObligationId?: string
+  // Set on a todo-continuation nudge, so the turn that consumes it is charged
+  // to the continuation budget and other reminder turns are not.
+  todoContinuation?: true
   // Set on a retry handed to a reload successor: a reminder-only retry never runs
   // beginWakeupTurn, so the successor restores the logical turn's provenance here.
   backgroundWake?: boolean
@@ -1135,6 +1140,23 @@ type LiveSession = {
   // regardless of which order the model tried them in. Updated only at
   // turn start; reads against the live counter elsewhere are intentional.
   successfulSendsAtTurnStart: number
+  // `turnSeq` of the turn that consumed a todo-continuation nudge, if the
+  // current one did. Its outcome is recorded as a continuation turn.
+  todoContinuationTurnSeq: number | null
+  // Count of output this session delivered to the person: successful channel
+  // sends plus formal GitHub reviews (which never bump
+  // `successfulChannelSends`). The two marks snapshot it at the start of the
+  // logical turn and at the latest successful todo_write; todo continuation
+  // compares them with the live count at idle (see
+  // `handedBackSinceLastTodoWrite`).
+  deliveredOutputs: number
+  deliveredOutputsAtLogicalTurnStart: number
+  deliveredOutputsAtLastTodoWrite: number
+  // `deliveredOutputs` right after a channel_reply that renewed a promise to
+  // keep working landed in this logical turn, or null. Logical-turn scoped (not
+  // cleared by the router's own retry prompts) so a silent retry after a
+  // progress reply is not read as handing the turn back.
+  deliveredOutputsAtRenewal: number | null
   // Per-send-target count of tool-source sends with a reservation currently
   // in flight (slot reserved, outbound callback not yet settled). Lets the
   // policy-denial guard tell a legitimate parallel send-burst (denials that
@@ -1180,7 +1202,7 @@ type LiveSession = {
   // (like `skippedTurn`/`skipLockedSendTurn`) so a stale record from an earlier
   // turn can never trigger a nudge on a later one. `null` when no such reply
   // ended this turn.
-  lastTerminalReplyCompletion: { turnSeq: number; text?: string; tokens: number } | null
+  lastTerminalReplyCompletion: { turnSeq: number; text?: string } | null
   // Armed after a successful terminal reply. pi-agent-core invokes streamFunction
   // again only after emitting every matching toolResult into its event queue;
   // the wrapper consumes this marker at that awaited provider boundary and
@@ -3313,6 +3335,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         coverageDeferredSince: null,
         coverageDeferredParentSessionId: null,
         successfulSendsAtTurnStart: 0,
+        todoContinuationTurnSeq: null,
+        deliveredOutputs: 0,
+        deliveredOutputsAtLogicalTurnStart: 0,
+        deliveredOutputsAtLastTodoWrite: 0,
+        deliveredOutputsAtRenewal: null,
         inFlightToolSends: new Map(),
         policyDeniedToolSendsThisTurn: new Map(),
         emptyTurnRetries: 0,
@@ -3391,8 +3418,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // AgentSession processes message events through one serial queue. By
         // the time this synthetic aborted message_end reaches the subscriber,
         // every preceding toolResult event has completed extension handling
-        // and SessionManager persistence. Preserve the original assistant
-        // usage rather than recording this local stream's zero-token envelope.
+        // and SessionManager persistence. The provider's own tool-use
+        // message_end already recorded that turn's usage, so this outcome only
+        // carries the termination provenance; copying the usage here would
+        // charge it to the continuation budget twice.
         const terminalCompletion = live.lastTerminalReplyCompletion
         if (termination !== undefined && terminalCompletion?.turnSeq === live.turnSeq) {
           enqueueTodoOutcomeWrite(live, {
@@ -3401,7 +3430,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             turnId: live.sessionId,
             stopReason: usage.stopReason,
             termination,
-            tokens: terminalCompletion.tokens,
+            continuationTurn: live.todoContinuationTurnSeq === live.turnSeq,
           })
           return
         }
@@ -3412,6 +3441,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           stopReason: usage.stopReason,
           ...(termination !== undefined ? { termination } : {}),
           ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
+          continuationTurn: live.todoContinuationTurnSeq === live.turnSeq,
         }
         enqueueTodoOutcomeWrite(live, outcomeArgs)
       })
@@ -3926,6 +3956,18 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const githubCloseoutOwnsTurn = (live: LiveSession): boolean =>
     live.githubReviewThreadCloseout !== null || live.githubReviewThreadCloseoutDecisionTurn === live.turnSeq
 
+  // True when this logical turn delivered output (a channel message or a formal
+  // review) after its last todo_write, or at all when it wrote none, unless the
+  // latest output was a channel_reply that renewed a promise to keep working.
+  // Todo continuation skips such turns: the agent already handed the turn back
+  // to the person. Read at idle, after reply recovery has had its chance to
+  // deliver the turn's final prose.
+  const handedBackSinceLastTodoWrite = (live: LiveSession): boolean => {
+    const mark = Math.max(live.deliveredOutputsAtLogicalTurnStart, live.deliveredOutputsAtLastTodoWrite)
+    if (live.deliveredOutputs <= mark) return false
+    return live.deliveredOutputsAtRenewal !== live.deliveredOutputs
+  }
+
   const promisesUnfinishedWork = (live: LiveSession, text: unknown): boolean =>
     typeof text === 'string' && detectContinuationWillingness(text) && !githubCloseoutOwnsTurn(live)
 
@@ -3951,6 +3993,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ) {
         live.qualifyingWorkThisLogicalTurn = true
       }
+      if (context.toolCall.name === 'todo_write' && !context.isError) {
+        live.deliveredOutputsAtLastTodoWrite = live.deliveredOutputs
+      }
       const succeeded = context.toolCall.name === 'channel_reply' && !context.isError && details?.ok === true
       const keepTurnAlive = details?.continue_after_reply === true
       if (succeeded) {
@@ -3970,6 +4015,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.promisedWorkOutstandingThisLogicalTurn = keepTurnAlive
         if (keepTurnAlive) {
           live.continueReplyTurn = { turnSeq: live.turnSeq, sendCount: live.successfulChannelSends }
+          live.deliveredOutputsAtRenewal = live.deliveredOutputs
         }
       }
       // A landed channel_send settles only the debt its tool captured from this
@@ -3994,7 +4040,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         live.lastTerminalReplyCompletion = {
           turnSeq: live.turnSeq,
           ...(typeof replyText === 'string' ? { text: replyText } : {}),
-          tokens: context.assistantMessage.usage.totalTokens,
         }
         live.pendingTerminalReplyStop = {
           turnSeq: live.turnSeq,
@@ -4169,6 +4214,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // time too: a user who stops mid-decision must not receive the reminder.
     const decision = live.todoOutcomeWrite.then(async () => {
       try {
+        if (handedBackSinceLastTodoWrite(live)) {
+          await recordTurnHandBack({ agentDir: options.agentDir, origin: buildLiveOrigin(live) })
+        }
         await (options.runIdleContinuation ?? runIdleContinuation)({
           agentDir: options.agentDir,
           origin: buildLiveOrigin(live),
@@ -4180,7 +4228,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // Self-continuation of the SAME work episode, not external injection:
             // `qualifyingWorkThisLogicalTurn` must survive it so a follow-up reply
             // can still cite the durable work this turn already did.
-            live.pendingSystemReminders.push(retryReminder(text))
+            live.pendingSystemReminders.push({ ...retryReminder(text), todoContinuation: true })
+          },
+          onDecision: (result) => {
+            const line = describeContinuationDecision(result)
+            if (line !== null) logger.info(`[channels] ${live.keyId}: ${line}`)
           },
         })
       } catch (err) {
@@ -5159,6 +5211,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.userStoppedTurnSeq = null
     live.nextPromptMaxTokens = undefined
     live.githubReviewOutputTurn = null
+    live.deliveredOutputsAtLogicalTurnStart = live.deliveredOutputs
+    live.deliveredOutputsAtRenewal = null
     live.toolExecutionThisLogicalTurn = false
     live.backgroundWakeLogicalTurn = true
     live.providerErrorSilencedThisLogicalTurn = null
@@ -5615,6 +5669,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           // review landed earlier in this logical turn keeps suppressing the
           // empty-turn fallback across the reminder-only retry iterations.
           live.githubReviewOutputTurn = null
+          live.deliveredOutputsAtLogicalTurnStart = live.deliveredOutputs
+          live.deliveredOutputsAtRenewal = null
           live.toolExecutionThisLogicalTurn = false
           live.backgroundWakeLogicalTurn = false
           live.providerErrorSilencedThisLogicalTurn = null
@@ -5683,6 +5739,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const engageAddPromises = live.currentTurnEngageReactions
         live.turnSeq++
         live.successfulSendsAtTurnStart = successfulSendsBeforePrompt
+        // Only a prompt made of nothing but the nudge is a continuation turn: fresh
+        // input or another wakeup sharing the prompt is not continuation spend.
+        live.todoContinuationTurnSeq =
+          batch.length === 0 &&
+          reminders.length > 0 &&
+          reminders.every((reminder) => reminder.todoContinuation === true)
+            ? live.turnSeq
+            : null
         live.skipLockedSendTurn = null
         live.disengagedTurn = null
         live.emptyTurnFallbackTurn = null
@@ -7667,6 +7731,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
+      live.deliveredOutputs++
       if (!live.botParticipated) {
         live.botParticipated = true
         void persistBotParticipation(live).catch((err) => {
@@ -9607,6 +9672,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         args.inboundCoverage ?? [],
       )
       live.githubReviewOutputTurn = live.turnSeq
+      live.deliveredOutputs++
       logger.info(`[channels] ${live.keyId}: github_review_output state=${args.state} turn=${live.turnSeq}`)
       return { kind: 'stamped' }
     }

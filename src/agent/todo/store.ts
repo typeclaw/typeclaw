@@ -20,6 +20,14 @@ export type Todo = {
 type TodoFile = {
   version: 1
   todos: Todo[]
+  // Epoch ms of the last write. Optional: files written before it existed
+  // have none, and readers treat that as unknown age.
+  updatedAt?: number
+}
+
+export type TodoList = {
+  todos: Todo[]
+  updatedAt: number | null
 }
 
 export function todoDir(agentDir: string): string {
@@ -42,26 +50,31 @@ export function todoContentPath(agentDir: string, scope: TodoScope): string {
 }
 
 export async function readTodos(agentDir: string, scope: TodoScope): Promise<Todo[]> {
+  return (await readTodoList(agentDir, scope)).todos
+}
+
+export async function readTodoList(agentDir: string, scope: TodoScope): Promise<TodoList> {
   const path = todoContentPath(agentDir, scope)
   let raw: string
   try {
     raw = await readFile(path, 'utf8')
   } catch (err) {
-    if (isEnoent(err)) return []
+    if (isEnoent(err)) return { todos: [], updatedAt: null }
     throw err
   }
   let parsed: Partial<TodoFile>
   try {
     parsed = JSON.parse(raw) as Partial<TodoFile>
   } catch {
-    return []
+    return { todos: [], updatedAt: null }
   }
-  if (!Array.isArray(parsed.todos)) return []
+  const updatedAt = typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : null
+  if (!Array.isArray(parsed.todos)) return { todos: [], updatedAt }
   // The file is force-committed and hand-editable, so a corrupt or partially
   // edited entry can appear. Drop anything that is not a well-formed Todo
   // rather than let a `null`/malformed item crash incompleteTodos (`t.status`)
   // or surface as trusted state to the model.
-  return parsed.todos.filter(isValidTodo)
+  return { todos: parsed.todos.filter(isValidTodo), updatedAt }
 }
 
 function isValidTodo(value: unknown): value is Todo {
@@ -80,9 +93,14 @@ function isValidTodo(value: unknown): value is Todo {
 // session (see resolveTodoScope), so the only concurrent writers are the rare
 // duplicate-attach case, where last-writer-wins on the rename is acceptable —
 // the alternative (lost-update detection) is not worth a lock for a todo list.
-export async function writeTodos(agentDir: string, scope: TodoScope, todos: Todo[]): Promise<void> {
+export async function writeTodos(
+  agentDir: string,
+  scope: TodoScope,
+  todos: Todo[],
+  now: number = Date.now(),
+): Promise<void> {
   const path = todoContentPath(agentDir, scope)
-  const payload: TodoFile = { version: 1, todos }
+  const payload: TodoFile = { version: 1, todos, updatedAt: now }
   await mkdir(dirname(path), { recursive: true })
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')

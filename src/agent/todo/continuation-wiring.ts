@@ -1,6 +1,6 @@
 import type { SessionOrigin } from '@/agent/session-origin'
 
-import { maybeInjectContinuation } from './continuation'
+import { type ContinuationInjectResult, maybeInjectContinuation } from './continuation'
 import { type TurnOutcome } from './continuation-policy'
 import {
   armRestartKickSuppression,
@@ -26,17 +26,19 @@ export function classifyStopReason(raw: unknown): TurnOutcome['stopReason'] {
 
 // Extract the stopReason and token usage from a pi `message_end` event.
 // Returns null for any event that is not an assistant message_end. `tokens`
-// comes from the assistant message's `usage.totalTokens`; it is undefined when
-// the provider did not report usage.
+// is the assistant message's `usage.output`: the work the model did. Input and
+// cache counts re-bill the whole context on every request, so they track
+// context size and provider caching, not continuation cost. It is undefined
+// when the provider did not report usage.
 export function extractTurnUsage(event: unknown): { stopReason: TurnOutcome['stopReason']; tokens?: number } | null {
   if (typeof event !== 'object' || event === null) return null
   const e = event as { type?: unknown; message?: unknown }
   if (e.type !== 'message_end') return null
   const message = e.message as { role?: unknown; stopReason?: unknown; usage?: unknown } | undefined
   if (message?.role !== 'assistant') return null
-  const usage = message.usage as { totalTokens?: unknown } | undefined
-  const total = usage?.totalTokens
-  const tokens = typeof total === 'number' && Number.isFinite(total) ? total : undefined
+  const usage = message.usage as { output?: unknown } | undefined
+  const output = usage?.output
+  const tokens = typeof output === 'number' && Number.isFinite(output) ? output : undefined
   return { stopReason: classifyStopReason(message.stopReason), ...(tokens !== undefined ? { tokens } : {}) }
 }
 
@@ -54,6 +56,7 @@ export async function recordTurnOutcome(args: {
   stopReason: TurnOutcome['stopReason']
   termination?: TurnOutcome['termination']
   tokens?: number
+  continuationTurn?: boolean
   now?: number
 }): Promise<void> {
   const scope = resolveTodoScope(args.origin)
@@ -65,8 +68,24 @@ export async function recordTurnOutcome(args: {
     endedAt: args.now ?? Date.now(),
     ...(args.termination !== undefined ? { termination: args.termination } : {}),
     ...(args.tokens !== undefined ? { tokens: args.tokens } : {}),
+    ...(args.continuationTurn === true ? { continuationTurn: true as const } : {}),
   }
   await writeContinuationState(args.agentDir, scope, onTurnOutcome(state, outcome))
+}
+
+// Mark the recorded outcome as a turn that handed output back to the person.
+// Called at idle rather than when the outcome is written, because a channel
+// turn can still deliver its final prose after its last assistant message
+// ends. No-op for scopeless origins or before any outcome exists.
+export async function recordTurnHandBack(args: { agentDir: string; origin: SessionOrigin }): Promise<void> {
+  const scope = resolveTodoScope(args.origin)
+  if (scope === null) return
+  const state = await readContinuationState(args.agentDir, scope)
+  if (state.lastTurnOutcome === null) return
+  await writeContinuationState(args.agentDir, scope, {
+    ...state,
+    lastTurnOutcome: { ...state.lastTurnOutcome, deliveredAfterTodoWrite: true },
+  })
 }
 
 // Reset the continuation episode at the start of a REAL user turn. Injected
@@ -135,8 +154,10 @@ export async function runIdleContinuation(args: {
   agentDir: string
   origin: SessionOrigin
   deliver: DeliverContinuation
+  onDecision?: (result: ContinuationInjectResult) => void
 }): Promise<boolean> {
   const result = await maybeInjectContinuation({ agentDir: args.agentDir, origin: args.origin })
+  args.onDecision?.(result)
   if (result.kind !== 'injected') return false
   args.deliver(result.text)
   return true

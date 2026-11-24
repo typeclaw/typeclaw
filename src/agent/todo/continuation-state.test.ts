@@ -185,3 +185,27 @@ describe('restart-kick suppression', () => {
     expect(consumed.suppressNextIdleNudgeReason).toBeNull()
   })
 })
+
+describe('onTurnOutcome continuation spend', () => {
+  const OUTCOME: TurnOutcome = { turnId: 't', stopReason: 'stop', endedAt: 1, tokens: 11_000 }
+  const base = (): ContinuationState => ({
+    ...emptyContinuationState(),
+    episode: { ...EPISODE, cumulativeTokens: 9_000 },
+  })
+
+  test('charges each continuation message to the open episode as it is recorded', () => {
+    const first = onTurnOutcome(base(), { ...OUTCOME, tokens: 400, continuationTurn: true })
+    const second = onTurnOutcome(first, { ...OUTCOME, tokens: 600, continuationTurn: true })
+    expect(second.episode?.cumulativeTokens).toBe(10_000)
+  })
+
+  test('does not charge a wakeup or user turn with the same usage', () => {
+    expect(onTurnOutcome(base(), OUTCOME).episode?.cumulativeTokens).toBe(9_000)
+    expect(onTurnOutcome(base(), { ...OUTCOME, continuationTurn: true }).episode?.cumulativeTokens).toBe(20_000)
+  })
+
+  test('does not open an episode for spend recorded without one', () => {
+    const state = onTurnOutcome(emptyContinuationState(), { ...OUTCOME, continuationTurn: true })
+    expect(state.episode).toBeNull()
+  })
+})

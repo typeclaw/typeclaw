@@ -22,8 +22,8 @@ function baseState(overrides: Partial<ContinuationState> = {}): ContinuationStat
   return { ...emptyContinuationState(), lastTurnOutcome: STOP, ...overrides }
 }
 
-function decide(state: ContinuationState, todos: Todo[] = INCOMPLETE, now = 2000) {
-  return decideContinuation({ state, todos, limits: DEFAULT_CONTINUATION_LIMITS, now, newEpisodeId })
+function decide(state: ContinuationState, todos: Todo[] = INCOMPLETE, now = 2000, listUpdatedAt: number | null = now) {
+  return decideContinuation({ state, todos, listUpdatedAt, limits: DEFAULT_CONTINUATION_LIMITS, now, newEpisodeId })
 }
 
 describe('hashIncomplete', () => {
@@ -141,6 +141,13 @@ describe('parseContinuationState (fail-closed validation)', () => {
   test('a length stopReason round-trips (budget truncation is continuation-eligible)', () => {
     const state = { lastTurnOutcome: { turnId: 't', stopReason: 'length', endedAt: 1 } }
     expect(parseContinuationState(state).lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'length', endedAt: 1 })
+  })
+
+  test('the delivered-after-todo-write flag round-trips and a non-true value is dropped', () => {
+    const flagged = { lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, deliveredAfterTodoWrite: true } }
+    expect(parseContinuationState(flagged).lastTurnOutcome?.deliveredAfterTodoWrite).toBe(true)
+    const bogus = { lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, deliveredAfterTodoWrite: 'yes' } }
+    expect(parseContinuationState(bogus).lastTurnOutcome).toEqual({ turnId: 't', stopReason: 'stop', endedAt: 1 })
   })
 
   test('an unknown suppressor value is dropped', () => {
@@ -282,6 +289,26 @@ describe('decideContinuation', () => {
     expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-auto-turns' })
   })
 
+  test('skips a list untouched for longer than the age limit', () => {
+    const now = 10 * DEFAULT_CONTINUATION_LIMITS.maxListAgeMs
+    const old = now - DEFAULT_CONTINUATION_LIMITS.maxListAgeMs
+    expect(decide(baseState(), INCOMPLETE, now, old)).toEqual({ kind: 'skip', reason: 'stale-list' })
+    expect(decide(baseState(), INCOMPLETE, now, old + 1).kind).toBe('inject')
+  })
+
+  test('treats a list with no recorded write time as stale', () => {
+    expect(decide(baseState(), INCOMPLETE, 2000, null)).toEqual({ kind: 'skip', reason: 'stale-list' })
+  })
+
+  test('skips a turn that delivered a message after its last todo_write', () => {
+    const state = baseState({ lastTurnOutcome: { ...STOP, deliveredAfterTodoWrite: true } })
+    expect(decide(state)).toEqual({ kind: 'skip', reason: 'delivered-after-todo-write' })
+  })
+
+  test('still nudges a turn that stopped silently with work left', () => {
+    expect(decide(baseState()).kind).toBe('inject')
+  })
+
   test('skips at the token ceiling', () => {
     const state = baseState({
       episode: {
@@ -297,29 +324,18 @@ describe('decideContinuation', () => {
     expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-tokens' })
   })
 
-  test('accumulates the just-completed turn tokens into the episode', () => {
-    const state = baseState({ lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, tokens: 1234 } })
-    const d = decide(state)
-    expect(d.kind).toBe('inject')
-    if (d.kind === 'inject') expect(d.episode.cumulativeTokens).toBe(1234)
-  })
-
-  test('token spend across turns crosses the ceiling and stops continuation', () => {
-    const nearCeiling = DEFAULT_CONTINUATION_LIMITS.maxCumulativeTokens - 100
+  test('does not charge the user turn that opens the episode', () => {
     const state = baseState({
-      lastTurnOutcome: { turnId: 't', stopReason: 'stop', endedAt: 1, tokens: 200 },
-      episode: {
-        episodeId: 'e',
-        startedAt: 1500,
-        autoTurnCount: 1,
-        cumulativeTokens: nearCeiling,
-        failureCount: 0,
-        stagnationCount: 0,
-        lastIncompleteHash: 'prev',
+      lastTurnOutcome: {
+        turnId: 't',
+        stopReason: 'stop',
+        endedAt: 1,
+        tokens: DEFAULT_CONTINUATION_LIMITS.maxCumulativeTokens * 3,
       },
     })
-    // nearCeiling + 200 >= maxCumulativeTokens → the folded spend trips the gate.
-    expect(decide(state)).toEqual({ kind: 'skip', reason: 'max-tokens' })
+    const d = decide(state)
+    expect(d.kind).toBe('inject')
+    if (d.kind === 'inject') expect(d.episode.cumulativeTokens).toBe(0)
   })
 
   test('skips at the wall-clock ceiling', () => {

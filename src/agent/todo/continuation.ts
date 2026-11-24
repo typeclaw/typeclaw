@@ -3,7 +3,7 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { type ContinuationLimits, DEFAULT_CONTINUATION_LIMITS, decideContinuation } from './continuation-policy'
 import { consumeRestartKickSuppression, readContinuationState, writeContinuationState } from './continuation-state'
 import { resolveTodoScope, type TodoScope } from './scope'
-import { readTodos } from './store'
+import { readTodoList } from './store'
 
 export const TODO_CONTINUATION_SOURCE = 'todo-continuation'
 
@@ -23,6 +23,17 @@ export const CONTINUATION_PROMPT = [
   '---',
   '',
 ].join('\n')
+
+// Skip reasons that fire on almost every idle and say nothing about pending
+// work; operator logs omit them so the ones that matter stay readable.
+const ROUTINE_SKIP_REASONS = new Set(['no-origin', 'no-scope', 'no-incomplete-todos'])
+
+// One operator-log line for a continuation decision that involved pending
+// work, or null when the decision is routine.
+export function describeContinuationDecision(result: ContinuationInjectResult): string | null {
+  if (result.kind === 'injected') return 'todo_continuation inject'
+  return ROUTINE_SKIP_REASONS.has(result.reason) ? null : `todo_continuation skip reason=${result.reason}`
+}
 
 export type ContinuationInjectResult =
   | { kind: 'injected'; scope: TodoScope; text: string }
@@ -54,10 +65,10 @@ export async function maybeInjectContinuation(args: MaybeInjectContinuationArgs)
   const limits = args.limits ?? DEFAULT_CONTINUATION_LIMITS
   const newEpisodeId = args.newEpisodeId ?? (() => crypto.randomUUID())
 
-  const todos = await readTodos(args.agentDir, scope)
+  const { todos, updatedAt } = await readTodoList(args.agentDir, scope)
   const state = await readContinuationState(args.agentDir, scope)
 
-  const decision = decideContinuation({ state, todos, limits, now, newEpisodeId })
+  const decision = decideContinuation({ state, todos, listUpdatedAt: updatedAt, limits, now, newEpisodeId })
 
   if (decision.kind === 'skip') {
     if (state.suppressNextIdleNudgeReason !== null) {

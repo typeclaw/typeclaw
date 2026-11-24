@@ -16206,7 +16206,165 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     })
   })
 
-  test('preserves assistant token usage in the explicit terminal outcome', async () => {
+  test('records only the turn a todo continuation nudge started as a continuation turn', async () => {
+    const flags: Array<boolean | undefined> = []
+    let nudged = false
+    const { router, sessions } = makeRouter(await tempDir(), {
+      recordTurnOutcome: async (args) => {
+        flags.push(args.continuationTurn)
+      },
+      runIdleContinuation: async ({ deliver }) => {
+        if (nudged) return false
+        nudged = true
+        deliver('keep working through the list')
+        return true
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound())
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Progress update.' })
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await waitFor(() => flags.length >= 2)
+
+    expect(sessions[0]!.prompts[1]).toContain('keep working through the list')
+    expect(flags.slice(0, 2)).toEqual([false, true])
+  })
+
+  test('does not record a nudge that shares its prompt with another reminder as a continuation turn', async () => {
+    const flags: Array<boolean | undefined> = []
+    let nudged = false
+    const routerRef: { current?: ChannelRouter } = {}
+    const { router, sessions } = makeRouter(await tempDir(), {
+      recordTurnOutcome: async (args) => {
+        flags.push(args.continuationTurn)
+      },
+      runIdleContinuation: async ({ deliver }) => {
+        if (nudged) return false
+        nudged = true
+        deliver('keep working through the list')
+        routerRef.current!.__testing!.injectContinuationReminder(KEY, 'A background task finished.')
+        return true
+      },
+    })
+    routerRef.current = router
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    await router.route(inbound())
+    sessions[0]!.onPrompt = async () => {
+      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Progress update.' })
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('') })
+    }
+    await router.__testing!.flushDebounce(KEY)
+    await waitFor(() => flags.length >= 2)
+
+    expect(sessions[0]!.prompts[1]).toContain('keep working through the list')
+    expect(sessions[0]!.prompts[1]).toContain('A background task finished.')
+    expect(flags.slice(0, 2)).toEqual([false, false])
+  })
+
+  // Runs one turn and returns whether the idle decision saw it as handing back.
+  async function lastDeliveredFlag(
+    steps: (router: ChannelRouter, session: FakeSession) => Promise<void>,
+    opts: { key?: ChannelKey; finalText?: string } = {},
+  ): Promise<boolean | undefined> {
+    const key = opts.key ?? KEY
+    const dir = await tempDir()
+    const scope = resolveTodoScope({ kind: 'channel', ...key, participants: [] })!
+    const flags: Array<boolean | undefined> = []
+    const { router, sessions } = makeRouter(dir, {
+      runIdleContinuation: async () => {
+        flags.push((await readContinuationState(dir, scope)).lastTurnOutcome?.deliveredAfterTodoWrite)
+        return false
+      },
+    })
+    router.registerOutbound(key.adapter, async () => ({ ok: true }))
+    await router.route(inbound({ adapter: key.adapter, workspace: key.workspace, chat: key.chat }))
+    sessions[0]!.onPrompt = async () => {
+      await steps(router, sessions[0]!)
+      if (opts.finalText !== undefined) sessions[0]!.setAssistantText(opts.finalText)
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage(opts.finalText ?? '') })
+    }
+    await router.__testing!.flushDebounce(key)
+    await waitFor(() => flags.length > 0)
+    return flags.at(-1)
+  }
+
+  const sendUpdate = (router: ChannelRouter) =>
+    router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Here is where things stand.' })
+
+  test('flags a turn that delivered a message after its last todo_write', async () => {
+    const flag = await lastDeliveredFlag(async (router, session) => {
+      await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+      await sendUpdate(router)
+    })
+    expect(flag).toBe(true)
+  })
+
+  test('does not flag a turn whose last todo_write came after its message', async () => {
+    const flag = await lastDeliveredFlag(async (router, session) => {
+      await sendUpdate(router)
+      await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+    })
+    expect(flag).not.toBe(true)
+  })
+
+  test('flags a turn whose final prose was delivered by reply recovery', async () => {
+    const flag = await lastDeliveredFlag(
+      async (_router, session) => {
+        await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+      },
+      { finalText: '정리해서 올려드렸어요. 남은 건 테스트 결과예요.' },
+    )
+    expect(flag).toBe(true)
+  })
+
+  test('flags a turn that posted a formal GitHub review after its last todo_write', async () => {
+    const githubKey: ChannelKey = { adapter: 'github', workspace: 'acme/repo', chat: 'pr:672', thread: null }
+    const flag = await lastDeliveredFlag(
+      async (router, session) => {
+        await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+        await router.noteGithubReviewOutput({
+          sessionId: 'ses_fake_1',
+          workspace: 'acme/repo',
+          prNumber: 672,
+          state: 'APPROVE',
+        })
+      },
+      { key: githubKey },
+    )
+    expect(flag).toBe(true)
+  })
+
+  test('keeps a renewing reply exempt across a silent retry prompt', async () => {
+    let prompts = 0
+    const flag = await lastDeliveredFlag(async (router, session) => {
+      prompts++
+      if (prompts > 1) return
+      await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+      await sendUpdate(router)
+      await session.agent.afterToolCall!(
+        afterToolContext('channel_reply', { ok: true, continue_after_reply: true }, false, '계속 확인 중이에요'),
+      )
+      router.__testing!.injectContinuationReminder(KEY, 'Your last tool call was left unanswered; continue.')
+    })
+    expect(prompts).toBe(2)
+    expect(flag).not.toBe(true)
+  })
+
+  test('does not flag a reply that promised to keep working', async () => {
+    const flag = await lastDeliveredFlag(async (router, session) => {
+      await session.agent.afterToolCall!(afterToolContext('todo_write', { ok: true }, false))
+      await sendUpdate(router)
+      await session.agent.afterToolCall!(
+        afterToolContext('channel_reply', { ok: true, continue_after_reply: true }, false, '계속 확인 중이에요'),
+      )
+    })
+    expect(flag).not.toBe(true)
+  })
+
+  test('records a terminal reply turn output once, on the provider tool-use outcome', async () => {
     const writes: Array<{ termination?: string; tokens?: number }> = []
     const { router, sessions } = makeRouter(await tempDir(), {
       recordTurnOutcome: async (args) => {
@@ -16221,17 +16379,19 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     const context = afterToolContext('channel_reply', { ok: true }, false)
     context.assistantMessage = {
       ...context.assistantMessage,
-      usage: { ...context.assistantMessage.usage, totalTokens: 73 },
+      usage: { ...context.assistantMessage.usage, output: 73, totalTokens: 40_073 },
     }
 
+    sessions[0]!.emit({ type: 'message_end', message: { ...context.assistantMessage, stopReason: 'toolUse' } })
     await sessions[0]!.agent.afterToolCall!(context)
     await streamOnce(sessions[0]!)
     sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
     await waitFor(() => writes.some((write) => write.termination === 'terminal-after-channel-reply'))
 
     expect(writes.filter((write) => write.termination === 'terminal-after-channel-reply')).toEqual([
-      { termination: 'terminal-after-channel-reply', tokens: 73 },
+      { termination: 'terminal-after-channel-reply' },
     ])
+    expect(writes.reduce((sum, write) => sum + (write.tokens ?? 0), 0)).toBe(73)
   })
 
   test('the pinned parallel agent loop finalizes a mixed batch and makes exactly one provider call', async () => {
@@ -16492,7 +16652,7 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
     expect(agent.signal.aborted).toBe(false)
   })
 
-  test('terminal channel_reply with incomplete todos delivers a continuation reminder', async () => {
+  test('terminal channel_reply with incomplete todos hands the turn back without a reminder', async () => {
     const dir = await tempDir()
     const scope = resolveTodoScope({
       kind: 'channel',
@@ -16528,20 +16688,19 @@ describe('ChannelRouter post-tool follow-up suppression', () => {
         sessions[0]!.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'aborted' } })
         return
       }
-
-      if (attempt > 2) {
-        sessions[0]!.setAssistantText('NO_REPLY')
-        return
-      }
-      expect(text).toContain('Incomplete todo items remain in your list')
-      await writeTodos(dir, scope, [{ content: 'finish the follow-up', status: 'completed' }])
-      await router.send({ adapter: 'discord-bot', workspace: 'g1', chat: 'c1', text: 'Follow-up finished.' })
-      sessions[0]!.setAssistantText('Follow-up finished.')
-      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('Follow-up finished.') })
+      sessions[0]!.setAssistantText(text)
     }
     await router.__testing!.flushDebounce(KEY)
 
-    expect(sessions[0]!.prompts[1]).toContain('Incomplete todo items remain in your list')
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    const state = await readContinuationState(dir, scope)
+    // The terminal-reply provenance still keeps the runtime's own abort from
+    // arming the user-stop block; the delivered reply is what skips the nudge.
+    expect(state.autoResumeBlockedUntilRealUserTurn).toBe(false)
+    expect(state.lastTurnOutcome).toMatchObject({
+      termination: 'terminal-after-channel-reply',
+      deliveredAfterTodoWrite: true,
+    })
   })
 
   test('an unproven abort with incomplete todos remains blocked until a later user turn', async () => {

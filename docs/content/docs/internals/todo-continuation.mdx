@@ -55,11 +55,13 @@ A continuation **episode** is the unit a budget applies to. It opens when the fi
 | Budget                | Default  | Skip reason      |
 | --------------------- | -------- | ---------------- |
 | `maxAutoTurns`        | `3`      | `max-auto-turns` |
-| `maxCumulativeTokens` | `25_000` | `max-tokens`     |
+| `maxCumulativeTokens` | `20_000` | `max-tokens`     |
 | `maxWallClockMs`      | `30 min` | `max-wall-clock` |
 | `stagnationLimit`     | `2`      | `stagnation`     |
 
-The just-completed turn's token spend (`lastTurnOutcome.tokens`, from the assistant message's `usage.totalTokens`) is folded into `cumulativeTokens` **before** the ceiling check, so the budget reflects real spend; missing usage counts as 0.
+The budget counts **output tokens**: `lastTurnOutcome.tokens` is the final assistant message's `usage.output`. Input and cache counts re-bill the whole context on every request, so they track context size and provider caching rather than the work a turn did; with them, one ordinary turn exhausted the budget. Output is charged to the open episode's `cumulativeTokens` as each assistant message's outcome is recorded (`onTurnOutcome`), and **only when todo continuation started that turn** (`continuationTurn`), so continuation spend counts even when a later idle skips instead of injecting. The channel router tags its nudge reminder and marks a turn whose prompt carries nothing but that nudge; the TUI server marks turns whose queued item came from continuation. The user turn that opens an episode, a background-completion wakeup that lands inside one, and a prompt that mixes the nudge with fresh input or another reminder are never charged. Missing usage counts as 0.
+
+Separately from the episode budgets, a list whose file was last written 72 hours ago or more (`maxListAgeMs`) is skipped as `stale-list`. `writeTodos` stamps `updatedAt` on every write; a file with no stamp (written before stamps existed) counts as stale. Lists that get worked again are touched within the hour almost every time, so an older list is abandoned work in a conversation that has moved on.
 
 ### Stagnation: hash-equality, not real progress
 
@@ -72,13 +74,21 @@ The just-completed turn's token spend (`lastTurnOutcome.tokens`, from the assist
 `decideContinuation` checks in order, first match wins:
 
 1. **`no-incomplete-todos`** — nothing left to do.
-2. **`restart-kick-suppressed`** — the one-shot restart suppressor is armed (below).
-3. **`user-abort-blocked`** — the durable user-abort suppressor is set (policy D1).
-4. **`turn-not-safe`** — the last outcome is missing, `error`, `unknown`, or an unproven `aborted`. The sole safe abort is a successful terminal `channel_reply` carrying runtime-owned `termination: 'terminal-after-channel-reply'` provenance; the raw stop reason remains `aborted`. `unknown`, missing, stale, and malformed provenance all fail closed. `error` has no exception, even with terminal-reply provenance (see below).
-5. **`max-auto-turns` / `max-tokens` / `max-wall-clock`** — a budget ceiling tripped.
-6. **`stagnation`** — `stagnationCount` hit the limit.
+2. **`stale-list`** — the list was last written `maxListAgeMs` (72 hours) ago or more, or has no recorded write time.
+3. **`restart-kick-suppressed`** — the one-shot restart suppressor is armed (below).
+4. **`user-abort-blocked`** — the durable user-abort suppressor is set (policy D1).
+5. **`turn-not-safe`** — the last outcome is missing, `error`, `unknown`, or an unproven `aborted`. The sole safe abort is a successful terminal `channel_reply` carrying runtime-owned `termination: 'terminal-after-channel-reply'` provenance; the raw stop reason remains `aborted`. `unknown`, missing, stale, and malformed provenance all fail closed. `error` has no exception, even with terminal-reply provenance (see below).
+6. **`delivered-after-todo-write`** — the channel turn delivered a message after its last `todo_write` (below).
+7. **`max-auto-turns` / `max-tokens` / `max-wall-clock`** — a budget ceiling tripped.
+8. **`stagnation`** — `stagnationCount` hit the limit.
 
-Only after all six pass does it return `inject` with `autoTurnCount + 1`.
+Only after all eight pass does it return `inject` with `autoTurnCount + 1`.
+
+### A turn that hands back a message does not continue
+
+Continuation exists for a turn that **stops silently** with work left. A channel turn that delivers output (a channel message or a formal GitHub review) after its last `todo_write` (or, with no `todo_write` that logical turn, at all) has handed the turn back to the person, so the router records `deliveredAfterTodoWrite: true` on its outcome and the idle skips with `delivered-after-todo-write`. Replaying stranded channel turns showed nudges after a delivered message mostly produced early or repeated posts about work still waiting on a scheduled check, a restart, or a background result, while silent stops were the ones a nudge helped. A `channel_reply` that renews a promise to keep working (`continue_after_reply: true`) does not count as handing back.
+
+The router counts delivered output per session (`deliveredOutputs`: successful sends plus formal reviews), marks it at each successful `todo_write` and at the start of the logical turn, and compares at idle, inside the serialized decision chain (`recordTurnHandBack`). Recording at idle rather than when the outcome is written matters: reply recovery can deliver a turn's final prose after its last assistant message ends. A terminal `channel_reply` always hands back, so terminal-reply provenance no longer leads to a nudge; it still keeps that runtime-owned abort from arming the user-abort block. TUI turns are unaffected: they record no deliveries.
 
 ### Failed turns do not auto-continue
 
@@ -108,7 +118,7 @@ Two suppressors live in `ContinuationState` and gate injection independent of bu
 - **`recordTurnStart`** resets the episode at the start of a **real** user turn. Injected continuation turns pass `isRealUserTurn=false` so the budget keeps counting down. No-op for scopeless origins.
 - **`recordTurnOutcome`** persists the just-completed turn's `stopReason` + `tokens` from a pi `message_end` event. Channel sessions also attach one-shot terminal-reply provenance only when the raw outcome is `aborted` and the router's abort stamp matches the current turn. In both TUI and channel sessions, per-session writes are serialized on a recoverable tail, so an older outcome can never land after a newer one, while each tail value separately reports whether its write succeeded. The drain waits for the latest tail before `recordTurnStart` and again before the idle decision, and skips continuation when that latest write failed instead of consulting stale eligible state. The TUI drain re-checks its queue after that wait, so a real user prompt that arrived meanwhile runs first. The idle decision itself is chained onto the same tail, so an outcome write that starts during the decision (an abort) lands after the decision's own state write. `classifyStopReason` maps anything unrecognized to `unknown` so the idle path fails closed; `extractTurnUsage` only reads assistant `message_end` events.
 - **`armRestartKickForOrigin`** arms the one-shot before a restart kick.
-- **`runIdleContinuation`** is the idle-path entry: it calls `maybeInjectContinuation` (decide + persist) and, on `injected`, delivers the `CONTINUATION_PROMPT` via the origin-appropriate mechanism the caller supplies (TUI `stream.publish`; channel `pendingSystemReminders` + drain).
+- **`runIdleContinuation`** is the idle-path entry: it calls `maybeInjectContinuation` (decide + persist) and, on `injected`, delivers the `CONTINUATION_PROMPT` via the origin-appropriate mechanism the caller supplies (TUI `stream.publish`; channel `pendingSystemReminders` + drain). Its `onDecision` callback lets both drivers write one operator-log line per idle with pending work: `todo_continuation inject` or `todo_continuation skip reason=<reason>` (`describeContinuationDecision`). Idles with no pending work log nothing. These lines count **policy evaluations**: the channel router's pre-policy exits (a failed outcome write, a user stop, a background child spawned this turn still running) never reach the policy and keep their own log lines.
 
 The episode mutation is persisted **before** delivery, so a crash between persist and deliver can only **under**-count — a missed delivery wastes one budget slot, never an unbounded loop. The injected `CONTINUATION_PROMPT` (`continuation.ts`) is a fenced `**[SYSTEM MESSAGE — not from a human]**` block — the same convention as the [engagement](/docs/internals/engagement) loop-guard and group-chat notices — that tells the model to work the next item, verify completed work skeptically before asserting done, and call `todo_clear` when genuinely finished.
 

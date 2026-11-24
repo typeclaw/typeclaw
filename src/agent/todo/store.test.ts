@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { TodoScope } from './scope'
-import { incompleteTodos, readTodos, type Todo, todoContentPath, writeTodos } from './store'
+import { incompleteTodos, readTodoList, readTodos, type Todo, todoContentPath, writeTodos } from './store'
 
 const TUI_SCOPE: TodoScope = { kind: 'tui', key: 'tui' }
 const CHANNEL_SCOPE: TodoScope = { kind: 'channel', key: 'channel/slack-bot,T1,C1,_root' }
@@ -31,6 +31,21 @@ describe('todo store', () => {
     ]
     await writeTodos(agentDir, TUI_SCOPE, todos)
     expect(await readTodos(agentDir, TUI_SCOPE)).toEqual(todos)
+  })
+
+  test('records when the list was written', async () => {
+    await writeTodos(agentDir, TUI_SCOPE, [{ content: 'x', status: 'pending' }], 1234)
+    expect(await readTodoList(agentDir, TUI_SCOPE)).toEqual({
+      todos: [{ content: 'x', status: 'pending' }],
+      updatedAt: 1234,
+    })
+  })
+
+  test('a list file without a write time reads as unknown age', async () => {
+    const path = todoContentPath(agentDir, TUI_SCOPE)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, JSON.stringify({ version: 1, todos: [{ content: 'x', status: 'pending' }] }))
+    expect((await readTodoList(agentDir, TUI_SCOPE)).updatedAt).toBeNull()
   })
 
   test('nested scope keys create their parent directories', async () => {

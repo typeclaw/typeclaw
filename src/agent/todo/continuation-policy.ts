@@ -3,15 +3,20 @@ import { createHash } from 'node:crypto'
 import { incompleteTodos, type Todo } from './store'
 
 export const DEFAULT_MAX_AUTO_TURNS = 3
-export const DEFAULT_MAX_CUMULATIVE_TOKENS = 25_000
+export const DEFAULT_MAX_CUMULATIVE_TOKENS = 20_000
 export const DEFAULT_MAX_WALL_CLOCK_MS = 30 * 60_000
 export const DEFAULT_STAGNATION_LIMIT = 2
+// Nearly every list that gets worked again is touched within an hour of its
+// last write; a list left untouched for days is abandoned, and nudging it would
+// revive old work in a conversation that has moved on.
+export const DEFAULT_MAX_LIST_AGE_MS = 72 * 60 * 60_000
 
 export type ContinuationLimits = {
   maxAutoTurns: number
   maxCumulativeTokens: number
   maxWallClockMs: number
   stagnationLimit: number
+  maxListAgeMs: number
 }
 
 export const DEFAULT_CONTINUATION_LIMITS: ContinuationLimits = {
@@ -19,6 +24,7 @@ export const DEFAULT_CONTINUATION_LIMITS: ContinuationLimits = {
   maxCumulativeTokens: DEFAULT_MAX_CUMULATIVE_TOKENS,
   maxWallClockMs: DEFAULT_MAX_WALL_CLOCK_MS,
   stagnationLimit: DEFAULT_STAGNATION_LIMIT,
+  maxListAgeMs: DEFAULT_MAX_LIST_AGE_MS,
 }
 
 // A continuation episode is the unit a budget applies to. It opens when the
@@ -52,11 +58,24 @@ export type TurnOutcome = {
   // continue. Optional so older state files remain valid.
   termination?: 'terminal-after-channel-reply'
   endedAt: number
-  // Total tokens the just-completed turn consumed (from the assistant
-  // message's usage). Accumulated into the episode's cumulativeTokens so the
-  // token ceiling reflects real spend. Optional for older state files and for
-  // turns whose usage was unavailable; missing counts as 0.
+  // Output tokens of the just-completed turn's final assistant message.
+  // Accumulated into an open episode's cumulativeTokens so the token ceiling
+  // reflects auto-turn spend. Optional for older state files and for turns
+  // whose usage was unavailable; missing counts as 0.
   tokens?: number
+  // Set when todo continuation itself started the turn. Only these turns are
+  // charged to the episode budget: a user turn, or a background-completion
+  // wakeup that happens to land inside an open episode, is not continuation
+  // spend.
+  continuationTurn?: true
+  // Set at idle when the channel turn delivered output (a message or a formal
+  // review) after its last todo_write (or, with no todo_write, at all) and that
+  // output did not renew a promise to keep working. Delivering output hands the
+  // turn back to the person;
+  // nudging after it mostly produced premature or repeated posts about work
+  // still waiting on something outside the turn. A silent stop is the case
+  // continuation exists for.
+  deliveredAfterTodoWrite?: true
 }
 
 export type ContinuationState = {
@@ -143,6 +162,8 @@ function parseOutcome(value: unknown): TurnOutcome | null {
     endedAt: o.endedAt,
     ...(o.termination === 'terminal-after-channel-reply' ? { termination: o.termination } : {}),
     ...(isFiniteNumber(o.tokens) ? { tokens: o.tokens } : {}),
+    ...(o.continuationTurn === true ? { continuationTurn: true as const } : {}),
+    ...(o.deliveredAfterTodoWrite === true ? { deliveredAfterTodoWrite: true as const } : {}),
   }
 }
 
@@ -184,9 +205,11 @@ export type ContinuationDecision =
 
 export type ContinuationSkipReason =
   | 'no-incomplete-todos'
+  | 'stale-list'
   | 'restart-kick-suppressed'
   | 'user-abort-blocked'
   | 'turn-not-safe'
+  | 'delivered-after-todo-write'
   | 'max-auto-turns'
   | 'max-tokens'
   | 'max-wall-clock'
@@ -200,13 +223,20 @@ export type ContinuationSkipReason =
 export function decideContinuation(args: {
   state: ContinuationState
   todos: readonly Todo[]
+  // When the list was last written; null for a list with no recorded write
+  // time, which is treated as stale.
+  listUpdatedAt: number | null
   limits: ContinuationLimits
   now: number
   newEpisodeId: () => string
 }): ContinuationDecision {
-  const { state, todos, limits, now } = args
+  const { state, todos, listUpdatedAt, limits, now } = args
 
   if (incompleteTodos(todos).length === 0) return { kind: 'skip', reason: 'no-incomplete-todos' }
+
+  if (listUpdatedAt === null || now - listUpdatedAt >= limits.maxListAgeMs) {
+    return { kind: 'skip', reason: 'stale-list' }
+  }
 
   if (state.suppressNextIdleNudgeReason === 'restart-kick') {
     return { kind: 'skip', reason: 'restart-kick-suppressed' }
@@ -230,6 +260,8 @@ export function decideContinuation(args: {
     return { kind: 'skip', reason: 'turn-not-safe' }
   }
 
+  if (outcome.deliveredAfterTodoWrite === true) return { kind: 'skip', reason: 'delivered-after-todo-write' }
+
   const hash = hashIncomplete(todos)
   const base: ContinuationEpisode = state.episode ?? {
     episodeId: args.newEpisodeId(),
@@ -241,14 +273,10 @@ export function decideContinuation(args: {
     lastIncompleteHash: null,
   }
 
-  // Fold the just-completed turn's token spend into the episode BEFORE checking
-  // the ceiling, so the budget reflects what the previous auto-turn actually
-  // cost. `lastTurnOutcome.tokens` is the spend of the turn that drove this
-  // idle; missing usage counts as 0.
-  const episode: ContinuationEpisode = {
-    ...base,
-    cumulativeTokens: base.cumulativeTokens + (outcome.tokens ?? 0),
-  }
+  // Continuation spend is charged to the open episode as each continuation
+  // turn's output is recorded (`onTurnOutcome`), so it counts even when an idle
+  // skips instead of injecting; the decision only checks it.
+  const episode = base
 
   if (episode.autoTurnCount >= limits.maxAutoTurns) return { kind: 'skip', reason: 'max-auto-turns' }
   if (episode.cumulativeTokens >= limits.maxCumulativeTokens) return { kind: 'skip', reason: 'max-tokens' }

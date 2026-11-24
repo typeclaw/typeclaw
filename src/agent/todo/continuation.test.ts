@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 
-import { CONTINUATION_PROMPT, maybeInjectContinuation } from './continuation'
+import { CONTINUATION_PROMPT, describeContinuationDecision, maybeInjectContinuation } from './continuation'
 import { DEFAULT_CONTINUATION_LIMITS } from './continuation-policy'
 import {
   armRestartKickSuppression,
@@ -14,7 +14,7 @@ import {
   writeContinuationState,
 } from './continuation-state'
 import { resolveTodoScope } from './scope'
-import { writeTodos } from './store'
+import { todoContentPath, writeTodos } from './store'
 
 const TUI: SessionOrigin = { kind: 'tui', sessionId: 'ses_x' }
 const SCOPE = resolveTodoScope(TUI)!
@@ -46,6 +46,28 @@ describe('maybeInjectContinuation', () => {
     if (res.kind === 'injected') expect(res.text).toBe(CONTINUATION_PROMPT)
     const state = await readContinuationState(agentDir, SCOPE)
     expect(state.episode?.autoTurnCount).toBe(1)
+  })
+
+  test('skips a list last written beyond the age limit', async () => {
+    const now = Date.now()
+    await writeTodos(
+      agentDir,
+      SCOPE,
+      [{ content: 'task', status: 'pending' }],
+      now - DEFAULT_CONTINUATION_LIMITS.maxListAgeMs,
+    )
+    await seedSafeOutcome()
+    const res = await maybeInjectContinuation({ agentDir, origin: TUI, now })
+    expect(res).toEqual({ kind: 'skipped', reason: 'stale-list' })
+  })
+
+  test('skips a list file written before write times were recorded', async () => {
+    const path = todoContentPath(agentDir, SCOPE)
+    await mkdir(dirname(path), { recursive: true })
+    await writeFile(path, JSON.stringify({ version: 1, todos: [{ content: 'task', status: 'pending' }] }))
+    await seedSafeOutcome()
+    const res = await maybeInjectContinuation({ agentDir, origin: TUI })
+    expect(res).toEqual({ kind: 'skipped', reason: 'stale-list' })
   })
 
   test('skips when no incomplete todos', async () => {
@@ -135,5 +157,25 @@ describe('maybeInjectContinuation', () => {
     // budget is not reset by a process boundary.
     const res = await maybeInjectContinuation({ agentDir, origin: TUI, newEpisodeId: () => 'ep-restart' })
     expect(res.kind).toBe('skipped')
+  })
+})
+
+describe('describeContinuationDecision', () => {
+  test('names the reason for a skip that involved pending work', () => {
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'delivered-after-todo-write' })).toBe(
+      'todo_continuation skip reason=delivered-after-todo-write',
+    )
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'stale-list' })).toBe(
+      'todo_continuation skip reason=stale-list',
+    )
+  })
+
+  test('reports an injection', () => {
+    expect(describeContinuationDecision({ kind: 'injected', scope: SCOPE, text: 'x' })).toBe('todo_continuation inject')
+  })
+
+  test('stays quiet for idles with no pending work', () => {
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'no-incomplete-todos' })).toBeNull()
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'no-scope' })).toBeNull()
   })
 })

@@ -23,7 +23,7 @@ import { sessionMetaPayload } from '@/agent/session-meta'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { parseSubagentCompletedPayload, renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
 import type { CreateSessionForSubagent, SubagentCoalescer } from '@/agent/subagents'
-import { TODO_CONTINUATION_SOURCE } from '@/agent/todo/continuation'
+import { describeContinuationDecision, TODO_CONTINUATION_SOURCE } from '@/agent/todo/continuation'
 import {
   armRestartKickForOrigin,
   clearAbortSuppressionForOrigin,
@@ -238,6 +238,9 @@ type SessionState = {
   // cancellation) still resume the session once.
   heldForChildSince: number | null
   unsubChildSettle: Unsubscribe | null
+  // Whether todo continuation started the turn in flight. Its outcome is then
+  // charged to the continuation budget.
+  continuationTurn: boolean
   // Latest turn's usage, captured from `message_end` by forwardSessionEvents and
   // read at the `done` send site (which lives outside that subscriber). Reset at
   // each turn start so a turn with no usage event sends a plain `done`.
@@ -605,6 +608,7 @@ export function createServer({
                     ),
               heldForChildSince: null,
               unsubChildSettle: null,
+              continuationTurn: false,
               lastUsage: null,
               dispose,
             }
@@ -1080,6 +1084,7 @@ function subscribeTurnOutcome(state: SessionState, agentDir: string, logger: Ser
         turnId: state.sessionFileId,
         stopReason: usage.stopReason,
         ...(usage.tokens !== undefined ? { tokens: usage.tokens } : {}),
+        continuationTurn: state.continuationTurn,
       },
       logger,
     )
@@ -1230,6 +1235,7 @@ async function drain(
       if (!item) break
       const turnStartedAt = Date.now()
       state.heldForChildSince = null
+      state.continuationTurn = item.source === TODO_CONTINUATION_SOURCE
       pushQueueState(ws, state)
       send(ws, { type: 'prompt_started', messageId: item.streamMessageId, text: item.text })
       // Only a prompt typed in the TUI is a new request; continuations,
@@ -1353,6 +1359,10 @@ async function maybeContinueTodos(
             ts: Date.now(),
             source: TODO_CONTINUATION_SOURCE,
           })
+        },
+        onDecision: (result) => {
+          const line = describeContinuationDecision(result)
+          if (line !== null) logger.info(`[server] ${state.sessionFileId}: ${line}`)
         },
       })
     } catch (err) {
