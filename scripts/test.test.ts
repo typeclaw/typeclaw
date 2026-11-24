@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import {
+  bunTestArgs,
   collectChangeSet,
   createImportGraph,
   type ImportGraph,
@@ -25,6 +26,23 @@ const graph = fakeGraph({
   'src/b/b.test.ts': ['src/b/b.ts'],
   'src/c/c.test.ts': ['src/shared/util.ts'],
   'scripts/require-parallel.ts': ['src/preload-helper.ts'],
+})
+
+describe('bunTestArgs', () => {
+  test('gives a run without its own budget the 30s timeout', () => {
+    expect(bunTestArgs(['./src/a.test.ts'])).toEqual([
+      'test',
+      '--parallel',
+      '--no-orphans',
+      '--timeout',
+      '30000',
+      './src/a.test.ts',
+    ])
+  })
+
+  test.each([[['--timeout', '60000']], [['--timeout=60000']]])('keeps an explicit budget %j', (budget) => {
+    expect(bunTestArgs(budget)).toEqual(['test', '--parallel', '--no-orphans', ...budget])
+  })
 })
 
 describe('selectImpactedTests', () => {

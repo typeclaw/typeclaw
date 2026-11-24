@@ -214,8 +214,18 @@ function isCi(): boolean {
   return value !== undefined && value !== '' && value !== '0' && value !== 'false'
 }
 
+// Bun ignores `[test] timeout` in bunfig.toml (verified on 1.4.0, serial and
+// --parallel), so every test fell back to its 5s default locally while CI
+// passed an explicit budget. This keeps local runs on CI's budget.
+const DEFAULT_TIMEOUT_MS = '30000'
+
+export function bunTestArgs(args: readonly string[]): string[] {
+  const hasTimeout = args.some((arg) => arg === '--timeout' || arg.startsWith('--timeout='))
+  return ['test', '--parallel', '--no-orphans', ...(hasTimeout ? [] : ['--timeout', DEFAULT_TIMEOUT_MS]), ...args]
+}
+
 async function runBunTest(args: readonly string[]): Promise<number> {
-  const proc = Bun.spawn([process.execPath, 'test', '--parallel', '--no-orphans', ...args], {
+  const proc = Bun.spawn([process.execPath, ...bunTestArgs(args)], {
     stdio: ['inherit', 'inherit', 'inherit'],
   })
   return proc.exited
