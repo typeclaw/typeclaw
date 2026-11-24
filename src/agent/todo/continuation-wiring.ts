@@ -1,6 +1,6 @@
 import type { SessionOrigin } from '@/agent/session-origin'
 
-import { maybeInjectContinuation } from './continuation'
+import { type ContinuationInjectResult, maybeInjectContinuation } from './continuation'
 import { type TurnOutcome } from './continuation-policy'
 import {
   armRestartKickSuppression,
@@ -154,8 +154,10 @@ export async function runIdleContinuation(args: {
   agentDir: string
   origin: SessionOrigin
   deliver: DeliverContinuation
+  onDecision?: (result: ContinuationInjectResult) => void
 }): Promise<boolean> {
   const result = await maybeInjectContinuation({ agentDir: args.agentDir, origin: args.origin })
+  args.onDecision?.(result)
   if (result.kind !== 'injected') return false
   args.deliver(result.text)
   return true

@@ -20,6 +20,7 @@ import {
 import type { RestartHandoff } from '@/agent/restart-handoff'
 import type { ChannelParticipant, SessionOrigin } from '@/agent/session-origin'
 import { renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
+import { describeContinuationDecision } from '@/agent/todo/continuation'
 import {
   armRestartKickForOrigin,
   clearAbortSuppressionForOrigin,
@@ -4228,6 +4229,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // `qualifyingWorkThisLogicalTurn` must survive it so a follow-up reply
             // can still cite the durable work this turn already did.
             live.pendingSystemReminders.push({ ...retryReminder(text), todoContinuation: true })
+          },
+          onDecision: (result) => {
+            const line = describeContinuationDecision(result)
+            if (line !== null) logger.info(`[channels] ${live.keyId}: ${line}`)
           },
         })
       } catch (err) {

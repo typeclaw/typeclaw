@@ -23,7 +23,7 @@ import { sessionMetaPayload } from '@/agent/session-meta'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { parseSubagentCompletedPayload, renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
 import type { CreateSessionForSubagent, SubagentCoalescer } from '@/agent/subagents'
-import { TODO_CONTINUATION_SOURCE } from '@/agent/todo/continuation'
+import { describeContinuationDecision, TODO_CONTINUATION_SOURCE } from '@/agent/todo/continuation'
 import {
   armRestartKickForOrigin,
   clearAbortSuppressionForOrigin,
@@ -1359,6 +1359,10 @@ async function maybeContinueTodos(
             ts: Date.now(),
             source: TODO_CONTINUATION_SOURCE,
           })
+        },
+        onDecision: (result) => {
+          const line = describeContinuationDecision(result)
+          if (line !== null) logger.info(`[server] ${state.sessionFileId}: ${line}`)
         },
       })
     } catch (err) {

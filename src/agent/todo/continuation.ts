@@ -24,6 +24,17 @@ export const CONTINUATION_PROMPT = [
   '',
 ].join('\n')
 
+// Skip reasons that fire on almost every idle and say nothing about pending
+// work; operator logs omit them so the ones that matter stay readable.
+const ROUTINE_SKIP_REASONS = new Set(['no-origin', 'no-scope', 'no-incomplete-todos'])
+
+// One operator-log line for a continuation decision that involved pending
+// work, or null when the decision is routine.
+export function describeContinuationDecision(result: ContinuationInjectResult): string | null {
+  if (result.kind === 'injected') return 'todo_continuation inject'
+  return ROUTINE_SKIP_REASONS.has(result.reason) ? null : `todo_continuation skip reason=${result.reason}`
+}
+
 export type ContinuationInjectResult =
   | { kind: 'injected'; scope: TodoScope; text: string }
   | { kind: 'skipped'; reason: string }

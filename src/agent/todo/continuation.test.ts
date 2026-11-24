@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
 
-import { CONTINUATION_PROMPT, maybeInjectContinuation } from './continuation'
+import { CONTINUATION_PROMPT, describeContinuationDecision, maybeInjectContinuation } from './continuation'
 import { DEFAULT_CONTINUATION_LIMITS } from './continuation-policy'
 import {
   armRestartKickSuppression,
@@ -157,5 +157,25 @@ describe('maybeInjectContinuation', () => {
     // budget is not reset by a process boundary.
     const res = await maybeInjectContinuation({ agentDir, origin: TUI, newEpisodeId: () => 'ep-restart' })
     expect(res.kind).toBe('skipped')
+  })
+})
+
+describe('describeContinuationDecision', () => {
+  test('names the reason for a skip that involved pending work', () => {
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'delivered-after-todo-write' })).toBe(
+      'todo_continuation skip reason=delivered-after-todo-write',
+    )
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'stale-list' })).toBe(
+      'todo_continuation skip reason=stale-list',
+    )
+  })
+
+  test('reports an injection', () => {
+    expect(describeContinuationDecision({ kind: 'injected', scope: SCOPE, text: 'x' })).toBe('todo_continuation inject')
+  })
+
+  test('stays quiet for idles with no pending work', () => {
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'no-incomplete-todos' })).toBeNull()
+    expect(describeContinuationDecision({ kind: 'skipped', reason: 'no-scope' })).toBeNull()
   })
 })
