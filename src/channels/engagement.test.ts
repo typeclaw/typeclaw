@@ -1593,7 +1593,8 @@ describe('decideEngagement (multi-human sticky target check)', () => {
     expect(ledger.has(KEY, 'alice', 1000)).toBe(true)
   })
 
-  test('a credited author naming a known peer bot observes, credit preserved', () => {
+  test('a credited author naming a known peer bot in plain text still engages (the model decides)', () => {
+    // given a credited human in a two-human group with a known peer bot
     const ledger = new StickyLedger()
     ledger.grant(KEY, 'alice', 10_000)
     const participants: readonly ChannelParticipant[] = [
@@ -1601,6 +1602,8 @@ describe('decideEngagement (multi-human sticky target check)', () => {
       participant('bob'),
       { ...participant('라라'), isBot: true },
     ]
+
+    // when alice names the peer bot in plain text, with no mention or reply
     const decision = decideEngagement({
       message: inbound({ authorId: 'alice', text: '라라아 그거 어떻게 됐어?' }),
       config: baseConfig,
@@ -1609,8 +1612,59 @@ describe('decideEngagement (multi-human sticky target check)', () => {
       now: 1000,
       participants,
     })
+
+    // then sticky engages exactly as for a plain-text human name; the
+    // group-chat nudge leaves the stay-silent call to the model
+    expect(decision).toBe('engage')
+  })
+
+  test('a credited peer bot whose message contains its own name engages', () => {
+    // given a peer bot holding a credit in a two-human group
+    const ledger = new StickyLedger()
+    ledger.grant(KEY, 'peer1', 10_000)
+    const participants: readonly ChannelParticipant[] = [
+      participant('alice'),
+      participant('bob'),
+      { ...participant('라라'), authorId: 'peer1', isBot: true },
+    ]
+
+    // when it posts a self-labelled report, as a human would
+    const decision = decideEngagement({
+      message: inbound({
+        authorId: 'peer1',
+        authorName: '라라',
+        authorIsBot: true,
+        text: '라라 리뷰: v5를 수정 요청으로 돌렸어',
+      }),
+      config: baseConfig,
+      key: KEY,
+      ledger,
+      now: 1000,
+      participants,
+    })
+
+    // then the credit engages; a name in text is not structural addressing
+    expect(decision).toBe('engage')
+  })
+
+  test('a credited peer bot that @-mentions a third party still observes, credit preserved', () => {
+    const ledger = new StickyLedger()
+    ledger.grant(KEY, 'peer1', 10_000)
+    const decision = decideEngagement({
+      message: inbound({
+        authorId: 'peer1',
+        authorIsBot: true,
+        text: '<@UBOB> 확인해줘',
+        mentionsOthers: true,
+      }),
+      config: baseConfig,
+      key: KEY,
+      ledger,
+      now: 1000,
+      participants: [...crowded, { ...participant('peer1'), isBot: true }],
+    })
     expect(decision).toBe('observe')
-    expect(ledger.has(KEY, 'alice', 1000)).toBe(true)
+    expect(ledger.has(KEY, 'peer1', 1000)).toBe(true)
   })
 
   test("after a suppressed third-party message, the same author's next plain follow-up consumes the preserved credit and engages", () => {

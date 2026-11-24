@@ -107,17 +107,27 @@ export function decideEngagement(input: EngagementInput): EngagementDecision {
   // Multi-human pre-sticky target check. In a busy group the conversational
   // target shifts every message: the author we're mid-exchange with (and hold
   // a sticky credit for) may, on THIS turn, structurally address a third party
-  // — "@bob what do you think?", a reply to another human's message, or a
-  // peer bot by name. Sticky below is content-blind by design (it answers "am
-  // I mid-conversation with this author?"), so without this guard it would
-  // force-engage on a message plainly aimed elsewhere and burn the credit.
+  // — "@bob what do you think?" or a reply to another human's message. Sticky
+  // below is content-blind by design (it answers "am I mid-conversation with
+  // this author?"), so without this guard it would force-engage on a message
+  // plainly aimed elsewhere and burn the credit.
   //
   // This stays inside the pinned content-blind philosophy: it adds NO semantic
-  // text interpretation. It reuses the SAME structural booleans the post-alias
-  // suppressors already trust (`mentionsOthers`, `replyToOtherMessageId`,
-  // `textTargetsAnyPeerBot`) — the adapter classifiers decide "addressed to
-  // someone else", not this gate. The only refinement is ordering: when those
-  // structural signals fire in a multi-human group, observe BEFORE consuming
+  // text interpretation. It reuses only the adapter-classified structural
+  // booleans (`mentionsOthers`, `replyToOtherMessageId`), which apply the same
+  // way whether the author or the target is a human or a bot. Plain-text peer
+  // bot names (`textTargetsAnyPeerBot`) are deliberately NOT checked here: a
+  // name in text is not structural addressing (bots routinely sign or label
+  // their own posts and name each other in reports), human names in text never
+  // step aside either, and an engaged turn in a multi-human group carries the
+  // group-chat nudge telling the model to stay silent when the message is aimed
+  // at another person or bot (while the peer-bot loop guard is active, its
+  // warning replaces that nudge and only suggests `NO_REPLY` for noise). The
+  // cost: `consume` slides the credit's expiry, so a credited author who keeps
+  // naming other bots keeps waking us for silent turns, exactly as plain
+  // chatter from a credited human already does. The only refinement is
+  // ordering: when those structural signals fire in a multi-human group,
+  // observe BEFORE consuming
   // sticky, and PRESERVE the credit so the author's next untargeted follow-up
   // still wakes us within the window. A plain follow-up (no suppressor set)
   // is untouched: it falls through to sticky and engages exactly as before.
@@ -135,7 +145,7 @@ export function decideEngagement(input: EngagementInput): EngagementDecision {
     config.stickiness !== 'off' &&
     !explicitOnly &&
     !matchesAnyAlias(message.text, selfAliases) &&
-    targetsSomeoneElse(message, participants, botInThread)
+    structurallyTargetsSomeoneElse(message, botInThread)
   ) {
     return 'observe'
   }
@@ -254,11 +264,10 @@ function isFreshCompleteSoloRoom(membership: MembershipCount | null, now: number
   return membership.humans <= 1
 }
 
-// Structural "this message is addressed to someone other than us" test. Pure
-// over adapter-classified booleans + observed peer names — no semantic text
-// interpretation, so it is safe for the content-blind engagement gate. Shared
-// by the multi-human pre-sticky check and the post-alias fallback suppressors
-// so the two can never drift apart.
+// Structural "this message is addressed to someone other than us" test, pure
+// over adapter-classified booleans. Used alone by the multi-human pre-sticky
+// check, and as the base of `targetsSomeoneElse` for the solo-human fallback
+// suppressors so the two can never drift apart.
 //
 //   - `mentionsOthers` — the message tags at least one other user and none of
 //     the mentions resolve to us.
@@ -267,18 +276,25 @@ function isFreshCompleteSoloRoom(membership: MembershipCount | null, now: number
 //     `parent_user_id` is the THREAD ROOT author, not the immediate parent, so
 //     a thread a human opens by @-mentioning us would otherwise drop every
 //     follow-up; `botInThread` is the escape hatch once we're participating.
-//   - `textTargetsAnyPeerBot` — the text names a known peer bot (observed via
-//     `participants[]`). A never-seen peer's first addressing slips through,
-//     then is caught forever once that peer has spoken once.
+function structurallyTargetsSomeoneElse(message: InboundMessage, botInThread: boolean): boolean {
+  if (message.mentionsOthers) return true
+  if (message.replyToOtherMessageId !== null && !botInThread) return true
+  return false
+}
+
+// Fallback-suppressor variant: the structural test plus `textTargetsAnyPeerBot`
+// — the text names a known peer bot (observed via `participants[]`). In a
+// 1-human-N-bot room, addressing a bot by plain name ("라라야 cron 좀 봐줘") is
+// the only signal that keeps every OTHER bot's solo-human fallback from
+// answering. A never-seen peer's first addressing slips through, then is
+// caught forever once that peer has spoken once.
 function targetsSomeoneElse(
   message: InboundMessage,
   participants: readonly ChannelParticipant[],
   botInThread: boolean,
 ): boolean {
-  if (message.mentionsOthers) return true
-  if (message.replyToOtherMessageId !== null && !botInThread) return true
-  if (textTargetsAnyPeerBot(message.text, participants)) return true
-  return false
+  if (structurallyTargetsSomeoneElse(message, botInThread)) return true
+  return textTargetsAnyPeerBot(message.text, participants)
 }
 
 // Membership is a room property, so a Slack thread inherits its parent
