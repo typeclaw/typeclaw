@@ -2089,6 +2089,24 @@ describe('github-cli-auth plugin — review verdict lease is released on a tool.
     expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
   })
 
+  test('staging a literal review example in a heredoc neither blocks nor reserves a verdict', async () => {
+    process.env.GH_TOKEN = 'ghs_seeded'
+    stubGithubFetch()
+    const hook = await hookFor(tokenResolver('ghs_minted'))
+
+    // given: a quoted heredoc that only writes a review example to a file
+    const staged = await hook(reviewBashEvent(`cat > notes.md <<'EOF'\n${CLEAN_REVIEW}\nEOF`, 'call-1'), hookCtx)
+    expect(staged).toBeUndefined()
+
+    // when: the real review is submitted for the same PR
+    const event = reviewBashEvent(CLEAN_REVIEW, 'call-2')
+    const submitted = await hook(event, hookCtx)
+
+    // then: no in-flight lease from the example blocks it
+    expect(submitted).toBeUndefined()
+    expect(event.args[TYPECLAW_INTERNAL_BASH_ENV]).toEqual({ GH_TOKEN: 'ghs_minted' })
+  })
+
   test('an ALLOWED in-flight submission still blocks a concurrent duplicate (the fix does not weaken the guard)', async () => {
     process.env.GH_TOKEN = 'ghs_seeded'
     stubGithubFetch()

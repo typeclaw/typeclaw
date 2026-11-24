@@ -196,6 +196,16 @@ describe('detectReviewSubmission — gh not at the start of the command', () => 
 })
 
 describe('detectReviewSubmission — non-matches', () => {
+  test('a literal review example staged in a heredoc body is not a submission', () => {
+    const command =
+      "cat > notes.md <<'EOF'\n" +
+      'gh api -X POST repos/acme/widgets/pulls/5/reviews -f event=APPROVE\n' +
+      'gh pr review 5 -R acme/widgets --request-changes -b "needs work"\n' +
+      'EOF'
+    expect(detectReviewSubmission({ command })).toBeNull()
+    expect(detectReviewSubmissionAttempt(command)).toBeNull()
+  })
+
   test('a plain pr view is null', () => {
     expect(detectReviewSubmission({ command: 'gh pr view 12 -R acme/widgets' })).toBeNull()
   })
