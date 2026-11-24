@@ -56,6 +56,7 @@ export async function recordTurnOutcome(args: {
   stopReason: TurnOutcome['stopReason']
   termination?: TurnOutcome['termination']
   tokens?: number
+  continuationTurn?: boolean
   now?: number
 }): Promise<void> {
   const scope = resolveTodoScope(args.origin)
@@ -67,6 +68,7 @@ export async function recordTurnOutcome(args: {
     endedAt: args.now ?? Date.now(),
     ...(args.termination !== undefined ? { termination: args.termination } : {}),
     ...(args.tokens !== undefined ? { tokens: args.tokens } : {}),
+    ...(args.continuationTurn === true ? { continuationTurn: true as const } : {}),
   }
   await writeContinuationState(args.agentDir, scope, onTurnOutcome(state, outcome))
 }

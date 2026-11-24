@@ -792,6 +792,25 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
     t.session.resolvePrompt()
     t.ws.close()
   })
+
+  test('records the continuation turn, not the user turn, as continuation spend', async () => {
+    const flags: Array<boolean | undefined> = []
+    const t = await startTodoTurn({
+      recordTurnOutcome: async (args) => {
+        flags.push(args.continuationTurn)
+        await recordTurnOutcome(args)
+      },
+    })
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.session.promptCalls.length === 2)
+    emitAssistantEnd(t.session, 'stop')
+    await waitForState(() => flags.length === 2)
+
+    expect(flags).toEqual([false, true])
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
 })
 
 describe('createServer abort handling (no stream — fallback path)', () => {
