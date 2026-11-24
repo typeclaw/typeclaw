@@ -142,6 +142,7 @@ async function startWithSession(
     containerName?: string
     recordTurnOutcome?: typeof recordTurnOutcome
     runIdleContinuation?: typeof runIdleContinuation
+    liveSubagentRegistry?: LiveSubagentRegistry
   } = {},
 ): Promise<{ url: string }> {
   const pluginRuntime =
@@ -162,6 +163,7 @@ async function startWithSession(
     ...(extra.containerName !== undefined ? { containerName: extra.containerName } : {}),
     ...(extra.recordTurnOutcome ? { recordTurnOutcome: extra.recordTurnOutcome } : {}),
     ...(extra.runIdleContinuation ? { runIdleContinuation: extra.runIdleContinuation } : {}),
+    ...(extra.liveSubagentRegistry ? { liveSubagentRegistry: extra.liveSubagentRegistry } : {}),
   }).start()
   server = built
   return { url: `ws://localhost:${built.port}` }
@@ -478,19 +480,29 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
   // turn — the stale state a premature idle decision would wrongly act on — and
   // starts one real user turn. Every idle decision's injected/not result is
   // recorded so tests can await the decision instead of sleeping.
-  async function startTodoTurn(seams: { recordTurnOutcome?: typeof recordTurnOutcome } = {}) {
+  async function startTodoTurn(
+    seams: {
+      recordTurnOutcome?: typeof recordTurnOutcome
+      liveSubagentRegistry?: LiveSubagentRegistry
+      pluginHooks?: HookBus
+    } = {},
+  ) {
     const agentDir = await mkdtemp(join(tmpdir(), 'server-todo-order-'))
     await writeTodos(agentDir, scope, [{ content: 'finish the work', status: 'pending' }])
     await recordTurnOutcome({ agentDir, origin, turnId: 'prior', stopReason: 'stop' })
     const decisions: boolean[] = []
     const warnings: string[] = []
+    const infos: string[] = []
     const session = createFakeSession()
+    const stream = createStream()
+    const { pluginHooks, ...rest } = seams
     const { url } = await startWithSession(session, {
       agentDir,
-      stream: createStream(),
+      stream,
       sessionFactory: createSessionFactory({ agentDir }),
-      logger: { info: () => {}, warn: (m) => warnings.push(m), error: () => {} },
-      ...seams,
+      logger: { info: (m) => infos.push(m), warn: (m) => warnings.push(m), error: () => {} },
+      ...(pluginHooks ? { pluginRegistry: (await import('@/plugin/registry')).emptyRegistry(), pluginHooks } : {}),
+      ...rest,
       runIdleContinuation: async (args) => {
         const injected = await runIdleContinuation(args)
         decisions.push(injected)
@@ -498,12 +510,13 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
       },
     })
     const conn = await connect(url)
-    await conn.waitFor((m) => m.type === 'connected')
+    const connected = await conn.waitFor((m) => m.type === 'connected')
+    const sessionId = connected.type === 'connected' ? connected.sessionId : ''
     conn.ws.send(JSON.stringify({ type: 'prompt', text: 'do thing' }))
     await waitForState(() => session.promptCalls.length === 1)
     const lastStopReason = async () =>
       (await readContinuationState(agentDir, scope)).lastTurnOutcome?.stopReason ?? null
-    return { ...conn, session, decisions, warnings, lastStopReason }
+    return { ...conn, session, stream, sessionId, decisions, warnings, infos, lastStopReason }
   }
 
   test('idle decision waits for a pending error write instead of continuing on the prior stop', async () => {
@@ -600,6 +613,182 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
     await waitForState(() => t.session.promptCalls.length === 2)
     expect(t.session.promptCalls[1]).toContain('user follow-up')
     expect(t.decisions).toEqual([])
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
+  function runningChild(parentSessionId: string, startedAt: number) {
+    return {
+      taskId: 'bg_wait1',
+      sessionId: 'ses_child',
+      subagentName: 'explorer',
+      parentSessionId,
+      background: true,
+      startedAt,
+      status: 'running' as const,
+      abort: async () => {},
+    }
+  }
+
+  test('defers continuation while a background child spawned this turn is still running', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    registry.register(runningChild(t.sessionId, Date.now()))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await t.waitFor((m) => m.type === 'done')
+
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+    expect(t.decisions).toEqual([])
+    expect(t.session.promptCalls).toHaveLength(1)
+    t.ws.close()
+  })
+
+  test('resumes once when a held child settles without a completion reminder', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    registry.register(runningChild(t.sessionId, Date.now()))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+    await expectStable(() => t.session.promptCalls.length > 1, {
+      durationMs: 20,
+      description: 'prompt before the child settles',
+    })
+
+    // A work-key cancellation settles the child and publishes no completion.
+    registry.recordCompletionIfRunning('bg_wait1', { ok: false, error: 'cancelled: converted to draft', durationMs: 1 })
+
+    await waitForState(() => t.session.promptCalls.length === 2)
+    expect(t.session.promptCalls[1]).toContain('Incomplete todo items remain')
+    expect(t.decisions).toEqual([true])
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
+  test('a held child that completes is resumed by its completion reminder, not a nudge', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    registry.register(runningChild(t.sessionId, Date.now()))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+
+    registry.recordCompletionIfRunning('bg_wait1', { ok: true, durationMs: 1 })
+    t.stream.publish({
+      target: { kind: 'broadcast' },
+      payload: {
+        kind: 'subagent.completed',
+        taskId: 'bg_wait1',
+        subagent: 'explorer',
+        parentSessionId: t.sessionId,
+        ok: true,
+        durationMs: 1,
+      },
+    })
+
+    await waitForState(() => t.session.promptCalls.length === 2)
+    expect(t.session.promptCalls[1]).toContain('bg_wait1')
+    expect(t.session.promptCalls[1]).not.toContain('Incomplete todo items remain')
+    expect(t.decisions).toEqual([])
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
+  test('a child settling while a closed session tears down starts no turn', async () => {
+    const endGate = Promise.withResolvers<void>()
+    let ending = false
+    const hooks = createHookBus()
+    hooks.registerAll(
+      'p',
+      '/agent',
+      { info: () => {}, warn: () => {}, error: () => {} },
+      {
+        'session.end': async () => {
+          ending = true
+          await endGate.promise
+        },
+      },
+    )
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry, pluginHooks: hooks })
+    registry.register(runningChild(t.sessionId, Date.now()))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+
+    t.ws.close()
+    await waitForState(() => ending)
+    registry.recordCompletionIfRunning('bg_wait1', { ok: false, error: 'cancelled: converted to draft', durationMs: 1 })
+
+    await expectStable(() => t.session.promptCalls.length > 1, {
+      durationMs: 20,
+      description: 'turn started on a closing session',
+    })
+    expect(t.decisions).toEqual([])
+    endGate.resolve()
+  })
+
+  test('a continuation whose turn start outlives the socket dispatches no model request', async () => {
+    const endGate = Promise.withResolvers<void>()
+    const turnStartGate = Promise.withResolvers<void>()
+    const turnStartEntered = Promise.withResolvers<void>()
+    let turnStarts = 0
+    let turnEnds = 0
+    let ending = false
+    const hooks = createHookBus()
+    hooks.registerAll(
+      'p',
+      '/agent',
+      { info: () => {}, warn: () => {}, error: () => {} },
+      {
+        'session.turn.start': async () => {
+          turnStarts++
+          if (turnStarts < 2) return
+          turnStartEntered.resolve()
+          await turnStartGate.promise
+        },
+        'session.turn.end': async () => {
+          turnEnds++
+        },
+        'session.end': async () => {
+          ending = true
+          await endGate.promise
+        },
+      },
+    )
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry, pluginHooks: hooks })
+    registry.register(runningChild(t.sessionId, Date.now()))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+
+    registry.recordCompletionIfRunning('bg_wait1', { ok: false, error: 'cancelled: converted to draft', durationMs: 1 })
+    await turnStartEntered.promise
+    t.ws.close()
+    await waitForState(() => ending)
+    turnStartGate.resolve()
+
+    await expectStable(() => t.session.promptCalls.length > 1, {
+      durationMs: 20,
+      description: 'model request on a closing session',
+    })
+    await waitForState(() => turnEnds === turnStarts)
+    expect(turnEnds).toBe(2)
+    endGate.resolve()
+  })
+
+  test('still continues when the only running child predates the turn', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    registry.register(runningChild(t.sessionId, 0))
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+    await t.waitFor((m) => m.type === 'done')
+
+    await waitForState(() => t.decisions.length === 1)
+    expect(t.decisions).toEqual([true])
     t.session.resolvePrompt()
     t.ws.close()
   })
