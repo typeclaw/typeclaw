@@ -81,7 +81,12 @@ import {
   wrapSystemTool,
   zodToToolParameters,
 } from './plugin-tools'
-import { promptCacheKeyForOrigin, sharedSessionIdForOrigin, withPromptCacheKey } from './prompt-cache-key'
+import {
+  promptCacheKeyForOrigin,
+  sharedSessionIdForOrigin,
+  withInstructionsAsDeveloperInput,
+  withPromptCacheKey,
+} from './prompt-cache-key'
 import { wrapTransformContextWithLocalFailureMarker } from './provider-error'
 import { createReloadTool } from './reload-tool'
 import type { RestartHandoffOrigin } from './restart-handoff'
@@ -697,7 +702,8 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     }
     const onPayload = async (payload: unknown, payloadModel: typeof requestModel) => {
       const next = (await streamOptions?.onPayload?.(payload, payloadModel)) ?? payload
-      const final = promptCacheKey === undefined ? next : withPromptCacheKey(next, promptCacheKey)
+      const keyed = promptCacheKey === undefined ? next : withPromptCacheKey(next, promptCacheKey)
+      const final = payloadModel.api === 'openai-codex-responses' ? withInstructionsAsDeveloperInput(keyed) : keyed
       if (streamOptions?.sessionId === session.sessionId) {
         cacheKeepalive?.capture(payloadModel, context, requestOptions, final)
       }
