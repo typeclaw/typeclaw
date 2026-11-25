@@ -1189,6 +1189,18 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   const isMyTeam = requestedTeam !== null && teamIsBotMember === true
   if (!isMeAsUser && !isMyTeam) return null
 
+  // Assignment and reviewer requests share pending work and a check. Removing
+  // only the reviewer request must not stop a review still owed by assignment.
+  if (
+    action === 'review_request_removed' &&
+    Array.isArray(pr.assignees) &&
+    pr.assignees.some((assignee) => {
+      const user = readUser(assignee)
+      return user !== null && (user.login === selfLogin || (decoyLogin !== null && user.login === decoyLogin))
+    })
+  )
+    return null
+
   const title = readString(pr, 'title') ?? `#${number}`
   const head = readString(readRecord(pr.head), 'ref')
   const baseRef = readString(readRecord(pr.base), 'ref')

@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import { createSessionWithDispose } from '@/agent'
+import { githubReviewChecks } from '@/channels/github-review-check'
 import { recordVerifiedDismissal } from '@/channels/github-review-turn-ledger'
 import { createRecoveryNotice } from '@/channels/recovery-notice'
 import { createChannelRouter } from '@/channels/router'
@@ -54,6 +55,7 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
   const dir = existingDir ?? (await mkdtemp(join(tmpdir(), 'github-pending-reviews-')))
   const store = await loadPendingReviewStore(dir, logger)
   const calls: string[] = []
+  const statuses: Array<Record<string, unknown>> = []
   const reviews: Array<Record<string, unknown>> = []
   const timeline: Array<Record<string, unknown>> = []
   const allowedAuthors = new Set<string>()
@@ -75,6 +77,10 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
         await hold.released
       }
       if (url.endsWith('/user')) return Response.json({ login: 'bot', id: 1 })
+      if (url.includes('/statuses/') && init?.method === 'POST') {
+        statuses.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+        return Response.json({})
+      }
       if (url.includes('/timeline?')) return Response.json(timeline)
       if (url.includes('/compare/')) return Response.json({ status: comparison })
       if (url.endsWith('/reviews/123')) return Response.json({ id: 123, state: 'COMMENTED' })
@@ -173,6 +179,7 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
     config,
     fetchImpl,
     calls,
+    statuses,
     reviews,
     timeline,
     allowedAuthors,
@@ -489,6 +496,47 @@ test('clears pending work when the review request for the bot is removed', async
     requested_reviewer: { login: 'bot', id: 1, type: 'User' },
   })
   expect(await f.store.list()).toEqual([])
+})
+
+test('keeps the pending review and check after assignment then reviewer removal while still assigned', async () => {
+  // #given
+  const f = await fixture()
+  f.config.review.check = true
+  await f.adapter.start()
+  const assigned = f.nextRoute()
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  await f.deliver('assigned', 'pull_request', {
+    assignee: bot,
+    pull_request: { ...pull, assignees: [bot] },
+  })
+  expect((await assigned).kind).toBe('accepted')
+  const recorded = await f.store.list()
+  expect(recorded).toHaveLength(1)
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+    'assigned-removal-review',
+  )
+  expect(f.statuses.map((status) => status.state)).toEqual(['pending'])
+
+  try {
+    // #when
+    const response = await f.deliver('review_request_removed', 'pull_request', {
+      requested_reviewer: bot,
+      pull_request: { ...pull, assignees: [bot], updated_at: '2026-01-01T00:01:00Z' },
+    })
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(response.status).toBe(200)
+    expect(await f.store.list()).toEqual(recorded)
+    expect(f.statuses.map((status) => status.state)).toEqual(['pending'])
+    expect(f.routed.map((message) => message.eventKind)).toEqual(['pull_request:assigned'])
+  } finally {
+    await githubReviewChecks.reviewerSettled('assigned-removal-review', {
+      kind: 'cancelled',
+      reason: 'test cleanup',
+    })
+  }
 })
 
 test('keeps pending work when another reviewer is removed', async () => {

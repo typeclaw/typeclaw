@@ -382,6 +382,39 @@ describe('classifyGithubInbound', () => {
   })
 
   describe('pull_request.review_request_removed', () => {
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw[bot]'],
+      ['app', 'typeclaw[bot]', 'typeclaw'],
+    ] as const)('drops removal under %s auth while %s remains assigned as %s', (authType, selfLogin, assigneeLogin) => {
+      // #given
+      const payload = reviewRequestRemovedPayload({
+        reviewerLogin: authType === 'app' ? 'typeclaw' : selfLogin,
+      })
+      ;(payload.pull_request as Record<string, unknown>).assignees = [
+        { login: 'someone-else', id: 10, type: 'User' },
+        { login: assigneeLogin, id: 99, type: 'User' },
+      ]
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+
+      // #then
+      expect(msg).toBe(null)
+    })
+
+    it('still emits a cleanup signal when only another user remains assigned', () => {
+      // #given
+      const payload = reviewRequestRemovedPayload({ reviewerLogin: 'typeclaw-bot' })
+      ;(payload.pull_request as Record<string, unknown>).assignees = [{ login: 'someone-else', id: 10, type: 'User' }]
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+
+      // #then
+      expect(msg?.text).toContain('You can stop any in-progress review.')
+    })
+
     it('emits a cleanup signal when the bot is un-requested', () => {
       const msg = classifyGithubInbound(
         'pull_request',
