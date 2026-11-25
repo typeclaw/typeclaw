@@ -86,6 +86,9 @@ type ReplyReviewRoundResolution =
   | { kind: 'clear' }
   | { kind: 'unknown'; expiresAt: number }
 
+const recoveringDeliveries = new WeakMap<DeliveryDedup, Set<string>>()
+class GithubDeliveryRecoveryInFlightError extends Error {}
+
 export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
     if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
@@ -101,7 +104,13 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
     const payload = parseJson(body)
     if (payload === null) return ok()
     // The HTTP request is only transport; event handling is the shared core.
-    await processVerifiedGithubDelivery(options, { event, delivery, payload })
+    try {
+      await processVerifiedGithubDelivery(options, { event, delivery, payload })
+    } catch (error) {
+      if (error instanceof GithubDeliveryRecoveryInFlightError)
+        return new Response('delivery recovery in progress', { status: 503 })
+      throw error
+    }
     return ok()
   }
 }
@@ -116,6 +125,28 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
 // later/duplicate live delivery collapse to one route. HMAC is the caller's job:
 // the live handler verifies the body; the sweep trusts the authenticated API.
 export async function processVerifiedGithubDelivery(
+  options: GithubWebhookHandlerOptions,
+  input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
+): Promise<void> {
+  const { delivery } = input
+  let recovering = recoveringDeliveries.get(options.dedup)
+  if (delivery !== '' && recovering?.has(delivery)) throw new GithubDeliveryRecoveryInFlightError()
+  if (input.recovered !== true || delivery === '') return processGithubDelivery(options, input)
+  if (recovering === undefined) {
+    recovering = new Set()
+    recoveringDeliveries.set(options.dedup, recovering)
+  }
+  // Ownership is not proof of admission. A same-GUID redelivery must stay
+  // retryable until this attempt either admits work or definitively consumes it.
+  recovering.add(delivery)
+  try {
+    await processGithubDelivery(options, input)
+  } finally {
+    recovering.delete(delivery)
+  }
+}
+
+async function processGithubDelivery(
   options: GithubWebhookHandlerOptions,
   input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
 ): Promise<void> {

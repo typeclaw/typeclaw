@@ -192,12 +192,13 @@ async function fixture(
   let routeSignal = Promise.withResolvers<RouteReceipt>()
   const route = router.route.bind(router)
   router.route = async (message, onAdmitted) => {
+    const signal = routeSignal
     routeAttempts.push(message)
     const task = route(message, onAdmitted)
     routeTasks.push(task)
     const receipt = await task
     routed.push(message)
-    routeSignal.resolve(receipt)
+    signal.resolve(receipt)
     return receipt
   }
   let handler: ((req: Request) => Promise<Response>) | undefined
@@ -983,6 +984,69 @@ test.each(
     expect(f.routed).toHaveLength(1)
   },
 )
+
+test.each(
+  ['assigned', 'review_requested'].flatMap((action) =>
+    ['transient', 'stale', 'admitted'].map((outcome) => ({ action, outcome })),
+  ),
+)('keeps same-GUID redelivery retryable during recovered $action admission: $outcome', async ({ action, outcome }) => {
+  // #given: pause exactly the admission lookup, after recovery reserves the GUID.
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const payload = {
+    action,
+    repository: { name: 'widgets', owner: { login: 'acme' } },
+    pull_request: { ...pull, assignees: [bot] },
+    assignee: bot,
+    requested_reviewer: bot,
+    sender: { login: 'alice', id: 10, type: 'User' },
+  }
+  const turn = Promise.withResolvers<void>()
+  const f = await fixture(undefined, { recoveredDelivery: payload, prompt: () => turn.promise })
+  cleanups.push(async () => turn.resolve())
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
+  const endpoint = action === 'assigned' ? '/pulls/7' : '/requested_reviewers'
+  let reads = 0
+  const hold = f.holdFetch((url) => url.endsWith(endpoint) && ++reads === 2)
+  const recovery = f.recoverRemoval()
+  await hold.reached
+
+  // #when: a maintainer requests signed redelivery while the lookup can still fail.
+  let redelivery: Response
+  try {
+    redelivery = await f.deliver(action, 'pull_request', payload, 'old-removal')
+    if (outcome === 'transient') {
+      const failRead = action === 'assigned' ? f.failPull : f.failRequestedReviewers
+      failRead(() => new Response('unavailable', { status: 503 }))
+    } else if (outcome === 'stale') {
+      f.pull.assignees = []
+      f.requestedReviewers.users = []
+    }
+  } finally {
+    hold.release()
+    await recovery
+  }
+
+  // #then: no success ACK can hide a failed recovery from subsequent sweeps.
+  expect(redelivery.status).toBe(503)
+  expect(f.routed).toHaveLength(outcome === 'admitted' ? 1 : 0)
+  if (outcome === 'transient') {
+    expect(await f.store.list()).toEqual([])
+    expect(f.routeAttempts).toEqual([])
+    f.failPull()
+    f.failRequestedReviewers()
+    await f.recoverRemoval()
+    expect(f.routed).toHaveLength(1)
+    expect(f.routeAttempts).toHaveLength(1)
+  }
+  expect((await f.deliver(action, 'pull_request', payload, 'old-removal')).status).toBe(200)
+  expect(f.routed).toHaveLength(outcome === 'stale' ? 0 : 1)
+  expect(await f.store.list()).toHaveLength(outcome === 'stale' ? 0 : 1)
+})
 
 test.each([
   { status: 403, headers: new Headers({ 'x-ratelimit-remaining': '0' }), message: 'API rate limit exceeded' },
