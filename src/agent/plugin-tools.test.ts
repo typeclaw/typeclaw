@@ -47,6 +47,7 @@ import {
   resolveProtectedZones,
   resolveHiddenPaths,
   SandboxDegradedProcError,
+  holdSessionTmp,
   SESSION_TMP_ROOT,
   resolvePrivilegedSandboxRuntime,
 } from '@/sandbox'
@@ -6419,6 +6420,53 @@ describe('wrapBuiltinToolDefinition /tmp path redirect (per-session scratch)', (
       }
     },
   )
+
+  test('a session dispose during an in-flight /tmp read keeps the scratch dir until the read settles', async () => {
+    // given
+    const sessionId = uniqueSessionId('dispose-mid-read')
+    const sessionDir = `${SESSION_TMP_ROOT}/${sessionId}`
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(`${sessionDir}/review.json`, '{}')
+    const releaseSession = holdSessionTmp(sessionId)
+    const reading = Promise.withResolvers<void>()
+    const finish = Promise.withResolvers<void>()
+    const wrapped = wrapBuiltinToolDefinition(
+      {
+        name: 'read',
+        label: 'read',
+        description: '',
+        parameters: Type.Object({ path: Type.String() }),
+        async execute(_id: string, params: { path: string }) {
+          reading.resolve()
+          await finish.promise
+          return { content: [{ type: 'text' as const, text: await readFile(params.path, 'utf8') }], details: {} }
+        },
+      },
+      {
+        agentDir: '/agent',
+        sessionId,
+        hooks: createHookBus(),
+        getOrigin: () => guest,
+        permissions: createPermissionService(),
+      },
+    )
+    try {
+      const call = wrapped.execute('c', { path: '/tmp/review.json' } as never, undefined, undefined, {} as never)
+      await reading.promise
+
+      // when
+      await releaseSession()
+
+      // then
+      expect(await readFile(`${sessionDir}/review.json`, 'utf8')).toBe('{}')
+      finish.resolve()
+      const result = await call
+      expect(result.content).toEqual([{ type: 'text', text: '{}' }])
+    } finally {
+      finish.resolve()
+      await rm(sessionDir, { recursive: true, force: true })
+    }
+  })
 
   test('a sandboxed role (guest) reading /tmp resolves to the same session backing dir bash wrote', async () => {
     const sessionId = uniqueSessionId('guest-read')

@@ -13,6 +13,7 @@ import {
   ensureBwrapAvailable,
   ensureHiddenMaskTargets,
   ensureSessionTmpDir,
+  leaseSessionTmp,
   reconcileDependencyBinWrappers,
   resolveHiddenPaths,
   resolvePrivilegedSandboxRuntime,
@@ -131,9 +132,13 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
     deferredPreparation,
   } = options
   const boundary = options.boundary ?? DEFAULT_BASH_SANDBOX_BOUNDARY
+  // Held until the caller's post-exit cleanup, so neither a session dispose nor
+  // the orphan sweep removes the scratch dir a running command has bound.
+  const releaseTmpLease = leaseSessionTmp(sessionId)
   let preparation: DeferredBashPreparationResult | undefined
   let privilegedRuntime: Awaited<ReturnType<typeof resolvePrivilegedSandboxRuntime>> | undefined
   const cleanup = async (): Promise<void> => {
+    releaseTmpLease()
     const tasks: Promise<void>[] = []
     if (privilegedRuntime !== undefined) {
       tasks.push((boundary.cleanupRuntime ?? cleanupPrivilegedSandboxRuntime)(privilegedRuntime))

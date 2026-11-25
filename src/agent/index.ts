@@ -58,7 +58,7 @@ import type {
 import { createHookBus, materializeSkills } from '@/plugin'
 import { CORE_SYSTEM_TOOL_NAMES } from '@/plugin/core-tool-names'
 import type { ReloadRegistry } from '@/reload'
-import { canSeePrivateSurface, enterSubagentTmpScope, resolveHiddenPaths } from '@/sandbox'
+import { canSeePrivateSurface, enterSubagentTmpScope, holdSessionTmp, resolveHiddenPaths } from '@/sandbox'
 import type { Stream } from '@/stream'
 
 import { getAuthFor } from './auth'
@@ -804,12 +804,26 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
           options.origin.parentSessionId,
         )
       : undefined
+  // Channel drivers end a session through `session.dispose()` alone, so the
+  // scratch release rides that wrapper; the returned dispose repeats it for
+  // drivers that only call that one (release is idempotent).
+  const releaseSessionTmp = holdSessionTmp(options.plugins?.sessionId ?? sessionManager.getSessionId())
+  const discardSessionTmp = () =>
+    releaseSessionTmp().catch((err: unknown) => {
+      console.warn(`[session-tmp] discard failed: ${err instanceof Error ? err.message : String(err)}`)
+    })
+  const disposeSession = session.dispose.bind(session)
+  session.dispose = () => {
+    disposeSession()
+    void discardSessionTmp()
+  }
   const dispose = async () => {
     await codemodeRuntime?.dispose()
     stopIdleCompaction()
     cacheKeepalive?.close()
     unsubCacheKeepalive()
     releaseSubagentTmp?.()
+    await discardSessionTmp()
     unsubLoopGuardTurn()
     unsubRestart?.()
     unsubToolNudge()
