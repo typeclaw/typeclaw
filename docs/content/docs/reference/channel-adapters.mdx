@@ -115,6 +115,8 @@ thread. GitHub synthetic review rounds carry distinct round/commit identities,
 and the open-PR catch-up retries a PR whose replay was not `accepted` or
 `duplicate`.
 
+Synthetic `watch` events use a stable watch/run identifier, not a platform message ID. Replaying a previously admitted verdict does not start another turn.
+
 Interrupted accepted work transfers to a fixed runtime-notice outbox on boot.
 Inbound requests and background work that share the exact target, account,
 permission principal and captured parent are grouped into one notice. The work
