@@ -1859,6 +1859,7 @@ export type ChannelRouter = {
 export type AliasesProvider = () => readonly string[]
 
 export type CreateChannelRouterOptions = {
+  onHumanInbound?: (origin: SessionOrigin) => void
   agentDir: string
   bootEpoch?: string
   backgroundObligations?: BackgroundObligationStore
@@ -4506,6 +4507,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       chat: live.key.chat,
       ...(live.resolvedNames.chatName !== undefined ? { chatName: live.resolvedNames.chatName } : {}),
       thread: live.key.thread,
+      isDm: live.lastInboundIsDm,
+      ...(live.room ? { room: live.room } : {}),
       ...(live.githubReviewRound !== null ? { githubReviewRound: live.githubReviewRound } : {}),
       ...(live.room?.parentChat !== undefined ? { parentChat: live.room.parentChat } : {}),
       ...(live.room?.parentChatName !== undefined ? { parentChatName: live.room.parentChatName } : {}),
@@ -6531,6 +6534,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const route = async (event: InboundMessage, onAdmitted?: () => Promise<void>): Promise<RouteReceipt> => {
     const receipt = await routeInbound(event, onAdmitted)
+    if (!event.authorIsBot && !event.handoff && receipt.kind !== 'denied')
+      options.onHumanInbound?.(inboundAuthorOrigin(event))
     if (receipt.kind === 'observed' || receipt.kind === 'control') catchUp.noteObserved(event)
     return receipt
   }
