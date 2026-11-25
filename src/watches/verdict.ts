@@ -25,12 +25,24 @@ export function parseProbeOutput(
   stderr: string,
   mode: WatchRecord['mode'],
   previous: unknown,
+  digest?: string,
 ): ProbeResult {
   if (!(mode === 'diff' ? code === 0 : [0, 10, 20, 30].includes(code)))
     throw new Error(`Probe exited ${code}: ${stderr.trim() || stdout.trim()}`)
   if (mode === 'diff') {
-    if (typeof previous !== 'string' || previous === stdout) return { verdict: 'quiet', state: stdout }
-    return { verdict: 'wake', summary: createTwoFilesPatch('previous', 'current', previous, stdout), state: stdout }
+    if (!digest || !/^[a-f0-9]{64}$/.test(digest)) throw new Error('Missing full stdout digest')
+    const state = { digest, tail: stdout }
+    const prior = z.object({ digest: z.string(), tail: z.string() }).safeParse(previous)
+    // Older baselines have only the tail. Preserve visible diffs on upgrade
+    // and establish the full-stream digest on the first post-upgrade tick.
+    const before = prior.success ? prior.data.tail : typeof previous === 'string' ? previous : undefined
+    if (before === undefined || (prior.success ? prior.data.digest === digest : before === stdout))
+      return { verdict: 'quiet', state }
+    const summary =
+      before === stdout
+        ? `Stdout changed outside the retained tail (SHA-256 ${digest}).`
+        : createTwoFilesPatch('previous', 'current', before, stdout)
+    return { verdict: 'wake', state, summary }
   }
   const summary = stdout.trim()
   const last = summary.split('\n').at(-1)

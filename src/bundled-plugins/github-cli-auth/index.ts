@@ -34,12 +34,7 @@ import {
   createGitAuthLoginResolver,
   type GitAuthCredential,
 } from './git-auth-diagnostic'
-import {
-  analyzeGitCommand,
-  createSessionTmpGitResolvers,
-  defaultGitResolvers,
-  resolveGhDefaultRepoFromCwd,
-} from './git-command'
+import { analyzeGitCommand, createSessionTmpGitResolvers, resolveGhDefaultRepoFromCwd } from './git-command'
 import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 import { matchesGrantedPush, takeGrantedPush } from './granted-push'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
@@ -279,11 +274,18 @@ export default definePlugin({
     // (2) the working tree's `origin` remote. NOT from any `-R`/path in the
     // command (that is the attacker-controllable input the parser already
     // handles). The slug is still gated by the repos[] allowlist at mint time.
-    const resolveTrustedFallbackRepo = async (origin: SessionOrigin | undefined): Promise<string | undefined> => {
+    const resolveTrustedFallbackRepo = async ({
+      origin,
+      bashCwd,
+      sessionId,
+    }: Pick<ToolBeforeEvent, 'origin' | 'bashCwd' | 'sessionId'>): Promise<string | undefined> => {
       if (origin?.kind === 'channel' && origin.adapter === 'github' && origin.workspace !== '') {
         return origin.workspace
       }
-      const fromCwd = await resolveGhDefaultRepoFromCwd(ctx.agentDir, defaultGitResolvers)
+      const fromCwd = await resolveGhDefaultRepoFromCwd(
+        bashCwd ?? ctx.agentDir,
+        createSessionTmpGitResolvers(ctx.agentDir, sessionId),
+      )
       return fromCwd ?? undefined
     }
 
@@ -315,7 +317,7 @@ export default definePlugin({
     // 'fall-through' means "not a repo-targeting gh command" so the caller can
     // try the git path on the same command (e.g. `git ... # gh` substrings).
     const handleGhCommand = async (params: {
-      event: Pick<ToolBeforeEvent, 'callId' | 'args' | 'origin' | 'sessionId'>
+      event: Pick<ToolBeforeEvent, 'callId' | 'args' | 'origin' | 'sessionId' | 'bashCwd'>
       command: string
     }): Promise<HookResult | 'fall-through'> => {
       const { event, command } = params
@@ -330,7 +332,7 @@ export default definePlugin({
       let fallbackRepo: string | undefined
       let fallbackRepoUsed = false
       if (decision.kind === 'block' && decision.code === 'missing-repo') {
-        fallbackRepo = await resolveTrustedFallbackRepo(event.origin)
+        fallbackRepo = await resolveTrustedFallbackRepo(event)
         if (fallbackRepo !== undefined) {
           const withFallback = analyzeGhCommand(command, fallbackRepo)
           if (withFallback.kind === 'inject') {
@@ -551,14 +553,14 @@ export default definePlugin({
     }
 
     const handleGitCommand = async (params: {
-      event: { callId: string; args: Record<string, unknown>; origin?: SessionOrigin }
+      event: Pick<ToolBeforeEvent, 'callId' | 'args' | 'origin' | 'bashCwd'>
       command: string
       agentDir: string
       sessionId: string
     }): Promise<HookResult> => {
       const { event, command, agentDir, sessionId } = params
       const decision = await analyzeGitCommand(command, {
-        cwd: agentDir,
+        cwd: event.bashCwd ?? agentDir,
         resolvers: createSessionTmpGitResolvers(agentDir, sessionId),
       })
       const grantedPush = takeGrantedPush(event.callId)

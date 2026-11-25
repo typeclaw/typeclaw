@@ -25,7 +25,10 @@ test('judge accepts exit and last-line JSON forms, but non-contract exits remain
 test('diff establishes a quiet baseline and ignores JSON verdicts on later changes', () => {
   const before = '{"verdict":"done"}\n',
     after = 'new\n'
-  expect(parseProbeOutput(0, before, '', 'diff', undefined)).toMatchObject({ verdict: 'quiet', state: before })
-  expect(parseProbeOutput(0, before, '', 'diff', before).verdict).toBe('quiet')
-  expect(parseProbeOutput(0, after, '', 'diff', before).summary).toContain(`-${before}+${after}`)
+  const baseline = parseProbeOutput(0, before, '', 'diff', undefined, 'a'.repeat(64))
+  expect(baseline.verdict).toBe('quiet')
+  expect(parseProbeOutput(0, before, '', 'diff', baseline.state, 'a'.repeat(64)).verdict).toBe('quiet')
+  expect(parseProbeOutput(0, after, '', 'diff', baseline.state, 'b'.repeat(64)).summary).toContain(
+    `-${before}+${after}`,
+  )
 })

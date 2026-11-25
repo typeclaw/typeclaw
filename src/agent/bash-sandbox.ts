@@ -96,6 +96,10 @@ export function buildBashFilesystemPolicy(options: BashFilesystemPolicyOptions) 
 export type BashSandboxReveal = NonNullable<SandboxPolicy['reveal']>
 
 export type BashSandboxRequest = {
+  readonly cwd?: string
+  // Applied inside bwrap, after guards and token brokers have inspected the
+  // actual command. Watch probes need separate bounded stdout/stderr.
+  readonly frameOutput?: (command: string) => string
   readonly getGithubSelf?: GetGithubSelf
   readonly command: string
   readonly permissions: PermissionService
@@ -228,14 +232,14 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
       ...(options.reveal === undefined ? {} : { reveal: options.reveal }),
       symlinks,
       network: options.network ?? 'inherit',
-      cwd: agentDir,
+      cwd: options.cwd ?? agentDir,
       proc,
       procSelfExe: resolveProcSelfExe(),
       ...spreadSandboxEnv(
         buildSandboxEnvPolicy(sandboxEnvOverlay, privilegedRuntime?.env, envNames.exposable, envWithhold),
       ),
     }
-    const { commandString, spawnEnv } = boundary.buildCommand(command, policy)
+    const { commandString, spawnEnv } = boundary.buildCommand(options.frameOutput?.(command) ?? command, policy)
     // The overlay carries command-scoped secret VALUES (e.g. a per-repo GH_TOKEN)
     // that live in neither process.env nor argv; resolveSpawnEnv snapshots
     // inherited names from process.env only, so merge the overlay values in here

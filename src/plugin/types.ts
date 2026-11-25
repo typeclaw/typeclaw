@@ -231,6 +231,8 @@ export type SessionPromptEvent = {
 export type ToolProvenance = 'first-party' | 'plugin'
 
 export type ToolBeforeEvent = {
+  // Resolved execution directory inside the sandbox; never taken from tool args.
+  bashCwd?: string
   tool: string
   sessionId: string
   callId: string
