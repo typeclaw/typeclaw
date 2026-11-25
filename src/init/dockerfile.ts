@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { CONTAINER_AGENT_MESSENGER_CONFIG_DIR } from '@/agent-messenger/config-dir'
 import { renderBrowserLayers } from '@/browser/dockerfile'
 import type { BrowserConfig } from '@/browser/registry'
@@ -8,6 +10,7 @@ import { OMO_CLI_VERSION } from '@/coding-agent/omo'
 import { validateDockerfileAppendLine } from '@/config/config'
 import type { DockerfileConfig, DockerfileFeatureToggle } from '@/config/config'
 import { TESTED_BUN_VERSION } from '@/hostd/version'
+import { SESSION_TMP_ROOT } from '@/sandbox/session-tmp'
 
 import { GHCR_BASE_IMAGE_REPO } from './cli-version'
 
@@ -291,7 +294,10 @@ export const NETWORK_BLOCK_IPV6_NETS = ['fc00::/7', 'fe80::/10', 'ff00::/8', '::
 // bare IPs and CIDR notation. Validation already happened in config.ts at
 // parse time, so the shim trusts the env. Empty env → loop body never
 // runs, zero ACCEPT rules added.
-export function buildEntrypointShim(): string {
+// `sessionScratch` exists for tests only: the production shim renders the fixed
+// mount path, never an env override, because the root phase chowns that tree
+// recursively and .env is forwarded into the container.
+export function buildEntrypointShim({ sessionScratch = SESSION_TMP_ROOT }: { sessionScratch?: string } = {}): string {
   const ipv4Rules = NETWORK_BLOCK_IPV4_NETS.map(
     (net) => `iptables -A OUTPUT -d ${net} -j REJECT --reject-with icmp-port-unreachable`,
   )
@@ -500,8 +506,17 @@ fi
 
 runtime_home="\${TYPECLAW_RUNTIME_HOME:-/home/agent}"
 mkdir -p "$runtime_home"
+# Session scratch is a per-agent named volume (src/container/start.ts) that
+# outlives the container. Docker creates it root-owned, and a changed host UID
+# would leave 0700 session dirs the runtime cannot sweep, so take the tree over
+# whenever its owner is not the runtime identity. An ordinary restart finds the
+# owner already matching and skips the walk over leftover checkouts.
+session_scratch="${sessionScratch}"
 if [ -n "\${TYPECLAW_HOST_UID:-}" ] && [ -n "\${TYPECLAW_HOST_GID:-}" ]; then
   chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$runtime_home"
+  if [ -d "$session_scratch" ] && [ "$(stat -c '%u:%g' "$session_scratch")" != "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" ]; then
+    chown -R "$TYPECLAW_HOST_UID:$TYPECLAW_HOST_GID" "$session_scratch"
+  fi
 fi
 # Adopt the runtime HOME for the rest of this root phase, BEFORE any
 # link_configured_symlinks call. The re-exec paths below override HOME again for
@@ -595,7 +610,18 @@ function renderEntrypointShimLayer(): string {
   return `# Layer 6 (small, changes with the egress shim): install /usr/local/bin/typeclaw-entrypoint.
 # The shim is a no-op unless \`network.blockInternal\` is true at runtime.
 RUN echo "${encoded}" | base64 -d > ${TYPECLAW_ENTRYPOINT_PATH} \\
- && chmod +x ${TYPECLAW_ENTRYPOINT_PATH}`
+ && chmod +x ${TYPECLAW_ENTRYPOINT_PATH}
+LABEL ${ENTRYPOINT_SHIM_LABEL}="${entrypointShimHash()}"`
+}
+
+// Stamps the image with the shim it carries. A failed upgrade build leaves the
+// refreshed Dockerfile on disk and the old image tagged, so the next start sees
+// no Dockerfile change; `start` compares this label instead and rebuilds rather
+// than run an entrypoint older than the run arguments it is given.
+export const ENTRYPOINT_SHIM_LABEL = 'dev.typeclaw.entrypoint-shim'
+
+export function entrypointShimHash(): string {
+  return createHash('sha256').update(buildEntrypointShim()).digest('hex').slice(0, 16)
 }
 
 // Bake the secret-free git-askpass helper (github-cli-auth broker delivers the

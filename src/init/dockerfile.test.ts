@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { dockerfileSchema } from '@/config/config'
+import { SESSION_TMP_ROOT } from '@/sandbox/session-tmp'
 import { isWindows } from '@/shared'
 
 import { GHCR_BASE_IMAGE_REPO } from './cli-version'
@@ -14,6 +15,8 @@ import {
   buildEntrypointShim,
   BUN_BASE_IMAGE,
   classifyDockerfileAppend,
+  ENTRYPOINT_SHIM_LABEL,
+  entrypointShimHash,
   CHROME_RUNTIME_APT_PACKAGES_AMD64,
   CLOUDFLARED_RELEASE_URL_BASE,
   CLOUDFLARED_VERSION,
@@ -1544,7 +1547,10 @@ exit 0
     await writeFile(join(bakedHome, '.codex', 'hooks.json'), '{"hooks":"cx"}')
 
     const seedShimPath = join(seedWorkdir, 'shim-seed.sh')
-    await writeShellScript(seedShimPath, buildEntrypointShim())
+    await writeShellScript(
+      seedShimPath,
+      buildEntrypointShim({ sessionScratch: join(seedWorkdir, 'no-session-scratch') }),
+    )
 
     const proc = Bun.spawn(['/bin/sh', seedShimPath, 'run'], {
       env: {
@@ -1568,6 +1574,65 @@ exit 0
     expect(dumped).not.toContain('codex_hooks={"hooks":"cx"}')
     expect(readFileSync(chownDump, 'utf8').trim()).toBe(`-R 12345:23456 ${expectedRuntimeHome}`)
     rmSync(seedWorkdir, { recursive: true, force: true })
+  })
+
+  test.each([
+    { owner: '0:0', label: 'a fresh root-owned volume', takesOver: true },
+    { owner: '501:20', label: 'scratch left by a previous host UID', takesOver: true },
+    { owner: '12345:23456', label: 'scratch already owned by the runtime', takesOver: false },
+  ])('takes over session scratch only when it holds $label', async ({ owner, takesOver }) => {
+    // given: a scratch volume whose root reports `owner`
+    const workdir = mkdtempSync(join(tmpdir(), 'typeclaw-shim-scratch-'))
+    const bin = join(workdir, 'bin')
+    await mkdir(bin, { recursive: true })
+    await symlinkHostBinaries(bin, ['mkdir', 'ln', 'readlink', 'env', 'sh', 'rm', 'sleep'])
+    const chownDump = join(workdir, 'chown.log')
+    await writeShellScript(join(bin, 'chown'), `#!/bin/sh\nprintf '%s\n' "$*" >> "${chownDump}"\nexit 0\n`)
+    await writeShellScript(join(bin, 'stat'), `#!/bin/sh\nprintf '%s\n' '${owner}'\n`)
+    await writeShellScript(
+      join(bin, 'setpriv'),
+      `#!/bin/sh
+while [ $# -gt 0 ]; do case "$1" in --) shift; break;; *) shift;; esac; done
+exec "$@"
+`,
+    )
+    await writeShellScript(join(bin, 'bun'), '#!/bin/sh\nexit 0\n')
+    const scratch = join(workdir, 'session-scratch')
+    await mkdir(scratch)
+    const shimPath = join(workdir, 'shim.sh')
+    await writeShellScript(shimPath, buildEntrypointShim({ sessionScratch: scratch }))
+
+    // when
+    const proc = Bun.spawn(['/bin/sh', shimPath, 'run'], {
+      env: {
+        PATH: bin,
+        HOME: workdir,
+        TYPECLAW_RUNTIME_HOME: join(workdir, 'runtime-home'),
+        TYPECLAW_HOST_UID: '12345',
+        TYPECLAW_HOST_GID: '23456',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    })
+    expect(await proc.exited).toBe(0)
+
+    // then: a matching owner is left alone, so an ordinary restart never walks
+    // the leftover checkouts
+    const chowns = readFileSync(chownDump, 'utf8').trim().split('\n')
+    expect(chowns.includes(`-R 12345:23456 ${scratch}`)).toBe(takesOver)
+    expect(chowns.some((line) => line.endsWith(scratch) && !line.startsWith('-R '))).toBe(false)
+    rmSync(workdir, { recursive: true, force: true })
+  })
+
+  test('renders the fixed scratch mount path with no environment override', () => {
+    const shim = buildEntrypointShim()
+    expect(shim).toContain(`session_scratch="${SESSION_TMP_ROOT}"`)
+    expect(shim).not.toContain('TYPECLAW_SESSION_SCRATCH')
+  })
+
+  test('stamps the image with the hash of the shim it installs', () => {
+    const dockerfile = buildDockerfile(undefined, { baseImageVersion: '0.1.0' })
+    expect(dockerfile).toContain(`LABEL ${ENTRYPOINT_SHIM_LABEL}="${entrypointShimHash()}"`)
   })
 
   test('root fallback creates TYPECLAW_RUNTIME_HOME without a host identity, then execs the agent with that HOME', async () => {
