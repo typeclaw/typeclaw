@@ -81,6 +81,7 @@ import type { CronHandlerContext } from '@/plugin/types'
 import { createContainerBroker, publishForwardResult, subscribeForwardRequest } from '@/portbroker'
 import { formatChannelReloadSummary, ReloadRegistry, type ReloadAllResult, type ReloadContext } from '@/reload'
 import { createClaimController } from '@/role-claim'
+import { startSessionTmpSweeper } from '@/sandbox'
 import { exportGithubCliStoreForAgent, hydrateChannelEnvFromSecrets, refreshProviderOAuthForAgent } from '@/secrets'
 import { createServer, type Server } from '@/server'
 import {
@@ -371,6 +372,11 @@ async function startAgentRuntime(
       : null
   const lastWords = lastWordsRun !== null ? startLastWordsRecorder({ agentDir: cwd, run: lastWordsRun }) : null
   registerBootCleanup(() => lastWords?.dispose())
+  // Session scratch lives on the container's /tmp, which only this process owns
+  // inside a container; outside one, /tmp is shared with every other process, so
+  // a sweep there could delete another run's live scratch.
+  const stopSessionTmpSweeper = containerName !== undefined ? startSessionTmpSweeper(console.log) : undefined
+  registerBootCleanup(() => stopSessionTmpSweeper?.())
   const stopEmbedder = startEmbedderProcess()
   registerBootCleanup(stopEmbedder)
   const vectorStartupPromise = buildStartupVectorIndex(cwd).catch((err) => {
@@ -1228,6 +1234,7 @@ async function startAgentRuntime(
     // into the next `startAgent`.
     try {
       stopResourceSampler()
+      stopSessionTmpSweeper?.()
       scheduler?.stop()
       cronConsumer.stop()
       subagentConsumer.stop()

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, rename, rm } from 'node:fs/promises'
+import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { posix } from 'node:path'
 
 // Container-only code over the POSIX `/tmp`; pinned to `path.posix` so the test
@@ -13,8 +13,15 @@ const { basename, dirname, isAbsolute, join, relative, resolve } = posix
 // subdir of /tmp gives `/tmp` semantics without either sharing the whole
 // container /tmp into a sandboxed role or persisting anything into the project
 // surface. The container /tmp only dies with the container, and agents run for
-// weeks, so a dir is discarded when its last live session releases it.
+// weeks, so a dir is discarded when its last live session releases it and
+// periodically swept (`sweepSessionTmp`) for anything a crash left behind.
 export const SESSION_TMP_ROOT = '/tmp/typeclaw-session'
+
+// A dir that no live session holds but that was touched this recently is left
+// alone by the periodic sweep, so a scratch user outside the session factory
+// (one short bash run) is never swept mid-use.
+export const SESSION_TMP_SWEEP_MIN_AGE_MS = 60 * 60 * 1000
+export const SESSION_TMP_SWEEP_INTERVAL_MS = 60 * 60 * 1000
 
 const DISCARD_PREFIX = '.discard-'
 
@@ -37,6 +44,13 @@ const liveTmpHolders = new Map<string, number>()
 // session claiming a name mid-discard gets a fresh dir instead of one the
 // pending rename is about to take away.
 const pendingMoves = new Map<string, Promise<void>>()
+
+let renameDir: typeof rename = rename
+
+// Lets a test hold a move-aside mid-rename to exercise overlapping discards.
+export function __setSessionTmpRenameForTesting(fn: typeof rename | undefined): void {
+  renameDir = fn ?? rename
+}
 
 export function sessionTmpDir(sessionId: string): string {
   return join(SESSION_TMP_ROOT, subagentTmpScopes.get(sessionId)?.scope ?? sessionId)
@@ -73,9 +87,10 @@ export function holdSessionTmp(sessionId: string): () => Promise<void> {
   }
 }
 
-// Keeps a dir from being discarded for one bash call, which may run
+// Keeps a dir out of every discard and sweep for one bash call, which may run
 // with no session holding the dir (a watch probe) or outlive its session's
-// dispose (a tool still unwinding). Releasing a lease never discards.
+// dispose (a tool still unwinding). Releasing a lease never discards; a dir it
+// outlived is reclaimed by the sweep.
 export function leaseSessionTmp(sessionId: string): () => void {
   const name = scratchName(sessionId)
   if (name === undefined) return () => {}
@@ -86,6 +101,72 @@ export function leaseSessionTmp(sessionId: string): () => void {
     released = true
     unclaim(name)
   }
+}
+
+// Sweeps once at boot (`minAgeMs: 0`: nothing is live yet, so everything there
+// is a previous run's debris) and then hourly for dirs a missed release left.
+export function startSessionTmpSweeper(log: (message: string) => void): () => void {
+  const sweep = (minAgeMs?: number) =>
+    sweepSessionTmp({ log, ...(minAgeMs !== undefined ? { minAgeMs } : {}) }).then(
+      (removed) => {
+        if (removed > 0) log(`[session-tmp] swept ${removed} orphaned session scratch dir(s)`)
+      },
+      (err: unknown) => log(`[session-tmp] sweep failed: ${describeError(err)}`),
+    )
+  void sweep(0)
+  const timer = setInterval(() => void sweep(), SESSION_TMP_SWEEP_INTERVAL_MS)
+  timer.unref?.()
+  return () => clearInterval(timer)
+}
+
+// Removes scratch dirs nothing claims and returns how many. Every eligible dir
+// is renamed aside before any delete starts, so the window in which a new
+// session could claim a dir being swept stays at one rename, not one recursive
+// delete of a large checkout. A failing entry is logged and skipped.
+export async function sweepSessionTmp(
+  options: { root?: string; minAgeMs?: number; now?: number; log?: (message: string) => void } = {},
+): Promise<number> {
+  const root = options.root ?? SESSION_TMP_ROOT
+  const minAgeMs = options.minAgeMs ?? SESSION_TMP_SWEEP_MIN_AGE_MS
+  const now = options.now ?? Date.now()
+  let names: string[]
+  try {
+    names = await readdir(root)
+  } catch (error) {
+    if (isErrnoCode(error, 'ENOENT')) return 0
+    throw error
+  }
+  const trash: { dir: string; counted: boolean }[] = []
+  for (const name of names) {
+    if (name.startsWith(DISCARD_PREFIX)) {
+      trash.push({ dir: join(root, name), counted: false })
+      continue
+    }
+    if (minAgeMs > 0) {
+      const info = await stat(join(root, name)).catch(() => undefined)
+      if (info === undefined || now - info.mtimeMs < minAgeMs) continue
+    }
+    // Checked after the last await, so the claim test and the move registration
+    // run in one synchronous step.
+    // A dir already being moved aside is that discard's to finish.
+    if (liveTmpHolders.has(name) || pendingMoves.has(name)) continue
+    try {
+      const moved = await moveAside(root, name)
+      if (moved !== undefined) trash.push({ dir: moved, counted: true })
+    } catch (error) {
+      options.log?.(`[session-tmp] could not move ${name} aside: ${describeError(error)}`)
+    }
+  }
+  let removed = 0
+  for (const { dir, counted } of trash) {
+    try {
+      await rm(dir, { recursive: true, force: true })
+      if (counted) removed++
+    } catch (error) {
+      options.log?.(`[session-tmp] could not delete ${dir}: ${describeError(error)}`)
+    }
+  }
+  return removed
 }
 
 export async function ensureSessionTmpDir(sessionId: string): Promise<string> {
@@ -151,7 +232,7 @@ function moveAside(root: string, name: string): Promise<string | undefined> {
   const inFlight = pendingMoves.get(name)
   if (inFlight !== undefined) return inFlight.then(() => undefined)
   const trash = join(root, `${DISCARD_PREFIX}${name}-${randomUUID()}`)
-  const move = rename(join(root, name), trash).then(
+  const move = renameDir(join(root, name), trash).then(
     () => trash,
     (error: unknown) => {
       if (isErrnoCode(error, 'ENOENT')) return undefined
@@ -167,6 +248,10 @@ function moveAside(root: string, name: string): Promise<string | undefined> {
     if (pendingMoves.get(name) === settled) pendingMoves.delete(name)
   })
   return move
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function isErrnoCode(error: unknown, code: string): boolean {

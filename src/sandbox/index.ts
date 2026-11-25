@@ -56,6 +56,7 @@ export {
   SESSION_TMP_ROOT,
   enterSubagentTmpScope,
   sessionTmpDir,
+  startSessionTmpSweeper,
 } from './session-tmp'
 export {
   DEPENDENCY_BIN_SANDBOX_DIR,

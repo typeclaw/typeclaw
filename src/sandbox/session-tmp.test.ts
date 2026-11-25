@@ -1,17 +1,21 @@
 import { describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, rename, rm, utimes, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  __setSessionTmpRenameForTesting,
   enterSubagentTmpScope,
   ensureSessionTmpDir,
   holdSessionTmp,
   isUnderTmp,
+  leaseSessionTmp,
   mapVirtualTmpPath,
   SESSION_TMP_ROOT,
   sessionTmpDir,
+  sweepSessionTmp,
 } from './session-tmp'
 
 describe('session-tmp path mapping', () => {
@@ -144,6 +148,50 @@ describe('session-tmp lifetime', () => {
     leaveAnchor()
   })
 
+  test('the sweep removes stale unheld dirs and keeps held or recently touched ones', async () => {
+    // given
+    const root = await mkdtemp(join(tmpdir(), 'session-tmp-sweep-'))
+    const now = Date.now()
+    const old = new Date(now - 2 * 60 * 60 * 1000)
+    const stale = `stale-${randomUUID()}`
+    const held = `held-${randomUUID()}`
+    const fresh = `fresh-${randomUUID()}`
+    for (const name of [stale, held, fresh]) await mkdir(join(root, name, 'review-checkout-a'), { recursive: true })
+    await utimes(join(root, stale), old, old)
+    await utimes(join(root, held), old, old)
+    await mkdir(join(root, '.discard-crashed-mid-delete'))
+    const release = holdSessionTmp(held)
+
+    try {
+      // when
+      const removed = await sweepSessionTmp({ root, now })
+
+      // then
+      expect(removed).toBe(1)
+      expect((await readdir(root)).sort()).toEqual([fresh, held].sort())
+    } finally {
+      await release()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('the boot sweep removes every unheld dir regardless of age', async () => {
+    // given
+    const root = await mkdtemp(join(tmpdir(), 'session-tmp-boot-'))
+    await mkdir(join(root, `fresh-${randomUUID()}`))
+
+    try {
+      // when
+      const removed = await sweepSessionTmp({ root, minAgeMs: 0 })
+
+      // then
+      expect(removed).toBe(1)
+      expect(await readdir(root)).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   test('a malformed session id never directs the discard outside the scratch root', async () => {
     // given
     const name = `session-tmp-victim-${randomUUID()}`
@@ -180,5 +228,135 @@ describe('session-tmp lifetime', () => {
     expect(existsSync(join(dir, 'new.txt'))).toBe(true)
     expect(existsSync(join(dir, 'old.txt'))).toBe(false)
     await second()
+  })
+
+  test('a bash lease keeps a dir through its session release and the sweep, and its own release discards nothing', async () => {
+    // given
+    const sessionId = `lease-${randomUUID()}`
+    const releaseSession = holdSessionTmp(sessionId)
+    const releaseLease = leaseSessionTmp(sessionId)
+    const dir = await ensureSessionTmpDir(sessionId)
+    await utimes(dir, new Date(0), new Date(0))
+
+    // when
+    await releaseSession()
+    // Only a dir back-dated past 30 minutes is eligible, so a parallel test's
+    // fresh scratch under the shared root is never touched.
+    await sweepSessionTmp({ minAgeMs: 30 * 60 * 1000 })
+
+    // then
+    expect(existsSync(dir)).toBe(true)
+    releaseLease()
+    expect(existsSync(dir)).toBe(true)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'the sweep keeps reclaiming other dirs after one fails to delete',
+    async () => {
+      // given
+      const root = await mkdtemp(join(tmpdir(), 'session-tmp-stuck-'))
+      const locked = join(root, '.discard-locked', 'ro')
+      await mkdir(locked, { recursive: true })
+      await writeFile(join(locked, 'f'), 'x')
+      await chmod(locked, 0o500)
+      await mkdir(join(root, `orphan-${randomUUID()}`))
+      const logs: string[] = []
+
+      try {
+        // when
+        const removed = await sweepSessionTmp({ root, minAgeMs: 0, log: (m) => logs.push(m) })
+
+        // then
+        expect(removed).toBe(1)
+        expect(await readdir(root)).toEqual(['.discard-locked'])
+        expect(logs.some((m) => m.includes('.discard-locked'))).toBe(true)
+      } finally {
+        await chmod(locked, 0o700)
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('a sweep reaching a dir whose final release is mid-move leaves it to that move instead of renaming again', async () => {
+    // given
+    const sessionId = `overlap-${randomUUID()}`
+    const first = holdSessionTmp(sessionId)
+    const old = await ensureSessionTmpDir(sessionId)
+    await utimes(old, new Date(0), new Date(0))
+    const renames: string[] = []
+    const unblock = Promise.withResolvers<void>()
+    __setSessionTmpRenameForTesting(async (from, to) => {
+      // The sweep walks the shared root; only this test's dir is counted and held.
+      if (String(from) !== old) return rename(from, to)
+      renames.push(String(from))
+      if (renames.length === 1) await unblock.promise
+      await rename(from, to)
+    })
+
+    try {
+      // when
+      const releasing = first()
+      await sweepSessionTmp({ minAgeMs: 30 * 60 * 1000 })
+      const second = holdSessionTmp(sessionId)
+      const preparing = ensureSessionTmpDir(sessionId)
+      unblock.resolve()
+      await releasing
+      const dir = await preparing
+      await writeFile(join(dir, 'new.txt'), 'new')
+
+      // then
+      expect(renames).toEqual([old])
+      expect(existsSync(join(dir, 'new.txt'))).toBe(true)
+      await second()
+    } finally {
+      unblock.resolve()
+      __setSessionTmpRenameForTesting(undefined)
+    }
+  })
+
+  test('a second final release while the first is mid-move joins it instead of renaming again', async () => {
+    // given
+    const sessionId = `coalesce-${randomUUID()}`
+    const first = holdSessionTmp(sessionId)
+    const old = await ensureSessionTmpDir(sessionId)
+    const renames: string[] = []
+    const unblock = Promise.withResolvers<void>()
+    __setSessionTmpRenameForTesting(async (from, to) => {
+      if (String(from) !== old) return rename(from, to)
+      renames.push(String(from))
+      if (renames.length === 1) await unblock.promise
+      await rename(from, to)
+    })
+
+    try {
+      // when
+      const firstRelease = first()
+      const secondRelease = holdSessionTmp(sessionId)()
+      const third = holdSessionTmp(sessionId)
+      let prepared = false
+      const preparing = ensureSessionTmpDir(sessionId).then((dir) => {
+        prepared = true
+        return dir
+      })
+      await Promise.resolve()
+      expect(prepared).toBe(false)
+      unblock.resolve()
+      await Promise.all([firstRelease, secondRelease])
+      const dir = await preparing
+      await writeFile(join(dir, 'new.txt'), 'new')
+
+      // then
+      expect(renames).toEqual([old])
+      expect(existsSync(join(dir, 'new.txt'))).toBe(true)
+      await third()
+    } finally {
+      unblock.resolve()
+      __setSessionTmpRenameForTesting(undefined)
+    }
+  })
+
+  test('the sweep is a no-op when no session ever created scratch', async () => {
+    expect(await sweepSessionTmp({ root: join(tmpdir(), `session-tmp-missing-${randomUUID()}`) })).toBe(0)
   })
 })
