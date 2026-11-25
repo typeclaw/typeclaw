@@ -985,6 +985,7 @@ export const configSchema = z
     browser: browserSchema,
     git: gitSchema,
     githubCli: githubCliSchema,
+    watches: z.strictObject({ auto: z.boolean().default(true) }).prefault({}),
     typevault: typevaultSchema,
     logs: logsSchema,
     lastWords: lastWordsSchema,
@@ -1285,6 +1286,7 @@ export const FIELD_EFFECTS: Record<string, FieldEffect> = {
   // down; a live write would detach sandboxes' read-only .git/config bind.
   'git.remotes': 'restart-required',
   githubCli: 'restart-required',
+  'watches.auto': 'applied',
   typevault: 'restart-required',
   logs: 'ignored',
   lastWords: 'applied',
