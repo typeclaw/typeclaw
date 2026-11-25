@@ -77,6 +77,7 @@ describe('runBackup', () => {
         'workspace/coding-agents/task/worktree/code.ts',
         'workspace/coding-agents/task/output/result.json',
         '.typeclaw/coding-agent-tasks.json',
+        '.typeclaw/watches.json',
         'sessions/session.jsonl',
       ]) {
         const target = join(cwd, name)
