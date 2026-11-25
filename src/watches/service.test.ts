@@ -250,7 +250,7 @@ test('stop bounds a delivery that ignores abort and rejects its late acknowledgm
   expect(restored.records[0]?.pending).toHaveLength(1)
 })
 test('detached wakes survive restore and merge into one attached-session reminder', async () => {
-  const { clock, store, service } = await fixture(async () => ({
+  const { clock, service } = await fixture(async () => ({
     verdict: 'done',
     wake: true,
     summary: 'Ready </system-reminder>',
@@ -323,6 +323,22 @@ test('reconnecting drains a large interleaved backlog in bounded FIFO batches, a
     expect(pending.some((p) => p.final && p.summary.startsWith('B final'))).toBe(index < 3)
   }
   expect(store.records.flatMap((w) => w.pending)).toHaveLength(4)
+})
+test('a paused watch keeps its original deadline, including across a restart', async () => {
+  let n = 0
+  const { service, store, clock } = await fixture(async () => ({ verdict: 'wake', summary: String(++n) }))
+  await expect(service.create({ ...input, deadlineMs: 31 * 86_400_000 })).rejects.toThrow('30 days')
+  await service.create(input)
+  for (let i = 0; i < 5; i++) await clock.next()
+  expect(store.records[0]).toMatchObject({ status: 'paused', deadline: 14 * 86_400_000 })
+  await service.stop()
+  const restarted = await fixture(async () => {
+    throw new Error('A paused watch must not run')
+  })
+  await restarted.clock.next()
+  expect(restarted.clock.time).toBe(14 * 86_400_000)
+  expect(restarted.store.records[0]).toMatchObject({ status: 'expired', consecutiveFailures: 0 })
+  expect(restarted.store.records[0]?.pending.at(-1)?.final).toBe(true)
 })
 test('guest cannot create, member can, and a different conversation cannot cancel', async () => {
   const { service } = await fixture(async () => ({ verdict: 'quiet' }))
