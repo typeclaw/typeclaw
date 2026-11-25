@@ -1,0 +1,12 @@
+---
+title: Watches
+description: Probe scheduling, durable verdicts, and delivery of follow-up reminders.
+---
+
+`src/watches/service.ts` runs under `typeclaw run`, independently of cron. The first probe is due immediately; subsequent intervals by age are 1 minute before one hour, 5 minutes before one day, 15 minutes before one week, then 30 minutes. A `next` hint is clamped to 1 minute–1 hour. At most two probes are running. Failures back off exponentially; only failure three in each streak queues a diagnostic wake. A quiet verdict, duplicate summary, or human input breaks a wake streak. The fifth consecutive wake pauses the watch. Paused watches still expire.
+
+`store.ts` publishes the verdict, probe state, next due time and pending reminders together by atomic rename to `.typeclaw/watches.json`. Both the authority file and its temporary staging area are masked from model tools. A restart reruns a probe whose verdict never committed. Expiry queues a final wake even if the watch was paused. The verdict and delivery acknowledgment are separate commits: a crash between delivery and acknowledgment can repeat a reminder.
+
+`runner.ts` uses the hook-wrapped bash builtin, not cron exec. It gives the command 120 seconds and reads the last 8 KiB of each output stream. `TYPECLAW_WATCH_ID` identifies the watch; `TYPECLAW_WATCH_LAST_RUN_AT` is the previous completion as an ISO instant, absent initially. The private-mode directory at `workspace/.typeclaw-watches/<id>/` survives between ticks and is removed on cancellation, completion or expiry. This directory is probe scratch space, not trusted authority. Registered bundled probes run in-process with JSON state and a per-repo token resolver.
+
+`delivery.ts` coalesces pending reminders for two seconds. Attachment and idle events retry held TUI delivery; the durable channel target includes the authenticated requester and adapter-classified room context. Different requesters are never merged into one inbound. The channel delivery seam defaults to logging and holding the batch. Fresh wakes reuse the cron prompt driver (including fallback, hooks and child drain) with `jobKind: 'watch'`.

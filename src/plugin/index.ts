@@ -1,6 +1,7 @@
 export {
   bashTool,
   codingAgentTool,
+  watchTool,
   defineCommand,
   definePlugin,
   defineSubagent,

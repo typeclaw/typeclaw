@@ -11672,6 +11672,7 @@ describe('ChannelRouter plugin lifecycle hooks', () => {
     expect(idleEvents).toHaveLength(1)
     expect(idleEvents[0]!.origin).toEqual({
       kind: 'channel',
+      isDm: false,
       adapter: 'slack-bot',
       workspace: 'T123',
       chat: 'C456',

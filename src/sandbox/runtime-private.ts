@@ -4,6 +4,7 @@
 export const CANONICAL_AGENT_RUNTIME_PRIVATE_FILES = [
   '.typeclaw/incidents.json',
   '.typeclaw/coding-agent-tasks.json',
+  '.typeclaw/watches.json',
 ] as const
 
 // Directories whose files are replaced by rename while the runtime runs. A file

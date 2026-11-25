@@ -92,7 +92,7 @@ Things the DSL rejects (the parser emits actionable errors at boot, but you shou
 
 Three sources contribute permission strings:
 
-1. **Core** (always present): `channel.respond`, `session.control`, `session.admin`, `cron.schedule`, `cron.modify`, `subagent.spawn`, `subagent.cancel`, `subagent.output`, `subagent.spawn.operator`, `fs.see.private`, `fs.see.secrets`, `browser.shared`, `vault.use` (with `typevault.enabled`, bash gets a TypeVault grant for the role's tier and the tiers below it).
+1. **Core** (always present): `channel.respond`, `session.control`, `session.admin`, `cron.schedule`, `cron.modify`, `watch.create` (create/rearm follow-up probes; owner, trusted and member by default), `subagent.spawn`, `subagent.cancel`, `subagent.output`, `subagent.spawn.operator`, `fs.see.private`, `fs.see.secrets`, `browser.shared`, `vault.use` (with `typevault.enabled`, bash gets a TypeVault grant for the role's tier and the tiers below it).
 2. **Bundled security plugin** (always loaded): the eight per-guard strings (`security.bypass.secretExfilBash`, `security.bypass.gitExfil`, `security.bypass.gitRemoteTainted`, `security.bypass.secretExfilRead`, `security.bypass.ssrf`, `security.bypass.sessionSearchSecrets`, `security.bypass.systemPromptLeak`, `security.bypass.outboundSecret`) AND three severity-tier strings (`security.bypass.low`, `security.bypass.medium`, `security.bypass.high`).
 3. **User-declared plugins** (variable): each plugin can contribute its own strings via `definePlugin({ permissions: [...] })`.
 

@@ -219,6 +219,7 @@ function createPiBuiltinToolDefinition(name: PiBuiltinToolName, cwd: string): To
         spawnHook: bashSpawnHookWithOverlay,
         operations: {
           async exec(command, dir, options) {
+            options.signal?.throwIfAborted()
             const before = readOomEvents()
             const result = await operations.exec(command, dir, options)
             const note =
@@ -315,6 +316,8 @@ export type WrapToolOptions = {
 }
 
 export type WrapSystemToolOptions = {
+  readonly bashCwd?: string
+  readonly frameBashOutput?: (command: string) => string
   readonly getGithubSelf?: GetGithubSelf
   agentDir: string
   sessionId: string
@@ -504,6 +507,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
         opts.guards,
         envelope.acknowledgements,
       )
+      signal?.throwIfAborted()
       if (blockResult !== undefined) {
         throw new Error(`blocked: ${blockResult.reason}`)
       }
@@ -512,6 +516,7 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
         args: mutableArgs,
         agentDir: opts.agentDir,
       })
+      signal?.throwIfAborted()
       if (gitControlResult !== undefined) throw new Error(`blocked: ${gitControlResult.reason}`)
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
@@ -606,6 +611,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       const blockResult = await opts.hooks.runToolBefore(
         {
           tool: tool.name,
+          ...(tool.name === 'bash' && opts.bashCwd !== undefined ? { bashCwd: opts.bashCwd } : {}),
           sessionId: opts.sessionId,
           callId: toolCallId,
           args: mutableArgs,
@@ -710,7 +716,10 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             managedConfigBefore = await snapshotManagedConfigFiles(opts.agentDir, (content, destination) =>
               managedConfigBlock(content, destination, undefined),
             )
+            signal?.throwIfAborted()
             preparedSandboxRuntime = await prepareBashSandbox({
+              cwd: opts.bashCwd,
+              frameOutput: opts.frameBashOutput,
               ...(managedConfigBefore.readOnly !== undefined
                 ? { readOnlyFiles: managedConfigBefore.readOnly.files }
                 : {}),
@@ -726,6 +735,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               reveal: bashReveal,
               boundary: sandboxBoundary,
             })
+            signal?.throwIfAborted()
             attemptArgs.command = preparedSandboxRuntime.commandString
           }
 
@@ -733,6 +743,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             TMP_REDIRECT_TOOLS.has(tool.name) && opts.permissions !== undefined
               ? await applyTmpPathRedirect(attemptArgs, opts.permissions, liveOrigin, opts.agentDir, opts.sessionId)
               : undefined
+          signal?.throwIfAborted()
           pinnedFiles = await enforceAndPinToolFiles({
             tool: tool.name,
             args: attemptArgs,
@@ -747,7 +758,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               : {}),
             signal,
           })
+          signal?.throwIfAborted()
           await preparedSandboxRuntime?.verify()
+          signal?.throwIfAborted()
           spawnEnvContext =
             bashEnvOverlay !== undefined ||
             bashEnvWithhold !== undefined ||
@@ -762,10 +775,20 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
               : tool.name === 'bash'
                 ? {}
                 : undefined
-          const run = () =>
-            bashEnvStore.run(spawnEnvContext, () =>
+          const run = async () => {
+            signal?.throwIfAborted()
+            const result = await bashEnvStore.run(spawnEnvContext, () =>
               tool.execute(toolCallId, attemptArgs as Static<TParams>, signal, onUpdate, ctx),
             )
+            if (tool.name !== 'bash' || !opts.frameBashOutput || result.isError) return result
+            // Pi's display truncates by line count as well as bytes. Use the
+            // bounded protocol frame before that cut, still in plaintext for
+            // the normal tool.after redaction and result hooks below.
+            const full = result.structuredContent
+            if (!isRecord(full) || full.truncated !== false || typeof full.output !== 'string')
+              throw new Error('Incomplete framed bash output')
+            return { ...result, content: [{ type: 'text' as const, text: full.output }] }
+          }
           let executed: Awaited<ReturnType<typeof run>>
           if (tool.name === 'write' || tool.name === 'edit') {
             // Checked at commit, on the exact bytes (see writeToolOutputNoFollow).

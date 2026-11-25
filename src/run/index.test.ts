@@ -5,6 +5,9 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+import { raceWithAbortSignal } from '@earendil-works/pi-ai/utils/abort'
+
+import type { AgentSession } from '@/agent'
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } from '@/channels'
 import { InboundJournal } from '@/channels/inbound-journal'
@@ -16,6 +19,7 @@ import type { SessionFactory } from '@/sessions'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TuiOptions } from '@/tui'
 import type { TunnelManager, TunnelManagerOptions } from '@/tunnels'
+import { WatchStore } from '@/watches/store'
 
 import {
   type LoadCronFn,
@@ -188,6 +192,167 @@ describe('startAgent', () => {
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('typeclaw agent')
   })
+
+  test('stop closes channels and the inbound journal while a probe is waiting for an App token', async () => {
+    const store = new WatchStore(testCwd)
+    const record = {
+      id: randomUUID(),
+      description: 'PR state',
+      probe: { command: 'gh pr view 1 -R owner/repo --json state' },
+      mode: 'judge' as const,
+      createdAt: Date.now(),
+      deadline: Date.now() + 60_000,
+      createdByRole: 'member',
+      createdByOrigin: { kind: 'cron' as const, jobKind: 'prompt' as const, jobId: 'job' },
+      wakeTarget: { kind: 'fresh' as const },
+      nextRunAt: 0,
+      consecutiveWakes: 0,
+      consecutiveFailures: 0,
+      status: 'active' as const,
+      pending: [],
+    }
+    await store.update((rows) => rows.push(record))
+    const minting = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>(),
+      events: string[] = []
+    running = await startAgent({
+      port: 0,
+      attachTui: false,
+      cwd: testCwd,
+      loadCron: noCron,
+      createChannelManager: (opts) => {
+        opts.githubTokenBridge!.registerResolver(async () => {
+          minting.resolve()
+          await release.promise
+          return { token: 'fixture' }
+        })
+        return {
+          ...journalCapturingManager(testCwd, (journal) => {
+            const close = journal.close.bind(journal)
+            journal.close = async () => {
+              await close()
+              events.push('journal closed')
+            }
+          })(opts),
+          stop: async () => {
+            events.push('channels stopped')
+          },
+        }
+      },
+    })
+    await minting.promise
+    const stopped = Promise.resolve(running.stop())
+    try {
+      await raceWithAbortSignal(stopped, AbortSignal.timeout(8000))
+      expect(events).toEqual(['channels stopped', 'journal closed'])
+      await store.restore()
+      expect(store.records).toEqual([record])
+    } finally {
+      release.resolve()
+      await stopped
+    }
+  })
+  test.each(['child', 'turn-start hook', 'session-end hook'] as const)(
+    'stop releases a fresh watch parked on a %s and closes channels before the shutdown deadline',
+    async (stage) => {
+      const store = new WatchStore(testCwd),
+        pending = { key: randomUUID(), summary: 'Ready', final: true }
+      await store.update((rows) =>
+        rows.push({
+          id: randomUUID(),
+          description: 'Job',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdAt: 0,
+          deadline: 1,
+          createdByRole: 'member',
+          createdByOrigin: { kind: 'cron', jobKind: 'prompt', jobId: 'job' },
+          wakeTarget: { kind: 'fresh' },
+          nextRunAt: 0,
+          consecutiveWakes: 0,
+          consecutiveFailures: 0,
+          status: 'done',
+          pending: [pending],
+        }),
+      )
+      const parked = Promise.withResolvers<void>(),
+        releaseHook = Promise.withResolvers<void>(),
+        events: string[] = []
+      running = await startAgent({
+        port: 0,
+        attachTui: false,
+        cwd: testCwd,
+        loadCron: noCron,
+        createChannelManager: (opts) => ({
+          ...journalCapturingManager(testCwd, () => {})(opts),
+          stop: async () => {
+            events.push('channels stopped')
+          },
+        }),
+        createUnattendedAgentSession: async (opts) => {
+          const registry = opts!.liveSubagentRegistry!,
+            sessionId = opts!.sessionManager!.getSessionId()
+          // Keep the shutdown fixture independent of embedding and logger model calls.
+          opts!.plugins!.hooks.unregisterAll('memory')
+          if (stage !== 'child') {
+            opts!.plugins!.hooks.registerAll('park-watch-hook', testCwd, console, {
+              [stage === 'turn-start hook' ? 'session.turn.start' : 'session.end']: async () => {
+                parked.resolve()
+                await releaseHook.promise
+              },
+            })
+          }
+          return {
+            subscribe: () => () => {},
+            abort: async () => {
+              events.push('abort')
+            },
+            dispose: () => events.push('dispose'),
+            prompt: async () => {
+              events.push('prompt')
+              if (stage !== 'child') return
+              registerChild()
+              // list() has no asynchronous gap between the drain's snapshot and
+              // installing its waiter. No completion is ever broadcast for this child.
+              const list = registry.list.bind(registry)
+              registry.list = (...args) => {
+                if (args[0]?.parentSessionId === sessionId) parked.resolve()
+                return list(...args)
+              }
+            },
+          } as unknown as AgentSession
+          function registerChild() {
+            registry.register({
+              taskId: 'child',
+              sessionId: 'child-session',
+              parentSessionId: sessionId,
+              subagentName: 'operator',
+              background: true,
+              status: 'running',
+              startedAt: Date.now(),
+              abort: async () => {},
+            })
+          }
+        },
+      })
+      await parked.promise
+      const stopped = Promise.resolve(running.stop())
+      try {
+        await raceWithAbortSignal(stopped, AbortSignal.timeout(8000))
+        expect(events).toEqual([
+          ...(stage === 'turn-start hook' ? [] : ['prompt']),
+          ...(stage === 'session-end hook' ? [] : ['abort']),
+          'dispose',
+          'channels stopped',
+        ])
+        await store.restore()
+        expect(store.records[0]?.pending).toEqual([pending])
+      } finally {
+        releaseHook.resolve()
+        await stopped
+      }
+    },
+  )
 
   test('keeps the host GitHub CLI store untouched when the agent has no stored credential', async () => {
     const hostHomeDir = await mkdtemp(join(tmpdir(), 'typeclaw-run-host-home-'))

@@ -42,6 +42,7 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
       'subagent.spawn',
       'subagent.spawn.operator',
       'vault.use',
+      'watch.create',
     ])
   })
 
@@ -61,6 +62,7 @@ describe('built-in role contract (role-tower model: owner=high, trusted=medium, 
       'subagent.output',
       'subagent.spawn',
       'vault.use',
+      'watch.create',
     ])
   })
 

@@ -3,6 +3,7 @@ import { z } from 'zod'
 import {
   bashTool,
   codingAgentTool,
+  watchTool,
   editTool,
   findTool,
   grepTool,
@@ -78,7 +79,7 @@ export function createOperatorSubagent(): Subagent<OperatorPayload> {
   return {
     systemPrompt: OPERATOR_SYSTEM_PROMPT,
     profile: 'default',
-    tools: [readTool, grepTool, findTool, lsTool, bashTool, writeTool, editTool, codingAgentTool],
+    tools: [readTool, grepTool, findTool, lsTool, bashTool, writeTool, editTool, codingAgentTool, watchTool],
     payloadSchema: operatorPayloadSchema,
     visibility: 'public',
     rosterDescription:
@@ -95,7 +96,7 @@ export function createOperatorSubagent(): Subagent<OperatorPayload> {
     inFlightKey: (payload) => payload?.requestId ?? `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     toolResultBudget: {
       maxTotalBytes: 1_000_000,
-      toolNames: ['read', 'grep', 'find', 'ls', 'bash', 'write', 'edit', 'coding_agent'],
+      toolNames: ['read', 'grep', 'find', 'ls', 'bash', 'write', 'edit', 'coding_agent', 'watch'],
     },
   }
 }

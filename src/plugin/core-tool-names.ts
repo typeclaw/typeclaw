@@ -10,7 +10,7 @@ export const PI_BUILTIN_TOOL_NAMES: readonly PiBuiltinToolName[] = [
   'ls',
 ]
 
-export const CORE_SYSTEM_TOOL_NAMES = ['web_search', 'web_fetch', 'look_at', 'coding_agent'] as const
+export const CORE_SYSTEM_TOOL_NAMES = ['web_search', 'web_fetch', 'look_at', 'coding_agent', 'watch'] as const
 
 // codemode is conditional and must not enter the always-registered system catalog.
 export const CORE_TOOL_NAMES: ReadonlySet<string> = new Set([

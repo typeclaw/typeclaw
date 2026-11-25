@@ -64,6 +64,7 @@ export type ChannelManagerOptions = {
   agentDir: string
   channelsConfigRef: () => ChannelsConfig
   onRecoveryReady?: () => void
+  onHumanInbound?: import('./router').CreateChannelRouterOptions['onHumanInbound']
   // Plain-text names the agent answers to in channel engagement (the
   // `alias` field in `typeclaw.json`), forwarded to the router as
   // `configuredAliases`. Read live on every inbound so an `applied`-class
@@ -256,6 +257,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const logger = options.logger ?? consoleLogger
   const env = options.env ?? process.env
   const router = createChannelRouter({
+    onHumanInbound: options.onHumanInbound,
     agentDir: options.agentDir,
     ...(options.backgroundObligations ? { backgroundObligations: options.backgroundObligations } : {}),
     ...(options.inboundJournal ? { inboundJournal: options.inboundJournal } : {}),

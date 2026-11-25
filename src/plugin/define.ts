@@ -81,3 +81,4 @@ export const lsTool: BuiltinToolRef = { __builtinTool: 'ls' }
 export const webSearchTool: BuiltinToolRef = { __builtinTool: 'web_search' }
 export const webFetchTool: BuiltinToolRef = { __builtinTool: 'web_fetch' }
 export const codingAgentTool: BuiltinToolRef = { __builtinTool: 'coding_agent' }
+export const watchTool: BuiltinToolRef = { __builtinTool: 'watch' }

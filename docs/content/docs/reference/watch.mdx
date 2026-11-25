@@ -1,0 +1,23 @@
+---
+title: Watch tool
+description: Follow an external job without starting an agent turn on every check.
+---
+
+Use `watch` when the question is “has anything happened that needs attention?” Use cron when the work must happen at a particular time regardless of external state.
+
+```json
+{
+  "action": "create",
+  "description": "Report when the export is available",
+  "probe": { "command": "if test -f workspace/export.csv; then echo 'Export ready'; exit 30; fi" },
+  "deadline": "2d"
+}
+```
+
+`create` returns an `id`. `list` shows watches in the caller's conversation (all watches for the owner). Use `cancel` with an `id` to stop a live watch or `rearm` to resume a paused one. `create` and `rearm` require `watch.create`, granted by default to owner, trusted and member. Deadlines are relative durations, default 14 days, maximum 30 days.
+
+**Judge mode** (default): exit `0` for quiet, `10` to wake, `20` to finish silently or `30` to finish and wake. Stdout supplies the summary; alternatively end stdout with JSON such as `{"verdict":"wake","summary":"Export needs credentials","next":"15m"}`. A JSON `done` verdict ends silently unless it includes `"wake":true`. Deadline expiry always sends a final reminder. Other exits are failures. A command can specify `cwd`. Make side effects idempotent: execution is at least once, not exactly once.
+
+**Diff mode**: set `"mode":"diff"` for a command whose stable stdout is the state of interest. The first successful output establishes a baseline; subsequent changes wake with a unified diff. Do not use diff for multi-step statuses where most transitions require no action.
+
+TUI wakes wait for an attached, idle TUI. Reconnecting opens a new session but still receives pending wakes; they stay pending until a turn starts. Unattended watches without a human ancestor start a fresh slim session. **Channel wakes are currently held, not posted.** No probes are registered automatically.

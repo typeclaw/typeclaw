@@ -52,6 +52,7 @@ import { createTunnelBridge, type TunnelBridge } from '@/channels/tunnel-bridge'
 import { retainCodingAgentService } from '@/coding-agent'
 import { createConfigReloadable, getConfig, loadConfigBundleSync, reloadConfig, withDefaultPlugins } from '@/config'
 import { markRuntimeOwnsConfigWindows, reconcileLeftoverConfigWindowsSync } from '@/config/config-commits'
+import type { ModelRef } from '@/config/providers'
 import {
   type CountStore,
   type CronConsumer,
@@ -66,6 +67,7 @@ import {
   type ParseCronMode,
   type Scheduler,
 } from '@/cron'
+import { runUnattendedPrompt } from '@/cron/consumer'
 import { logDependencyBinProblems, registerDependencyBinDoctorCheck, validateDependencyBins } from '@/dependencies'
 import { trackGithubGitIdentityEnv } from '@/git/resolve-identity'
 import { CLI_VERSION } from '@/init/cli-version'
@@ -94,6 +96,14 @@ import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 import { setActiveTunnelManager } from '@/tunnels/active'
 import { runtimeTunnels } from '@/typevault/prompt-tunnel'
+import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
+import { ProbeRegistry, createProbeRunner } from '@/watches/runner'
+import { WatchService } from '@/watches/service'
+import { stopWatchWorkers } from '@/watches/shutdown'
+import { WatchStore } from '@/watches/store'
+import { watchTarget } from '@/watches/target'
+import { registerWatchRuntime } from '@/watches/tool'
+import type { WatchWakeDelivery } from '@/watches/types'
 
 import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
@@ -123,6 +133,8 @@ export type ChannelManagerFactory = typeof createChannelManager
 export type TunnelManagerFactory = (options: TunnelManagerOptions) => TunnelManager
 
 export type StartAgentOptions = {
+  createUnattendedAgentSession?: typeof createSession
+  deliverChannelWatch?: WatchWakeDelivery
   port: number
   attachTui: boolean
   initialPrompt?: string
@@ -197,6 +209,8 @@ async function startAgentRuntime(
   {
     port,
     attachTui,
+    deliverChannelWatch,
+    createUnattendedAgentSession = createSession,
     initialPrompt,
     cwd = process.cwd(),
     createTui = createTuiDefault,
@@ -500,6 +514,16 @@ async function startAgentRuntime(
   })
   registerBootCleanup(() => inboundJournal.close())
   let recoveryDispatcher: RecoveryDispatcher | undefined
+  const store = new WatchStore(cwd)
+  const registry = new ProbeRegistry()
+  const runner = createProbeRunner(
+    cwd,
+    pluginsLoaded.permissions,
+    () => pluginRuntime.get().hooks,
+    githubTokenBridge,
+    registry,
+  )
+  const watches: WatchService = new WatchService(store, runner.run, runner.cleanup, () => dispatcher.notify())
   const channelManager = createChannelManagerFor({
     agentDir: cwd,
     backgroundObligations,
@@ -510,6 +534,9 @@ async function startAgentRuntime(
     aliasesRef: () => getConfig().alias,
     onRecoveryReady: () => {
       void recoveryDispatcher?.wake().catch((error) => console.warn(`[run] recovery wake failed: ${error}`))
+    },
+    onHumanInbound: (origin) => {
+      void watches.progress(watchTarget(origin)).catch((e) => console.warn('[watch] inbound:', e))
     },
     // Resolve the live bus at delivery time so plugin reloads take effect
     // without rebuilding adapters, and no subscribers means no snapshot work.
@@ -794,9 +821,6 @@ async function startAgentRuntime(
       await job.handler(ctx)
     },
     createSessionForCron: async (job, refOverride) => {
-      const snap = pluginRuntime.get()
-      const sessionManager = SessionManager.create(cwd, sessionFactory.sessionDir())
-      const sessionId = sessionManager.getSessionId()
       const cronOrigin: SessionOrigin = {
         kind: 'cron',
         jobId: job.id,
@@ -815,55 +839,61 @@ async function startAgentRuntime(
       await clearTodosForOrigin(cwd, cronOrigin).catch((err) =>
         console.error(`[cron] ${job.id}: clear todos failed: ${err instanceof Error ? err.message : String(err)}`),
       )
-      const session = await createSession({
-        getGithubSelf: githubTokenBridge.getSelf,
-        reloadRegistry,
-        sessionManager,
-        stream,
-        channelRouter: channelManager.router,
-        origin: cronOrigin,
-        permissions: pluginsLoaded.permissions,
-        ...(refOverride !== undefined ? { refOverride } : {}),
-        ...(snap.hasAnyPluginContent
-          ? {
-              plugins: {
-                registry: snap.registry,
-                hooks: snap.hooks,
-                sessionId,
-                agentDir: cwd,
-              },
-            }
-          : {}),
-        liveSubagentRegistry,
-        subagentCoalescer,
-        subagentRegistry: pluginRuntime.get().subagents,
-        createSessionForSubagent,
-        ...containerNameOpt,
-        ...runtimeVersionOpt,
-        ...mcpManagerOpt,
-      })
-      liveSessionRegistry.register({
-        sessionId,
-        session,
-        origin: sessionMetaPayload(cronOrigin).origin,
-        registeredAtMs: Date.now(),
-      })
-      return {
-        prompt: (text) => session.prompt(text),
-        dispose: () => {
-          liveSessionRegistry.unregister(sessionId)
-          session.dispose()
-        },
-        sessionId,
-        agentDir: cwd,
-        origin: cronOrigin,
-        session,
-        ...(snap.hasAnyPluginContent ? { hooks: snap.hooks } : {}),
-        getTranscriptPath: () => sessionManager.getSessionFile(),
-        backgroundDrain: { stream, sessionId, liveRegistry: liveSubagentRegistry },
-      }
+      return createUnattendedSession(cronOrigin, refOverride)
     },
   })
+  async function createUnattendedSession(cronOrigin: SessionOrigin, refOverride?: ModelRef) {
+    const snap = pluginRuntime.get()
+    const sessionManager = SessionManager.create(cwd, sessionFactory.sessionDir())
+    const sessionId = sessionManager.getSessionId()
+    const session = await createUnattendedAgentSession({
+      getGithubSelf: githubTokenBridge.getSelf,
+      reloadRegistry,
+      sessionManager,
+      stream,
+      channelRouter: channelManager.router,
+      origin: cronOrigin,
+      permissions: pluginsLoaded.permissions,
+      ...(refOverride !== undefined ? { refOverride } : {}),
+      ...(snap.hasAnyPluginContent
+        ? {
+            plugins: {
+              registry: snap.registry,
+              hooks: snap.hooks,
+              sessionId,
+              agentDir: cwd,
+            },
+          }
+        : {}),
+      liveSubagentRegistry,
+      subagentCoalescer,
+      subagentRegistry: pluginRuntime.get().subagents,
+      createSessionForSubagent,
+      ...containerNameOpt,
+      ...runtimeVersionOpt,
+      ...mcpManagerOpt,
+    })
+    liveSessionRegistry.register({
+      sessionId,
+      session,
+      origin: sessionMetaPayload(cronOrigin).origin,
+      registeredAtMs: Date.now(),
+    })
+    return {
+      prompt: (text: string) => session.prompt(text),
+      dispose: () => {
+        liveSessionRegistry.unregister(sessionId)
+        session.dispose()
+      },
+      sessionId,
+      agentDir: cwd,
+      origin: cronOrigin,
+      session,
+      ...(snap.hasAnyPluginContent ? { hooks: snap.hooks } : {}),
+      getTranscriptPath: () => sessionManager.getSessionFile(),
+      backgroundDrain: { stream, sessionId, liveRegistry: liveSubagentRegistry },
+    }
+  }
 
   const internalJobs = () => pluginCronJobs(pluginRuntime.get().registry)
   const factory = createSchedulerFor ?? makeDefaultSchedulerFactory(internalJobs)
@@ -1112,6 +1142,10 @@ async function startAgentRuntime(
     })
 
   const serverFactory = createServer({
+    onWatchTargetReady: (id) => dispatcher.notify(id),
+    onWatchUserPrompt: (sessionId) => {
+      void watches.progress({ kind: 'tui', sessionId }).catch((e) => console.warn('[watch] inbound:', e))
+    },
     getGithubSelf: githubTokenBridge.getSelf,
     port,
     reloadAll: reloadAllNonDestructive,
@@ -1137,6 +1171,31 @@ async function startAgentRuntime(
     ...containerBrokerOpt,
   })
   let server: BunServer | null = null
+  const dispatcher = new WakeDispatcher(store, async (target, wakes, origin, signal) => {
+    if (target.kind === 'channel') {
+      if (deliverChannelWatch) return deliverChannelWatch(target, wakes, origin, signal)
+      console.info(`[watch] holding ${wakes.length} channel wake(s); channel delivery not installed`)
+      return 'held'
+    }
+    const prompt = renderWatchReminder(target, wakes)
+    if (target.kind === 'tui') return serverFactory.deliverWatch(prompt)
+    if (origin.kind !== 'cron') throw new Error('Missing watch origin')
+    return (await runUnattendedPrompt(
+      { id: origin.jobId, prompt },
+      (ref) => createUnattendedSession(origin, ref),
+      console,
+      signal,
+    ))
+      ? 'delivered'
+      : 'failed'
+  })
+  const unregister = registerWatchRuntime(cwd, { service: watches, registry })
+  const stopWatches = async () => {
+    unregister()
+    await stopWatchWorkers(watches, dispatcher)
+  }
+  registerBootCleanup(stopWatches)
+  await watches.start()
   registerBootCleanup(() => server?.stop(true))
   server = serverFactory.start()
 
@@ -1161,6 +1220,7 @@ async function startAgentRuntime(
       cronConsumer.stop()
       subagentConsumer.stop()
       server.stop(true)
+      await stopWatches()
       void disposeMaterializedSkills(pluginRuntime)
       tunnelBridge.stop()
       subagentCompletionBridge.stop()

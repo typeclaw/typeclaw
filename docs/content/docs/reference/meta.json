@@ -5,6 +5,7 @@
     "typeclaw-json",
     "recommended-mounts",
     "cron-json",
+    "watch",
     "secrets-json",
     "cli",
     "match-rule-dsl",

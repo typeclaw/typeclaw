@@ -9,6 +9,8 @@ You have a cron file at `./cron.json` in your agent folder. It defines periodic 
 
 ## What cron actually does
 
+For “keep checking until this needs attention,” use the `watch` tool rather than scheduling a recurring prompt. Pick judge mode for a multi-stage job: return quiet for ordinary progress, wake for an actionable condition, and done for a terminal result. Keep cron for work driven by the clock. Channel watch reminders are held rather than posted until channel delivery is enabled.
+
 The typeclaw runtime starts a scheduler when the container boots. The scheduler reads `cron.json` **once** at startup. While the container runs, it fires each enabled job at its next scheduled time. There is no daemon outside the container — if the container is down, nothing runs.
 
 This is a **best-effort scheduler**. Concretely:
