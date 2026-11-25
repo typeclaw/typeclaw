@@ -11,6 +11,7 @@ import type { AgentSession } from '@/agent'
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
 import { createChannelRouter, type ChannelManager, type ChannelManagerOptions } from '@/channels'
 import { InboundJournal } from '@/channels/inbound-journal'
+import { defaultHistoryConfig } from '@/channels/schema'
 import { channelKeyId } from '@/channels/types'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
@@ -191,6 +192,82 @@ describe('startAgent', () => {
     const res = await fetch(`http://localhost:${running.server.port}`)
     expect(res.status).toBe(200)
     expect(await res.text()).toBe('typeclaw agent')
+  })
+
+  test('an unavailable journal leaves the operator online and a failed channel verdict pending on disk', async () => {
+    const blocker = new InboundJournal(testCwd)
+    await blocker.initialize()
+    const store = new WatchStore(testCwd)
+    const verdict = { key: randomUUID(), summary: 'Ready', final: true }
+    const failed = Promise.withResolvers<unknown>()
+    try {
+      await store.update((rows) =>
+        rows.push({
+          id: randomUUID(),
+          description: 'Build',
+          mode: 'judge',
+          probe: { command: 'true' },
+          createdAt: 0,
+          deadline: 1,
+          createdByRole: 'member',
+          createdByOrigin: { kind: 'channel', ...journalTarget },
+          wakeTarget: {
+            kind: 'channel',
+            key: journalTarget,
+            requester: { authorId: 'member', authorAdapter: journalTarget.adapter },
+          },
+          nextRunAt: 0,
+          consecutiveFailures: 0,
+          consecutiveWakes: 0,
+          status: 'done',
+          pending: [verdict],
+        }),
+      )
+      running = await startAgent({
+        port: 0,
+        attachTui: false,
+        cwd: testCwd,
+        loadCron: noCron,
+        createChannelManager: (opts) => {
+          const router = createChannelRouter({
+            agentDir: testCwd,
+            inboundJournal: opts.inboundJournal,
+            backgroundObligations: opts.backgroundObligations,
+            configForAdapter: () => ({
+              enabled: true,
+              history: defaultHistoryConfig(),
+              engagement: { trigger: ['mention'], stickiness: 'off' },
+            }),
+          })
+          router.registerSelfIdentity(journalTarget.adapter, () => ({ id: 'bot' }))
+          const route = router.route
+          router.route = async (...args) => {
+            try {
+              return await route(...args)
+            } catch (error) {
+              failed.resolve(error)
+              throw error
+            }
+          }
+          return {
+            router,
+            start: async () => {},
+            stop: () => router.stop(),
+            reload: async () => ({ started: [], stopped: [], restarted: [], restartRequired: [] }),
+            restartAdapter: async () => {},
+          }
+        },
+      })
+      const error = await raceWithAbortSignal(failed.promise, AbortSignal.timeout(10_000))
+      expect(String(error)).toMatch(/journal|frozen/i)
+      expect(await (await fetch(running.server.url)).text()).toBe('typeclaw agent')
+      await running.stop()
+      running = null
+      await store.restore()
+      expect(store.records[0]!.pending).toEqual([verdict])
+    } finally {
+      await blocker.close()
+    }
   })
 
   test('stop closes channels and the inbound journal while a probe is waiting for an App token', async () => {

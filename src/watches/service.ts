@@ -36,8 +36,9 @@ export class WatchService {
     private readonly pending: () => void,
     private readonly clock = systemClock,
   ) {}
-  async start() {
+  async start(afterRestore?: () => Promise<void>) {
     await this.store.restore()
+    await afterRestore?.()
     for (const w of this.store.records) if (isEnded(w)) await this.cleanup(w.id)
     this.running = true
     this.arm()

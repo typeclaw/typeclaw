@@ -20,4 +20,4 @@ Use `watch` when the question is â€œhas anything happened that needs attention?â
 
 **Diff mode**: set `"mode":"diff"` for a command whose stable stdout is the state of interest. The first successful output establishes a baseline; subsequent changes wake with a unified diff. Do not use diff for multi-step statuses where most transitions require no action.
 
-TUI wakes wait for an attached, idle TUI. Reconnecting opens a new session but still receives pending wakes; they stay pending until a turn starts. Unattended watches without a human ancestor start a fresh slim session. **Channel wakes are currently held, not posted.** No probes are registered automatically.
+TUI wakes wait for an attached, idle TUI. Reconnecting opens a new session but still receives pending wakes; they stay pending until a turn starts. Channel wakes return to the original conversation, even if its session has gone cold. The requester must still have `channel.respond`. A wake is a private reminder to the agent, not a message posted to the channel. Unattended watches without a human ancestor start a fresh slim session. No probes are registered automatically.

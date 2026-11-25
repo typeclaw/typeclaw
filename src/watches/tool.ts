@@ -46,7 +46,7 @@ export function createWatchTool(
     name: 'watch',
     label: 'Watch',
     description:
-      'Create a follow-up probe; list, cancel or rearm a paused watch. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true. next and deadline are durations like 5m or 2d. Other exits fail. Channel wakes are currently held for future delivery.',
+      'Create a follow-up probe; list, cancel or rearm a paused watch. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true. next and deadline are durations like 5m or 2d. Other exits fail. A channel wake returns to the original conversation as a system reminder.',
     parameters: zodToToolParameters(parameters),
     async execute(_id, args) {
       const input = request.parse(args)
