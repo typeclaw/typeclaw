@@ -1,9 +1,10 @@
 import type { SessionOrigin } from '@/agent/session-origin'
+import { todosWithActiveWatches } from '@/watches/runtime'
 
 import { type ContinuationLimits, DEFAULT_CONTINUATION_LIMITS, decideContinuation } from './continuation-policy'
 import { consumeRestartKickSuppression, readContinuationState, writeContinuationState } from './continuation-state'
 import { resolveTodoScope, type TodoScope } from './scope'
-import { readTodoList } from './store'
+import { incompleteTodos, readTodoList } from './store'
 
 export const TODO_CONTINUATION_SOURCE = 'todo-continuation'
 
@@ -45,6 +46,7 @@ export type MaybeInjectContinuationArgs = {
   now?: number
   limits?: ContinuationLimits
   newEpisodeId?: () => string
+  deferredTodos?: ReadonlySet<string>
 }
 
 // Decide-and-persist entry point called from the idle path of each origin's
@@ -77,6 +79,18 @@ export async function maybeInjectContinuation(args: MaybeInjectContinuationArgs)
     return { kind: 'skipped', reason: decision.reason }
   }
 
+  // Only park when nothing is runnable. The policy still owns the restart-kick one-shot.
+  const linked = todosWithActiveWatches(args.agentDir, args.origin)
+  const deferred = new Set([...(args.deferredTodos ?? []), ...(state.watchHandedBackTodos ?? [])])
+  const incomplete = incompleteTodos(todos)
+  const runnable = incomplete.filter(({ content }) => !linked.has(content) && !deferred.has(content))
+  if (runnable.length === 0) {
+    return { kind: 'skipped', reason: 'watch-pending' }
+  }
+
   await writeContinuationState(args.agentDir, scope, { ...state, episode: decision.episode })
-  return { kind: 'injected', scope, text: CONTINUATION_PROMPT }
+  const text = incomplete.some(({ content }) => deferred.has(content))
+    ? `${CONTINUATION_PROMPT}Continue only these runnable todo items (JSON array): ${JSON.stringify(runnable.map(({ content }) => content))}\n`
+    : CONTINUATION_PROMPT
+  return { kind: 'injected', scope, text }
 }

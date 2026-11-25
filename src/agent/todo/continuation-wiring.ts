@@ -12,7 +12,7 @@ import {
   writeContinuationState,
 } from './continuation-state'
 import { resolveTodoScope } from './scope'
-import { writeTodos } from './store'
+import { incompleteTodos, readTodos, writeTodos } from './store'
 
 // Map a pi `message_end` event's stopReason onto the TurnOutcome stopReason
 // space. Anything we don't recognize collapses to 'unknown' so the idle path
@@ -95,12 +95,30 @@ export async function recordTurnStart(args: {
   agentDir: string
   origin: SessionOrigin
   isRealUserTurn: boolean
+  clearWatchHandBack?: boolean
 }): Promise<void> {
   const scope = resolveTodoScope(args.origin)
   if (scope === null) return
   const state = await readContinuationState(args.agentDir, scope)
   const next = onTurnStart(state, args.isRealUserTurn)
+  if (args.isRealUserTurn && args.clearWatchHandBack) delete next.watchHandedBackTodos
   if (next !== state) await writeContinuationState(args.agentDir, scope, next)
+}
+
+export async function recordWatchTodoHandBack(args: {
+  agentDir: string
+  origin: SessionOrigin
+  contents: readonly string[]
+}): Promise<void> {
+  const scope = resolveTodoScope(args.origin)
+  if (scope === null) return
+  const state = await readContinuationState(args.agentDir, scope)
+  const held = new Set([...(state.watchHandedBackTodos ?? []), ...args.contents])
+  const incomplete = incompleteTodos(await readTodos(args.agentDir, scope))
+  const watchHandedBackTodos = [
+    ...new Set(incomplete.map(({ content }) => content).filter((content) => held.has(content))),
+  ]
+  await writeContinuationState(args.agentDir, scope, { ...state, watchHandedBackTodos })
 }
 
 // Arm the one-shot restart-kick suppressor for an origin's scope, so the first
@@ -154,9 +172,10 @@ export async function runIdleContinuation(args: {
   agentDir: string
   origin: SessionOrigin
   deliver: DeliverContinuation
+  deferredTodos?: ReadonlySet<string>
   onDecision?: (result: ContinuationInjectResult) => void
 }): Promise<boolean> {
-  const result = await maybeInjectContinuation({ agentDir: args.agentDir, origin: args.origin })
+  const result = await maybeInjectContinuation(args)
   args.onDecision?.(result)
   if (result.kind !== 'injected') return false
   args.deliver(result.text)

@@ -36,6 +36,7 @@ import { createChannelFetchAttachmentTool } from '@/agent/tools/channel-fetch-at
 import { createChannelHistoryTool } from '@/agent/tools/channel-history'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
+import { createSpawnSubagentTool } from '@/agent/tools/spawn-subagent'
 import { createSubagentOutputTool } from '@/agent/tools/subagent-output'
 import {
   __resetReviewObserverForTest,
@@ -51,6 +52,8 @@ import { createHookBus, type HookBus, type SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
 import { deliverChannelWakes } from '@/watches/channel'
 import { WakeDispatcher } from '@/watches/delivery'
+import { ProbeRegistry } from '@/watches/runner'
+import { registerWatchRuntime } from '@/watches/runtime'
 import { WatchService } from '@/watches/service'
 import { WatchStore } from '@/watches/store'
 
@@ -1332,7 +1335,7 @@ describe('channel watch wakes', () => {
           phase: 'closed',
           outcome: { kind: 'delivered' },
         })
-        if (typeof first !== 'string' && first.kind === 'accepted')
+        if (typeof first !== 'string' && 'kind' in first && first.kind === 'accepted')
           expect(journal.get(first.inputId)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
       } finally {
         await router.stop()
@@ -22158,6 +22161,514 @@ describe('ChannelRouter background-child await suppression', () => {
 
     expect(continuationRuns).toBe(0)
     expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
+  })
+
+  test('todo continuation parks for linked work but resumes when runnable work arrives', async () => {
+    const dir = await tempDir()
+    const origin = { kind: 'channel', ...KEY } as const
+    const scope = resolveTodoScope(origin)
+    if (!scope) throw new Error('Expected a channel todo scope')
+    const waiting = 'Merge after checks'
+    const logs: string[] = []
+    const { router, sessions } = makeRouter(dir, { logs })
+    const service = new WatchService(
+      new WatchStore(dir),
+      async () => ({ verdict: 'quiet' }),
+      async () => {},
+      () => {},
+      { now: () => 0, after: () => () => {} },
+    )
+    const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
+    try {
+      await router.route(inbound({ text: 'Merge when checks pass' }))
+      const [session] = sessions
+      if (!session) throw new Error('Expected an engaged session')
+      const stopSilently = () => {
+        session.setAssistantText('NO_REPLY')
+        session.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+      }
+      session.onPrompt = async () => {
+        await service.create({
+          description: 'Wait for checks',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdByRole: 'owner',
+          createdByOrigin: origin,
+          wakeTarget: { kind: 'channel', key: KEY, requester: { authorId: 'alice', authorAdapter: KEY.adapter } },
+          waitsFor: waiting,
+        })
+        await writeTodos(dir, scope, [{ content: waiting, status: 'pending' }])
+        stopSilently()
+        // If a nudge is delivered, don't create another watch in that turn.
+        session.onPrompt = stopSilently
+      }
+      await router.__testing?.flushDebounce(KEY)
+      expect(session.prompts).toHaveLength(1)
+      expect(logs.some((line) => line.endsWith('todo_continuation skip reason=watch-pending'))).toBe(true)
+
+      session.onPrompt = async () => {
+        await writeTodos(dir, scope, [
+          { content: waiting, status: 'pending' },
+          { content: 'Finish the unrelated task', status: 'pending' },
+        ])
+        stopSilently()
+        session.onPrompt = async () => {
+          await writeTodos(dir, scope, [])
+          stopSilently()
+        }
+      }
+      await router.route(inbound({ externalMessageId: 'next-inbound', text: 'Do another task' }))
+      await router.__testing?.flushDebounce(KEY)
+      expect(session.prompts).toHaveLength(3)
+      expect(logs.some((line) => line.endsWith('todo_continuation inject'))).toBe(true)
+    } finally {
+      unregister()
+      await router.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.each([
+    { evicted: false, revoked: false, replies: false },
+    { evicted: true, revoked: false, replies: false },
+    { evicted: true, revoked: true, replies: false },
+    { evicted: false, revoked: false, replies: true },
+    { evicted: false, revoked: false, replies: false, failure: 'error' },
+    { evicted: false, revoked: false, replies: false, failure: 'throw' },
+    { evicted: false, revoked: false, replies: false, child: 'running' },
+    { evicted: false, revoked: false, replies: false, child: 'queued' },
+    { evicted: false, revoked: false, replies: false, child: 'queued', completionReplies: true },
+    { evicted: false, revoked: false, replies: false, child: 'result-ready' },
+    { evicted: false, revoked: false, replies: false, child: 'publishing' },
+    { evicted: false, revoked: false, replies: false, child: 'queued', secondWake: true },
+    { evicted: false, revoked: false, replies: false, child: 'queued', reload: true },
+    { evicted: false, revoked: false, replies: false, child: 'running', denyCompletion: true },
+    { evicted: false, revoked: false, replies: true, secondWake: true },
+    { evicted: false, revoked: false, replies: false, child: 'launch-failed' },
+    { evicted: false, revoked: false, replies: false, child: 'queued', reload: true, replaceAccount: true },
+  ])(
+    'a linked channel wake respects the ordinary speaker, permissions and replies (%j)',
+    async ({
+      evicted,
+      revoked,
+      replies,
+      failure,
+      child,
+      completionReplies,
+      secondWake,
+      reload,
+      denyCompletion,
+      replaceAccount,
+    }) => {
+      const dir = await tempDir()
+      const origin = { kind: 'channel', ...KEY } as const
+      const scope = resolveTodoScope(origin)
+      if (!scope) throw new Error('Expected a channel todo scope')
+      const waiting = 'Merge after checks'
+      const secondTodo = 'Publish after checks'
+      const secondVerdict = 'Publishing checks passed'
+      const secondRequester = 'other-watch-requester'
+      let queueSecondWake: (() => Promise<void>) | undefined
+      const logs: string[] = []
+      const originRefs: SessionOriginRef[] = []
+      const nowRef = { value: 1000 }
+      const ordinarySpeaker = 'ordinary-speaker'
+      const parentChat = 'parent-channel'
+      let mayRespond = true
+      let mayWatchRespond = true
+      const checkedParents: Array<string | undefined> = []
+      const speakers: Array<[string | undefined, string | undefined, string | undefined]> = []
+      const sent: string[] = []
+      const reply = 'Checks passed; please confirm before merging.'
+      const childId = 'watch-review'
+      const completionReply = 'The review is complete.'
+      const parentSessionId = 'ses_fake_1'
+      const accountIdentity = fallbackChannelAccountIdentity(KEY.adapter, KEY.workspace, 'bot')
+      let bot = 'bot'
+      const backgroundObligations = new BackgroundObligationStore(dir)
+      const publishCompletion = () =>
+        router.injectSubagentCompletionReminder({
+          parentSessionId,
+          taskId: childId,
+          subagent: 'explorer',
+          ok: true,
+          durationMs: 1,
+        })
+      let runningWatchLineage: string | undefined
+      const { router, sessions } = makeRouter(dir, {
+        logs,
+        originRefs,
+        nowRef,
+        backgroundObligations,
+        newestRunningChildSubagentStartedAt: (_id, lineage) =>
+          runningWatchLineage !== undefined && lineage === runningWatchLineage ? nowRef.value : null,
+        permissions: {
+          ...grantAllPermissions,
+          has: (actor, permission) => {
+            if (
+              actor?.kind === 'channel' &&
+              actor.lastInboundAuthorId === 'watch-requester' &&
+              permission === 'channel.respond'
+            )
+              return mayWatchRespond
+            if (
+              actor?.kind === 'channel' &&
+              actor.lastInboundAuthorId === ordinarySpeaker &&
+              permission === 'channel.respond'
+            ) {
+              checkedParents.push(actor.parentChat)
+              return mayRespond
+            }
+            return true
+          },
+        },
+        onSessionCreated: (session) => {
+          const originRef = originRefs.at(-1)
+          session.onPrompt = async (text) => {
+            const current = originRef?.current
+            if (current?.kind === 'channel')
+              speakers.push([current.lastInboundAuthorId, current.parentChat, current.lastInboundAuthorAdapter])
+            if (replies && current?.kind === 'channel' && current.lastInboundAuthorId === 'watch-requester') {
+              await router.send({ ...KEY, text: reply })
+            }
+            if (completionReplies && text.includes(childId)) {
+              await router.send({ ...KEY, text: completionReply })
+            }
+            if (text.includes(secondVerdict)) {
+              await writeTodos(dir, scope, [{ content: waiting, status: 'pending' }])
+            } else if (text.includes('Checks passed')) {
+              if (!child) await queueSecondWake?.()
+              if (child === 'launch-failed') {
+                const tool = createSpawnSubagentTool({
+                  registry: { explorer: { systemPrompt: 'Review the changes.', visibility: 'public' } },
+                  liveRegistry: new LiveSubagentRegistry(),
+                  createSessionForSubagent: async () => {
+                    throw new Error('Fixture could not create child session')
+                  },
+                  agentDir: dir,
+                  parentSessionId,
+                  getOrigin: () => current,
+                  router,
+                  getAccountIdentity: async () => accountIdentity,
+                  generateTaskId: () => childId,
+                })
+                const result = await tool.execute(
+                  'call',
+                  { subagent_type: 'explorer', prompt: 'Review the changes.' },
+                  undefined,
+                  undefined,
+                  {} as Parameters<typeof tool.execute>[4],
+                )
+                expect(result.details).toMatchObject({ ok: false, error: expect.stringContaining('could not create') })
+              } else if (child) {
+                if (!accountIdentity) throw new Error('Expected an authenticated adapter')
+                const accepted = await router.acceptBackgroundResponse({
+                  parentSessionId,
+                  key: KEY,
+                  taskId: childId,
+                  subagentName: 'explorer',
+                  startedAt: nowRef.value,
+                  accountIdentity,
+                })
+                if (!accepted.watchTurnId) throw new Error('Expected a watch child lineage')
+                if (child === 'running') runningWatchLineage = accepted.watchTurnId
+                if (child === 'queued') {
+                  await queueSecondWake?.()
+                  await publishCompletion()
+                  if (replaceAccount) bot = 'replacement'
+                  if (reload) await router.tearDownAllLive()
+                }
+                if (child === 'result-ready') await backgroundObligations.resultReady(accepted.obligationId)
+              }
+              if (failure === 'error') {
+                session.setAssistantMidTurn('', 'error')
+                session.emit({ type: 'message_end', message: { ...assistantMessage(''), stopReason: 'error' } })
+                return
+              }
+            }
+            if (text.includes('Incomplete todo items remain')) await writeTodos(dir, scope, [])
+            session.setAssistantText('NO_REPLY')
+            session.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+            if (text.includes('Checks passed') && failure === 'throw') throw new Error('Watch prompt failed')
+          }
+        },
+      })
+      router.registerSelfIdentity(KEY.adapter, () => ({ id: bot }))
+      router.registerOutbound(KEY.adapter, async ({ text }) => {
+        if (text !== undefined) sent.push(text)
+        return { ok: true }
+      })
+      const store = new WatchStore(dir)
+      const service = new WatchService(
+        store,
+        async () => ({ verdict: 'quiet' }),
+        async () => {},
+        () => {},
+      )
+      const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
+      try {
+        await router.route(
+          inbound({
+            text: 'Merge when checks pass',
+            authorId: ordinarySpeaker,
+            authorAdapter: 'discord',
+            room: { kind: 'thread', parentChat },
+            accountIdentity,
+          }),
+        )
+        const wakeTarget = {
+          kind: 'channel',
+          key: KEY,
+          requester: { authorId: 'watch-requester', authorAdapter: KEY.adapter },
+        } as const
+        const watchId = await service.create({
+          description: 'Wait for CI',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdByRole: 'owner',
+          createdByOrigin: origin,
+          wakeTarget,
+          waitsFor: waiting,
+        })
+        const todos = [{ content: waiting, status: 'pending' as const }]
+        if (secondWake) {
+          const target = { ...wakeTarget, requester: { ...wakeTarget.requester, authorId: secondRequester } }
+          const id = await service.create({
+            description: 'Wait for publishing CI',
+            probe: { command: 'true' },
+            mode: 'judge',
+            createdByRole: 'owner',
+            createdByOrigin: origin,
+            wakeTarget: target,
+            waitsFor: secondTodo,
+          })
+          const pending = { key: crypto.randomUUID(), summary: secondVerdict, final: false }
+          await store.update((rows) => rows.find((row) => row.id === id)?.pending.push(pending))
+          queueSecondWake = async () => {
+            expect(
+              await deliverChannelWakes(router, target, [{ ...pending, watchId: id, description: secondTodo }]),
+            ).toBe('queued')
+          }
+          todos.push({ content: secondTodo, status: 'pending' })
+        }
+        await writeTodos(dir, scope, todos)
+        await router.__testing?.flushDebounce(KEY)
+        expect(speakers).toEqual([[ordinarySpeaker, parentChat, 'discord']])
+        expect(logs.some((line) => line.endsWith('todo_continuation skip reason=watch-pending'))).toBe(true)
+
+        if (evicted) {
+          nowRef.value += SESSION_IDLE_MS + 1
+          await router.__testing?.runIdleGc()
+          expect(router.liveCount()).toBe(0)
+          expect((await loadChannelSessions(dir))[0]?.lastOrdinarySpeaker).toEqual({
+            authorId: ordinarySpeaker,
+            authorAdapter: 'discord',
+            parentChat,
+          })
+        }
+        mayRespond = !revoked
+        checkedParents.length = 0
+        const wake = { key: crypto.randomUUID(), summary: 'Checks passed', final: false }
+        await store.update((rows) => {
+          const watch = rows.find((row) => row.id === watchId)
+          if (!watch) throw new Error('Expected a persisted watch')
+          watch.pending.push(wake)
+        })
+        expect(await deliverChannelWakes(router, wakeTarget, [{ ...wake, watchId, description: 'Wait for CI' }])).toBe(
+          'queued',
+        )
+        await router.__testing?.flushDebounce(KEY)
+
+        if (replaceAccount) {
+          const before = sessions.flatMap((session) => session.prompts)
+          expect(before).toHaveLength(2)
+          expect(await backgroundObligations.lookup(parentSessionId, childId)).toMatchObject({
+            accountIdentity,
+            transfer: expect.any(Object),
+          })
+          await router.route(inboundForSelf(bot, { text: 'Please carry on.', externalMessageId: 'after-reload' }))
+          await router.__testing?.flushDebounce(KEY)
+          const after = sessions.flatMap((session) => session.prompts)
+          expect(after).toHaveLength(4)
+          expect(after[2]).toContain('Please carry on.')
+          expect(after[3]).toContain('Incomplete todo items remain')
+          expect(after.some((prompt) => prompt.includes(childId))).toBe(false)
+          expect(logs.filter((line) => line.endsWith('todo_continuation inject'))).toHaveLength(1)
+          return
+        }
+        expect(sessions).toHaveLength(evicted || reload ? 2 : 1)
+        const prompts = sessions.flatMap((session) => session.prompts)
+        expect(prompts[1]).toContain('Checks passed')
+        const continues =
+          !revoked &&
+          !replies &&
+          !failure &&
+          (!child || child === 'launch-failed' || (child === 'queued' && !completionReplies))
+        expect(sent).toEqual(replies ? [reply] : completionReplies ? [completionReply] : [])
+        if (secondWake) expect(prompts[2]).toContain(secondVerdict)
+        if (child === 'queued') expect(prompts[secondWake ? 3 : 2]).toContain(childId)
+        expect(prompts).toHaveLength(2 + Number(secondWake === true) + Number(child === 'queued') + Number(continues))
+        if (reload) expect(sessions[1]?.prompts).toHaveLength(2)
+        if (continues) expect(prompts.at(-1)).toContain('Incomplete todo items remain')
+        const expectedSpeakers: typeof speakers = [
+          [ordinarySpeaker, parentChat, 'discord'],
+          ['watch-requester', undefined, undefined],
+        ]
+        if (secondWake) expectedSpeakers.push([secondRequester, undefined, undefined])
+        if (child === 'queued') expectedSpeakers.push(['watch-requester', undefined, undefined])
+        if (continues) expectedSpeakers.push([ordinarySpeaker, parentChat, 'discord'])
+        expect(speakers).toEqual(expectedSpeakers)
+        if (!replies && !failure && !child) expect(checkedParents).toContain(parentChat)
+        expect(logs.filter((line) => line.endsWith('todo_continuation inject'))).toHaveLength(continues ? 1 : 0)
+        expect(store.records[0]?.status).toBe('active')
+        expect(store.records[0]?.waitsFor).toBeUndefined()
+        if (child === 'launch-failed') {
+          expect(await backgroundObligations.lookup(parentSessionId, childId)).toMatchObject({
+            phase: 'closed',
+            outcome: { kind: 'intentionally-suppressed', reason: 'launch-failed' },
+          })
+        } else if (child && child !== 'queued') {
+          runningWatchLineage = undefined
+          mayWatchRespond = !denyCompletion
+          await publishCompletion()
+          await router.__testing?.flushDebounce(KEY)
+          const after = sessions.flatMap((session) => session.prompts)
+          if (denyCompletion) {
+            expect(after).toHaveLength(2)
+            expect(await backgroundObligations.lookup(parentSessionId, childId)).toMatchObject({
+              phase: 'closed',
+              outcome: { kind: 'intentionally-suppressed', reason: 'watch-permission-denied' },
+            })
+            mayWatchRespond = true
+          } else {
+            expect(after).toHaveLength(4)
+            expect(after[2]).toContain(childId)
+            expect(after[3]).toContain('Incomplete todo items remain')
+            expect(speakers.slice(-2)).toEqual([
+              ['watch-requester', undefined, undefined],
+              [ordinarySpeaker, parentChat, 'discord'],
+            ])
+            expect(logs.filter((line) => line.endsWith('todo_continuation inject'))).toHaveLength(1)
+          }
+        }
+        if (denyCompletion || (replies && secondWake)) {
+          expect(logs.filter((line) => line.endsWith('todo_continuation inject'))).toHaveLength(0)
+          await router.route(
+            inbound({
+              text: 'Please carry on.',
+              authorId: ordinarySpeaker,
+              authorAdapter: 'discord',
+              room: { kind: 'thread', parentChat },
+              accountIdentity,
+            }),
+          )
+          await router.__testing?.flushDebounce(KEY)
+          const after = sessions.flatMap((session) => session.prompts)
+          expect(after.at(-2)).toContain('Please carry on.')
+          expect(after.at(-1)).toContain('Incomplete todo items remain')
+          expect(after.some((prompt) => prompt.includes(childId))).toBe(false)
+          expect(logs.filter((line) => line.endsWith('todo_continuation inject'))).toHaveLength(1)
+        }
+      } finally {
+        unregister()
+        await router.stop()
+        await rm(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('a denied linked wake does not park the todo after the requester regains access', async () => {
+    const dir = await tempDir()
+    const origin = { kind: 'channel', ...KEY } as const
+    const scope = resolveTodoScope(origin)
+    if (!scope) throw new Error('Expected a channel todo scope')
+    const requester = 'watch-requester'
+    let mayWake = false
+    const { router, sessions } = makeRouter(dir, {
+      permissions: {
+        ...grantAllPermissions,
+        has: (actor, permission) =>
+          permission !== 'channel.respond' ||
+          actor?.kind !== 'channel' ||
+          actor.lastInboundAuthorId !== requester ||
+          mayWake,
+      },
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const store = new WatchStore(dir)
+    const service = new WatchService(
+      store,
+      async () => ({ verdict: 'quiet' }),
+      async () => {},
+      () => {},
+    )
+    const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
+    const wakeTarget = {
+      kind: 'channel',
+      key: KEY,
+      requester: { authorId: requester, authorAdapter: KEY.adapter },
+    } as const
+    let deliver: (() => Promise<void>) | undefined
+    const dispatcher = new WakeDispatcher(store, (_target, wakes) => deliverChannelWakes(router, wakeTarget, wakes), {
+      now: () => 0,
+      after: (_ms, fn) => {
+        deliver = fn
+        return () => {
+          deliver = undefined
+        }
+      },
+    })
+    try {
+      const waiting = 'Merge after checks'
+      const id = await service.create({
+        description: 'Wait for CI',
+        probe: { command: 'true' },
+        mode: 'judge',
+        createdByRole: 'owner',
+        createdByOrigin: origin,
+        wakeTarget,
+        waitsFor: waiting,
+      })
+      const accountIdentity = fallbackChannelAccountIdentity(KEY.adapter, KEY.workspace, 'bot')
+      await writeTodos(dir, scope, [{ content: waiting, status: 'pending' }])
+      await router.route(inbound({ text: 'Merge when checks pass', accountIdentity }))
+      const [session] = sessions
+      if (!session) throw new Error('Expected an engaged session')
+      session.onPrompt = async (text) => {
+        if (text.includes('Incomplete todo items remain')) await writeTodos(dir, scope, [])
+        session.setAssistantText('NO_REPLY')
+        session.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+      }
+      await router.__testing?.flushDebounce(KEY)
+      expect(session.prompts).toHaveLength(1)
+      await store.update((rows) => {
+        const watch = rows.find((row) => row.id === id)
+        if (!watch) throw new Error('Expected a persisted watch')
+        watch.pending.push({ key: crypto.randomUUID(), summary: 'Checks passed', final: false })
+      })
+      dispatcher.notify()
+      if (!deliver) throw new Error('Expected a scheduled wake')
+      await deliver()
+      await router.__testing?.flushDebounce(KEY)
+      expect(session.prompts).toHaveLength(1)
+
+      mayWake = true
+      dispatcher.notify()
+      await router.route(inbound({ text: 'Continue the work', accountIdentity }))
+      await router.__testing?.flushDebounce(KEY)
+      expect(session.prompts).toHaveLength(3)
+      expect(session.prompts[2]).toContain('Incomplete todo items remain')
+      expect(session.prompts.some((text) => text.includes('Checks passed'))).toBe(false)
+      const restored = new WatchStore(dir)
+      await restored.restore()
+      expect(restored.records[0]).toMatchObject({ status: 'active', pending: [] })
+      expect(restored.records[0]?.waitsFor).toBeUndefined()
+    } finally {
+      await dispatcher.stop()
+      unregister()
+      await router.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

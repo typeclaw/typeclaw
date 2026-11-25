@@ -67,16 +67,24 @@ const queues = new Map<string, Promise<void>>()
 /**
  * Process-wide lookup index per store directory, shared by every instance in this process. One
  * directory scan builds it and every write in this process extends it, so completion lookups read
- * only exact candidates. Provenance (taskId) and frozen transfers never change once written, and
- * closed rows stay on disk as tombstones, so entries are only ever added. The directory has one
- * writer process; a new instance (a new boot or test phase) discards the cached index.
+ * only exact candidates. Task and delivery entries are only added; the watch index tracks
+ * obligations that still await a completion turn. The directory has one writer process;
+ * a new instance (a new boot or test phase) discards the cached index.
  */
 type ObligationIndex = {
   byTask: Map<string, Set<string>>
   byDelivery: Map<string, Set<string>>
+  pendingWatchChildren: Map<string, Set<string>>
   ready: Promise<void>
 }
 const indexes = new Map<string, ObligationIndex>()
+function isPendingWatchChild(row: BackgroundObligation): boolean {
+  return (
+    !row.transfer &&
+    (row.phase === 'accepted' || row.phase === 'result-ready' || (row.phase === 'turn-owned' && !!row.completionId))
+  )
+}
+
 function indexRow(directory: string, row: BackgroundObligation) {
   const index = indexes.get(directory)
   if (!index) return
@@ -87,6 +95,16 @@ function indexRow(directory: string, row: BackgroundObligation) {
   }
   add(index.byTask, row.taskId)
   if (row.transfer) add(index.byDelivery, row.transfer.deliveryId)
+  if (row.watchOrigin) {
+    const lineage = row.watchOrigin.turnId
+    if (isPendingWatchChild(row)) {
+      add(index.pendingWatchChildren, lineage)
+    } else {
+      const ids = index.pendingWatchChildren.get(lineage)
+      ids?.delete(row.obligationId)
+      if (ids?.size === 0) index.pendingWatchChildren.delete(lineage)
+    }
+  }
 }
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 async function syncDirectory(path: string) {
@@ -367,7 +385,12 @@ export class BackgroundObligationStore {
       await existing.ready
       return existing
     }
-    const index: ObligationIndex = { byTask: new Map(), byDelivery: new Map(), ready: Promise.resolve() }
+    const index: ObligationIndex = {
+      byTask: new Map(),
+      byDelivery: new Map(),
+      pendingWatchChildren: new Map(),
+      ready: Promise.resolve(),
+    }
     indexes.set(this.directory, index)
     // Registered before the scan starts, so a row renamed in after its readdir is added by write().
     index.ready = this.list().then(
@@ -400,6 +423,22 @@ export class BackgroundObligationStore {
     return (await this.indexedRows('byTask', taskId)).find(
       (row) => row.taskId === taskId && channelKeyId(row.target) === channelKeyId(target),
     )
+  }
+
+  /** Includes accepted children in the gap between registry completion and result publication. */
+  async hasPendingWatchChild(target: ChannelKey, lineage: string): Promise<boolean> {
+    const ids = (await this.index()).pendingWatchChildren.get(lineage)
+    for (const id of ids ?? []) {
+      const row = await this.get(id)
+      if (
+        row &&
+        channelKeyId(row.target) === channelKeyId(target) &&
+        belongsToBackgroundLineage(row, lineage) &&
+        isPendingWatchChild(row)
+      )
+        return true
+    }
+    return false
   }
   private async deliveryRows(deliveryId: string) {
     return (await this.indexedRows('byDelivery', deliveryId)).filter((row) => row.transfer?.deliveryId === deliveryId)

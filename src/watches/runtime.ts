@@ -27,11 +27,15 @@ export function getWatchRuntime(dir: string): WatchRuntime | undefined {
   return runtimes.get(dir)
 }
 
-// Only a watch created this turn can stand in for its continuation. A paused
-// watch wakes nothing until it is rearmed.
-export function hasActiveWatchFor(dir: string, origin: SessionOrigin, createdSince: number): boolean {
+export function todosWithActiveWatches(dir: string, origin: SessionOrigin): ReadonlySet<string> {
   const records = runtimes.get(dir)?.service.store.records ?? []
-  return records.some((w) => w.status === 'active' && w.createdAt >= createdSince && wakesConversation(w, origin))
+  const linked = new Set<string>()
+  for (const watch of records) {
+    if (watch.status === 'active' && watch.waitsFor !== undefined && wakesConversation(watch, origin)) {
+      linked.add(watch.waitsFor)
+    }
+  }
+  return linked
 }
 
 function wakesConversation(w: WatchRecord, origin: SessionOrigin): boolean {

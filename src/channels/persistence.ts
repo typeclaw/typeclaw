@@ -5,7 +5,7 @@ import type { ChannelParticipant } from '@/agent/session-origin'
 
 import { toRef } from './adapters/webex-id-ref'
 import { describeError } from './describe-error'
-import type { AdapterId } from './schema'
+import { ADAPTER_IDS, type AdapterId } from './schema'
 import type { ChannelKey, GithubReviewFollowupRound, GithubReviewThreadCloseout } from './types'
 
 const FILE_VERSION = 7
@@ -29,6 +29,7 @@ export type ChannelSessionRecord = {
   sessionFile?: string
   lastInboundAt?: number
   participants: ChannelParticipant[]
+  lastOrdinarySpeaker?: { authorId: string; authorAdapter: AdapterId; parentChat?: string }
   // Set once the bot has delivered a message into this conversation. The live
   // send counter resets on restart and rollover, so this is what keeps a
   // thread the bot already joined from looking like an un-addressed intrusion.
@@ -251,9 +252,20 @@ function isValidRecord(v: unknown): v is ChannelSessionRecord {
     (r.sessionFile === undefined || typeof r.sessionFile === 'string') &&
     (r.lastInboundAt === undefined || typeof r.lastInboundAt === 'number') &&
     Array.isArray(r.participants) &&
+    (r.lastOrdinarySpeaker === undefined || isValidOrdinarySpeaker(r.lastOrdinarySpeaker)) &&
     (r.botParticipated === undefined || r.botParticipated === true) &&
     (r.githubReviewRound === undefined || isValidGithubReviewRound(r.githubReviewRound, r)) &&
     (r.githubReviewThreadCloseout === undefined || isValidGithubReviewThreadCloseout(r.githubReviewThreadCloseout, r))
+  )
+}
+
+function isValidOrdinarySpeaker(value: unknown): boolean {
+  return (
+    isObject(value) &&
+    typeof value.authorId === 'string' &&
+    value.authorId.length > 0 &&
+    ADAPTER_IDS.some((adapter) => adapter === value.authorAdapter) &&
+    (value.parentChat === undefined || (typeof value.parentChat === 'string' && value.parentChat.length > 0))
   )
 }
 

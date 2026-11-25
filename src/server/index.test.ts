@@ -259,29 +259,14 @@ describe('createServer tool event forwarding', () => {
     )
     const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
     const releaseDelivery = Promise.withResolvers<void>()
-    const waitingForAck = Promise.withResolvers<'waiting'>()
-    const enteredIdle = Promise.withResolvers<'idle'>()
-    // Await calls .then on a Promise subclass, giving this test a causal
-    // checkpoint without sleeping or letting the acknowledgment commit early.
-    class ObservedAcknowledgment extends Promise<void> {
-      static override get [Symbol.species]() {
-        return Promise
-      }
-      override then<T = void, R = never>(
-        onfulfilled?: ((value: void) => T | PromiseLike<T>) | null,
-        onrejected?: ((reason: unknown) => R | PromiseLike<R>) | null,
-      ) {
-        waitingForAck.resolve('waiting')
-        return super.then(onfulfilled, onrejected)
-      }
-    }
+    const delivered = Promise.withResolvers<'held' | 'delivered' | 'failed'>()
     let tick: (() => Promise<void>) | undefined
     let delivery: Promise<void> | undefined
     const dispatcher = new WakeDispatcher(
       store,
       async (target, batch, _origin, _signal, acknowledgment) => {
-        const observed = new ObservedAcknowledgment((resolve) => void acknowledgment.then(resolve))
-        const receipt = await factory.deliverWatch(renderWatchReminder(target, batch), observed)
+        const receipt = await factory.deliverWatch(renderWatchReminder(target, batch), acknowledgment)
+        delivered.resolve(receipt)
         await releaseDelivery.promise
         return receipt
       },
@@ -300,6 +285,7 @@ describe('createServer tool event forwarding', () => {
     if (!scope) throw new Error('Expected the TUI todo scope')
     const waiting = 'Merge after checks'
     const idleDecisions: boolean[] = []
+    const linksAtIdle: Array<string | undefined> = []
     const session = createFakeSession()
     const factory = createServer({
       port: 0,
@@ -308,7 +294,7 @@ describe('createServer tool event forwarding', () => {
       createSession: async () => session,
       onWatchTargetReady: (id) => dispatcher.notify(id),
       runIdleContinuation: async (args) => {
-        if (session.promptCalls.length === 2) enteredIdle.resolve('idle')
+        linksAtIdle.push(store.records[0]?.waitsFor)
         const injected = await runIdleContinuation(args)
         idleDecisions.push(injected)
         return injected
@@ -346,15 +332,20 @@ describe('createServer tool event forwarding', () => {
       await waitForState(() => session.promptCalls.length === 2)
       expect(session.promptCalls[1]).toContain('Checks passed')
       session.emit({ type: 'agent_start' })
+      expect(await delivered.promise).toBe('delivered')
       session.resolvePrompt()
 
-      expect(await Promise.race([waitingForAck.promise, enteredIdle.promise])).toBe('waiting')
+      // With no hooks or new outcome writes, the drain can reach idle in
+      // microtasks if it skips the acknowledgment wait. Keep the write gated.
+      await setImmediate()
+      expect(linksAtIdle).toEqual([waiting])
       expect(store.records[0]?.waitsFor).toBe(waiting)
       releaseDelivery.resolve()
       await delivery
       await waitForState(() => session.promptCalls.length === 3)
       expect(session.promptCalls[2]).toContain('Incomplete todo items remain')
       expect(idleDecisions).toEqual([false, true])
+      expect(linksAtIdle).toEqual([waiting, undefined])
       await writeTodos(dir, scope, [])
       session.resolvePrompt()
       await waitForState(() => idleDecisions.length === 3)

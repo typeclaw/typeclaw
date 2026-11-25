@@ -4,6 +4,14 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import type { SessionOrigin } from '@/agent/session-origin'
+import { createPermissionService } from '@/permissions'
+import { WakeDispatcher } from '@/watches/delivery'
+import { createBundledProbeRegistry } from '@/watches/runner'
+import { registerWatchRuntime } from '@/watches/runtime'
+import { WatchService } from '@/watches/service'
+import { WatchStore } from '@/watches/store'
+import { registerWatchesFromBash } from '@/watches/tool'
+import type { WatchWakeTarget } from '@/watches/types'
 
 import { CONTINUATION_PROMPT, describeContinuationDecision, maybeInjectContinuation } from './continuation'
 import { DEFAULT_CONTINUATION_LIMITS } from './continuation-policy'
@@ -157,6 +165,202 @@ describe('maybeInjectContinuation', () => {
     // budget is not reset by a process boundary.
     const res = await maybeInjectContinuation({ agentDir, origin: TUI, newEpisodeId: () => 'ep-restart' })
     expect(res.kind).toBe('skipped')
+  })
+})
+
+describe('maybeInjectContinuation with a watch on the conversation', () => {
+  const waiting = 'Merge after checks'
+  const alsoWaiting = 'Review the export'
+  const CHANNEL: SessionOrigin = {
+    kind: 'channel',
+    adapter: 'slack-bot',
+    workspace: 'workspace',
+    chat: 'room',
+    thread: 'thread',
+    lastInboundAuthorId: 'requester',
+  }
+  const channelTarget = (chat: string): WatchWakeTarget => ({
+    kind: 'channel',
+    key: { adapter: 'slack-bot', workspace: 'workspace', chat, thread: 'thread' },
+    requester: { authorId: 'requester', authorAdapter: 'slack-bot' },
+  })
+  const tuiTarget = { kind: 'tui', sessionId: 'another-session' } as const
+
+  function setupWatches() {
+    const store = new WatchStore(agentDir)
+    const service = new WatchService(
+      store,
+      async () => ({ verdict: 'quiet' }),
+      async () => {},
+      () => {},
+      { now: () => 0, after: () => () => {} },
+    )
+    const unregister = registerWatchRuntime(agentDir, {
+      service,
+      registry: createBundledProbeRegistry(),
+      isAutoEnabled: () => true,
+      resolveGithubCredential: async () => ({ kind: 'token', token: 'fixture' }),
+    })
+    return {
+      store,
+      unregister,
+      create: (wakeTarget: WatchWakeTarget, waitsFor: string) =>
+        service.create({
+          description: 'Check for the result',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdByRole: 'owner',
+          createdByOrigin: wakeTarget.kind === 'channel' ? CHANNEL : TUI,
+          wakeTarget,
+          waitsFor,
+        }),
+    }
+  }
+
+  async function seedPending(origin: SessionOrigin, ...contents: string[]) {
+    const scope = resolveTodoScope(origin)
+    if (!scope) throw new Error('Expected a todo scope')
+    await writeTodos(agentDir, scope, [
+      ...contents.map((content, index) => ({ content, status: index === 0 ? 'pending' : 'in_progress' }) as const),
+      { content: 'Already finished', status: 'completed' },
+      { content: 'No longer needed', status: 'cancelled' },
+    ])
+    await writeContinuationState(
+      agentDir,
+      scope,
+      onTurnOutcome(await readContinuationState(agentDir, scope), { turnId: 't', stopReason: 'stop', endedAt: 1 }),
+    )
+  }
+
+  test('parks without spending budget when every incomplete todo is linked to an active watch', async () => {
+    await seedPending(TUI, waiting, alsoWaiting)
+    const { create, unregister } = setupWatches()
+    try {
+      await create(tuiTarget, waiting)
+      await create(tuiTarget, alsoWaiting)
+      const res = await maybeInjectContinuation({ agentDir, origin: TUI })
+      expect(res).toEqual({ kind: 'skipped', reason: 'watch-pending' })
+      expect((await readContinuationState(agentDir, SCOPE)).episode).toBeNull()
+      expect(describeContinuationDecision(res)).toBe('todo_continuation skip reason=watch-pending')
+    } finally {
+      unregister()
+    }
+  })
+
+  test('injects when a runnable todo is unlinked alongside a linked one', async () => {
+    await seedPending(TUI, waiting, 'Draft release notes')
+    const { create, unregister } = setupWatches()
+    try {
+      await create(tuiTarget, waiting)
+      const result = await maybeInjectContinuation({ agentDir, origin: TUI })
+      expect(result.kind).toBe('injected')
+      expect((await readContinuationState(agentDir, SCOPE)).episode?.autoTurnCount).toBe(1)
+    } finally {
+      unregister()
+    }
+  })
+
+  test('a deferred watch result leaves unrelated todos runnable', async () => {
+    const runnable = 'Draft release notes'
+    await seedPending(TUI, waiting, runnable)
+    const result = await maybeInjectContinuation({ agentDir, origin: TUI, deferredTodos: new Set([waiting]) })
+    expect(result.kind).toBe('injected')
+    if (result.kind !== 'injected') throw new Error('Expected a continuation prompt')
+    expect(result.text).toContain(runnable)
+    expect(result.text).not.toContain(waiting)
+  })
+
+  test('the next TUI idle continues after a nonterminal green wake leaves the todo incomplete', async () => {
+    await seedPending(TUI, waiting)
+    const { create, store, unregister } = setupWatches()
+    let attempt: (() => Promise<void>) | undefined
+    let attached = false
+    const dispatcher = new WakeDispatcher(store, async () => (attached ? 'delivered' : 'held'), {
+      now: () => 0,
+      after: (_ms, fn) => {
+        attempt = fn
+        return () => {
+          attempt = undefined
+        }
+      },
+    })
+    const flush = async () => {
+      if (!attempt) throw new Error('Expected a scheduled wake delivery')
+      await attempt()
+    }
+    const decide = () => maybeInjectContinuation({ agentDir, origin: TUI })
+    const parked = { kind: 'skipped', reason: 'watch-pending' } as const
+    try {
+      const id = await create(tuiTarget, waiting)
+      expect(await decide()).toEqual(parked)
+      // The PR probe has reported green without ending the watch.
+      await store.update((rows) => {
+        const watch = rows.find((row) => row.id === id)
+        if (!watch) throw new Error('Expected a persisted watch')
+        watch.pending.push({ key: crypto.randomUUID(), summary: 'Checks passed', final: false })
+      })
+      dispatcher.notify()
+      await flush()
+      expect(await decide()).toEqual(parked)
+
+      attached = true
+      dispatcher.notify('attached')
+      await flush()
+      expect((await decide()).kind).toBe('injected')
+      const restored = new WatchStore(agentDir)
+      await restored.restore()
+      expect(restored.records[0]?.status).toBe('active')
+      expect(restored.records[0]?.waitsFor).toBeUndefined()
+    } finally {
+      await dispatcher.stop()
+      unregister()
+    }
+  })
+
+  test('an auto-registered issue watch does not park continuation', async () => {
+    await seedPending(TUI, waiting)
+    const { store, unregister } = setupWatches()
+    try {
+      await registerWatchesFromBash(
+        agentDir,
+        TUI,
+        createPermissionService(),
+        'gh issue create',
+        'https://github.com/acme/widgets/issues/13',
+      )
+      expect(store.records).toHaveLength(1)
+      expect(store.records[0]?.waitsFor).toBeUndefined()
+      expect((await maybeInjectContinuation({ agentDir, origin: TUI })).kind).toBe('injected')
+    } finally {
+      unregister()
+    }
+  })
+
+  test('a linked channel watch does not park a different conversation', async () => {
+    await seedPending(CHANNEL, waiting)
+    const { create, unregister } = setupWatches()
+    try {
+      await create(channelTarget('other-room'), waiting)
+      expect((await maybeInjectContinuation({ agentDir, origin: CHANNEL })).kind).toBe('injected')
+    } finally {
+      unregister()
+    }
+  })
+
+  test('a paused linked watch does not park continuation', async () => {
+    await seedPending(TUI, waiting)
+    const { create, store, unregister } = setupWatches()
+    try {
+      const id = await create(tuiTarget, waiting)
+      await store.update((rows) => {
+        const watch = rows.find((row) => row.id === id)
+        if (!watch) throw new Error('Expected a persisted watch')
+        watch.status = 'paused'
+      })
+      expect((await maybeInjectContinuation({ agentDir, origin: TUI })).kind).toBe('injected')
+    } finally {
+      unregister()
+    }
   })
 })
 

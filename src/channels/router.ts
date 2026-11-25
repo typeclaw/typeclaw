@@ -21,6 +21,7 @@ import type { RestartHandoff } from '@/agent/restart-handoff'
 import type { ChannelParticipant, SessionOrigin } from '@/agent/session-origin'
 import { renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
 import { describeContinuationDecision } from '@/agent/todo/continuation'
+import { isContinuationSafeOutcome, type TurnOutcome } from '@/agent/todo/continuation-policy'
 import {
   armRestartKickForOrigin,
   clearAbortSuppressionForOrigin,
@@ -29,6 +30,7 @@ import {
   recordTurnHandBack,
   recordTurnOutcome,
   recordTurnStart,
+  recordWatchTodoHandBack,
   runIdleContinuation,
 } from '@/agent/todo/continuation-wiring'
 import { defuseRuntimeMarkers } from '@/agent/tools/runtime-notice'
@@ -42,6 +44,7 @@ import type { ChannelOutboundBeforeEvent, ChannelOutboundOrigin, HookBus } from 
 import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
 import { renderWatchReminder } from '@/watches/delivery'
+import { getWatchRuntime } from '@/watches/runtime'
 
 import { adapterNamespace } from './adapter-namespace'
 import { extractMentionedUserIds } from './adapters/mention-hints'
@@ -821,7 +824,14 @@ type ReminderActor = {
   parentChat?: string
 }
 
-type WatchRequester = ReminderActor & { room?: InboundMessage['room']; isDm: boolean; originTurnId?: string }
+type WatchRequester = ReminderActor & {
+  room?: InboundMessage['room']
+  isDm: boolean
+  originTurnId?: string
+  releasedTodos?: readonly string[]
+  deliveredReply?: boolean
+  outcome?: Pick<TurnOutcome, 'stopReason' | 'termination'>
+}
 
 type PendingSystemReminder = ({ kind: 'retry'; turnId: string } | { kind: 'wakeup' }) & {
   text: string
@@ -883,6 +893,7 @@ type PendingReloadHandoff = {
   inbounds: QueuedInbound[]
   observed: ObservedInbound[]
   reminders: PendingSystemReminder[]
+  watchTodoLinks?: [lineage: string, contents: readonly string[]][]
   coverage: PendingReloadCoverage | null
   retainedAt: number
   estimatedBytes: number
@@ -1152,6 +1163,7 @@ type LiveSession = {
   lastTurnAuthorAdapter: AdapterId
   lastTurnHandoff: boolean
   consecutiveAborts: number
+  lastOrdinarySpeaker?: ChannelSessionRecord['lastOrdinarySpeaker']
   // Per-(chat:thread) count of bot messages sent without intervening user
   // input being rendered into the model's context. Reset at the top of each
   // drain() iteration that picks up a non-empty batch (= a new user turn is
@@ -1179,6 +1191,8 @@ type LiveSession = {
   // turn. A successor may run under another ID than the one its adopted rows name.
   backgroundTurnOwnerSessionId: string
   backgroundStopVersion: number
+  // A clean, silent linked watch is waiting for its own children to finish.
+  watchTodoLinks: Map<string, readonly string[]>
   // True only for the reminder-only iteration that consumed a willingness
   // nudge. `willingnessNudges` persists across the logical turn, so it remains
   // nonzero after a substantive result and would misclassify NO_REPLY from a
@@ -2578,6 +2592,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     pending.inbounds.length +
     pending.observed.length +
     pending.reminders.length +
+    (pending.watchTodoLinks?.length ?? 0) +
     (pending.coverage === null ? 0 : pending.coverage.inboundIds.length + pending.coverage.backgroundIds.length)
 
   const estimateReloadHandoffBytes = (
@@ -2585,11 +2600,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     observed: ObservedInbound[],
     reminders: PendingSystemReminder[],
     coverage: PendingReloadCoverage | null,
+    watchTodoLinks?: PendingReloadHandoff['watchTodoLinks'],
   ): number => {
     try {
       const serializableInbounds = inbounds.map(({ engageReaction: _engageReaction, ...inbound }) => inbound)
       return Buffer.byteLength(
-        JSON.stringify({ inbounds: serializableInbounds, observed, reminders, coverage }),
+        JSON.stringify({ inbounds: serializableInbounds, observed, reminders, coverage, watchTodoLinks }),
         'utf8',
       )
     } catch {
@@ -2896,15 +2912,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const observed = live.contextBuffer.slice()
     const reminders = live.pendingSystemReminders.slice()
     const coverage = deferredToBackground ? reloadCoverageSnapshot(live) : null
+    const watchTodoLinks = [...live.watchTodoLinks]
     const incoming: PendingReloadHandoff = {
       key: live.key,
       sessionId: live.sessionId,
       inbounds,
       observed,
       reminders,
+      watchTodoLinks,
       coverage,
       retainedAt: now(),
-      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders, coverage),
+      estimatedBytes: estimateReloadHandoffBytes(inbounds, observed, reminders, coverage, watchTodoLinks),
     }
     const hasWork = pendingReloadHandoffItemCount(incoming) > 0
     const retained = hasWork && retainReloadHandoff(incoming)
@@ -2919,6 +2937,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.promptQueue.length = 0
     live.contextBuffer.length = 0
     live.pendingSystemReminders.length = 0
+    live.watchTodoLinks.clear()
     live.inboundCoverage = []
     live.backgroundCoverage = []
     return retained
@@ -3020,6 +3039,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       existing.inbounds.push(...incoming.inbounds)
       existing.observed.push(...incoming.observed)
       existing.reminders.push(...incoming.reminders)
+      if (incoming.watchTodoLinks?.length) {
+        existing.watchTodoLinks = [...(existing.watchTodoLinks ?? []), ...incoming.watchTodoLinks]
+      }
       if (incoming.coverage !== null) existing.coverage = incoming.coverage
       existing.estimatedBytes += incoming.estimatedBytes
       return true
@@ -3081,6 +3103,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         inbounds: [],
         observed: [],
         reminders: [],
+        watchTodoLinks: undefined,
         estimatedBytes: estimateReloadHandoffBytes([], [], [], coverage),
       })
     } else {
@@ -3089,6 +3112,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.promptQueue.push(...pending.inbounds)
     live.contextBuffer.push(...pending.observed)
     live.pendingSystemReminders.push(...pending.reminders)
+    for (const [lineage, todos] of pending.watchTodoLinks ?? []) live.watchTodoLinks.set(lineage, todos)
     // A retry-only reload handoff resumes the source turn, not the successor's
     // initial random turn ID. Restore its claims too: if fresh input wins the
     // race, normal fresh-turn bookkeeping must still account for that debt.
@@ -3177,6 +3201,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               chat: prev.chat,
               thread: prev.thread,
               participants: prev.participants,
+              lastOrdinarySpeaker: prev.lastOrdinarySpeaker,
               ...(prev.botParticipated === true ? { botParticipated: true as const } : {}),
               lastInboundAt: 0,
               ...(prev.githubReviewThreadCloseout !== undefined && prev.githubReviewRound !== undefined
@@ -3228,6 +3253,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           chat: record.chat,
           thread: record.thread,
           participants: record.participants,
+          lastOrdinarySpeaker: record.lastOrdinarySpeaker,
           ...(record.botParticipated === true ? { botParticipated: true as const } : {}),
           lastInboundAt: 0,
           ...(record.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
@@ -3261,6 +3287,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           sessionId: resumeTarget.sessionId,
           sessionFile: resumeTarget.sessionFile,
           participants: (record?.participants ?? []) as ChannelParticipant[],
+          lastOrdinarySpeaker: record?.lastOrdinarySpeaker,
           ...(record?.botParticipated === true ? { botParticipated: true as const } : {}),
           lastInboundAt: now(),
           ...(record?.githubReviewRound !== undefined ? { githubReviewRound: record.githubReviewRound } : {}),
@@ -3367,6 +3394,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         ...(transcriptPath ? { sessionFile: basename(transcriptPath) } : {}),
         lastInboundAt: now(),
         participants,
+        lastOrdinarySpeaker: resolvedRecord?.lastOrdinarySpeaker,
         ...(resolvedRecord?.botParticipated === true ? { botParticipated: true as const } : {}),
         ...(restoredRound !== null && restoredRoundStatus !== null
           ? (() => {
@@ -3432,6 +3460,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         backgroundCoverage: [],
         inboundCoverage: [],
         backgroundStopVersion: 0,
+        watchTodoLinks: new Map(),
         backgroundTurnId: randomUUID(),
         backgroundTurnOwnerSessionId: created.sessionId,
         willingnessReminderIteration: false,
@@ -3478,6 +3507,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         lastTurnAuthorId: triggeringAuthorId ?? null,
         lastTurnAuthorAdapter: key.adapter,
         lastTurnHandoff: false,
+        lastOrdinarySpeaker: resolvedRecord?.lastOrdinarySpeaker,
         consecutiveAborts: 0,
         consecutiveSends: new Map(),
         lastSentText: new Map(),
@@ -3554,8 +3584,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
       })
       live.unsubTodoOutcome = created.session.subscribe((event: unknown) => {
+        const watch = live.watchRequester
         const usage = extractTurnUsage(event)
-        if (usage === null) return
+        if (usage === null) {
+          if (watch && (event as { type?: unknown } | null)?.type === 'agent_start') watch.outcome = undefined
+          return
+        }
         const stampedAbort = live.abortReasonThisTurn
         const termination: 'terminal-after-channel-reply' | undefined =
           usage.stopReason === 'aborted' &&
@@ -3564,6 +3598,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           stampedAbort.reason === 'terminal_after_channel_reply'
             ? 'terminal-after-channel-reply'
             : undefined
+        if (watch) {
+          watch.outcome = { stopReason: usage.stopReason, termination }
+          return
+        }
         // Keep the same-turn stamp through validateChannelTurn. Clearing it on
         // the aborted assistant event made the later stranded-toolUse retry log
         // `abort_reason=unknown`, even though this subscriber had just consumed
@@ -3836,6 +3874,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     next[idx] = { ...next[idx]!, botParticipated: true }
     mappings = next
     await persist()
+  }
+
+  const rememberOrdinarySpeaker = async (
+    live: LiveSession,
+    speaker: NonNullable<ChannelSessionRecord['lastOrdinarySpeaker']>,
+  ) => {
+    const previous = live.lastOrdinarySpeaker
+    if (previous && sameActor(previous, speaker)) return
+    live.lastOrdinarySpeaker = speaker
+    const record = mappings && findRecord(mappings, live.key)
+    if (!record) return
+    record.lastOrdinarySpeaker = speaker
+    await persist().catch((err) =>
+      logger.warn(`[channels] ${live.keyId}: failed to persist ordinary speaker: ${describeError(err)}`),
+    )
   }
 
   const fireTyping = async (
@@ -4163,7 +4216,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ) {
         live.qualifyingWorkThisLogicalTurn = true
       }
-      if (context.toolCall.name === 'todo_write' && !context.isError) {
+      if (context.toolCall.name === 'todo_write' && !context.isError && !live.watchRequester) {
         live.deliveredOutputsAtLastTodoWrite = live.deliveredOutputs
       }
       const succeeded = context.toolCall.name === 'channel_reply' && !context.isError && details?.ok === true
@@ -4361,9 +4414,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     }
   }
 
-  const recordTodoTurnStart = async (live: LiveSession, isRealUserTurn: boolean): Promise<void> => {
+  const recordTodoTurnStart = async (live: LiveSession, batch: readonly QueuedInbound[]): Promise<void> => {
     try {
-      await recordTurnStart({ agentDir: options.agentDir, origin: buildLiveOrigin(live), isRealUserTurn })
+      await recordTurnStart({
+        agentDir: options.agentDir,
+        origin: buildLiveOrigin(live),
+        isRealUserTurn: batch.length > 0,
+        clearWatchHandBack: batch.some((input) => !input.authorIsBot && !input.handoff),
+      })
     } catch (err) {
       logger.warn(`[channels] ${live.keyId}: todo turn-start failed: ${describeError(err)}`)
     }
@@ -4375,9 +4433,20 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // the same drain pass. The episode guard bounds how many times this can
   // re-fire; a reminder-only turn records isRealUserTurn=false so it never
   // resets the budget.
-  const maybeContinueTodosChannel = async (live: LiveSession): Promise<void> => {
+  const maybeContinueTodosChannel = async (live: LiveSession, actor?: ReminderActor): Promise<void> => {
     if (live.destroyed) return
     if (hasOrdinaryContinuation(live)) return
+    const current = buildLiveOrigin(live)
+    const origin =
+      actor && current.kind === 'channel'
+        ? {
+            ...current,
+            parentChat: actor.parentChat,
+            lastInboundAuthorId: actor.authorId,
+            lastInboundAuthorAdapter: actor.authorAdapter,
+          }
+        : current
+    if (actor && (!actor.authorId || !permissions.has(origin, CORE_PERMISSIONS.channelRespond))) return
     // Joined to the outcome-write chain so a concurrent /stop's durable abort is
     // ORDERED AFTER this decision's own state write instead of racing it. The
     // decision itself awaits disk, so the stop marker is re-read at delivery
@@ -4385,11 +4454,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const decision = live.todoOutcomeWrite.then(async () => {
       try {
         if (handedBackSinceLastTodoWrite(live)) {
-          await recordTurnHandBack({ agentDir: options.agentDir, origin: buildLiveOrigin(live) })
+          await recordTurnHandBack({ agentDir: options.agentDir, origin })
         }
+        const deferredTodos = await backgroundObligations.withTargetLane(live.key, async () => {
+          const contents = new Set<string>()
+          for (const [lineage, todos] of live.watchTodoLinks) {
+            if (await backgroundObligations.hasPendingWatchChild(live.key, lineage)) {
+              for (const todo of todos) contents.add(todo)
+            } else {
+              live.watchTodoLinks.delete(lineage)
+            }
+          }
+          return contents
+        })
         await (options.runIdleContinuation ?? runIdleContinuation)({
           agentDir: options.agentDir,
-          origin: buildLiveOrigin(live),
+          origin,
+          deferredTodos,
           deliver: (text) => {
             if (live.destroyed || live.userStoppedTurnSeq === live.turnSeq) {
               logger.info(`[channels] ${live.keyId}: dropping todo continuation reminder after user stop`)
@@ -4398,7 +4479,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // Self-continuation of the SAME work episode, not external injection:
             // `qualifyingWorkThisLogicalTurn` must survive it so a follow-up reply
             // can still cite the durable work this turn already did.
-            live.pendingSystemReminders.push({ ...retryReminder(live, text), todoContinuation: true })
+            live.pendingSystemReminders.push({
+              ...retryReminder(live, text),
+              ...(actor ? { actor } : {}),
+              todoContinuation: true,
+            })
           },
           onDecision: (result) => {
             const line = describeContinuationDecision(result)
@@ -4412,6 +4497,36 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
     live.todoOutcomeWrite = decision
     await decision
+  }
+
+  const runOrdinaryTodoIdle = async (live: LiveSession, actor?: ReminderActor): Promise<void> => {
+    if (!(await awaitLatestTodoOutcomeWrite(live))) {
+      logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
+    } else if (live.userStoppedTurnSeq === live.turnSeq) {
+      logger.info(`[channels] ${live.keyId}: skipping todo continuation after user stop`)
+    } else if (isAwaitingBackgroundChild(live, 'todo-continuation')) {
+      logger.info(`[channels] ${live.keyId}: skipping todo continuation while background child runs`)
+    } else {
+      await maybeContinueTodosChannel(live, actor)
+    }
+  }
+
+  const acknowledgeLinkedWatchStarts = async (live: LiveSession, refs: readonly InboundRef[]): Promise<string[]> => {
+    const store = getWatchRuntime(options.agentDir)?.service.store
+    if (!store) return []
+    const messageIds = new Set(refs.map(({ inputId }) => inboundJournal.get(inputId)?.reference?.messageId))
+    const keys = new Set<string>()
+    const todos = new Set<string>()
+    for (const w of store.records) {
+      if (w.waitsFor === undefined || w.wakeTarget.kind !== 'channel' || channelKeyId(w.wakeTarget.key) !== live.keyId)
+        continue
+      for (const wake of w.pending) {
+        if (!messageIds.has(`watch:${w.id}:${wake.key}`)) continue
+        keys.add(wake.key)
+        todos.add(w.waitsFor)
+      }
+    }
+    return (await store.acknowledgeWakes(keys)) ? [...todos] : []
   }
 
   const postEmptyTurnFallback = async (live: LiveSession, cause: string): Promise<void> => {
@@ -4881,7 +4996,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // is the idle bystander hasStoppableWork excludes, so /stop never answers for
   // it, never withdraws it and never posts "stopped" on its behalf.
   const isStoppableReloadHandoff = (pending: PendingReloadHandoff | undefined): pending is PendingReloadHandoff =>
-    pending !== undefined && (pending.inbounds.length > 0 || pending.reminders.length > 0 || pending.coverage !== null)
+    pending !== undefined &&
+    (pending.inbounds.length > 0 ||
+      pending.reminders.length > 0 ||
+      (pending.watchTodoLinks?.length ?? 0) > 0 ||
+      pending.coverage !== null)
 
   // After a committed stop withdrawal the handoff keeps only its observed
   // context, which a live stop also leaves in place for the next turn.
@@ -4896,6 +5015,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ...pending,
       inbounds: [],
       reminders: [],
+      watchTodoLinks: undefined,
       coverage: null,
       estimatedBytes: estimateReloadHandoffBytes([], pending.observed, [], null),
     })
@@ -4947,6 +5067,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         logger.error(`[channels] background stop withdrawal failed: ${describeError(error)}`)
       } finally {
         live.backgroundStopVersion++
+        live.watchTodoLinks.clear()
         live.userStoppedTurnSeq = live.turnSeq
         live.lastTerminalReplyCompletion = null
         live.pendingTerminalReplyStop = null
@@ -5586,6 +5707,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               lastQuestionSignal: live.lastQuestionSignal,
               currentTurnHandoff: live.currentTurnHandoff,
               reminderActor: live.reminderActor,
+              deliveredOutputsAtLogicalTurnStart: live.deliveredOutputsAtLogicalTurnStart,
+              deliveredOutputsAtRenewal: live.deliveredOutputsAtRenewal,
             }
             const priorOrigin = live.originRef.current
             iteration.defer(() => {
@@ -5819,6 +5942,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (drained === undefined) break
         const { batch, observed, reminders, stopVersion, actor, watch } = drained
         live.watchRequester = watch
+        if (watch) watch.outcome = undefined
         live.reminderActor = actor
         if (live.backgroundStopVersion !== stopVersion || (batch.length === 0 && reminders.length === 0)) continue
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
@@ -6064,7 +6188,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // stranded or aborted cycle cannot clear itself through a retry.
         if (isRealUserTurn) live.session.resetLoopGuard?.()
         await awaitLatestTodoOutcomeWrite(live)
-        await recordTodoTurnStart(live, isRealUserTurn)
+        await recordTodoTurnStart(live, batch)
         const retrievalQuery = composeRetrievalQuery(batch)
         // A fresh real-user batch opens a new logical turn. Capture its question
         // shape as PENDING (committed only once the turn completes below). The
@@ -6111,6 +6235,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           rejection = gateWatchDispatch(live, stopVersion, requesterOrigin, startClaim ? [] : (start?.queued ?? []))
           if (rejection) throw denied
         }
+        let watchTurnSucceeded = false
         if (watch) {
           const { agent } = live.session
           const prompt = agent.prompt
@@ -6133,9 +6258,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const unsubscribeStart = start
           ? live.session.subscribe((event) => {
               if (event.type === 'agent_start' && !startClaim) {
-                startClaim = backgroundObligations.withTargetLane(live.key, () =>
-                  inboundJournal.claim(start.refs, start.owner),
-                )
+                startClaim = backgroundObligations.withTargetLane(live.key, async () => {
+                  const claim = await inboundJournal.claim(start.refs, start.owner)
+                  if (!watch) return
+                  // Release before a dispatcher retry can observe the claim.
+                  watch.releasedTodos = await acknowledgeLinkedWatchStarts(live, claim.inboundRefs).catch((error) => {
+                    logger.error(`[channels] watch todo link acknowledgment failed: ${describeError(error)}`)
+                    return []
+                  })
+                })
                 void startClaim.catch((error) =>
                   logger.error(`[channels] watch start claim failed: ${describeError(error)}`),
                 )
@@ -6228,6 +6359,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             live.pendingUserTurnSignal = null
           }
           logger.info(`[channels] ${live.keyId} prompted elapsed_ms=${now() - promptStart}`)
+          watchTurnSucceeded = result.success
         } catch (err) {
           if (err === denied && rejection) {
             if (rejection === 'watch-account-unavailable' && start && !startClaim) {
@@ -6255,11 +6387,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                 if (live.backgroundStopVersion === stopVersion)
                   live.pendingSystemReminders.unshift(...start.queued.filter((r) => !rejected.has(r)))
               })
-            } else if (typeof rejection === 'string')
+            } else if (typeof rejection === 'string') {
               await settleBackgroundCoverage(live, 'intentionally-suppressed', rejection)
+            }
             continue
           }
           logger.error(`[channels] ${live.keyId}: prompt threw: ${describeError(err)}`)
+          // Even a failed watch run can have reached agent_start. Finish its
+          // acknowledgment before settling the claimed coverage.
+          if (watch) await startClaim?.catch(() => {}) // Claim failures are already logged by the subscriber.
           // Fallback is exhausted by now (promptPersistentTurnWithFallback only
           // throws after rotating every eligible ref), so a recognizable provider
           // failure is terminal for this turn. Stage a redacted notice for the
@@ -6336,22 +6472,48 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           } else {
             await settleBackgroundCoverage(live, 'intentionally-suppressed', 'background-wake-turn-ended')
           }
+          // Decide in the watch lineage before restoring ordinary state. A child
+          // completion has a new requester object but retains its origin turn ID.
+          const lineage = activeLineage(live)
+          let continueOrdinaryTodo = false
+          if (lineage !== null) {
+            const contents = watch.releasedTodos ?? live.watchTodoLinks.get(lineage)
+            if (contents?.length) {
+              continueOrdinaryTodo = await backgroundObligations.withTargetLane(live.key, async () => {
+                if (live.backgroundStopVersion !== stopVersion) return false
+                if (watch.deliveredReply) {
+                  await awaitLatestTodoOutcomeWrite(live)
+                  await recordWatchTodoHandBack({
+                    agentDir: options.agentDir,
+                    origin: buildLiveOrigin(live),
+                    contents,
+                  })
+                }
+                // Only the association follows the reload. The obligation
+                // determines whether this lineage still owns unfinished work.
+                if (await backgroundObligations.hasPendingWatchChild(live.key, lineage)) {
+                  live.watchTodoLinks.set(lineage, contents)
+                  return false
+                }
+                live.watchTodoLinks.delete(lineage)
+                return (
+                  !retry &&
+                  !watch.deliveredReply &&
+                  watchTurnSucceeded &&
+                  isContinuationSafeOutcome(watch.outcome ?? null)
+                )
+              })
+            }
+          }
+          // Restore the parked ordinary turn now (the stack's later disposal is a
+          // no-op), so the continuation decision below sees ordinary state only.
+          iteration.dispose()
+          if (continueOrdinaryTodo && live.backgroundStopVersion === stopVersion && live.lastOrdinarySpeaker) {
+            await runOrdinaryTodoIdle(live, live.lastOrdinarySpeaker)
+          }
           continue
         }
-        const outcomeWriteSucceeded = await awaitLatestTodoOutcomeWrite(live)
-        if (!outcomeWriteSucceeded) {
-          logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
-        } else if (live.userStoppedTurnSeq === live.turnSeq) {
-          logger.info(`[channels] ${live.keyId}: skipping todo continuation after user stop`)
-        } else if (isAwaitingBackgroundChild(live, 'todo-continuation')) {
-          // The outstanding todo is usually the very work the running child was
-          // spawned to do, so continuing here re-wakes a session that is
-          // deliberately waiting and asks the model to report progress it does
-          // not have yet. The child's completion reminder is the correct wake.
-          logger.info(`[channels] ${live.keyId}: skipping todo continuation while background child runs`)
-        } else {
-          await maybeContinueTodosChannel(live)
-        }
+        await runOrdinaryTodoIdle(live)
         if (!isAwaitingBackgroundChild(live, 'staged-fallback')) {
           await resolveStagedFallback(live)
         }
@@ -6373,6 +6535,11 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.lastTurnAuthorId = live.currentTurnAuthorId
           live.lastTurnAuthorAdapter = live.currentTurnAuthorAdapter
           live.lastTurnHandoff = live.currentTurnHandoff
+          await rememberOrdinarySpeaker(live, {
+            authorId: live.currentTurnAuthorId,
+            authorAdapter: live.currentTurnAuthorAdapter,
+            parentChat: batch.at(-1)?.room?.parentChat,
+          })
         }
       }
     } finally {
@@ -7923,7 +8090,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
     const originalTurnAccount = activeTurnAccountIdentity(live)
-    const watchReply = live?.watchRequester !== undefined
+    const watchRequester = live?.watchRequester
+    const watchReply = watchRequester !== undefined
     const sameAdapterAccountScope =
       accountingTarget.adapter === msg.adapter && accountingTarget.workspace === msg.workspace
     const expectedAccountIdentity =
@@ -8183,7 +8351,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     if (live) {
       live.successfulChannelSends++
-      live.deliveredOutputs++
+      if (watchRequester) {
+        if (outputKind !== 'meta') watchRequester.deliveredReply = true
+      } else live.deliveredOutputs++
       if (!live.botParticipated) {
         live.botParticipated = true
         void persistBotParticipation(live).catch((err) => {
@@ -9868,9 +10038,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           current.phase === 'closed' ||
           current.transfer ||
           liveSessions.has(keyId) ||
-          !pending?.coverage ||
-          ![pending.coverage.coverageDeferredParentSessionId, pending.coverage.ownerSessionId].includes(
-            args.parentSessionId,
+          !pending ||
+          !(
+            (pending.coverage &&
+              [pending.coverage.coverageDeferredParentSessionId, pending.coverage.ownerSessionId].includes(
+                args.parentSessionId,
+              )) ||
+            pending.watchTodoLinks?.some(([lineage]) => current.watchOrigin?.turnId === lineage)
           )
         )
           return false
@@ -9901,6 +10075,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           pending.observed,
           reminders,
           pending.coverage,
+          pending.watchTodoLinks,
         )
         const exceeded =
           pendingReloadHandoffItemCount({ ...pending, reminders }) > handoffRetryItemLimit
@@ -10160,7 +10335,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         args.inboundCoverage ?? [],
       )
       live.githubReviewOutputTurn = live.turnSeq
-      live.deliveredOutputs++
+      if (live.watchRequester) live.watchRequester.deliveredReply = true
+      else live.deliveredOutputs++
       logger.info(`[channels] ${live.keyId}: github_review_output state=${args.state} turn=${live.turnSeq}`)
       return { kind: 'stamped' }
     }

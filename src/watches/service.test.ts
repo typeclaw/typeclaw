@@ -313,7 +313,7 @@ for (const action of ['cancel', 'timeout'] as const)
       bSignal = await second.promise
     const c = await service.create({ ...input, description: 'third' })
     try {
-      if (action === 'cancel') await service.change(a, 'cancel')
+      if (action === 'cancel') await service.change(a, 'cancel', tui)
       else {
         await clock.next()
         expect(clock.now()).toBe(120_000)
@@ -323,7 +323,7 @@ for (const action of ['cancel', 'timeout'] as const)
       expect(bSignal.aborted).toBe(false)
       await clock.next()
       expect(store.records.find((w) => w.id === c)?.status).toBe('done')
-      await service.change(b, 'cancel')
+      await service.change(b, 'cancel', tui)
       await bTick
     } finally {
       for (const token of tokens) token.resolve()

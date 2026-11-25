@@ -353,6 +353,17 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         }
         releaseCoalesceKey()
         const message = err instanceof Error ? err.message : String(err)
+        if (backgroundResponse && options.router) {
+          // A rejected handle means the child never started and cannot publish completion.
+          try {
+            await options.router.suppressUnstartedBackgroundResponse(backgroundResponse, 'launch-failed')
+          } catch (settlementError) {
+            const detail = settlementError instanceof Error ? settlementError.message : String(settlementError)
+            return errorResult(
+              `failed to spawn ${subagentName}: ${message}; could not settle background launch: ${detail}`,
+            )
+          }
+        }
         return errorResult(`failed to spawn ${subagentName}: ${message}`)
       }
 
