@@ -10,7 +10,7 @@ import {
   type BashSandboxBoundary,
 } from '@/agent/plugin-tools'
 import type { GithubTokenBridge } from '@/channels/github-token-bridge'
-import type { PermissionService } from '@/permissions'
+import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 import type { HookBus } from '@/plugin'
 import { shellQuote } from '@/sandbox'
 
@@ -66,6 +66,27 @@ export function createProbeRunner(
     },
     async run(w: WatchRecord, signal: AbortSignal): Promise<ProbeResult> {
       const origin = watchOrigin(w)
+      if (w.wakeTarget.kind === 'channel') {
+        // An unattended command cannot retain a human's old authority or
+        // gain their new one. Custom role bags need not form a strict tower.
+        const { key, requester, room } = w.wakeTarget
+        const channel = {
+          kind: 'channel',
+          ...key,
+          parentChat: room?.parentChat,
+          lastInboundAuthorId: requester.authorId,
+          lastInboundAuthorAdapter: requester.authorAdapter,
+        } as const
+        const current = permissions.describe(channel)
+        const original = permissions.permissionsForRole(w.createdByRole)
+        if (!original || !original.every((p) => current.permissions.includes(p))) {
+          if (!original || !current.permissions.every((p) => original.includes(p)))
+            throw new Error('Watch requester permissions changed; cancel and recreate the watch.')
+          origin.scheduledByRole = current.role
+        }
+      }
+      if (!permissions.has(origin, CORE_PERMISSIONS.watchCreate))
+        throw new Error('Denied by watch.create; the creator no longer has this permission.')
       signal.throwIfAborted()
       if ('bundled' in w.probe) {
         const ctx: BundledProbeContext<unknown> = {

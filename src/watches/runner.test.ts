@@ -192,3 +192,26 @@ test('registered probe receives parsed parameters, last state and the repo-scope
     ),
   ).toEqual({ verdict: 'done', state: ['baseline', 12] })
 })
+test('a channel requester can keep probing after a promotion but cannot keep a revoked role', async () => {
+  const permissions = createPermissionService()
+  const registry = new ProbeRegistry()
+  registry.register({
+    kind: 'status',
+    parseParams: () => null,
+    describe: () => 'status',
+    run: async () => ({ verdict: 'quiet', state: null }),
+  })
+  const runner = createProbeRunner(tmpdir(), permissions, () => createHookBus(), createGithubTokenBridge(), registry)
+  const key = { adapter: 'slack-bot', workspace: 'workspace', chat: 'room', thread: null } as const
+  const record: WatchRecord = {
+    ...w,
+    probe: { bundled: 'status', target: null },
+    wakeTarget: { kind: 'channel', key, requester: { authorAdapter: key.adapter, authorId: 'speaker' } },
+  }
+  permissions.replaceRoles({
+    trusted: { match: [{ kind: 'channel', platform: 'slack', workspace: 'workspace', author: 'speaker' }] },
+  })
+  expect((await runner.run(record, new AbortController().signal)).verdict).toBe('quiet')
+  permissions.replaceRoles({})
+  await expect(runner.run(record, new AbortController().signal)).rejects.toThrow('watch.create')
+})
