@@ -6,10 +6,8 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 
 import { detectCreatedGithubTargets } from './detect-created'
-import type { ResolveWatchGithubCredential } from './github-credential'
 import { githubParams } from './probes/github'
-import type { ProbeRegistry } from './runner'
-import type { WatchService } from './service'
+import { getWatchRuntime } from './runtime'
 import { probeSchema } from './store'
 import { conversationKey, watchTarget } from './target'
 import { duration } from './verdict'
@@ -32,19 +30,6 @@ const request = z.discriminatedUnion('action', [
 const parameters = createRequest
   .partial()
   .extend({ action: z.enum(['create', 'list', 'rearm', 'cancel']), id: id.optional() })
-type Runtime = {
-  service: WatchService
-  registry: ProbeRegistry
-  isAutoEnabled?: () => boolean
-  resolveGithubCredential?: ResolveWatchGithubCredential
-}
-const runtimes = new Map<string, Runtime>()
-export function registerWatchRuntime(dir: string, runtime: Runtime) {
-  runtimes.set(dir, runtime)
-  return () => {
-    if (runtimes.get(dir) === runtime) runtimes.delete(dir)
-  }
-}
 
 export async function registerWatchesFromBash(
   dir: string,
@@ -53,7 +38,7 @@ export async function registerWatchesFromBash(
   command: string,
   output: string,
 ): Promise<string[]> {
-  const runtime = runtimes.get(dir)
+  const runtime = getWatchRuntime(dir)
   if (!runtime?.isAutoEnabled?.() || !permissions.has(origin, CORE_PERMISSIONS.watchCreate)) return []
   const targets = detectCreatedGithubTargets(command, output)
   if (targets.length === 0) return []
@@ -108,7 +93,7 @@ export function createWatchTool(
     async execute(_id, args) {
       const input = request.parse(args)
       const origin = getOrigin(),
-        runtime = runtimes.get(dir)
+        runtime = getWatchRuntime(dir)
       if (!runtime || !origin) throw new Error('No watch runtime or requester for this session')
       const { service, registry } = runtime
       const role = permissions.resolveRole(origin)
