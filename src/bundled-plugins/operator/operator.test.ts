@@ -11,7 +11,7 @@ describe('operator subagent declaration', () => {
   test('declares only builtin tools the spawner already holds (spawning grants no new capability)', () => {
     const sub = createOperatorSubagent()
     const names = (sub.tools ?? []).map((tool) => (tool as { __builtinTool: string }).__builtinTool)
-    expect(names.toSorted()).toEqual(['bash', 'coding_agent', 'edit', 'find', 'grep', 'ls', 'read', 'write'])
+    expect(names.toSorted()).toEqual(['bash', 'coding_agent', 'edit', 'find', 'grep', 'ls', 'read', 'watch', 'write'])
   })
 
   test('declares canSpawnSubagents=true (orchestration tools are wired into its session)', () => {
