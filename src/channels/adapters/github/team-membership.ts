@@ -8,6 +8,7 @@
 // a real review request than wake the agent on a team the bot isn't in.
 
 import type { GithubAuthContext } from './auth'
+import { classifyGithubLookupFailure } from './lookup-failure'
 
 const ACTIVE_MEMBERSHIP_STATE = 'active'
 
@@ -62,8 +63,9 @@ async function lookup(
     if (requireCurrent) throw error
     return false
   }
-  if (res.status === 403 || res.status === 404) return false
   if (!res.ok) {
+    const failure = classifyGithubLookupFailure(res, await res.text().catch(() => ''))
+    if (failure === 'denied' && (res.status === 403 || res.status === 404)) return false
     if (requireCurrent) throw new Error(`GitHub team membership ${res.status}`)
     return false
   }

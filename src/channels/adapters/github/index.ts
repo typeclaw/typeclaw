@@ -337,37 +337,41 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   // same path a real delivery would.
   const routeInbound = async (
     message: InboundMessage,
-    validateAdmission?: () => Promise<void>,
+    validateAdmission?: () => Promise<boolean>,
   ): Promise<RouteReceipt> => {
     rememberWorkspace(message.workspace, message.chat)
     const store = pendingReviewStore
     const pending = message.githubPendingReview
     const prNumber = /^pr:(\d+)$/.exec(message.chat)?.[1]
-    // The webhook handler schedules this outside its acknowledgment path.
-    const receipt = await options.router.route(
-      {
-        ...message,
-        accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
-        eventKind: message.eventKind ?? 'review-followup',
-        revision: message.revision ?? 'original',
-      },
-      store !== null && pending !== undefined && prNumber !== undefined
-        ? () =>
-            store.record(
-              {
-                repo: message.workspace,
-                prNumber: Number(prNumber),
-                ...pending,
-                admittedAt: Date.now(),
-                authorId: message.authorId,
-                authorName: message.authorName,
-                authorIsBot: message.authorIsBot,
-                ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
-              },
-              validateAdmission,
-            )
-        : undefined,
-    )
+    const pendingEntry =
+      pending !== undefined && prNumber !== undefined
+        ? {
+            repo: message.workspace,
+            prNumber: Number(prNumber),
+            ...pending,
+            admittedAt: Date.now(),
+            authorId: message.authorId,
+            authorName: message.authorName,
+            authorIsBot: message.authorIsBot,
+            ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
+          }
+        : undefined
+    const route = (onAdmitted?: () => Promise<void>) =>
+      options.router.route(
+        {
+          ...message,
+          accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
+          eventKind: message.eventKind ?? 'review-followup',
+          revision: message.revision ?? 'original',
+        },
+        onAdmitted,
+      )
+    // Recovered validation may fail transiently: it must precede the router's
+    // journal, and finish before the sweep records this delivery as recovered.
+    const receipt =
+      store !== null && pendingEntry !== undefined && validateAdmission !== undefined
+        ? ((await store.admit(pendingEntry, validateAdmission, route)) ?? { kind: 'denied' as const })
+        : await route(store !== null && pendingEntry !== undefined ? () => store.record(pendingEntry) : undefined)
     // Only newly accepted work runs in this process. The router also invokes the admission
     // callback for an open duplicate, such as a redelivered trigger from a process that died.
     if (receipt.kind === 'accepted' && pending !== undefined && prNumber !== undefined)

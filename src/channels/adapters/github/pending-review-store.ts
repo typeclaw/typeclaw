@@ -26,6 +26,11 @@ export type PendingReviewStore = {
   list: () => Promise<readonly PendingReview[]>
   has: (repo: string, prNumber: number) => boolean
   record: (entry: PendingReview, validateAdmission?: () => Promise<void>) => Promise<void>
+  admit: <T>(
+    entry: PendingReview,
+    validateAdmission: () => Promise<boolean>,
+    route: (record: () => Promise<void>) => Promise<T>,
+  ) => Promise<T | undefined>
   clear: (
     repo: string,
     prNumber: number,
@@ -48,6 +53,9 @@ function key(repo: string, prNumber: number): string {
 // All instances share a lane. A detached old adapter must not overwrite the
 // replacement's admissions from a stale snapshot.
 const fileLanes = new Map<string, Promise<void>>()
+const admissionGuards = new Map<string, Set<{ id: string; assignmentTriggered: boolean; invalidated: boolean }>>()
+
+class RetiredReviewAdmission extends Error {}
 
 function onFileLane<T>(path: string, task: () => Promise<T>): Promise<T> {
   const result = (fileLanes.get(path) ?? Promise.resolve()).then(task)
@@ -75,50 +83,97 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
     await rename(`${path}.tmp`, path)
     entries = next
   }
+  const invalidateAdmissions = (id: string): void => {
+    for (const guard of admissionGuards.get(path) ?? []) if (guard.id === id) guard.invalidated = true
+  }
+  const record = async (entry: PendingReview): Promise<void> => {
+    const next = await latest()
+    const id = key(entry.repo, entry.prNumber)
+    const previous = next.get(id)
+    if (previous !== undefined && previous.admittedAt > entry.admittedAt) return
+    const samePullRequest = previous?.prId === entry.prId
+    const sameObligation = samePullRequest && previous.headSha === entry.headSha && previous.kind === entry.kind
+    // An unfinished assignment still backs this PR when boot replay or a
+    // live admission advances its head or review kind. Cancellation also
+    // requires checking whether that historical assignment is still current.
+    const assignmentTriggered =
+      entry.assignmentTriggered ?? (samePullRequest ? previous.assignmentTriggered : undefined)
+    // Several thread siblings can carry the same push. They share one PR
+    // obligation; keep its original admission time for completion checks.
+    const sameAdmission =
+      sameObligation &&
+      previous.authorId === entry.authorId &&
+      previous.authorName === entry.authorName &&
+      previous.authorIsBot === entry.authorIsBot
+    if (sameAdmission && previous.assignmentTriggered === assignmentTriggered) return
+    next.set(id, {
+      ...entry,
+      ...(sameAdmission ? { admittedAt: previous.admittedAt } : {}),
+      ...(assignmentTriggered === true ? { assignmentTriggered } : {}),
+    })
+    await persist(next)
+  }
   return {
     list: () => onFileLane(path, async () => [...(await latest()).values()]),
     has: (repo, prNumber) => entries.has(key(repo, prNumber)),
     record: (entry, validateAdmission) =>
       onFileLane(path, async () => {
-        // Freshness and persistence share the same lane as close/withdrawal.
-        // A recovered trigger must not recreate work cleared while routing.
         await validateAdmission?.()
-        const next = await latest()
-        const id = key(entry.repo, entry.prNumber)
-        const previous = next.get(id)
-        if (previous !== undefined && previous.admittedAt > entry.admittedAt) return
-        const samePullRequest = previous?.prId === entry.prId
-        const sameObligation = samePullRequest && previous.headSha === entry.headSha && previous.kind === entry.kind
-        // An unfinished assignment still backs this PR when boot replay or a
-        // live admission advances its head or review kind. Cancellation also
-        // requires checking whether that historical assignment is still current.
-        const assignmentTriggered =
-          entry.assignmentTriggered ?? (samePullRequest ? previous.assignmentTriggered : undefined)
-        // Several thread siblings can carry the same push. They share one PR
-        // obligation; keep its original admission time for completion checks.
-        const sameAdmission =
-          sameObligation &&
-          previous.authorId === entry.authorId &&
-          previous.authorName === entry.authorName &&
-          previous.authorIsBot === entry.authorIsBot
-        if (sameAdmission && previous.assignmentTriggered === assignmentTriggered) return
-        next.set(id, {
-          ...entry,
-          ...(sameAdmission ? { admittedAt: previous.admittedAt } : {}),
-          ...(assignmentTriggered === true ? { assignmentTriggered } : {}),
-        })
-        await persist(next)
+        await record(entry)
       }),
+    admit: async (entry, validateAdmission, route) => {
+      const guard = await onFileLane(path, async () => {
+        // All fallible freshness IO precedes the router's journal. A retirement
+        // after this read invalidates the admission without another REST lookup.
+        if (!(await validateAdmission())) return undefined
+        const guards = admissionGuards.get(path) ?? new Set()
+        const guard = {
+          id: key(entry.repo, entry.prNumber),
+          assignmentTriggered: entry.assignmentTriggered === true,
+          invalidated: false,
+        }
+        guards.add(guard)
+        admissionGuards.set(path, guards)
+        return guard
+      })
+      if (guard === undefined) return undefined
+      try {
+        // Do not hold the file lane while acquiring a router target lane: a
+        // concurrent live admission can already own that target and need this file.
+        return await route(() =>
+          onFileLane(path, async () => {
+            if (guard.invalidated) throw new RetiredReviewAdmission()
+            await record(entry)
+          }),
+        )
+      } catch (error) {
+        if (error instanceof RetiredReviewAdmission) return undefined
+        throw error
+      } finally {
+        const guards = admissionGuards.get(path)!
+        guards.delete(guard)
+        if (guards.size === 0) admissionGuards.delete(path)
+      }
+    },
     clear: (repo, prNumber, expected, isCurrentlyAssigned, isCurrentlyRequested) =>
       onFileLane(path, async () => {
         const next = await latest()
         const id = key(repo, prNumber)
         const current = next.get(id)
-        if (current === undefined) return true
+        const recovering = [...(admissionGuards.get(path) ?? [])].filter((guard) => guard.id === id)
+        if (current === undefined && recovering.length === 0) return true
         if ((await isCurrentlyRequested?.()) === true) return false
         // Read current assignees inside the admission lane, after loading the
         // latest provenance. Recovered payloads can predate a newer assignment.
-        if (current.assignmentTriggered === true && (await isCurrentlyAssigned?.()) === true) return false
+        if (
+          (current?.assignmentTriggered === true || recovering.some((guard) => guard.assignmentTriggered)) &&
+          (await isCurrentlyAssigned?.()) === true
+        )
+          return false
+        if (current === undefined) {
+          invalidateAdmissions(id)
+          return true
+        }
         if (
           expected !== undefined &&
           (current.prId !== expected.prId ||
@@ -133,6 +188,7 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
           return false
         next.delete(id)
         await persist(next)
+        invalidateAdmissions(id)
         return true
       }),
   }

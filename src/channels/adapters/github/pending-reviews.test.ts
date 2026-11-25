@@ -73,7 +73,7 @@ async function fixture(
   const currentPull = { ...pull, assignees: [] as Array<{ login: string; id: number; type: string }> }
   const requestedReviewers = {
     users: [] as Array<{ login: string; id: number; type: string }>,
-    teams: [] as Array<{ slug: string }>,
+    teams: [] as Array<{ slug: string; id?: number }>,
   }
   const teamMemberships = new Map<string, string>()
   let pullFailure: (() => Response) | undefined
@@ -188,11 +188,14 @@ async function fixture(
   })
   const routed: InboundMessage[] = []
   const routeAttempts: InboundMessage[] = []
+  const routeTasks: Promise<RouteReceipt>[] = []
   let routeSignal = Promise.withResolvers<RouteReceipt>()
   const route = router.route.bind(router)
   router.route = async (message, onAdmitted) => {
     routeAttempts.push(message)
-    const receipt = await route(message, onAdmitted)
+    const task = route(message, onAdmitted)
+    routeTasks.push(task)
+    const receipt = await task
     routed.push(message)
     routeSignal.resolve(receipt)
     return receipt
@@ -278,6 +281,7 @@ async function fixture(
       recoveryFinished = Promise.withResolvers<void>()
       recoveryTick()
       await recoveryFinished.promise
+      await Promise.allSettled(routeTasks)
     },
     setComparison: (status: string) => {
       comparison = status
@@ -836,15 +840,22 @@ test.each(['reviewers', 'assignees', 'team', 'team-network'])(
   },
 )
 
-test.each(['closed', 'unassigned'])('rejects recovered assignment admission after intervening %s', async (action) => {
+test.each(
+  [
+    { trigger: 'assigned', action: 'closed' },
+    { trigger: 'assigned', action: 'unassigned' },
+    { trigger: 'review_requested', action: 'closed' },
+  ].flatMap((input) => ['freshness', 'router'].map((pause) => ({ ...input, pause }))),
+)('rejects recovered $trigger admission after intervening $action at $pause', async ({ trigger, action, pause }) => {
   // #given
   const bot = { login: 'bot', id: 1, type: 'User' }
   const f = await fixture(undefined, {
     recoveredDelivery: {
-      action: 'assigned',
+      action: trigger,
       repository: { name: 'widgets', owner: { login: 'acme' } },
       pull_request: { ...pull, assignees: [bot] },
       assignee: bot,
+      requested_reviewer: bot,
       sender: { login: 'alice', id: 10, type: 'User' },
     },
   })
@@ -854,41 +865,151 @@ test.each(['closed', 'unassigned'])('rejects recovered assignment admission afte
   await f.adapter.start()
   await f.scanRead
   f.pull.assignees = [bot]
+  if (trigger === 'review_requested') f.requestedReviewers.users = [bot]
   await f.store.record({ ...pending, assignmentTriggered: true })
   const reached = Promise.withResolvers<void>()
   const resume = Promise.withResolvers<void>()
   const settled = Promise.withResolvers<void>()
-  const route = f.router.route.bind(f.router)
-  f.router.route = async (message, onAdmitted) => {
-    try {
-      return await route(
-        message,
-        message.eventKind === 'pull_request:assigned'
-          ? async () => {
-              reached.resolve()
-              await resume.promise
-              await onAdmitted?.()
-            }
-          : onAdmitted,
-      )
-    } finally {
-      if (message.eventKind === 'pull_request:assigned') settled.resolve()
+  if (pause === 'router') {
+    const route = f.router.route.bind(f.router)
+    f.router.route = async (message, onAdmitted) => {
+      if (message.eventKind !== `pull_request:${trigger}`) return route(message, onAdmitted)
+      reached.resolve()
+      await resume.promise
+      try {
+        return await route(message, onAdmitted)
+      } finally {
+        settled.resolve()
+      }
     }
   }
+  let reads = 0
+  f.failPull(() => {
+    const snapshot = { ...f.pull }
+    const response = Response.json(snapshot)
+    if (++reads === 1 && pause === 'freshness') {
+      response.json = async () => {
+        reached.resolve()
+        await resume.promise
+        return snapshot
+      }
+    }
+    return response
+  })
 
   // #when: pause after the recovery freshness read but before durable admission.
-  await f.recoverRemoval()
+  const recovery = f.recoverRemoval()
   await reached.promise
   if (action === 'closed') f.pull.state = 'closed'
   else f.pull.assignees = []
   await f.deliver(action, 'pull_request', { assignee: bot, pull_request: f.pull })
   expect(await f.store.list()).toEqual([])
   resume.resolve()
-  await settled.promise
+  if (pause === 'router') await settled.promise
+  await recovery
 
   // #then
   expect(await f.store.list()).toEqual([])
   expect(f.statuses).toEqual([])
+})
+
+test.each(
+  ['assigned', 'review_requested PR state', 'review_requested', 'team'].flatMap((source) => [
+    { source, failure: '503', response: () => new Response('unavailable', { status: 503 }) },
+    { source, failure: 'invalid JSON', response: () => new Response('{') },
+    { source, failure: 'missing fields', response: () => Response.json({}) },
+    {
+      source,
+      failure: 'network',
+      response: (): Response => {
+        throw new Error('network unavailable')
+      },
+    },
+  ]),
+)(
+  'retries the same recovered GUID after admission-time $source $failure without journaling it',
+  async ({ source, response }) => {
+    // #given
+    const bot = { login: 'bot', id: 1, type: 'User' }
+    const f = await fixture(undefined, {
+      recoveredDelivery: {
+        action: source === 'assigned' ? 'assigned' : 'review_requested',
+        repository: { name: 'widgets', owner: { login: 'acme' } },
+        pull_request: { ...pull, assignees: [bot] },
+        assignee: bot,
+        ...(source === 'team' ? { requested_team: { slug: 'reviewers', id: 1 } } : { requested_reviewer: bot }),
+        sender: { login: 'alice', id: 10, type: 'User' },
+      },
+    })
+    f.config.webhookUrl = 'https://example.com/github'
+    f.config.review.on = 'review_requested'
+    await f.adapter.start()
+    await f.scanRead
+    f.pull.assignees = [bot]
+    f.requestedReviewers.users = [bot]
+    f.requestedReviewers.teams = [{ slug: 'reviewers', id: 1 }]
+    f.teamMemberships.set('reviewers', 'active')
+    let reads = 0
+    const failRead =
+      source === 'team' ? f.failTeamMembership : source === 'review_requested' ? f.failRequestedReviewers : f.failPull
+    failRead(() => {
+      if (++reads === 2) return response()
+      return Response.json(
+        source === 'team' ? { state: 'active' } : source === 'review_requested' ? f.requestedReviewers : f.pull,
+      )
+    })
+
+    // #when: the initial lookup succeeds; only admission-time validation fails.
+    await f.recoverRemoval()
+
+    // #then: no router journal row exists and the next sweep admits this GUID once.
+    expect(await f.store.list()).toEqual([])
+    expect(f.routeAttempts).toEqual([])
+    const admitted = f.nextRoute()
+    await f.recoverRemoval()
+    expect((await admitted).kind).toBe('accepted')
+    expect(await f.store.list()).toMatchObject([{ headSha: 'head-one' }])
+    expect(f.routed).toHaveLength(1)
+    await f.deliver(
+      source === 'assigned' ? 'assigned' : 'review_requested',
+      'pull_request',
+      {
+        assignee: bot,
+        requested_reviewer: bot,
+        pull_request: f.pull,
+      },
+      'old-removal',
+    )
+    expect(f.routed).toHaveLength(1)
+  },
+)
+
+test.each([
+  { status: 403, headers: new Headers({ 'x-ratelimit-remaining': '0' }), message: 'API rate limit exceeded' },
+  { status: 403, headers: new Headers({ 'retry-after': '60' }), message: 'Forbidden' },
+  { status: 403, headers: new Headers(), message: 'You have exceeded a secondary rate limit.' },
+  { status: 429, headers: new Headers(), message: 'Too many requests' },
+])('preserves a requested team across throttled unassignment %j', async ({ status, headers, message }) => {
+  // #given
+  const f = await fixture()
+  await f.adapter.start()
+  await f.scanRead
+  await f.store.record({ ...pending, assignmentTriggered: true })
+  f.requestedReviewers.teams = [{ slug: 'reviewers' }]
+  f.teamMemberships.set('reviewers', 'active')
+  f.failTeamMembership(() => Response.json({ message }, { status, headers }))
+  const payload = { assignee: { login: 'bot', id: 1, type: 'User' } }
+
+  // #when
+  await expect(f.deliver('unassigned', 'pull_request', payload, 'throttled-unassign')).rejects.toThrow(String(status))
+
+  // #then: the same GUID retries the current lookup and preserves active membership.
+  expect(await f.store.list()).toEqual([{ ...pending, assignmentTriggered: true }])
+  expect(f.routeAttempts).toEqual([])
+  f.failTeamMembership()
+  await f.deliver('unassigned', 'pull_request', payload, 'throttled-unassign')
+  expect(await f.store.list()).toEqual([{ ...pending, assignmentTriggered: true }])
+  expect(f.routeAttempts).toEqual([])
 })
 
 test.each(['assigned', 'review_requested'])('does not recover %s after the PR closes', async (action) => {

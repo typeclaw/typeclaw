@@ -44,12 +44,12 @@ export type GithubWebhookHandlerOptions = {
   // eventAllowlist (the outer "process this webhook?" gate) — this is the inner
   // "does an admitted pull_request event become a review-trigger inbound?" gate.
   reviewOn?: () => GithubReviewOn
-  route: (message: InboundMessage, validateAdmission?: () => Promise<void>) => Promise<RouteReceipt>
+  route: (message: InboundMessage, validateAdmission?: () => Promise<boolean>) => Promise<RouteReceipt>
   logger: GithubInboundLogger
   // Optional: resolves whether the bot is a member of the given team. When
   // omitted, team-reviewer requests are silently dropped (the v1 fallback
   // behavior). The adapter wires this in production; tests inject a fake.
-  isBotInTeam?: (input: { org: string; slug: string; login: string }) => Promise<boolean>
+  isBotInTeam?: (input: { org: string; slug: string; login: string; requireCurrent?: true }) => Promise<boolean>
   // App-auth only: mints a repo-scoped token used to drop the decoy reviewer
   // once the bot's own review lands. Omitted under PAT auth (no decoy exists).
   authToken?: (context?: GithubAuthContext) => Promise<string>
@@ -255,7 +255,13 @@ export async function processVerifiedGithubDelivery(
     return
   }
 
-  const teamIsBotMember = await resolveTeamMembership(event, payload, options)
+  let teamIsBotMember: boolean | undefined
+  try {
+    teamIsBotMember = await resolveTeamMembership(event, payload, options, input.recovered === true)
+  } catch (error) {
+    options.dedup.delete(delivery)
+    throw error
+  }
   const reviewCommentParent = await resolveReviewCommentParent(event, payload, selfId, selfLogin, options)
   const replyReviewRound = await resolveReplyReviewRound(event, payload, selfLogin, reviewCommentParent, options)
   const classified = classifyGithubInbound(event, payload, selfLogin, {
@@ -305,29 +311,52 @@ export async function processVerifiedGithubDelivery(
           }
         : classified
 
-  // GitHub transport acknowledgment is not a durable admission receipt.
-  void Promise.resolve()
-    .then(() =>
-      options.route(
-        withApprovalPolicy(
-          {
-            ...routed,
-            receiptId: delivery,
-            accountIdentity: selfId === null ? undefined : `github:${selfId}`,
-          },
-          options.allowApprove?.() ?? true,
-        ),
-        input.recovered === true && event === 'pull_request' && action === 'assigned' && prNumber !== null
-          ? async () => {
-              if (!(await options.isCurrentlyAssigned?.(routed.workspace, prNumber)))
-                throw new Error('recovered assignment is no longer current')
-            }
-          : undefined,
+  // Live transport acknowledgment stays detached. Recovery must await admission
+  // so transient failures release the GUID and never enter the recovered log.
+  const admission = Promise.resolve().then(() =>
+    options.route(
+      withApprovalPolicy(
+        {
+          ...routed,
+          receiptId: delivery,
+          accountIdentity: selfId === null ? undefined : `github:${selfId}`,
+        },
+        options.allowApprove?.() ?? true,
       ),
-    )
-    .catch((error: unknown) => {
+      input.recovered === true &&
+        event === 'pull_request' &&
+        (action === 'assigned' || action === 'review_requested') &&
+        repository !== null &&
+        prNumber !== null
+        ? async () => {
+            if (action === 'review_requested') {
+              const requested = await recoveredReviewerIsCurrentlyRequested(
+                options,
+                repository,
+                prNumber,
+                payload,
+                routed.workspace,
+              )
+              return requested && (await resolveTeamMembership(event, payload, options, true)) !== false
+            }
+            if (options.isCurrentlyAssigned === undefined) throw new Error('recovered assignment check unavailable')
+            return options.isCurrentlyAssigned(routed.workspace, prNumber)
+          }
+        : undefined,
+    ),
+  )
+  if (input.recovered === true) {
+    try {
+      await admission
+    } catch (error) {
+      options.dedup.delete(delivery)
+      throw error
+    }
+  } else {
+    void admission.catch((error: unknown) => {
       options.logger.error(`[github] route failed: ${describeError(error)}`)
     })
+  }
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -1461,6 +1490,7 @@ async function resolveTeamMembership(
   event: string,
   payload: Record<string, unknown>,
   options: GithubWebhookHandlerOptions,
+  requireCurrent = false,
 ): Promise<boolean | undefined> {
   if (event !== 'pull_request') return undefined
   const action = readString(payload, 'action')
@@ -1476,8 +1506,14 @@ async function resolveTeamMembership(
   const org = team.org ?? readRepository(payload)?.owner ?? null
   if (org === null) return false
   try {
-    return await options.isBotInTeam({ org, slug: team.slug, login: selfLogin })
+    return await options.isBotInTeam({
+      org,
+      slug: team.slug,
+      login: selfLogin,
+      ...(requireCurrent ? { requireCurrent: true as const } : {}),
+    })
   } catch (err) {
+    if (requireCurrent) throw err
     options.logger.warn(`[github] team membership lookup failed: ${describeError(err)}`)
     return false
   }

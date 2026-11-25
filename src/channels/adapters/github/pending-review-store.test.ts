@@ -92,6 +92,93 @@ test('late completion and old admission cannot erase a newer head', async () => 
   expect(await store.list()).toEqual([newer])
 })
 
+test('retirement between pre-journal validation and recording consumes a recovered admission', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+
+  // #when: the router is waiting, but must not hold the store lane.
+  const admission = first.admit(
+    entry,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await resume.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+  await second.clear(entry.repo, entry.prNumber)
+  resume.resolve()
+
+  // #then
+  expect(await admission).toBeUndefined()
+  expect(await first.list()).toEqual([])
+})
+
+test('pre-journal validation and concurrent live recording do not invert router and store lanes', async () => {
+  // #given: a live route owns its target lane while recovery validates.
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const targetLane = Promise.withResolvers<void>()
+  const admission = store.admit(
+    entry,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await targetLane.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+
+  // #when: the live route can still obtain the file lane and release its target.
+  await store.record({ ...entry, prNumber: 8, prId: 800 })
+  targetLane.resolve()
+
+  // #then
+  expect(await admission).toBe('enqueued')
+  expect(await store.list()).toHaveLength(2)
+})
+
+test.each(['assignment', 'request'])('withdrawal preserves an in-flight %s before its first record', async (source) => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const review = { ...entry, ...(source === 'assignment' ? { assignmentTriggered: true as const } : {}) }
+  const admission = store.admit(
+    review,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await resume.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+
+  // #when: another obligation's withdrawal arrives before pending work is written.
+  const cleared = await store.clear(
+    entry.repo,
+    entry.prNumber,
+    undefined,
+    source === 'assignment' ? async () => true : undefined,
+    source === 'request' ? async () => true : undefined,
+  )
+  resume.resolve()
+
+  // #then
+  expect(cleared).toBe(false)
+  expect(await admission).toBe('enqueued')
+  expect(await store.list()).toEqual([review])
+})
+
 test('same-head sibling admissions preserve the obligation admission time', async () => {
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record(entry)
