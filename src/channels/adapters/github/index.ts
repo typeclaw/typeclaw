@@ -297,6 +297,16 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const typing = async (): Promise<void> => {}
   const dedup = createDeliveryDedup()
   const isBotInTeam = createTeamMembershipChecker({ token: authToken, fetchImpl })
+  const isCurrentlyAssigned = async (workspace: string, prNumber: number): Promise<boolean> => {
+    const token = await authToken({ repoSlug: workspace })
+    const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}`, {
+      headers: githubJsonHeaders(token),
+    })
+    if (!response.ok) throw new Error(`GitHub pending assignees ${response.status}`)
+    const current = z.object({ assignees: z.array(z.object({ login: z.string() })) }).parse(await response.json())
+    const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
+    return current.assignees.some((assignee) => logins.includes(assignee.login))
+  }
   // Shared inbound entry. Both the live webhook handler and the startup
   // reconciliation pass route through this so a replayed PR takes the exact
   // same path a real delivery would.
@@ -347,26 +357,14 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     fetchImpl,
     logger,
     route: routeInbound,
+    isCurrentlyAssigned,
     abortGithubPrTurn: options.router.abortGithubPrTurn,
     clearPendingReview: async (workspace, prNumber, reason) =>
       pendingReviewStore?.clear(
         workspace,
         prNumber,
         undefined,
-        reason === 'review-request-removed'
-          ? async () => {
-              const token = await authToken({ repoSlug: workspace })
-              const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}`, {
-                headers: githubJsonHeaders(token),
-              })
-              if (!response.ok) throw new Error(`GitHub pending assignees ${response.status}`)
-              const current = z
-                .object({ assignees: z.array(z.object({ login: z.string() })) })
-                .parse(await response.json())
-              const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
-              return current.assignees.some((assignee) => logins.includes(assignee.login))
-            }
-          : undefined,
+        reason === 'review-request-removed' ? () => isCurrentlyAssigned(workspace, prNumber) : undefined,
       ),
     reviewSubmitted: async (review) => {
       if (pendingReviewStore !== null) await completePendingReview(pendingReviewStore, review, authToken, fetchImpl)

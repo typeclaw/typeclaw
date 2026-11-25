@@ -53,7 +53,12 @@ const pull = {
 // Passing an existing dir starts the next process on the same agent folder.
 async function fixture(
   existingDir?: string,
-  options: { prompt?: () => Promise<void>; recoveredRemoval?: Record<string, unknown>; app?: true } = {},
+  options: {
+    prompt?: () => Promise<void>
+    recoveredRemoval?: Record<string, unknown>
+    recoveredDelivery?: Record<string, unknown>
+    app?: true
+  } = {},
 ) {
   const dir = existingDir ?? (await mkdtemp(join(tmpdir(), 'github-pending-reviews-')))
   const store = await loadPendingReviewStore(dir, logger)
@@ -63,9 +68,12 @@ async function fixture(
   const timeline: Array<Record<string, unknown>> = []
   const allowedAuthors = new Set<string>()
   const scanRead = Promise.withResolvers<void>()
-  const recoveryFinished = Promise.withResolvers<void>()
+  let recoveryFinished = Promise.withResolvers<void>()
   let recoveryTick: (() => void) | undefined
   const currentPull = { ...pull, assignees: [] as Array<{ login: string; id: number; type: string }> }
+  const requestedReviewers = { users: [] as Array<{ login: string; id: number; type: string }>, teams: [] }
+  let pullFailure: (() => Response) | undefined
+  let requestedReviewersFailure: (() => Response) | undefined
   let comparison = 'behind'
   let fetchWaiters: Array<{ match: (url: string) => boolean; resolve: () => void }> = []
   let fetchHolds: Array<{ match: (url: string) => boolean; reached: () => void; released: Promise<void> }> = []
@@ -102,8 +110,9 @@ async function fixture(
           },
         ])
       if (url.endsWith('/hooks/1/deliveries/11'))
-        return Response.json({ request: { payload: options.recoveredRemoval } })
-      if (url.endsWith('/requested_reviewers')) return Response.json({ users: [], teams: [] })
+        return Response.json({ request: { payload: options.recoveredDelivery ?? options.recoveredRemoval } })
+      if (url.endsWith('/requested_reviewers'))
+        return requestedReviewersFailure?.() ?? Response.json(requestedReviewers)
       if (url.includes('/statuses/') && init?.method === 'POST') {
         statuses.push(JSON.parse(String(init.body)) as Record<string, unknown>)
         return Response.json({})
@@ -118,7 +127,7 @@ async function fixture(
         return response
       }
       if (url.includes('/files?')) return Response.json([])
-      if (url.endsWith('/pulls/7')) return Response.json(currentPull)
+      if (url.endsWith('/pulls/7')) return pullFailure?.() ?? Response.json(currentPull)
       if (url.includes('/pulls?')) return Response.json([pull, { ...pull, id: 800, number: 8 }])
       if (url.endsWith('/graphql'))
         return Response.json({
@@ -168,9 +177,11 @@ async function fixture(
     },
   })
   const routed: InboundMessage[] = []
+  const routeAttempts: InboundMessage[] = []
   let routeSignal = Promise.withResolvers<RouteReceipt>()
   const route = router.route.bind(router)
   router.route = async (message, onAdmitted) => {
+    routeAttempts.push(message)
     const receipt = await route(message, onAdmitted)
     routed.push(message)
     routeSignal.resolve(receipt)
@@ -186,6 +197,9 @@ async function fixture(
       ...logger,
       info: (message) => {
         if (message.includes('recovered 1 missed delivery')) recoveryFinished.resolve()
+      },
+      warn: (message) => {
+        if (message.includes('delivery recovery failed')) recoveryFinished.resolve()
       },
     },
     fetchImpl,
@@ -208,7 +222,8 @@ async function fixture(
       return { stop: async () => {} }
     },
     tokenRefreshIntervalMs: 0,
-    deliveryRecoveryIntervalMs: options.recoveredRemoval === undefined ? 0 : 1,
+    deliveryRecoveryIntervalMs:
+      options.recoveredRemoval === undefined && options.recoveredDelivery === undefined ? 0 : 1,
     setInterval: (callback) => {
       recoveryTick = callback
       return { clear: () => {} }
@@ -235,9 +250,18 @@ async function fixture(
     allowedAuthors,
     scanRead: scanRead.promise,
     pull: currentPull,
+    requestedReviewers,
+    failPull: (failure?: () => Response) => {
+      pullFailure = failure
+    },
+    failRequestedReviewers: (failure?: () => Response) => {
+      requestedReviewersFailure = failure
+    },
     routed,
+    routeAttempts,
     recoverRemoval: async () => {
       if (recoveryTick === undefined) throw new Error('Recovery not configured')
+      recoveryFinished = Promise.withResolvers<void>()
       recoveryTick()
       await recoveryFinished.promise
     },
@@ -488,6 +512,158 @@ test.each(['new-head', 'new-admission'] as const)('verified dismissal preserves 
   await recordVerifiedDismissal(dismissal)
   expect(await f.store.list()).toEqual([newer])
 })
+
+test.each([
+  { action: 'assigned', login: 'bot', app: false },
+  { action: 'assigned', login: 'bot[bot]', app: true },
+  { action: 'assigned', login: 'bot', app: true },
+  { action: 'review_requested', login: 'bot', app: false },
+])('admits a recovered current review trigger, %j', async ({ action, login, app }) => {
+  // #given
+  const bot = { login, id: 1, type: app && login.endsWith('[bot]') ? 'Bot' : 'User' }
+  const f = await fixture(undefined, {
+    ...(app ? { app: true as const } : {}),
+    recoveredDelivery: {
+      action,
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: pull,
+      assignee: bot,
+      requested_reviewer: bot,
+      sender: { login: 'alice', id: 10, type: 'User' },
+    },
+  })
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
+
+  // #when
+  const admitted = f.nextRoute()
+  await f.recoverRemoval()
+  expect((await admitted).kind).toBe('accepted')
+
+  // #then
+  expect(await f.store.list()).toMatchObject([
+    { headSha: 'head-one', ...(action === 'assigned' ? { assignmentTriggered: true } : {}) },
+  ])
+  expect(f.routed.map((message) => message.eventKind)).toEqual([`pull_request:${action}`])
+})
+
+test.each(
+  ['assigned', 'review_requested'].flatMap((action) => [
+    { action, name: 'HTTP failure', response: () => new Response('unavailable', { status: 503 }) },
+    { action, name: 'invalid JSON', response: () => new Response('{') },
+    { action, name: 'missing state', response: () => Response.json({}) },
+    {
+      action,
+      name: 'invalid state',
+      response: () => Response.json({ assignees: [{}], users: {}, teams: [] }),
+    },
+  ]),
+)('retries a recovered $action after $name', async ({ action, response }) => {
+  // #given
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, {
+    recoveredDelivery: {
+      action,
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: { ...pull, assignees: [bot] },
+      assignee: bot,
+      requested_reviewer: bot,
+      sender: { login: 'alice', id: 10, type: 'User' },
+    },
+  })
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
+  const failRead = action === 'assigned' ? f.failPull : f.failRequestedReviewers
+  failRead(response)
+
+  // #when
+  await f.recoverRemoval()
+
+  // #then: no admission and neither dedup log consumes the failed GUID.
+  expect(await f.store.list()).toEqual([])
+  expect(f.routeAttempts).toEqual([])
+  expect(f.statuses).toEqual([])
+  failRead()
+  const admitted = f.nextRoute()
+  await f.recoverRemoval()
+  expect((await admitted).kind).toBe('accepted')
+  expect(await f.store.list()).toMatchObject([
+    { headSha: 'head-one', ...(action === 'assigned' ? { assignmentTriggered: true } : {}) },
+  ])
+})
+
+test.each(['assigned', 'review_requested'])(
+  'does not resurrect withdrawn work from a recovered %s delivery',
+  async (action) => {
+    // #given: the original trigger failed at ingress; only the separate request arrived.
+    const turn = Promise.withResolvers<void>()
+    const bot = { login: 'bot', id: 1, type: 'User' }
+    const f = await fixture(undefined, {
+      prompt: () => turn.promise,
+      recoveredDelivery: {
+        action,
+        repository: { name: 'widgets', owner: { login: 'acme' } },
+        pull_request: { ...pull, assignees: [bot] },
+        assignee: bot,
+        requested_reviewer: bot,
+        sender: { login: 'alice', id: 10, type: 'User' },
+      },
+    })
+    cleanups.push(async () => turn.resolve())
+    f.config.webhookUrl = 'https://example.com/github'
+    f.config.review.on = 'review_requested'
+    f.config.review.check = true
+    await f.adapter.start()
+    await f.scanRead
+    f.pull.assignees = [bot]
+    let routed = f.nextRoute()
+    await f.deliver('review_requested', 'pull_request', {
+      requested_reviewer: bot,
+      pull_request: { ...f.pull, updated_at: '2026-01-01T00:01:00Z' },
+    })
+    await routed
+    await githubReviewChecks.beginReview(
+      { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+      `withdrawn-recovered-${action}`,
+    )
+    try {
+      // #when: unassignment and removal succeed before the failed trigger is swept.
+      f.pull.assignees = []
+      await f.deliver('unassigned', 'pull_request', { assignee: bot, pull_request: f.pull })
+      routed = f.nextRoute()
+      await f.deliver('review_request_removed', 'pull_request', { requested_reviewer: bot })
+      await routed
+      await githubReviewChecks.sweep()
+      expect(await f.store.list()).toEqual([])
+      expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
+      const beforeRoutes = [...f.routed]
+      const beforeAttempts = f.routeAttempts.length
+      const beforeStatuses = [...f.statuses]
+      const recoveredRoute = f.nextRoute()
+      await f.recoverRemoval()
+      if (f.routeAttempts.length > beforeAttempts) await recoveredRoute
+
+      // #then: recovery cannot create pending work, checks, or even a router call.
+      expect(await f.store.list()).toEqual([])
+      expect(f.routeAttempts).toHaveLength(beforeAttempts)
+      expect(f.routed).toEqual(beforeRoutes)
+      expect(f.statuses).toEqual(beforeStatuses)
+    } finally {
+      await githubReviewChecks.reviewerSettled(`withdrawn-recovered-${action}`, {
+        kind: 'cancelled',
+        reason: 'test cleanup',
+      })
+    }
+  },
+)
 
 test.each([
   ['2026-01-03T00:00:00Z', 'DISMISSED', true],

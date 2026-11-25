@@ -69,6 +69,7 @@ export type GithubWebhookHandlerOptions = {
     | { kind: 'no-live-session' }
   >
   clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
+  isCurrentlyAssigned?: (workspace: string, prNumber: number) => Promise<boolean>
   // False means a current assignment-backed obligation preserved the work.
   clearPendingReview?: (
     workspace: string,
@@ -159,20 +160,36 @@ export async function processVerifiedGithubDelivery(
       ))
     }
   }
-  let staleRecoveredRemoval = false
+  let staleRecoveredRequest = false
   // A recovered removal can arrive after a newer re-request was admitted. Applying it
   // would cancel that request's check run and erase its pending replay entry.
-  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'review_request_removed') {
+  if (
+    input.recovered === true &&
+    eventAllowed &&
+    event === 'pull_request' &&
+    (action === 'review_request_removed' || action === 'review_requested')
+  ) {
     const repository = readRepository(payload)
     const prNumber = readNumber(readRecord(payload.pull_request), 'number')
     if (repository !== null && prNumber !== null) {
-      staleRecoveredRemoval = await recoveredReviewerIsRequestedAgain(
+      const currentlyRequested = await recoveredReviewerIsCurrentlyRequested(
         options,
         repository,
         prNumber,
         payload,
         `${repository.owner}/${repository.name}`,
       )
+      staleRecoveredRequest = action === 'review_request_removed' ? currentlyRequested : !currentlyRequested
+    }
+  }
+  let staleRecoveredAssignment = false
+  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'assigned') {
+    if (repository !== null && prNumber !== null) {
+      if (options.isCurrentlyAssigned === undefined) throw new Error('recovered assignment check unavailable')
+      staleRecoveredAssignment = !(await options.isCurrentlyAssigned(
+        `${repository.owner}/${repository.name}`,
+        prNumber,
+      ))
     }
   }
   const isSynchronize = event === 'pull_request' && action === 'synchronize'
@@ -183,7 +200,7 @@ export async function processVerifiedGithubDelivery(
     }
     // Reserve the delivery id synchronously before routing awaits so a live
     // webhook and the recovery sweep can never both route the same event. A
-    // recovered draft's retryable freshness read is the sole earlier await; a
+    // recovered event's retryable freshness reads happen before this reservation; a
     // concurrent live delivery reserves here first and wins this dedup check.
     // Synchronize uses its own synchronous,
     // releasable head-SHA reservation so a failed redelivery can retry. JS is
@@ -193,7 +210,7 @@ export async function processVerifiedGithubDelivery(
     options.dedup.add(delivery)
   }
 
-  if (!eventAllowed || staleRecoveredDraft || staleRecoveredRemoval) return
+  if (!eventAllowed || staleRecoveredDraft || staleRecoveredRequest || staleRecoveredAssignment) return
 
   // This control event must run before the self-author drop: a maintainer can
   // draft the bot's PR, and the bot can draft its own PR. Either action must
@@ -419,18 +436,18 @@ async function recoveredPullRequestIsStillDraft(
   }
 }
 
-async function recoveredReviewerIsRequestedAgain(
+async function recoveredReviewerIsCurrentlyRequested(
   options: GithubWebhookHandlerOptions,
   repository: { owner: string; name: string },
   prNumber: number,
   payload: Record<string, unknown>,
   workspace: string,
 ): Promise<boolean> {
-  const removedLogin = readUser(payload.requested_reviewer)?.login ?? null
-  const removedTeam = readReviewerTeam(payload.requested_team)?.slug ?? null
-  if (removedLogin === null && removedTeam === null) return false
+  const requestedLogin = readUser(payload.requested_reviewer)?.login ?? null
+  const requestedTeam = readReviewerTeam(payload.requested_team)?.slug ?? null
+  if (requestedLogin === null && requestedTeam === null) return false
   if (options.authToken === undefined) {
-    throw new Error(`recovered review request removal check unavailable for ${workspace}#${prNumber}: auth unavailable`)
+    throw new Error(`recovered review request check unavailable for ${workspace}#${prNumber}: auth unavailable`)
   }
   try {
     const token = await options.authToken({ repoSlug: workspace })
@@ -445,17 +462,17 @@ async function recoveredReviewerIsRequestedAgain(
     if (!Array.isArray(current?.users) || !Array.isArray(current?.teams)) {
       throw new Error('requested reviewers response missing users or teams')
     }
-    const requestedAgain =
-      (removedLogin !== null && current.users.some((user) => readUser(user)?.login === removedLogin)) ||
-      (removedTeam !== null && current.teams.some((team) => readReviewerTeam(team)?.slug === removedTeam))
-    if (requestedAgain) {
+    const currentlyRequested =
+      (requestedLogin !== null && current.users.some((user) => readUser(user)?.login === requestedLogin)) ||
+      (requestedTeam !== null && current.teams.some((team) => readReviewerTeam(team)?.slug === requestedTeam))
+    if (currentlyRequested && payload.action === 'review_request_removed') {
       options.logger.info(
         `[github] recovered review request removal skipped for ${workspace}#${prNumber}: reviewer was requested again`,
       )
     }
-    return requestedAgain
+    return currentlyRequested
   } catch (err) {
-    throw new Error(`recovered review request removal check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
+    throw new Error(`recovered review request check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
   }
 }
 
