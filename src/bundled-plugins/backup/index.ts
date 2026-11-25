@@ -206,6 +206,7 @@ async function runBackupOnce(
   const backupDeps = {
     gitSpawn,
     pushEnv,
+    warn: (message: string) => ctx.logger.warn(message),
     pickCommitMessage: async ({ status, diffstat }: { status: string; diffstat: string }): Promise<string> => {
       const key = `${status}\0${diffstat}`
       if (commitMessages.last?.key === key) return commitMessages.last.message

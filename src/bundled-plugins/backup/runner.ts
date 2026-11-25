@@ -10,6 +10,14 @@ export const COMMIT_TIMEOUT_MS = 30_000
 export const NETWORK_TIMEOUT_MS = 60_000
 export const MAINTENANCE_TIMEOUT_MS = 120_000
 
+// An agent-created untracked file above this is left out of the backup. Git
+// streams a blob over core.bigFileThreshold straight into a temporary pack, so a
+// large binary (a browser build a tool unpacked into the agent folder) makes
+// `git add` outlive COMMIT_TIMEOUT_MS; the killed add strands a pack-sized
+// tmp_pack_* file and fails the whole backup, every cycle. Runtime-owned
+// force-add roots are never skipped.
+export const MAX_UNTRACKED_FILE_BYTES = 50 * 1024 * 1024
+
 // The two maintenance tasks are gated INDEPENDENTLY because a backup commit with
 // auto-gc disabled (Fix 1) produces LOOSE OBJECTS, not packs:
 //   - loose-objects fires on the loose-object count (`count:` in count-objects),
@@ -45,6 +53,18 @@ const NONINTERACTIVE_ENV = {
   GCM_INTERACTIVE: 'never',
 } as const
 
+// Every pathspec the runner passes is a filename porcelain reported. Without
+// this, a selected name containing glob characters (`[x]`) would also match a
+// sibling the snapshot deliberately left out, such as an oversized file.
+// The other pathspec modes are reset because Git rejects literal mode combined
+// with an inherited GIT_GLOB_PATHSPECS or GIT_ICASE_PATHSPECS.
+const LITERAL_PATHSPEC_ENV = {
+  GIT_LITERAL_PATHSPECS: '1',
+  GIT_GLOB_PATHSPECS: '0',
+  GIT_NOGLOB_PATHSPECS: '0',
+  GIT_ICASE_PATHSPECS: '0',
+} as const
+
 export type GitSpawnResult = {
   exitCode: number
   stdout: string
@@ -67,6 +87,7 @@ export type BackupRunnerDeps = {
   // the minted token.
   pushEnv?: Record<string, string>
   now?: () => number
+  warn?: (message: string) => void
 }
 
 export type BackupRunnerOptions = {
@@ -142,10 +163,14 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
       return { ok: false, kind: 'commit-failed', reason: `git add -u failed: ${shortErr(removed)}` }
   }
   const removedPaths = new Set(missingAdds)
-  const snapshot = selectStagingSnapshot(
-    entries.filter((entry) => !entry.paths.every((path) => removedPaths.has(path))),
-    cwd,
-  )
+  const remaining = entries.filter((entry) => !entry.paths.every((path) => removedPaths.has(path)))
+  const snapshot = selectStagingSnapshot(remaining, cwd, await listGitlinks(cwd, deps, repo.gitArgs, remaining))
+  if (snapshot.oversized.length > 0) warnOversized(deps, snapshot.oversized)
+  if (snapshot.deferredDirectories.length > 0) {
+    deps.warn?.(
+      `[backup] left ${snapshot.deferredDirectories.join(', ')} out of the backup: a tracked file there was replaced by a directory, which an automatic commit cannot record. Commit the change by hand (git rm --cached <path>, then add the directory) to resume backing it up.`,
+    )
+  }
   if (snapshot.paths.length === 0 && snapshot.forcePaths.length === 0) return { ok: true, kind: 'clean' }
 
   // Keep the staged snapshot out of the shared index while the message subagent
@@ -212,8 +237,17 @@ export async function runBackup(options: BackupRunnerOptions, deps: BackupRunner
     })
     const lateEntries = reStatus.exitCode === 0 ? parsePorcelain(reStatus.stdout) : []
     const lateForce = selectForcePaths(lateEntries, cwd, ['sessions/'])
+    // An untracked file that grew past the cap while the message was generated
+    // is dropped here too: `git commit --only` rereads the worktree, and a failed
+    // commit would leave its intent-to-add entry looking tracked next run.
+    const grown = [...snapshot.untrackedPaths].flatMap((path) => {
+      const bytes = untrackedFileBytes(cwd, path)
+      return bytes > MAX_UNTRACKED_FILE_BYTES ? [{ path, bytes }] : []
+    })
+    if (grown.length > 0) warnOversized(deps, grown)
+    const grownSet = new Set(grown.map(({ path }) => path))
     const selected = uniquePaths([...snapshot.paths, ...snapshot.forcePaths, ...lateForce]).filter(
-      (path) => !snapshot.untrackedPaths.has(path) || hasDirectoryEntry(join(cwd, path)),
+      (path) => !snapshot.untrackedPaths.has(path) || (hasDirectoryEntry(join(cwd, path)) && !grownSet.has(path)),
     )
     const selectedSet = new Set(selected)
     // Porcelain still reports tracked deletions not yet committed by another
@@ -518,23 +552,99 @@ type StagingSnapshot = {
   paths: string[]
   untrackedPaths: Set<string>
   forcePaths: string[]
+  // Tracked files now replaced by a directory, deferred with everything under
+  // them: `git add` on the directory operand would pull in every child (one the
+  // size cap left out included), and `git commit --only` cannot record a file
+  // turning into a directory at all, so including it fails the whole backup.
+  deferredDirectories: string[]
+  oversized: { path: string; bytes: number }[]
 }
 
-function selectStagingSnapshot(entries: readonly PorcelainEntry[], cwd: string): StagingSnapshot {
+function selectStagingSnapshot(
+  entries: readonly PorcelainEntry[],
+  cwd: string,
+  gitlinks: ReadonlySet<string>,
+): StagingSnapshot {
+  const deferredDirectories = trackedDirectoryPaths(entries, cwd).filter((path) => !gitlinks.has(path))
+  const deferred = (path: string) => deferredDirectories.some((dir) => path === dir || path.startsWith(`${dir}/`))
   const paths: string[] = []
   const untrackedPaths = new Set<string>()
+  const oversized: { path: string; bytes: number }[] = []
   for (const entry of entries) {
     for (const path of entry.paths) {
-      if (isAgentOwned(path)) continue
+      if (isAgentOwned(path) || deferred(path)) continue
       const forceAdded = FORCE_ADD_PREFIXES.some((prefix) => path.startsWith(prefix))
       if (entry.kind === 'untracked') {
         if (forceAdded || !hasDirectoryEntry(join(cwd, path)) || isNestedRepository(join(cwd, path))) continue
+        const bytes = untrackedFileBytes(cwd, path)
+        if (bytes > MAX_UNTRACKED_FILE_BYTES) {
+          oversized.push({ path, bytes })
+          continue
+        }
         untrackedPaths.add(path)
       }
       paths.push(path)
     }
   }
-  return { paths: uniquePaths(paths), untrackedPaths, forcePaths: selectForcePaths(entries, cwd) }
+  return {
+    paths: uniquePaths(paths),
+    untrackedPaths,
+    forcePaths: selectForcePaths(entries, cwd),
+    deferredDirectories,
+    oversized,
+  }
+}
+
+function trackedDirectoryPaths(entries: readonly PorcelainEntry[], cwd: string): string[] {
+  return uniquePaths(
+    entries
+      .filter((entry) => entry.kind === 'tracked')
+      .flatMap((entry) => entry.paths)
+      .filter(
+        (path) =>
+          !isAgentOwned(path) &&
+          !FORCE_ADD_PREFIXES.some((prefix) => path.startsWith(prefix)) &&
+          lstatSync(join(cwd, path), { throwIfNoEntry: false })?.isDirectory() === true,
+      ),
+  )
+}
+
+// A checked-out submodule is also a directory in the worktree; its index entry
+// is a gitlink (mode 160000), and an advanced pointer is ordinary backup work.
+async function listGitlinks(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  gitArgs: readonly string[],
+  entries: readonly PorcelainEntry[],
+): Promise<Set<string>> {
+  const candidates = trackedDirectoryPaths(entries, cwd)
+  if (candidates.length === 0) return new Set()
+  const staged = await deps.gitSpawn([...gitArgs, 'ls-files', '-s', '-z', '--', ...candidates], {
+    cwd,
+    timeoutMs: COMMIT_TIMEOUT_MS,
+  })
+  if (staged.exitCode !== 0) return new Set()
+  return new Set(
+    staged.stdout
+      .split('\0')
+      .filter((record) => record.startsWith('160000 '))
+      .map((record) => record.slice(record.indexOf('\t') + 1)),
+  )
+}
+
+function untrackedFileBytes(cwd: string, path: string): number {
+  return lstatSync(join(cwd, path), { throwIfNoEntry: false })?.size ?? 0
+}
+
+function warnOversized(deps: BackupRunnerDeps, files: readonly { path: string; bytes: number }[]): void {
+  const listed = files.map(({ path, bytes }) => `${path} (${formatMiB(bytes)})`).join(', ')
+  deps.warn?.(
+    `[backup] left ${files.length} untracked file(s) over ${formatMiB(MAX_UNTRACKED_FILE_BYTES)} out of the backup: ${listed}. Move them under workspace/ or add them to typeclaw.json git.ignore.append.`,
+  )
+}
+
+function formatMiB(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024))} MiB`
 }
 
 async function retryAfterVanishedUntracked(
@@ -626,7 +736,7 @@ export function makeDefaultGitSpawn(bunOverride?: { spawn: typeof Bun.spawn }): 
         cwd,
         stdout: 'pipe',
         stderr: 'pipe',
-        env: { ...process.env, ...NONINTERACTIVE_ENV, ...env },
+        env: { ...process.env, ...NONINTERACTIVE_ENV, ...LITERAL_PATHSPEC_ENV, ...env },
         signal: controller.signal,
       })
       const exitedDrain = proc.exited
