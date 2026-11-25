@@ -959,8 +959,8 @@ export function classifyGithubInbound(
     if (number === null || id === null) return null
     const action = readString(payload, 'action')
     const reviewOn = options?.reviewOn ?? 'review_requested'
-    if (action === 'review_requested' || action === 'review_request_removed') {
-      // `off` disables the dedicated review trigger: these two actions exist
+    if (action === 'review_requested' || action === 'review_request_removed' || action === 'assigned') {
+      // `off` disables the dedicated review trigger: these actions exist
       // only to drive review-request behavior here, so under `off` they wake no
       // session rather than falling through to awareness-only context.
       if (reviewOn === 'off') return null
@@ -1082,7 +1082,7 @@ export function classifyGithubInbound(
 }
 
 type ReviewRequestInput = {
-  action: 'review_requested' | 'review_request_removed'
+  action: 'review_requested' | 'review_request_removed' | 'assigned'
   payload: Record<string, unknown>
   pr: Record<string, unknown>
   number: number
@@ -1175,12 +1175,12 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   const sender = readUser(payload.sender)
   if (sender === null) return null
   // Self-loop guard: if the bot (or its decoy) requested/un-requested the
-  // review, drop the event. The bot adding itself as a reviewer would
+  // review or assigned itself, drop the event. The bot adding itself as a reviewer would
   // otherwise wake a fresh session every time it self-assigns.
   if (sender.login === selfLogin || (decoyLogin !== null && sender.login === decoyLogin)) return null
 
-  const requestedUser = readUser(payload.requested_reviewer)
-  const requestedTeam = readReviewerTeam(payload.requested_team)
+  const requestedUser = readUser(action === 'assigned' ? payload.assignee : payload.requested_reviewer)
+  const requestedTeam = action === 'assigned' ? null : readReviewerTeam(payload.requested_team)
 
   const isMeAsUser =
     requestedUser !== null &&
@@ -1193,15 +1193,17 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   const baseRef = readString(readRecord(pr.base), 'ref')
   const branchSegment = head !== null && baseRef !== null ? ` Branch: ${head} → ${baseRef}.` : ''
   const verbed =
-    action === 'review_requested'
-      ? isMyTeam
-        ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
-        : `requested your review on PR #${number}: "${title}".`
-      : isMyTeam
-        ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
-        : `removed your review request on PR #${number}: "${title}".`
+    action === 'assigned'
+      ? `assigned you to review PR #${number}: "${title}".`
+      : action === 'review_requested'
+        ? isMyTeam
+          ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
+          : `requested your review on PR #${number}: "${title}".`
+        : isMyTeam
+          ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
+          : `removed your review request on PR #${number}: "${title}".`
   const closing =
-    action === 'review_requested'
+    action !== 'review_request_removed'
       ? ' Please review the changes line-by-line and post your feedback.'
       : ' You can stop any in-progress review.'
   const text = `@${sender.login} ${verbed}${branchSegment}${closing}`
@@ -1220,7 +1222,7 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
     thread: null,
     text,
     externalMessageId,
-    ...(action === 'review_requested' ? pendingReviewMetadata(pr, prId) : {}),
+    ...(action !== 'review_request_removed' ? pendingReviewMetadata(pr, prId) : {}),
     authorId: String(sender.id),
     authorName: sender.login,
     authorIsBot: sender.type === 'Bot',

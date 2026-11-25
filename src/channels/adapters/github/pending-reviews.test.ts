@@ -221,17 +221,30 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
   }
 }
 
-test.each(['opened', 'ready_for_review', 'review_requested'])('logs an admitted live %s trigger', async (action) => {
-  const f = await fixture()
-  await f.adapter.start()
-  const admitted = f.nextRoute()
-  await f.deliver(action, 'pull_request', { requested_reviewer: { login: 'bot', id: 1, type: 'User' } })
-  expect((await admitted).kind).toBe('accepted')
-  expect(f.routed[0]?.eventKind).toBe(`pull_request:${action}`)
-  expect(await f.store.list()).toMatchObject([
-    { repo: pending.repo, prId: 700, prNumber: 7, kind: 'review', headSha: 'head-one' },
-  ])
-})
+test.each(['opened', 'ready_for_review', 'review_requested', 'assigned'])(
+  'logs an admitted live %s trigger',
+  async (action) => {
+    // #given
+    const f = await fixture()
+    await f.adapter.start()
+    const admitted = f.nextRoute()
+    const target = { login: 'bot', id: 1, type: 'User' }
+
+    // #when
+    await f.deliver(
+      action,
+      'pull_request',
+      action === 'assigned' ? { assignee: target } : { requested_reviewer: target },
+    )
+
+    // #then
+    expect((await admitted).kind).toBe('accepted')
+    expect(f.routed[0]?.eventKind).toBe(`pull_request:${action}`)
+    expect(await f.store.list()).toMatchObject([
+      { repo: pending.repo, prId: 700, prNumber: 7, kind: 'review', headSha: 'head-one' },
+    ])
+  },
+)
 
 test('logs an admitted synchronize blocking re-review', async () => {
   const f = await fixture()

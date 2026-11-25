@@ -19,23 +19,24 @@ auth (`channels.github.auth.type: "app"`).
 
 For an App, this is the **recommended way to get on-demand PR reviews**: create
 a **real GitHub user account that impersonates the App** — same display name,
-same avatar — and request _that account_ as the reviewer. To a human looking at
+same avatar — and request _that account_ as the reviewer or assign it the PR. To a human looking at
 the PR, the reviewer reads as the app. Comments the agent posts still come from
 the App identity (the agent authenticates as the App), so the visible identity
 stays consistent.
 
 By convention the decoy account is named after the App's **slug**: an App
 whose bot actor is `my-app[bot]` is impersonated by a user account with login
-`my-app`. Requesting `my-app` as a reviewer is what wakes the agent.
+`my-app`. Requesting `my-app` as a reviewer or assigning it the PR wakes the agent.
 
 Set the decoy account up once, then drive reviews the natural way — request the
-decoy as a reviewer on any PR you want the agent to look at. A PAT-backed bot
-needs no decoy: it is already a real user you can request by its exact login.
+decoy as a reviewer or assignee on any PR you want the agent to look at. A PAT-backed bot
+needs no decoy: it is already a real user you can request or assign by its exact login.
 
 ## How the adapter matches it
 
 `classifyReviewRequest` (`src/channels/adapters/github/inbound.ts`) compares the
-incoming `requested_reviewer.login` against the bot's identity. Under App auth
+incoming `requested_reviewer.login` (or `assignee.login` for
+`pull_request.assigned`) against the bot's identity. Under App auth
 `selfLogin` is the bot actor `slug[bot]`, which can never match a real reviewer
 login — so the classifier also derives a **decoy login** and matches against
 it:
@@ -50,23 +51,26 @@ function resolveDecoyReviewerLogin(selfLogin, authType) {
 
 A `review_requested` engages the agent when `requested_reviewer.login` equals
 **either** `selfLogin` (the exact `slug[bot]`, kept for completeness) **or** the
-derived decoy login. The same decoy login extends the self-loop guard, so a
-review the decoy account requested of itself is dropped rather than waking a
-fresh session.
+derived decoy login. An `assigned` event uses the same matcher on `assignee.login`
+and starts the same review and review-check path. Assigning anyone else is ignored.
+The same decoy login extends the self-loop guard, so a review request or assignment
+sent by the bot or decoy account is dropped rather than waking a fresh session.
 
 Under **PAT auth** there is no decoy: the bot is a real user that can be
-requested directly by its exact login, so `resolveDecoyReviewerLogin` returns
-`null` and matching stays strict (`requested_reviewer.login === selfLogin`).
+requested or assigned directly by its exact login, so `resolveDecoyReviewerLogin` returns
+`null` and matching stays strict (`requested_reviewer.login === selfLogin` or
+`assignee.login === selfLogin`).
 
-## The only review trigger
+## Review triggers
 
-The decoy-reviewer path is the **only** way an App is asked to review: a review
-fires when, and only when, someone requests the decoy (or the bot's team).
-There is no implicit "review every opened PR" behavior — a `pull_request.opened`
-event lands as plain awareness-only context, identical to PAT mode. This keeps
-both auth modes on a single, predictable path: explicit `review_requested`
-only, no opened-PR branching. To have the agent review a PR, request its decoy
-reviewer.
+With the default `review.on: "review_requested"`, an App reviews when someone
+requests its decoy (or a team the bot belongs to), or assigns the PR to its
+decoy. Both `pull_request.review_requested` and `pull_request.assigned` are in
+the default event allowlist; custom allowlists must include the desired actions.
+A `pull_request.opened` event remains awareness-only by default, identical to PAT
+mode. `review.on: "opened"` additionally reviews non-draft PRs when they open or
+become ready. `review.on: "off"` disables these dedicated review triggers,
+including review requests and assignments.
 
 ## Automatic cleanup after the review
 

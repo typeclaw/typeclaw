@@ -1719,11 +1719,42 @@ describe('migrateLegacyConfigShape', () => {
     'pull_request_review.submitted',
   ]
 
+  const GITHUB_ALLOWLIST_V5 = [
+    'issue_comment.created',
+    'pull_request_review_comment.created',
+    'discussion_comment.created',
+    'issues.opened',
+    'pull_request.opened',
+    'pull_request.converted_to_draft',
+    'pull_request.ready_for_review',
+    'pull_request.review_requested',
+    'pull_request.review_request_removed',
+    'pull_request.synchronize',
+    'discussion.created',
+    'pull_request_review.submitted',
+  ]
+
+  test('a pre-assigned seeded allowlist re-tracks assignment reviews after migration', () => {
+    // #given
+    const json = {
+      models: { default: VALID_MODEL },
+      channels: { github: { repos: ['acme/widgets'], eventAllowlist: GITHUB_ALLOWLIST_V5 } },
+    }
+
+    // #when
+    const result = migrateLegacyConfigShape(json)
+
+    // #then
+    expect(result.changed).toBe(true)
+    expect(configSchema.parse(result.json).channels.github?.eventAllowlist).toContain('pull_request.assigned')
+  })
+
   test.each([
     ['v1 (0.5.1–0.10.0, 7 events)', GITHUB_ALLOWLIST_V1],
     ['v2 (0.11.0+, 9 events)', GITHUB_ALLOWLIST_V2],
     ['v3 (pre-synchronize, 10 events)', GITHUB_ALLOWLIST_V3],
     ['v4 (pre-converted-to-draft, 11 events)', GITHUB_ALLOWLIST_V4],
+    ['v5 (pre-assigned, 12 events)', GITHUB_ALLOWLIST_V5],
   ])('strips an older seeded github eventAllowlist: %s', (_label, seeded) => {
     const result = migrateLegacyConfigShape({
       models: { default: VALID_MODEL },

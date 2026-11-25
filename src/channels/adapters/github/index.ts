@@ -886,6 +886,7 @@ const REVIEW_TRIGGER_EVENT_KINDS: ReadonlySet<string> = new Set([
   'pull_request:opened',
   'pull_request:ready_for_review',
   'pull_request:review_requested',
+  'pull_request:assigned',
   'pull_request:synchronize:review-followup',
   'pull_request:reconcile',
   'pull_request:reconcile:rereview',
