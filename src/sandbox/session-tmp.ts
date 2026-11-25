@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readdir, rename, rm, stat } from 'node:fs/promises'
 import { posix } from 'node:path'
 
 // Container-only code over the POSIX `/tmp`; pinned to `path.posix` so the test
@@ -12,9 +12,10 @@ const { basename, dirname, isAbsolute, join, relative, resolve } = posix
 // force-committed by typeclaw, and scratch must never be committed. A per-session
 // subdir of /tmp gives `/tmp` semantics without either sharing the whole
 // container /tmp into a sandboxed role or persisting anything into the project
-// surface. The container /tmp only dies with the container, and agents run for
-// weeks, so a dir is discarded when its last live session releases it and
-// periodically swept (`sweepSessionTmp`) for anything a crash left behind.
+// surface. The root is a per-agent named volume (src/container/start.ts), so it
+// outlives the container, and agents run for weeks; a dir is discarded when its
+// last live session releases it and periodically swept (`sweepSessionTmp`) for
+// anything a crash or a restart left behind.
 export const SESSION_TMP_ROOT = '/tmp/typeclaw-session'
 
 // A dir that no live session holds but that was touched this recently is left
@@ -83,7 +84,7 @@ export function holdSessionTmp(sessionId: string): () => Promise<void> {
     released = true
     if (!unclaim(name)) return
     const trash = await moveAside(SESSION_TMP_ROOT, name)
-    if (trash !== undefined) await rm(trash, { recursive: true, force: true })
+    if (trash !== undefined) await removeTrash(trash)
   }
 }
 
@@ -160,7 +161,7 @@ export async function sweepSessionTmp(
   let removed = 0
   for (const { dir, counted } of trash) {
     try {
-      await rm(dir, { recursive: true, force: true })
+      await removeTrash(dir)
       if (counted) removed++
     } catch (error) {
       options.log?.(`[session-tmp] could not delete ${dir}: ${describeError(error)}`)
@@ -252,6 +253,31 @@ function moveAside(root: string, name: string): Promise<string | undefined> {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+// Scratch outlives the container on its volume, so a tree the delete cannot get
+// through would stay forever. Read-only dirs are routine there (Go's module
+// cache creates them by default), so restore owner access and retry once.
+async function removeTrash(dir: string): Promise<void> {
+  try {
+    await rm(dir, { recursive: true, force: true })
+    return
+  } catch (error) {
+    if (!isErrnoCode(error, 'EACCES') && !isErrnoCode(error, 'EPERM')) throw error
+  }
+  await restoreOwnerAccess(dir)
+  await rm(dir, { recursive: true, force: true })
+}
+
+// Walks only real dirs (lstat and Dirent types never follow a symlink), so a
+// link inside scratch cannot redirect the chmod outside it.
+async function restoreOwnerAccess(dir: string): Promise<void> {
+  const info = await lstat(dir)
+  if (!info.isDirectory()) return
+  await chmod(dir, (info.mode & 0o7777) | 0o700)
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) await restoreOwnerAccess(join(dir, entry.name))
+  }
 }
 
 function isErrnoCode(error: unknown, code: string): boolean {

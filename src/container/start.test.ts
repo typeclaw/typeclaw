@@ -8,8 +8,9 @@ import { basename, dirname, join } from 'node:path'
 import { DEFAULT_GITHUB_EVENT_ALLOWLIST } from '@/channels/schema'
 import { ensureGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { startDaemon, type Daemon } from '@/hostd/daemon'
-import { buildDockerfile, BUN_BASE_IMAGE } from '@/init/dockerfile'
+import { buildDockerfile, BUN_BASE_IMAGE, ENTRYPOINT_SHIM_LABEL, entrypointShimHash } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
+import { SESSION_TMP_ROOT } from '@/sandbox/session-tmp'
 import { isWindows } from '@/shared'
 
 import type { WithAgentOperationLock } from './agent-operation-lock'
@@ -1174,6 +1175,55 @@ describe('planStart model mount', () => {
   })
 })
 
+describe('planStart session scratch volume', () => {
+  test('keeps session scratch on a per-agent named volume, not the container writable layer', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    await writeTypeclawConfig(root)
+
+    const plan = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+
+    const volume = scratchVolume(plan.runArgs)
+    expect(volume?.src).toStartWith(`typeclaw-${plan.containerName}-`)
+    expect(volume?.argIdx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
+  })
+
+  test('reuses the volume across restarts of one folder but never across folders with the same name', async () => {
+    // given: a second agent folder sharing the first one's basename
+    const otherParent = await mkdtemp(join(tmpdir(), 'typeclaw-start-other-'))
+    const twin = join(otherParent, basename(root))
+    await mkdir(twin)
+    for (const dir of [root, twin]) {
+      await writeDockerfile(dir)
+      await writePackageJson(dir, { typeclaw: '^0.1.0' })
+      await writeTypeclawConfig(dir)
+    }
+
+    // when
+    const first = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    const restart = await planStart({ cwd: root, hostPort: 8973, imageExists: true })
+    const other = await planStart({ cwd: twin, hostPort: 8973, imageExists: true })
+    await rm(otherParent, { recursive: true, force: true })
+
+    // then
+    expect(other.containerName).toBe(first.containerName)
+    expect(scratchVolume(restart.runArgs)?.src).toBe(scratchVolume(first.runArgs)!.src)
+    expect(scratchVolume(other.runArgs)?.src).not.toBe(scratchVolume(first.runArgs)!.src)
+  })
+})
+
+function scratchVolume(runArgs: readonly string[]): { src: string; argIdx: number } | undefined {
+  const argIdx = runArgs.findIndex(
+    (arg, i) =>
+      runArgs[i - 1] === '--mount' && arg.startsWith('type=volume,') && arg.endsWith(`,dst=${SESSION_TMP_ROOT}`),
+  )
+  if (argIdx === -1) return undefined
+  const src = runArgs[argIdx]!.split(',')
+    .find((f) => f.startsWith('src='))!
+    .slice(4)
+  return { src, argIdx }
+}
+
 describe('planStart network egress filter', () => {
   test('grants NET_ADMIN and sets TYPECLAW_NETWORK_BLOCK_INTERNAL=1 when typeclaw.json is missing (new default = on)', async () => {
     await writeDockerfile(root)
@@ -1826,6 +1876,9 @@ type ContainerScenario =
 function fakeDockerExec(scenario: {
   imageExists: boolean
   imageIdBeforeBuild?: string
+  // The entrypoint-shim label on the existing image; defaults to the current
+  // shim, `null` models an image built before the label existed.
+  imageEntrypointShim?: string | null
   imageRmFails?: boolean
   imageTags?: string[]
   container: ContainerScenario
@@ -1883,6 +1936,10 @@ function fakeDockerExec(scenario: {
 
     if (args[0] === 'image' && args[1] === 'inspect') {
       if (!scenario.imageExists) return { exitCode: 1, stdout: '', stderr: '' }
+      if (args.some((arg) => arg.includes(ENTRYPOINT_SHIM_LABEL))) {
+        const label = scenario.imageEntrypointShim === undefined ? entrypointShimHash() : scenario.imageEntrypointShim
+        return { exitCode: 0, stdout: `${label ?? ''}\n`, stderr: '' }
+      }
       const imageId = scenario.imageIdBeforeBuild ?? 'sha256:old-image'
       return { exitCode: 0, stdout: `${imageId}\n`, stderr: '' }
     }
@@ -5054,6 +5111,37 @@ process.exit(0)`,
     expect(buildCall).toBeDefined()
     expect(buildCall!.dockerfileSnapshot).toBe(buildDockerfile(undefined, { baseImageVersion: '0.1.0' }))
     expect(buildCall!.dockerfileSnapshot).not.toContain('FROM stale')
+  })
+
+  test('rebuilds when the existing image carries an older entrypoint shim, even with an up-to-date Dockerfile', async () => {
+    // given: a failed upgrade build left the refreshed Dockerfile on disk and the
+    // pre-upgrade image tagged
+    await writeFile(join(root, 'Dockerfile'), buildDockerfile(undefined, { baseImageVersion: '0.1.0' }))
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({
+      imageExists: true,
+      imageEntrypointShim: null,
+      container: { exists: false },
+    })
+
+    // when: the retry runs without --build
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the image is rebuilt before the container runs
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.built).toBe(true)
+    const buildIdx = calls.findIndex((c) => isBuildCall(c.args))
+    expect(buildIdx).toBeGreaterThan(-1)
+    expect(buildIdx).toBeLessThan(calls.findIndex((c) => c.args[0] === 'run'))
   })
 
   test('skips build when the on-disk Dockerfile already matches the template and the image exists', async () => {

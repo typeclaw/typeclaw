@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, readdir, rename, rm, utimes, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import {
   __setSessionTmpRenameForTesting,
@@ -252,14 +252,18 @@ describe('session-tmp lifetime', () => {
   })
 
   test.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
-    'the sweep keeps reclaiming other dirs after one fails to delete',
+    'the sweep reclaims read-only trees without touching what their symlinks point at',
     async () => {
-      // given
-      const root = await mkdtemp(join(tmpdir(), 'session-tmp-stuck-'))
-      const locked = join(root, '.discard-locked', 'ro')
-      await mkdir(locked, { recursive: true })
-      await writeFile(join(locked, 'f'), 'x')
-      await chmod(locked, 0o500)
+      // given: a Go-module-cache-like tree of read-only dirs, holding a symlink
+      // to a read-only dir outside the scratch root
+      const root = await mkdtemp(join(tmpdir(), 'session-tmp-readonly-'))
+      const outside = await mkdtemp(join(tmpdir(), 'session-tmp-outside-'))
+      await chmod(outside, 0o500)
+      const cache = join(root, `orphan-${randomUUID()}`, 'pkg', 'mod', 'example.com')
+      await mkdir(cache, { recursive: true })
+      await writeFile(join(cache, 'go.mod'), 'module example.com\n')
+      await symlink(outside, join(cache, 'link'))
+      for (const dir of [cache, dirname(cache), dirname(dirname(cache))]) await chmod(dir, 0o555)
       await mkdir(join(root, `orphan-${randomUUID()}`))
       const logs: string[] = []
 
@@ -268,11 +272,13 @@ describe('session-tmp lifetime', () => {
         const removed = await sweepSessionTmp({ root, minAgeMs: 0, log: (m) => logs.push(m) })
 
         // then
-        expect(removed).toBe(1)
-        expect(await readdir(root)).toEqual(['.discard-locked'])
-        expect(logs.some((m) => m.includes('.discard-locked'))).toBe(true)
+        expect(removed).toBe(2)
+        expect(await readdir(root)).toEqual([])
+        expect(logs).toEqual([])
+        expect((await stat(outside)).mode & 0o777).toBe(0o500)
       } finally {
-        await chmod(locked, 0o700)
+        await chmod(outside, 0o700)
+        await rm(outside, { recursive: true, force: true })
         await rm(root, { recursive: true, force: true })
       }
     },
