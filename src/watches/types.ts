@@ -37,13 +37,14 @@ export type WatchWake = {
   final: boolean
 }
 
-export type WatchWakeDeliveryResult = 'delivered' | 'queued' | 'held' | 'failed'
+export type WatchWakeDeliveryResult = 'delivered' | 'queued' | 'held' | 'failed' | { deniedKeys: readonly string[] }
 
 export type WatchWakeDelivery = (
   target: WatchWakeTarget,
   wakes: readonly (WatchWake & { key: string })[],
   origin: SessionOrigin,
   signal: AbortSignal,
+  acknowledgment: Promise<void>,
 ) => Promise<WatchWakeDeliveryResult>
 
 // Trusted in-process probe shipped with TypeClaw. It never shells out; state is

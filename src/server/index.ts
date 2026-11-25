@@ -201,6 +201,7 @@ type QueuedPrompt = {
 
 type SessionState = {
   watchReceipt?: (result: 'delivered' | 'held' | 'failed') => void
+  watchAcknowledgment?: Promise<void>
   promptingWatch?: boolean
   onWatchTargetReady?: () => void
   session: AgentSession & { resetLoopGuard?: () => void }
@@ -1033,7 +1034,7 @@ export function createServer({
 
   return {
     start,
-    async deliverWatch(text: string): Promise<'held' | 'delivered' | 'failed'> {
+    async deliverWatch(text: string, acknowledgment?: Promise<void>): Promise<'held' | 'delivered' | 'failed'> {
       if (!stream) return 'held'
       for (const [sessionId, clients] of attached) {
         // Session stream messages multicast: choose exactly one idle receiver.
@@ -1049,6 +1050,7 @@ export function createServer({
         )
           continue
         const receipt = Promise.withResolvers<'held' | 'delivered' | 'failed'>()
+        state.watchAcknowledgment = acknowledgment
         state.watchReceipt = (result) => {
           state.watchReceipt = undefined
           receipt.resolve(result)
@@ -1363,6 +1365,11 @@ async function drain(
         if (state.promptingWatch) state.watchReceipt?.('failed')
         state.promptingWatch = false
       }
+      if (item.source === 'watch') {
+        // The next idle must see the link release even if the turn ended before the store write.
+        await state.watchAcknowledgment
+        state.watchAcknowledgment = undefined
+      }
       await fireTurnEnd()
       await fireIdle()
 
@@ -1392,6 +1399,7 @@ async function drain(
     }
   } finally {
     state.watchReceipt?.(ws.readyState === WebSocket.OPEN ? 'failed' : 'held')
+    state.watchAcknowledgment = undefined
     state.draining = false
     state.onWatchTargetReady?.()
   }

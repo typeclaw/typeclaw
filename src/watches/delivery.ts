@@ -116,9 +116,16 @@ export class WakeDispatcher {
     if (!group.length || this.stopped) return
     const batch = deliveryBatch(group)
     const first = group.find((w) => w.id === batch[0]!.watchId)!
+    const acknowledgment = Promise.withResolvers<void>()
     try {
       const readiness = this.tuiReadiness
-      const outcome = await this.deliver(first.wakeTarget, batch, watchOrigin(first), this.shutdown.signal)
+      const outcome = await this.deliver(
+        first.wakeTarget,
+        batch,
+        watchOrigin(first),
+        this.shutdown.signal,
+        acknowledgment.promise,
+      )
       if (this.stopped) return
       // Admission is not a start acknowledgment. Recheck the journal at the
       // next coalescing tick; the persisted verdict still owns the body.
@@ -130,9 +137,8 @@ export class WakeDispatcher {
       }
       if (outcome === 'failed') throw new Error('wake delivery failed')
       const ids = new Set(batch.map((p) => p.key))
-      await this.store.update((rows) => {
-        for (const w of rows) w.pending = w.pending.filter((p) => !ids.has(p.key))
-      })
+      // Denied results are discarded, but must still release their todo links.
+      await this.store.acknowledgeWakes(ids)
     } catch (e) {
       if (this.stopped) return
       console.warn(`[watch] retaining wake for ${first.id}:`, e)
@@ -141,6 +147,8 @@ export class WakeDispatcher {
           slot.cancel = undefined
           this.notify()
         })
+    } finally {
+      acknowledgment.resolve()
     }
   }
   async stop() {

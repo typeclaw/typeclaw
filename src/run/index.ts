@@ -99,11 +99,11 @@ import { runtimeTunnels } from '@/typevault/prompt-tunnel'
 import { deliverChannelWakes } from '@/watches/channel'
 import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
 import { createBundledProbeRegistry, createProbeRunner } from '@/watches/runner'
+import { registerWatchRuntime } from '@/watches/runtime'
 import { WatchService } from '@/watches/service'
 import { stopWatchWorkers } from '@/watches/shutdown'
 import { WatchStore } from '@/watches/store'
 import { watchTarget } from '@/watches/target'
-import { registerWatchRuntime } from '@/watches/tool'
 import type { WatchWakeDelivery } from '@/watches/types'
 
 import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
@@ -1173,13 +1173,13 @@ async function startAgentRuntime(
     ...containerBrokerOpt,
   })
   let server: BunServer | null = null
-  const dispatcher = new WakeDispatcher(store, async (target, wakes, origin, signal) => {
+  const dispatcher = new WakeDispatcher(store, async (target, wakes, origin, signal, acknowledgment) => {
     if (target.kind === 'channel') {
-      if (deliverChannelWatch) return deliverChannelWatch(target, wakes, origin, signal)
+      if (deliverChannelWatch) return deliverChannelWatch(target, wakes, origin, signal, acknowledgment)
       return deliverChannelWakes(channelManager.router, target, wakes)
     }
     const prompt = renderWatchReminder(target, wakes)
-    if (target.kind === 'tui') return serverFactory.deliverWatch(prompt)
+    if (target.kind === 'tui') return serverFactory.deliverWatch(prompt, acknowledgment)
     if (origin.kind !== 'cron') throw new Error('Missing watch origin')
     return (await runUnattendedPrompt(
       { id: origin.jobId, prompt },

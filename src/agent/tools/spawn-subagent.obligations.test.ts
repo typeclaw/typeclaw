@@ -108,13 +108,14 @@ test('abort during admission suppresses only the proven unstarted launch before 
   expect((await result).details).toMatchObject({ ok: false })
 })
 
-test('failure after invocation never suppresses an uncertain started response', async () => {
-  let suppressed = false
+test('a rejected session factory settles the unstarted ordinary channel obligation', async () => {
+  const settlements: unknown[] = []
+  const ref = { obligationId: 'obligation', generation: 1 }
   const f = fixture(
     {
-      acceptBackgroundResponse: async () => ({ obligationId: 'obligation', generation: 1 }),
-      suppressUnstartedBackgroundResponse: async () => {
-        suppressed = true
+      acceptBackgroundResponse: async () => ref,
+      suppressUnstartedBackgroundResponse: async (accepted, reason) => {
+        settlements.push({ accepted, reason })
       },
     },
     async () => {
@@ -122,6 +123,29 @@ test('failure after invocation never suppresses an uncertain started response', 
     },
   )
   expect((await f.spawn()).details).toMatchObject({ ok: false })
+  expect(settlements).toEqual([{ accepted: ref, reason: 'launch-failed' }])
+})
+
+test('failure after a child starts does not suppress its owed response', async () => {
+  let suppressed = false
+  const f = fixture({
+    acceptBackgroundResponse: async () => ({ obligationId: 'obligation', generation: 1 }),
+    suppressUnstartedBackgroundResponse: async () => {
+      suppressed = true
+    },
+  })
+  expect((await f.spawn()).details).toMatchObject({ ok: true, mode: 'background' })
+  const failed = Promise.withResolvers<void>()
+  const unsubscribe = f.registry.subscribe(() => {
+    if (f.registry.get('task')?.status === 'failed') failed.resolve()
+  })
+  try {
+    f.done.reject(new Error('child prompt failed after launch'))
+    await failed.promise
+    expect(f.registry.get('task')?.completion).toMatchObject({ ok: false })
+  } finally {
+    unsubscribe()
+  }
   expect(suppressed).toBe(false)
 })
 

@@ -23,7 +23,7 @@ export const systemClock: WatchClock = {
 }
 type NewWatch = Pick<
   WatchRecord,
-  'description' | 'mode' | 'probe' | 'createdByRole' | 'createdByOrigin' | 'wakeTarget'
+  'description' | 'mode' | 'probe' | 'createdByRole' | 'createdByOrigin' | 'wakeTarget' | 'waitsFor'
 > & { deadlineMs?: number }
 export class WatchService {
   private running = false
@@ -79,13 +79,16 @@ export class WatchService {
     this.arm()
     return record.id
   }
-  async change(id: string, action: 'rearm' | 'cancel') {
+  async change(id: string, action: 'rearm' | 'cancel', caller: WatchWakeTarget) {
     await this.store.update((rows) => {
       const w = rows.find((row) => row.id === id)
       if (!w || isEnded(w)) throw new Error('Watch is not live')
       if (action === 'cancel') {
+        const notifyTarget = w.waitsFor !== undefined && conversationKey(w.wakeTarget) !== conversationKey(caller)
+        const summary = `Watch cancelled; no further results will arrive for: ${w.waitsFor}`
         w.status = 'cancelled'
         w.pending = []
+        if (notifyTarget) enqueueWake(rows, w, summary, true)
         return
       }
       if (w.status !== 'paused' || w.deadline <= this.clock.now())
@@ -95,6 +98,7 @@ export class WatchService {
       w.nextRunAt = this.clock.now()
     })
     if (action === 'cancel') {
+      this.pending()
       const run = this.inflight.get(id)
       run?.controller.abort()
       await run?.task
@@ -166,12 +170,7 @@ export class WatchService {
     await this.store.update((rows) => {
       const w = rows.find((row) => row.id === snapshot.id)
       if (!w || isEnded(w) || signal.aborted) return
-      const wake = (summary: string, final = false) => {
-        // Assign in the serialized verdict write, not at probe start: two
-        // watches for one target can finish in either order.
-        const sequence = 1 + rows.reduce((max, row) => Math.max(max, row.pending.at(-1)?.sequence ?? 0), 0)
-        w.pending.push({ key: crypto.randomUUID(), summary: summary.slice(0, 16_384), final, sequence })
-      }
+      const wake = (summary: string, final = false) => enqueueWake(rows, w, summary, final)
       if (now >= w.deadline) {
         w.status = 'expired'
         wake('Watch expired.', true)
@@ -197,7 +196,8 @@ export class WatchService {
           .digest('hex')
         if (result.verdict === 'done') {
           w.status = 'done'
-          if (result.wake === true) wake(summary, true)
+          if (w.waitsFor !== undefined) wake(result.summary || `Watch finished; ${w.waitsFor} may proceed.`, true)
+          else if (result.wake === true) wake(summary, true)
         } else if (result.verdict === 'wake' && fingerprint !== w.lastSummaryFingerprint) {
           w.lastSummaryFingerprint = fingerprint
           w.consecutiveWakes++
@@ -211,6 +211,11 @@ export class WatchService {
     this.pending()
     if (this.store.records.some((w) => w.id === snapshot.id && isEnded(w))) await this.cleanup(snapshot.id)
   }
+}
+function enqueueWake(rows: readonly WatchRecord[], watch: WatchRecord, summary: string, final: boolean) {
+  // Assign inside the serialized store write, in enqueue order.
+  const sequence = 1 + rows.reduce((max, row) => Math.max(max, row.pending.at(-1)?.sequence ?? 0), 0)
+  watch.pending.push({ key: crypto.randomUUID(), summary: summary.slice(0, 16_384), final, sequence })
 }
 function isEnded(w: WatchRecord) {
   return w.status !== 'active' && w.status !== 'paused'

@@ -14,9 +14,10 @@ import { buildSandboxedCommand } from '@/sandbox'
 
 import { createWatchGithubCredentialResolver } from './github-credential'
 import { createBundledProbeRegistry } from './runner'
+import { registerWatchRuntime } from './runtime'
 import { WatchService } from './service'
 import { WatchStore } from './store'
-import { createWatchTool, registerWatchesFromBash, registerWatchRuntime } from './tool'
+import { createWatchTool, registerWatchesFromBash } from './tool'
 
 const channel = {
   kind: 'channel',

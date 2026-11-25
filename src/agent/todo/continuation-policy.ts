@@ -79,6 +79,8 @@ export type TurnOutcome = {
 }
 
 export type ContinuationState = {
+  // A linked watch replied about these items; only ordinary human input releases them.
+  watchHandedBackTodos?: readonly string[]
   episode: ContinuationEpisode | null
   lastTurnOutcome: TurnOutcome | null
   // One-shot suppressor: the restart kick prompt owns the first post-restart
@@ -126,6 +128,13 @@ export function parseContinuationState(value: unknown): ContinuationState {
     suppressNextIdleNudgeReason: v.suppressNextIdleNudgeReason === 'restart-kick' ? 'restart-kick' : null,
     autoResumeBlockedUntilRealUserTurn: v.autoResumeBlockedUntilRealUserTurn === true,
     restartAbortPending: v.restartAbortPending === true,
+    ...(Array.isArray(v.watchHandedBackTodos)
+      ? {
+          watchHandedBackTodos: v.watchHandedBackTodos.filter(
+            (content): content is string => typeof content === 'string',
+          ),
+        }
+      : {}),
   }
 }
 
@@ -215,6 +224,15 @@ export type ContinuationSkipReason =
   | 'max-wall-clock'
   | 'stagnation'
 
+export function isContinuationSafeOutcome(outcome: Pick<TurnOutcome, 'stopReason' | 'termination'> | null): boolean {
+  const terminalReply = outcome?.termination === 'terminal-after-channel-reply'
+  return (
+    outcome !== null &&
+    outcome.stopReason !== 'error' &&
+    ((outcome.stopReason !== 'aborted' && outcome.stopReason !== 'unknown') || terminalReply)
+  )
+}
+
 // Pure decision: given the current persisted state, the current todos, the
 // last turn outcome, a fresh episode-id factory, and `now`, decide whether to
 // inject a continuation and return the episode to persist. The caller is
@@ -245,22 +263,16 @@ export function decideContinuation(args: {
   if (state.autoResumeBlockedUntilRealUserTurn) return { kind: 'skip', reason: 'user-abort-blocked' }
 
   const outcome = state.lastTurnOutcome
-  const isSafeTerminalReply = outcome?.termination === 'terminal-after-channel-reply'
   // A failed final turn never auto-continues, even with terminal-reply
   // provenance: that exception only vouches for an intentional abort after a
   // landed reply, not for a turn whose last LLM request failed. Retries the
   // turn already ran replace this outcome if they succeed, and the next real
   // user turn records a fresh outcome, so this only stops runtime self-nudges.
-  if (
-    outcome === null ||
-    outcome.stopReason === 'error' ||
-    (outcome.stopReason === 'unknown' && !isSafeTerminalReply) ||
-    (outcome.stopReason === 'aborted' && !isSafeTerminalReply)
-  ) {
+  if (!isContinuationSafeOutcome(outcome)) {
     return { kind: 'skip', reason: 'turn-not-safe' }
   }
 
-  if (outcome.deliveredAfterTodoWrite === true) return { kind: 'skip', reason: 'delivered-after-todo-write' }
+  if (outcome?.deliveredAfterTodoWrite === true) return { kind: 'skip', reason: 'delivered-after-todo-write' }
 
   const hash = hashIncomplete(todos)
   const base: ContinuationEpisode = state.episode ?? {

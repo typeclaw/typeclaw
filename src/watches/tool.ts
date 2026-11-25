@@ -6,10 +6,8 @@ import type { SessionOrigin } from '@/agent/session-origin'
 import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 
 import { detectCreatedGithubTargets } from './detect-created'
-import type { ResolveWatchGithubCredential } from './github-credential'
 import { githubParams } from './probes/github'
-import type { ProbeRegistry } from './runner'
-import type { WatchService } from './service'
+import { getWatchRuntime } from './runtime'
 import { probeSchema } from './store'
 import { conversationKey, watchTarget } from './target'
 import { duration } from './verdict'
@@ -20,6 +18,7 @@ const createRequest = z.strictObject({
   probe: probeSchema,
   mode: z.enum(['judge', 'diff']).optional(),
   deadline: z.string().optional(),
+  waitsFor: z.string().min(1).optional(),
 })
 const id = z.uuid()
 const request = z.discriminatedUnion('action', [
@@ -32,19 +31,6 @@ const request = z.discriminatedUnion('action', [
 const parameters = createRequest
   .partial()
   .extend({ action: z.enum(['create', 'list', 'rearm', 'cancel']), id: id.optional() })
-type Runtime = {
-  service: WatchService
-  registry: ProbeRegistry
-  isAutoEnabled?: () => boolean
-  resolveGithubCredential?: ResolveWatchGithubCredential
-}
-const runtimes = new Map<string, Runtime>()
-export function registerWatchRuntime(dir: string, runtime: Runtime) {
-  runtimes.set(dir, runtime)
-  return () => {
-    if (runtimes.get(dir) === runtime) runtimes.delete(dir)
-  }
-}
 
 export async function registerWatchesFromBash(
   dir: string,
@@ -53,7 +39,7 @@ export async function registerWatchesFromBash(
   command: string,
   output: string,
 ): Promise<string[]> {
-  const runtime = runtimes.get(dir)
+  const runtime = getWatchRuntime(dir)
   if (!runtime?.isAutoEnabled?.() || !permissions.has(origin, CORE_PERMISSIONS.watchCreate)) return []
   const targets = detectCreatedGithubTargets(command, output)
   if (targets.length === 0) return []
@@ -103,12 +89,12 @@ export function createWatchTool(
     name: 'watch',
     label: 'Watch',
     description:
-      'Create a follow-up probe; list, cancel or rearm a paused watch. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true. next and deadline are durations like 5m or 2d. Other exits fail. A channel wake returns to the original conversation as a system reminder.',
+      'Create a follow-up probe; list, cancel or rearm a paused watch. On create, set waitsFor to the exact text of a pending todo in this conversation only if it cannot progress until the watch reports. A linked watch always wakes on completion. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently unless linked, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true or the watch is linked. next and deadline are durations like 5m or 2d. Other exits fail. A channel wake returns to the original conversation as a system reminder.',
     parameters: zodToToolParameters(parameters),
     async execute(_id, args) {
       const input = request.parse(args)
       const origin = getOrigin(),
-        runtime = runtimes.get(dir)
+        runtime = getWatchRuntime(dir)
       if (!runtime || !origin) throw new Error('No watch runtime or requester for this session')
       const { service, registry } = runtime
       const role = permissions.resolveRole(origin)
@@ -156,7 +142,7 @@ export function createWatchTool(
         if (!row) throw new Error('No such watch in this conversation')
         if (input.action === 'rearm' && role !== 'owner' && row.createdByRole !== role)
           throw new Error('Cannot rearm as another role')
-        await service.change(input.id, input.action)
+        await service.change(input.id, input.action, target)
         details = { id: input.id, status: input.action === 'cancel' ? 'cancelled' : 'active' }
       }
       return { content: [{ type: 'text', text: JSON.stringify(details) }], details }
