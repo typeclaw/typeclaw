@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test'
-import { createHmac } from 'node:crypto'
+import { createHmac, generateKeyPairSync } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -53,7 +53,7 @@ const pull = {
 // Passing an existing dir starts the next process on the same agent folder.
 async function fixture(
   existingDir?: string,
-  options: { prompt?: () => Promise<void>; recoveredRemoval?: Record<string, unknown> } = {},
+  options: { prompt?: () => Promise<void>; recoveredRemoval?: Record<string, unknown>; app?: true } = {},
 ) {
   const dir = existingDir ?? (await mkdtemp(join(tmpdir(), 'github-pending-reviews-')))
   const store = await loadPendingReviewStore(dir, logger)
@@ -65,7 +65,7 @@ async function fixture(
   const scanRead = Promise.withResolvers<void>()
   const recoveryFinished = Promise.withResolvers<void>()
   let recoveryTick: (() => void) | undefined
-  const currentPull = { ...pull }
+  const currentPull = { ...pull, assignees: [] as Array<{ login: string; id: number; type: string }> }
   let comparison = 'behind'
   let fetchWaiters: Array<{ match: (url: string) => boolean; resolve: () => void }> = []
   let fetchHolds: Array<{ match: (url: string) => boolean; reached: () => void; released: Promise<void> }> = []
@@ -82,6 +82,12 @@ async function fixture(
         await hold.released
       }
       if (url.endsWith('/user')) return Response.json({ login: 'bot', id: 1 })
+      if (url.endsWith('/app')) return Response.json({ slug: 'bot' })
+      if (url.endsWith('/users/bot%5Bbot%5D')) return Response.json({ login: 'bot[bot]', id: 1 })
+      if (url.endsWith('/installation')) return Response.json({ id: 1 })
+      if (url.endsWith('/app/installations/1'))
+        return Response.json({ permissions: { pull_requests: 'write' }, events: ['pull_request'] })
+      if (url.endsWith('/access_tokens')) return Response.json({ token: 'test-installation-token' })
       if (url.endsWith('/hooks') && init?.method === 'POST') return Response.json({ id: 1 })
       if (url.includes('/hooks?')) return Response.json([])
       if (url.endsWith('/hooks/1') && init?.method === 'DELETE') return new Response(null, { status: 204 })
@@ -171,6 +177,7 @@ async function fixture(
     return receipt
   }
   let handler: ((req: Request) => Promise<Response>) | undefined
+  let deliveryId = 0
   const adapter = createGithubAdapter({
     router,
     agentDir: dir,
@@ -182,7 +189,20 @@ async function fixture(
       },
     },
     fetchImpl,
-    secrets: { auth: { type: 'pat', token: { value: 'test-token' } }, webhookSecret: { value: 'test-secret' } },
+    secrets: {
+      auth: options.app
+        ? {
+            type: 'app',
+            appId: 1,
+            privateKey: {
+              value: generateKeyPairSync('rsa', { modulusLength: 2048 })
+                .privateKey.export({ type: 'pkcs8', format: 'pem' })
+                .toString(),
+            },
+          }
+        : { type: 'pat', token: { value: 'test-token' } },
+      webhookSecret: { value: 'test-secret' },
+    },
     httpListenImpl: (_port, callback) => {
       handler = callback
       return { stop: async () => {} }
@@ -254,7 +274,7 @@ async function fixture(
           body,
           headers: {
             'x-github-event': event,
-            'x-github-delivery': `${event}-${action}`,
+            'x-github-delivery': `${event}-${action}-${++deliveryId}`,
             'x-hub-signature-256': `sha256=${createHmac('sha256', 'test-secret').update(body).digest('hex')}`,
           },
         }),
@@ -543,6 +563,7 @@ test('keeps the pending review and check after assignment then reviewer removal 
   await f.adapter.start()
   const assigned = f.nextRoute()
   const bot = { login: 'bot', id: 1, type: 'User' }
+  f.pull.assignees = [bot]
   await f.deliver('assigned', 'pull_request', {
     assignee: bot,
     pull_request: { ...pull, assignees: [bot] },
@@ -577,6 +598,139 @@ test('keeps the pending review and check after assignment then reviewer removal 
   }
 })
 
+test.each([
+  { reassign: false, recovered: false },
+  { reassign: false, recovered: true },
+  { reassign: true, recovered: false },
+])('withdraws both requests after unassign, %j', async ({ reassign, recovered }) => {
+  // #given
+  const turn = Promise.withResolvers<void>()
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, {
+    prompt: () => turn.promise,
+    ...(recovered
+      ? {
+          recoveredRemoval: {
+            action: 'review_request_removed',
+            repository: { name: 'widgets', owner: { login: 'acme' } },
+            pull_request: { ...pull, assignees: [bot] },
+            requested_reviewer: bot,
+            sender: { login: 'alice', id: 10, type: 'User' },
+          },
+        }
+      : {}),
+  })
+  cleanups.push(async () => turn.resolve())
+  if (recovered) f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  let admitted = f.nextRoute()
+  await f.deliver('assigned', 'pull_request', { assignee: bot, pull_request: f.pull })
+  expect((await admitted).kind).toBe('accepted')
+  admitted = f.nextRoute()
+  await f.deliver('review_requested', 'pull_request', { requested_reviewer: bot, pull_request: f.pull })
+  expect((await admitted).kind).toBe('accepted')
+  const recorded = await f.store.list()
+  expect(recorded).toMatchObject([{ assignmentTriggered: true }])
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+    'unassigned-review',
+  )
+
+  try {
+    // #when
+    f.pull.assignees = []
+    await f.deliver('unassigned', 'pull_request', { assignee: bot, pull_request: f.pull })
+    if (reassign) {
+      f.pull.assignees = [bot]
+      admitted = f.nextRoute()
+      await f.deliver('assigned', 'pull_request', {
+        assignee: bot,
+        pull_request: { ...f.pull, updated_at: '2026-01-01T00:02:00Z' },
+      })
+      await admitted
+    }
+    const stopped = f.nextRoute()
+    if (recovered) await f.recoverRemoval()
+    else
+      await f.deliver('review_request_removed', 'pull_request', {
+        requested_reviewer: bot,
+        pull_request: { ...f.pull, updated_at: '2026-01-01T00:03:00Z' },
+      })
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(await f.store.list()).toEqual(reassign ? recorded : [])
+    if (reassign) {
+      expect(f.statuses.map((status) => status.state)).toEqual(['pending'])
+      expect(f.routed.some((message) => message.eventKind === 'pull_request:review_request_removed')).toBe(false)
+    } else {
+      await stopped
+      expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
+      expect(f.statuses[1]?.description).toBe('Not reviewed: the review request was removed')
+      expect(f.routed.at(-1)?.text).toContain('You can stop any in-progress review.')
+      expect(f.routed.at(-1)?.eventKind).toBe('pull_request:review_request_removed')
+      await f.adapter.stop()
+      await f.router.stop()
+      const next = await fixture(f.dir)
+      next.config.review.on = 'review_requested'
+      await next.adapter.start()
+      await next.scanRead
+      expect(await next.store.list()).toEqual([])
+      expect(next.routed).toEqual([])
+    }
+  } finally {
+    await githubReviewChecks.reviewerSettled('unassigned-review', { kind: 'cancelled', reason: 'test cleanup' })
+  }
+})
+
+test.each(['bot[bot]', 'bot'])('App assignment cancellation uses current assignee %s', async (login) => {
+  // #given
+  const turn = Promise.withResolvers<void>()
+  const f = await fixture(undefined, { app: true, prompt: () => turn.promise })
+  cleanups.push(async () => turn.resolve())
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  await f.scanRead
+  const assignee = { login, id: 1, type: 'User' }
+  const reviewer = { login: 'bot', id: 2, type: 'User' }
+  f.pull.assignees = [assignee]
+  let routed = f.nextRoute()
+  await f.deliver('assigned', 'pull_request', { assignee, pull_request: f.pull })
+  expect((await routed).kind).toBe('accepted')
+  routed = f.nextRoute()
+  await f.deliver('review_requested', 'pull_request', { requested_reviewer: reviewer, pull_request: f.pull })
+  expect((await routed).kind).toBe('accepted')
+  const pending = await f.store.list()
+
+  // #when
+  await f.deliver('review_request_removed', 'pull_request', {
+    requested_reviewer: reviewer,
+    pull_request: { ...f.pull, assignees: [] },
+  })
+
+  // #then
+  expect(await f.store.list()).toEqual(pending)
+  expect(f.routed).toHaveLength(2)
+
+  // #when
+  f.pull.assignees = [{ login: 'someone-else', id: 3, type: 'User' }]
+  await f.deliver('unassigned', 'pull_request', { assignee, pull_request: f.pull })
+  routed = f.nextRoute()
+  await f.deliver('review_request_removed', 'pull_request', {
+    requested_reviewer: reviewer,
+    pull_request: { ...f.pull, assignees: [assignee], updated_at: '2026-01-01T00:04:00Z' },
+  })
+  await routed
+
+  // #then
+  expect(await f.store.list()).toEqual([])
+  expect(f.routed.at(-1)?.text).toContain('You can stop any in-progress review.')
+})
+
 test('boot replay on a newer head preserves assignment work after reviewer removal', async () => {
   // #given
   const turn = Promise.withResolvers<void>()
@@ -603,6 +757,7 @@ test('boot replay on a newer head preserves assignment work after reviewer remov
 
   // #when
   const next = await fixture(f.dir, { prompt: () => turn.promise })
+  next.pull.assignees = [bot]
   next.pull.head = { ...pull.head, sha: 'head-two' }
   next.config.review.check = true
   admitted = next.nextRoute()
@@ -658,6 +813,7 @@ test('cancels a withdrawn request when assignment was not admitted by the allowl
   const requested = f.nextRoute()
   await f.deliver('review_requested', 'pull_request', { requested_reviewer: bot })
   expect((await requested).kind).toBe('accepted')
+  f.pull.assignees = [bot]
   await f.deliver('assigned', 'pull_request', { assignee: bot, pull_request: { ...pull, assignees: [bot] } })
   await githubReviewChecks.beginReview(
     { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
@@ -701,6 +857,7 @@ test('preserves a newer assignment obligation when an older removal is recovered
   f.config.review.check = true
   await f.adapter.start()
   const assigned = f.nextRoute()
+  f.pull.assignees = [bot]
   await f.deliver('assigned', 'pull_request', {
     assignee: bot,
     pull_request: { ...pull, assignees: [bot], updated_at: '2026-01-01T00:01:00Z' },

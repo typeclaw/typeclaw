@@ -30,7 +30,7 @@ export type PendingReviewStore = {
     repo: string,
     prNumber: number,
     expected?: PendingReview,
-    reason?: 'review-request-removed',
+    isCurrentlyAssigned?: () => Promise<boolean>,
   ) => Promise<boolean>
 }
 
@@ -86,7 +86,8 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
         const samePullRequest = previous?.prId === entry.prId
         const sameObligation = samePullRequest && previous.headSha === entry.headSha && previous.kind === entry.kind
         // An unfinished assignment still backs this PR when boot replay or a
-        // live admission advances its head or review kind. Only a clear ends it.
+        // live admission advances its head or review kind. Cancellation also
+        // requires checking whether that historical assignment is still current.
         const assignmentTriggered =
           entry.assignmentTriggered ?? (samePullRequest ? previous.assignmentTriggered : undefined)
         // Several thread siblings can carry the same push. They share one PR
@@ -104,15 +105,15 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
         })
         await persist(next)
       }),
-    clear: (repo, prNumber, expected, reason) =>
+    clear: (repo, prNumber, expected, isCurrentlyAssigned) =>
       onFileLane(path, async () => {
         const next = await latest()
         const id = key(repo, prNumber)
         const current = next.get(id)
         if (current === undefined) return true
-        // Decide on the latest persisted obligation inside the admission lane,
-        // never on an old removal payload's snapshot of the PR's assignees.
-        if (reason === 'review-request-removed' && current.assignmentTriggered === true) return false
+        // Read current assignees inside the admission lane, after loading the
+        // latest provenance. Recovered payloads can predate a newer assignment.
+        if (current.assignmentTriggered === true && (await isCurrentlyAssigned?.()) === true) return false
         if (
           expected !== undefined &&
           (current.prId !== expected.prId ||

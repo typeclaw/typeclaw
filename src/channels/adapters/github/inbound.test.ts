@@ -1120,6 +1120,44 @@ describe('createGithubWebhookHandler — review.on wiring', () => {
 })
 
 describe('createGithubWebhookHandler — pull_request.assigned', () => {
+  it('retries the same removal delivery after current assignment verification fails', async () => {
+    // #given
+    const routed: InboundMessage[] = []
+    let reads = 0
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => [...DEFAULT_GITHUB_EVENT_ALLOWLIST],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      logger,
+      clearPendingReview: async () => {
+        if (++reads === 1) throw new Error('GitHub pending assignees 503')
+        return true
+      },
+      route: async (message) => {
+        routed.push(message)
+        return { kind: 'observed' }
+      },
+    })
+    const request = () =>
+      signedRequest(
+        JSON.stringify(reviewRequestRemovedPayload({ reviewerLogin: 'typeclaw-bot' })),
+        'pull_request',
+        'retry-removal',
+      )
+
+    // #when
+    await expect(handler(request())).rejects.toThrow('GitHub pending assignees 503')
+    await handler(request())
+    await handler(request())
+
+    // #then
+    expect(reads).toBe(2)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.text).toContain('You can stop any in-progress review.')
+  })
+
   it.each([
     ['pat', 'typeclaw-bot', 'typeclaw-bot'],
     ['app', 'typeclaw[bot]', 'typeclaw[bot]'],

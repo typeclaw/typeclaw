@@ -99,7 +99,7 @@ test.each(['review', 'rereview'] as const)('assignment provenance survives a rep
 
   // #then
   expect(await store.list()).toEqual([{ ...newer, assignmentTriggered: true }])
-  expect(await store.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(false)
+  expect(await store.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(false)
 })
 
 test.each(['cleared', 'different-pr'] as const)(
@@ -116,7 +116,7 @@ test.each(['cleared', 'different-pr'] as const)(
 
     // #then
     expect(await store.list()).toEqual([newer])
-    expect(await store.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(true)
+    expect(await store.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(true)
   },
 )
 
@@ -132,7 +132,7 @@ test('a legacy record advancing its head gains no assignment provenance', async 
 
   // #then
   expect(await reloaded.list()).toEqual([newer])
-  expect(await reloaded.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(true)
+  expect(await reloaded.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(true)
 })
 
 test('withdrawal sees another instance assignment admission but closure still clears it', async () => {
@@ -143,7 +143,7 @@ test('withdrawal sees another instance assignment admission but closure still cl
   await second.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
 
   // #when
-  const cleared = await first.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')
+  const cleared = await first.clear(entry.repo, entry.prNumber, undefined, async () => true)
 
   // #then
   expect(cleared).toBe(false)
@@ -159,6 +159,46 @@ test('same-head requester replacement is not cleared by an older snapshot on the
   await store.record(requested)
   await store.clear(entry.repo, entry.prNumber, entry)
   expect(await store.list()).toEqual([requested])
+})
+
+test('withdrawal serializes its current assignment read before a newer admission', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  await first.record({ ...entry, assignmentTriggered: true })
+  const reading = Promise.withResolvers<void>()
+  const assigned = Promise.withResolvers<boolean>()
+  const newer = { ...entry, headSha: 'head-two', admittedAt: 200, assignmentTriggered: true as const }
+
+  // #when
+  const cleared = first.clear(entry.repo, entry.prNumber, undefined, async () => {
+    reading.resolve()
+    return assigned.promise
+  })
+  await reading.promise
+  const admitted = second.record(newer)
+  assigned.resolve(false)
+  await admitted
+
+  // #then
+  expect(await cleared).toBe(true)
+  expect(await first.list()).toEqual([newer])
+})
+
+test('an unavailable current assignment read leaves pending work intact for redelivery', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const assigned = { ...entry, assignmentTriggered: true as const }
+  await store.record(assigned)
+
+  // #when
+  const clear = store.clear(entry.repo, entry.prNumber, undefined, async () => {
+    throw new Error('GitHub unavailable')
+  })
+
+  // #then
+  await expect(clear).rejects.toThrow('GitHub unavailable')
+  expect(await store.list()).toEqual([assigned])
 })
 
 test('ignores malformed rows and tolerates a corrupted file', async () => {

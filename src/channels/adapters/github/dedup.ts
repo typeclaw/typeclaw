@@ -1,6 +1,7 @@
 export type DeliveryDedup = {
   has: (deliveryId: string) => boolean
   add: (deliveryId: string) => void
+  delete: (deliveryId: string) => boolean
   size: () => number
 }
 
@@ -47,6 +48,9 @@ export function createDeliveryDedup(limit = 1000): DeliveryDedup {
     },
     add(deliveryId: string): void {
       seen.set(deliveryId, true)
+    },
+    delete(deliveryId: string): boolean {
+      return seen.delete(deliveryId)
     },
     size(): number {
       return seen.size()

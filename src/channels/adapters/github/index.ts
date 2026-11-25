@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
+import { z } from 'zod'
+
 import { githubReviewChecks } from '@/channels/github-review-check'
 import { observeVerifiedDismissals } from '@/channels/github-review-turn-ledger'
 import type { GithubTokenBridge } from '@/channels/github-token-bridge'
@@ -18,12 +20,18 @@ import { describeError } from '../../describe-error'
 import { canonicalGithubRepo } from '../../github-repo'
 import { withOutboundAccount } from '../outbound-account'
 import { buildAuthStrategy, type GithubAuthContext } from './auth'
+import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
 import { findPermissionGaps } from './event-permissions'
 import { createGithubFetchAttachmentCallback } from './fetch-attachment'
 import { createChatWorkspaceIndex, createGithubHistoryCallback } from './history'
-import { createGithubWebhookHandler, processVerifiedGithubDelivery, type GithubWebhookHandlerOptions } from './inbound'
+import {
+  createGithubWebhookHandler,
+  processVerifiedGithubDelivery,
+  resolveBotMentionLogins,
+  type GithubWebhookHandlerOptions,
+} from './inbound'
 import { readGithubLastAlive, writeGithubLastAlive } from './last-alive'
 import { applyManagedPath, buildManagedPath, resolveAgentId } from './managed-path'
 import { createGithubMembershipResolver } from './membership'
@@ -341,7 +349,25 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     route: routeInbound,
     abortGithubPrTurn: options.router.abortGithubPrTurn,
     clearPendingReview: async (workspace, prNumber, reason) =>
-      pendingReviewStore?.clear(workspace, prNumber, undefined, reason),
+      pendingReviewStore?.clear(
+        workspace,
+        prNumber,
+        undefined,
+        reason === 'review-request-removed'
+          ? async () => {
+              const token = await authToken({ repoSlug: workspace })
+              const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}`, {
+                headers: githubJsonHeaders(token),
+              })
+              if (!response.ok) throw new Error(`GitHub pending assignees ${response.status}`)
+              const current = z
+                .object({ assignees: z.array(z.object({ login: z.string() })) })
+                .parse(await response.json())
+              const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
+              return current.assignees.some((assignee) => logins.includes(assignee.login))
+            }
+          : undefined,
+      ),
     reviewSubmitted: async (review) => {
       if (pendingReviewStore !== null) await completePendingReview(pendingReviewStore, review, authToken, fetchImpl)
     },

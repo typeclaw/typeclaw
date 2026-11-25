@@ -253,7 +253,15 @@ export async function processVerifiedGithubDelivery(
     if (prNumber !== null) {
       // Withdrawn work must not survive in the pending log, or the next boot's
       // pending replay reviews a PR nobody asked for anymore.
-      const cleared = await options.clearPendingReview?.(classified.workspace, prNumber, 'review-request-removed')
+      let cleared: boolean | void
+      try {
+        cleared = await options.clearPendingReview?.(classified.workspace, prNumber, 'review-request-removed')
+      } catch (error) {
+        // Current-assignee verification can fail transiently. Let the same
+        // delivery retry rather than permanently consuming the withdrawal.
+        options.dedup.delete(delivery)
+        throw error
+      }
       if (cleared === false) return
       void githubReviewChecks.cancelPullRequest(classified.workspace, prNumber, 'the review request was removed')
     }
