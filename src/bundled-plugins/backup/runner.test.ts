@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { rmSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -14,6 +14,8 @@ import {
   makeDefaultGitSpawn,
   runBackup,
   runMaintenance,
+  sweepPackDebris,
+  MAX_UNTRACKED_FILE_BYTES,
   withIndexLockRetry,
 } from './runner'
 
@@ -1407,5 +1409,316 @@ describe('makeDefaultGitSpawn', () => {
     expect(result.exitCode).toBe(1)
     expect(result.stderr).toBe('stdout drain failed')
     expect(aborted).toBe(true)
+  })
+})
+
+async function initRealRepo(cwd: string): Promise<(args: string[]) => Promise<GitSpawnResult>> {
+  const realGit = makeDefaultGitSpawn()
+  const git = async (args: string[]): Promise<GitSpawnResult> => {
+    const result = await realGit(args, { cwd, timeoutMs: 30_000 })
+    expect(result.exitCode).toBe(0)
+    return result
+  }
+  await git(['init', '-q', '-b', 'main'])
+  await git(['config', 'user.name', 'Test'])
+  await git(['config', 'user.email', 'test@example.com'])
+  return git
+}
+
+describe('oversized untracked files', () => {
+  test('leaves an oversized untracked file out, warns with its path, and still commits the rest', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-oversized-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await mkdir(join(cwd, 'tools'))
+      await writeFile(join(cwd, 'tools', 'chrome'), '')
+      await truncate(join(cwd, 'tools', 'chrome'), MAX_UNTRACKED_FILE_BYTES + 1)
+      await writeFile(join(cwd, 'notes.md'), 'kept\n')
+      const warnings: string[] = []
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        {
+          gitSpawn: makeDefaultGitSpawn(),
+          pickCommitMessage: async () => 'backup',
+          warn: (message) => warnings.push(message),
+        },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = (await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n')
+      expect(tree).toContain('notes.md')
+      expect(tree).not.toContain('tools/chrome')
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toContain('tools/chrome')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('backs up an untracked file of exactly the size limit without a warning', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-at-limit-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'data.bin'), '')
+      await truncate(join(cwd, 'data.bin'), MAX_UNTRACKED_FILE_BYTES)
+      const warnings: string[] = []
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: makeDefaultGitSpawn(), pickCommitMessage: async () => 'backup', warn: (m) => warnings.push(m) },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      expect((await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).toContain('data.bin')
+      expect(warnings).toEqual([])
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('a glob-shaped filename never stages the oversized sibling it would match as a pattern', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-glob-name-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'chrome'), '')
+      await truncate(join(cwd, 'chrome'), MAX_UNTRACKED_FILE_BYTES + 1)
+      await writeFile(join(cwd, '[c]hrome'), 'small\n')
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: makeDefaultGitSpawn(), pickCommitMessage: async () => 'backup', warn: () => {} },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = (await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n')
+      expect(tree).toContain('[c]hrome')
+      expect(tree).not.toContain('chrome')
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('an inherited glob pathspec mode does not break literal staging', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-glob-env-'))
+    const previous = process.env.GIT_GLOB_PATHSPECS
+    process.env.GIT_GLOB_PATHSPECS = '1'
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'notes.md'), 'kept\n')
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: makeDefaultGitSpawn(), pickCommitMessage: async () => 'backup' },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      expect((await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout).toContain('notes.md')
+    } finally {
+      if (previous === undefined) delete process.env.GIT_GLOB_PATHSPECS
+      else process.env.GIT_GLOB_PATHSPECS = previous
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('a tracked file replaced by a directory is deferred with its children while siblings still commit', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-file-to-dir-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'tools'), 'was a file\n')
+      await git(['add', 'tools'])
+      await git(['commit', '-qm', 'tools file'])
+      await rm(join(cwd, 'tools'))
+      await mkdir(join(cwd, 'tools'))
+      await writeFile(join(cwd, 'tools', 'chrome'), '')
+      await truncate(join(cwd, 'tools', 'chrome'), MAX_UNTRACKED_FILE_BYTES + 1)
+      await writeFile(join(cwd, 'tools', 'notes.md'), 'small\n')
+      await writeFile(join(cwd, 'sibling.md'), 'kept\n')
+      const staged: string[][] = []
+      const warnings: string[] = []
+      const realGit = makeDefaultGitSpawn()
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        {
+          gitSpawn: async (args, opts) => {
+            if (args.includes('add')) staged.push([...args])
+            return realGit(args, opts)
+          },
+          pickCommitMessage: async () => 'backup',
+          warn: (m) => warnings.push(m),
+        },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = (await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n')
+      expect(tree).toContain('sibling.md')
+      expect(tree).toContain('tools')
+      expect(tree.some((path) => path.startsWith('tools/'))).toBe(false)
+      expect(staged.some((args) => args.some((arg) => arg === 'tools' || arg.startsWith('tools/')))).toBe(false)
+      expect(warnings.some((m) => m.includes('tools'))).toBe(true)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('an advanced submodule pointer is still backed up', async () => {
+    // given
+    const root = await mkdtemp(join(tmpdir(), 'autobackup-submodule-'))
+    const upstream = join(root, 'upstream')
+    const cwd = join(root, 'agent')
+    try {
+      await mkdir(upstream)
+      const up = await initRealRepo(upstream)
+      await writeFile(join(upstream, 'a.txt'), 'a\n')
+      await up(['add', 'a.txt'])
+      await up(['commit', '-qm', 'a'])
+      await mkdir(cwd)
+      const git = await initRealRepo(cwd)
+      await git(['-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', upstream, 'mod'])
+      await git(['commit', '-qm', 'add submodule'])
+      const sub = async (args: string[]) => {
+        const result = await makeDefaultGitSpawn()(args, { cwd: join(cwd, 'mod'), timeoutMs: 30_000 })
+        expect(result.exitCode).toBe(0)
+        return result
+      }
+      await sub(['config', 'user.name', 'Test'])
+      await sub(['config', 'user.email', 'test@example.com'])
+      await writeFile(join(cwd, 'mod', 'b.txt'), 'b\n')
+      await sub(['add', 'b.txt'])
+      await sub(['commit', '-qm', 'b'])
+      const advanced = (await sub(['rev-parse', 'HEAD'])).stdout.trim()
+      const warnings: string[] = []
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        { gitSpawn: makeDefaultGitSpawn(), pickCommitMessage: async () => 'backup', warn: (m) => warnings.push(m) },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      expect((await git(['ls-tree', 'HEAD', 'mod'])).stdout).toContain(`160000 commit ${advanced}`)
+      expect(warnings).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('a file that grows past the limit during message generation is left out of the commit and the index', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-grown-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'download.bin'), 'partial')
+      await writeFile(join(cwd, 'notes.md'), 'kept\n')
+      const warnings: string[] = []
+
+      // when
+      const result = await runBackup(
+        { cwd, pushToOrigin: false },
+        {
+          gitSpawn: makeDefaultGitSpawn(),
+          pickCommitMessage: async () => {
+            await truncate(join(cwd, 'download.bin'), MAX_UNTRACKED_FILE_BYTES + 1)
+            return 'backup'
+          },
+          warn: (m) => warnings.push(m),
+        },
+      )
+
+      // then
+      expect(result).toEqual({ ok: true, kind: 'committed' })
+      const tree = (await git(['ls-tree', '-r', '--name-only', 'HEAD'])).stdout.split('\n')
+      expect(tree).toContain('notes.md')
+      expect(tree).not.toContain('download.bin')
+      expect((await git(['ls-files', '--', 'download.bin'])).stdout).toBe('')
+      expect(warnings.some((m) => m.includes('download.bin'))).toBe(true)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('sweepPackDebris', () => {
+  test('removes stale git temp files and keeps fresh temp files, directories, repack outputs, and real packs', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-debris-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'a.txt'), 'a\n')
+      await git(['add', 'a.txt'])
+      await git(['commit', '-qm', 'a'])
+      await git(['repack', '-qad'])
+      const packDir = join(cwd, '.git', 'objects', 'pack')
+      const fanout = join(cwd, '.git', 'objects', 'ab')
+      await mkdir(fanout, { recursive: true })
+      const now = Date.now()
+      const old = new Date(now - 2 * 24 * 60 * 60 * 1000)
+      const realPacks = await readdir(packDir)
+      for (const name of realPacks) await utimes(join(packDir, name), old, old)
+      for (const path of [
+        join(packDir, 'tmp_pack_stale'),
+        join(packDir, '.tmp-123-pack-held'),
+        join(fanout, 'tmp_obj_stale'),
+      ]) {
+        await writeFile(path, 'partial')
+        await utimes(path, old, old)
+      }
+      await writeFile(join(packDir, 'tmp_pack_writing'), 'partial')
+      const staleDir = join(packDir, 'tmp_pack_dir')
+      await mkdir(staleDir)
+      await writeFile(join(staleDir, 'child'), 'x')
+      await utimes(staleDir, old, old)
+
+      // when
+      const removed = await sweepPackDebris(cwd, baseDeps(makeDefaultGitSpawn()), { now })
+
+      // then
+      expect(removed).toBe(2)
+      expect((await readdir(packDir)).sort()).toEqual(
+        [...realPacks, '.tmp-123-pack-held', 'tmp_pack_dir', 'tmp_pack_writing'].sort(),
+      )
+      expect(await readdir(fanout)).toEqual([])
+      await git(['fsck', '--no-progress'])
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('never throws when locating the object store fails', async () => {
+    const cwd = await makeRepo()
+    try {
+      const gitSpawn: GitSpawn = async () => {
+        throw new Error('spawn failed')
+      }
+      expect(await sweepPackDebris(cwd, baseDeps(gitSpawn))).toBe(0)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('is a no-op outside a git repository', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-debris-norepo-'))
+    try {
+      expect(await sweepPackDebris(cwd, baseDeps(makeDefaultGitSpawn()))).toBe(0)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
   })
 })

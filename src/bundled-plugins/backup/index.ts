@@ -12,6 +12,7 @@ import {
   NETWORK_TIMEOUT_MS,
   runBackup,
   runMaintenance,
+  sweepPackDebris,
   type BackupResult,
 } from './runner'
 import {
@@ -206,6 +207,7 @@ async function runBackupOnce(
   const backupDeps = {
     gitSpawn,
     pushEnv,
+    warn: (message: string) => ctx.logger.warn(message),
     pickCommitMessage: async ({ status, diffstat }: { status: string; diffstat: string }): Promise<string> => {
       const key = `${status}\0${diffstat}`
       if (commitMessages.last?.key === key) return commitMessages.last.message
@@ -260,7 +262,22 @@ async function runBackupOnce(
   // outage must not suppress it). Best-effort: its outcome is logged, never folded
   // into the returned BackupResult.
   const result = await withGitLock(payload.agentDir, async () => {
-    const backup = await runBackup({ cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin }, backupDeps)
+    let backup: BackupResult
+    try {
+      backup = await runBackup({ cwd: payload.agentDir, pushToOrigin: payload.pushToOrigin }, backupDeps)
+    } finally {
+      // A thrown backup (ENOSPC creating the private index) is exactly when
+      // stranded debris most needs reclaiming.
+      try {
+        const debris = await sweepPackDebris(payload.agentDir, backupDeps)
+        if (debris > 0)
+          ctx.logger.info(
+            `[backup] removed ${debris} git temp file(s) untouched for over a day, presumed left by interrupted git runs`,
+          )
+      } catch {
+        // Cleanup must never replace the backup's own outcome or error.
+      }
+    }
     if (payload.maintenance && backupCommitted(backup)) {
       const maint = await runMaintenance(payload.agentDir, backupDeps)
       if (!maint.ok) ctx.logger.warn(`[backup] maintenance failed: ${maint.reason}`)

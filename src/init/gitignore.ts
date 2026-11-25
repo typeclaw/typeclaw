@@ -13,6 +13,8 @@ export const TRULY_IGNORED_PATTERNS = [
   '.typeclaw/',
   'node_modules/',
   'packages/*/node_modules/',
+  '.cache/',
+  '.bun/',
   'workspace/',
   'public/',
   'mounts/',
@@ -39,6 +41,10 @@ export function buildGitignore(config: GitignoreConfig = { append: [] }): string
 # start\` (see src/init/dockerfile.ts), so tracking it would only produce
 # noisy "Update Dockerfile" commits whenever the template changes. Treat it
 # like node_modules/ — reproducible from source, not part of agent state.
+#
+# .cache/ and .bun/ are tool caches (browser builds, package downloads) that
+# land in the agent folder when a tool treats it as HOME. Reproducible, and
+# large enough to stall every backup if they were staged.
 #
 # auth.json is the pre-rename name for secrets.json; kept here permanently
 # as a safety net so an agent folder cloned from a pre-rename machine never
