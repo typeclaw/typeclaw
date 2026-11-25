@@ -215,3 +215,47 @@ test('a channel requester can keep probing after a promotion but cannot keep a r
   permissions.replaceRoles({})
   await expect(runner.run(record, new AbortController().signal)).rejects.toThrow('watch.create')
 })
+
+test('polls deny a process PAT to a member, allow an entitled owner, and retain channel repo scope', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'watch-poll-pat-'))
+  const saved = process.env.GH_TOKEN
+  const token = 'ghp_' + 'fixture'
+  process.env.GH_TOKEN = token
+  const bridge = createGithubTokenBridge()
+  const registry = new ProbeRegistry()
+  const used: string[] = []
+  registry.register({
+    kind: 'fixture',
+    parseParams: (raw) => String(raw),
+    describe: (repo) => repo,
+    async run(ctx) {
+      const result = await ctx.resolveTokenForRepo(ctx.params)
+      if (result.kind === 'unavailable') throw new Error(result.reason)
+      used.push(result.token)
+      return { verdict: 'quiet', state: null }
+    },
+  })
+  const permissions = createPermissionService()
+  const runner = createProbeRunner(dir, permissions, createHookBus, bridge, registry)
+  const run = (createdByRole: string, repo: string) =>
+    runner.run({ ...w, createdByRole, probe: { bundled: 'fixture', target: repo } }, new AbortController().signal)
+  try {
+    await expect(run('member', 'acme/widgets')).rejects.toThrow('No GitHub polling credential')
+    expect(used).toEqual([])
+    await expect(run('owner', 'acme/widgets')).resolves.toMatchObject({ verdict: 'quiet' })
+    await writeFile(join(dir, '.env'), `GH_TOKEN=${token}\n`)
+    await expect(run('member', 'acme/widgets')).resolves.toMatchObject({ verdict: 'quiet' })
+    bridge.registerPatResolver(async (repo) => {
+      if (repo !== 'acme/widgets') throw new Error('Repo not in configured allowlist')
+      return { token: 'channel fixture' }
+    })
+    await expect(run('owner', 'acme/other')).rejects.toThrow('configured allowlist')
+    await expect(run('member', 'acme/widgets')).rejects.toThrow('not entitled')
+    await expect(run('owner', 'acme/widgets')).resolves.toMatchObject({ verdict: 'quiet' })
+    expect(used).toEqual([token, token, 'channel fixture'])
+  } finally {
+    if (saved === undefined) delete process.env.GH_TOKEN
+    else process.env.GH_TOKEN = saved
+    await rm(dir, { recursive: true, force: true })
+  }
+})

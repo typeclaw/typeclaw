@@ -20,4 +20,25 @@ Use `watch` when the question is “has anything happened that needs attention?�
 
 **Diff mode**: set `"mode":"diff"` for a command whose stable stdout is the state of interest. The first successful output establishes a baseline; subsequent changes wake with a unified diff. Do not use diff for multi-step statuses where most transitions require no action.
 
-TUI wakes wait for an attached, idle TUI. Reconnecting opens a new session but still receives pending wakes; they stay pending until a turn starts. Channel wakes return to the original conversation, even if its session has gone cold. If the adapter’s account is not ready, delivery retries. If the requester no longer has `channel.respond`, the wake is logged but not posted. The probe result is a private reminder to the agent; only its reply reaches the conversation. That reply does not make the agent engage with subsequent messages. Unattended watches without a human ancestor start a fresh slim session. No probes are registered automatically.
+## GitHub follow-up
+
+The bundled `github-pr` and `github-issue` probes take a GitHub.com repository slug and a positive PR or issue number. They use judge mode and do not run shell commands.
+
+```json
+{
+  "action": "create",
+  "description": "Follow up on PR acme/widgets#12",
+  "probe": { "bundled": "github-pr", "target": { "repo": "acme/widgets", "number": 12 } }
+}
+```
+
+- `github-pr` wakes for a new failing check set on the current head, once per head when checks have passed, for a new approval or change request from someone else, for new comments or review comments by others, or when the PR becomes conflicting. Pending checks alone are quiet. Pre-watch approvals are quiet, but an outstanding current-head change request can wake on the first poll. Merge or closure ends the watch and wakes the agent.
+- `github-issue` wakes for new comments by others. Closure ends the watch and wakes the agent with the close reason.
+
+By default, a successful model `bash` call that opens a PR or issue through a supported `gh pr create`, `gh issue create`, or `gh api` create registers the corresponding bundled watch. Viewing and listing do not. Registration requires `watch.create`, skips targets with an existing live watch, and includes the new watch ID in the bash result. Use that ID with `watch cancel` if follow-up is not needed. Set `"watches": { "auto": false }` in `typeclaw.json` to disable automatic registration without affecting existing watches or manual creation. The setting takes effect on reload.
+
+Automatic registration also requires a polling credential authorized for the caller and repository. An imported host `gh` login can fund the create command, but not unattended polling. If that is the only credential available, the bash result says no follow-up watch was scheduled. Configure GitHub App auth for the repository or an authorized PAT before creating a bundled watch manually.
+
+## Wake delivery
+
+TUI wakes wait for an attached, idle TUI. Reconnecting opens a new session but still receives pending wakes; they stay pending until a turn starts. Channel wakes return to the original conversation, even if its session has gone cold. If the adapter’s account is not ready, delivery retries. If the requester no longer has `channel.respond`, the wake is logged but not posted. The probe result is a private reminder to the agent; only its reply reaches the conversation. That reply does not make the agent engage with subsequent messages. Unattended watches without a human ancestor start a fresh slim session.

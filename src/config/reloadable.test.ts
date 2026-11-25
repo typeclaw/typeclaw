@@ -59,6 +59,21 @@ describe('createConfigReloadable', () => {
     expect(getConfig().port).toBe(9001)
   })
 
+  test('GitHub watch auto-registration defaults on and can be disabled on reload', async () => {
+    const configFile = join(cwd, 'typeclaw.json')
+    await writeFile(configFile, '{}')
+    const reloadable = createConfigReloadable({ cwd })
+    expect((await reloadable.reload()).ok).toBe(true)
+    expect(getConfig().watches.auto).toBe(true)
+
+    await writeFile(configFile, JSON.stringify({ watches: { auto: false } }))
+    expect(await reloadable.reload()).toMatchObject({
+      ok: true,
+      details: { applied: [{ path: 'watches.auto', before: true, after: false }], restartRequired: [] },
+    })
+    expect(getConfig().watches.auto).toBe(false)
+  })
+
   test('atomicity: mount path that does not exist on host fails reload and leaves live config untouched', async () => {
     await writeFile(join(cwd, 'typeclaw.json'), JSON.stringify({ model: VALID_MODEL_A, port: 9001, mounts: [] }))
     const reloadable = createConfigReloadable({ cwd })
@@ -408,7 +423,7 @@ function enumeratePaths(obj: Record<string, unknown>, prefix = ''): string[] {
 }
 
 function shouldRecurse(path: string): boolean {
-  return path === 'docker' || path === 'git' || path === 'permissions'
+  return path === 'docker' || path === 'git' || path === 'permissions' || path === 'watches'
 }
 
 // `roles.match` / `roles.permissions` are optional virtual paths and `git.user`

@@ -50,7 +50,9 @@ export class WatchService {
     for (const r of this.inflight.values()) r.controller.abort()
     await Promise.allSettled([...this.inflight.values()].map((r) => r.task))
   }
-  async create(input: NewWatch) {
+  async create(input: NewWatch): Promise<string>
+  async create(input: NewWatch, matchesExisting: (watch: WatchRecord) => boolean): Promise<string | undefined>
+  async create(input: NewWatch, matchesExisting?: (watch: WatchRecord) => boolean) {
     const now = this.clock.now(),
       ttl = input.deadlineMs ?? 14 * day
     if (!(ttl > 0 && ttl <= 30 * day)) throw new Error('Watch deadline must be positive and at most 30 days')
@@ -65,7 +67,15 @@ export class WatchService {
       consecutiveFailures: 0,
       pending: [],
     })
-    await this.store.update((rows) => rows.push(record))
+    let created = false
+    await this.store.update((rows) => {
+      // Check under the store's write queue so simultaneous bash calls cannot both register.
+      if (matchesExisting && rows.some((watch) => !isEnded(watch) && watch.deadline > now && matchesExisting(watch)))
+        return
+      rows.push(record)
+      created = true
+    })
+    if (!created) return undefined
     this.arm()
     return record.id
   }
@@ -182,7 +192,9 @@ export class WatchService {
         w.state = result.state
         interval = result.nextMs ?? interval
         const summary = result.summary || result.verdict
-        const fingerprint = createHash('sha256').update(summary).digest('hex')
+        const fingerprint = createHash('sha256')
+          .update(result.eventKey === undefined ? summary : `bundled-event:${result.eventKey}`)
+          .digest('hex')
         if (result.verdict === 'done') {
           w.status = 'done'
           if (result.wake === true) wake(summary, true)

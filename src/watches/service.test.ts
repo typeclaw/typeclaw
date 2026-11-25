@@ -3,12 +3,18 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { z } from 'zod'
+
 import type { SessionOrigin } from '@/agent/session-origin'
 import { createGithubTokenBridge } from '@/channels/github-token-bridge'
 import { createPermissionService } from '@/permissions'
+import { createHookBus } from '@/plugin'
 
 import { WakeDispatcher, renderWatchReminder } from './delivery'
-import { ProbeRegistry } from './runner'
+import { githubIssueProbe } from './probes/github-issue'
+import { githubPrProbe } from './probes/github-pr'
+import { comment, connection, fixtureProbe } from './probes/github.test-helpers'
+import { createProbeRunner, ProbeRegistry } from './runner'
 import { WatchService, type WatchClock } from './service'
 import { stopWatchWorkers } from './shutdown'
 import { WatchStore } from './store'
@@ -67,6 +73,99 @@ async function fixture(run: ConstructorParameters<typeof WatchService>[1], pendi
   await service.start()
   return { service, store, clock, ended }
 }
+
+test('bundled runner supplies the persisted start time and current GitHub identity', async () => {
+  const github = createGithubTokenBridge()
+  const registry = new ProbeRegistry()
+  registry.register({
+    kind: 'context-test',
+    parseParams: () => null,
+    describe: () => 'Context test',
+    async run({ startedAt, selfLogin }) {
+      return { verdict: 'done', wake: true, summary: `${startedAt}:${selfLogin}`, state: null }
+    },
+  })
+  const runner = createProbeRunner(dir, createPermissionService(), createHookBus, github, registry)
+  const { clock, service, store } = await fixture(runner.run)
+  clock.time = 1234
+  await service.create({ ...input, probe: { bundled: 'context-test', target: null } })
+  github.registerSelf({ login: 'agent[bot]', id: 42 })
+  await clock.next()
+  expect(store.records[0]?.pending[0]?.summary).toBe('1234:agent[bot]')
+  await service.stop()
+})
+
+test('the service delivers identical failure summaries on distinct PR heads', async () => {
+  const run = fixtureProbe(githubPrProbe, 'pullRequest')
+  const snapshot = (oid: string) => ({
+    state: 'OPEN',
+    merged: false,
+    mergeable: 'MERGEABLE',
+    headRefOid: oid,
+    commits: connection({
+      commit: {
+        oid,
+        statusCheckRollup: {
+          state: 'FAILURE',
+          contexts: {
+            ...connection({ __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE' }),
+            pageInfo: { hasNextPage: false },
+            checkRunCount: 1,
+            checkRunCountsByState: [{ state: 'FAILURE', count: 1 }],
+            statusContextCount: 0,
+            statusContextCountsByState: [],
+          },
+        },
+      },
+    }),
+    reviewDecision: null,
+    reviews: connection(),
+    latestOpinionatedReviews: connection(),
+    comments: connection(),
+    reviewThreads: connection(),
+  })
+  let row = snapshot('head-a')
+  const { service, store, clock } = await fixture(async () => {
+    const result = await run(row)
+    return { ...result, state: z.json().parse(result.state) }
+  })
+  try {
+    await service.create({ ...input, probe: { bundled: 'github-pr', target: { repo: 'acme/widgets', number: 12 } } })
+    await clock.next()
+    row = snapshot('head-b')
+    await clock.next()
+    await clock.next()
+    expect(store.records[0]?.pending.map(({ summary }) => summary)).toEqual([
+      'GitHub PR acme/widgets#12: failing CI: build.',
+      'GitHub PR acme/widgets#12: failing CI: build.',
+    ])
+  } finally {
+    await service.stop()
+  }
+})
+
+test('the service delivers the next comment from the same issue author even when the summary is identical', async () => {
+  const run = fixtureProbe(githubIssueProbe, 'issue')
+  const first = comment('first', 3)
+  let comments = connection(first)
+  const { service, store, clock } = await fixture(async () => {
+    const result = await run({ state: 'OPEN', stateReason: null, comments })
+    return { ...result, state: z.json().parse(result.state) }
+  })
+  try {
+    await service.create({ ...input, probe: { bundled: 'github-issue', target: { repo: 'acme/widgets', number: 12 } } })
+    await clock.next()
+    comments = connection(first, comment('next', 4))
+    await clock.next()
+    await clock.next()
+    expect(store.records[0]?.pending.map(({ summary }) => summary)).toEqual([
+      'GitHub issue acme/widgets#12: 1 comment (@alice).',
+      'GitHub issue acme/widgets#12: 1 comment (@alice).',
+    ])
+  } finally {
+    await service.stop()
+  }
+})
 test('duplicate wakes become quiet; rearmed done+wake bypasses the duplicate budget', async () => {
   let result: ProbeResult = { verdict: 'wake', summary: 'same' }
   const { clock, store, service, ended } = await fixture(async () => result)

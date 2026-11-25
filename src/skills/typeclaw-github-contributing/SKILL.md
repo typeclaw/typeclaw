@@ -11,7 +11,7 @@ This skill is the **etiquette of contributing to a GitHub repo**. It is not abou
 
 ## The rule
 
-When a PR or issue needs follow-up, use an explicit `watch` in judge mode rather than polling in repeated LLM turns. A pending check is not by itself a reason to wake. There is no automatic registration.
+When a PR or issue needs follow-up, prefer the watch ID returned by the create command rather than polling in repeated LLM turns. If no watch was registered and follow-up is still needed, create one manually in judge mode once an authorized polling credential is available. A pending check is not by itself a reason to wake.
 
 **Before you open an issue or PR, find the repo's contribution conventions and follow them. If a template exists, fill it — don't bypass it. If a CONTRIBUTING file exists, read it and honor it. Match the title style the repo already uses.**
 
@@ -110,6 +110,8 @@ The same applies to PRs: a quick `gh pr list --search` avoids opening a PR for s
    ```
    All five flags are required (`--draft` is optional). `--fill`, `--body-file`, `--template`, `--editor`, `--web` and `--attach` are refused because they read local files or open an editor/browser while the credential is live; omitting `--head` would make gh interrogate the checkout and offer to push. Fix ordinary Git errors yourself and retry. Without the `gitExfil` bypass, a plain one-branch push still works to repos listed in `channels.github.repos` under GitHub App auth; if `gitExfil` refuses it anyway, your role can't publish to that repository — surface the denial and only hand the operator a push command when the broker or your permissions refuse it. If the trusted store is unavailable, ask the operator to run `gh auth login --hostname github.com` on the host; the next real `typeclaw start` or `typeclaw restart` refreshes it automatically, while a start against an already-running container does not. When handing off, name a host-accessible checkout; never direct the operator to a per-session `/tmp` path.
 5. **Verify it landed** as intended (`gh issue view` / `gh pr view`) — confirm the template rendered and nothing got truncated.
+
+A successful model `bash` create normally registers a follow-up watch automatically. If the bash result includes a watch ID, do not create a duplicate watch. Use `watch` with `action: "cancel"` and that ID if follow-up is not needed. Automatic registration requires `watch.create` and can be disabled with `watches.auto`.
 
 ## Things you must not do
 

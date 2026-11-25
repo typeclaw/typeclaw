@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { raceWithAbortSignal } from '@earendil-works/pi-ai/utils/abort'
+import { ZodError } from 'zod'
 
 import type { AgentSession } from '@/agent'
 import { __resetForwardRequestForTesting as resetDashboardForwardRequest } from '@/bundled-plugins/agent-browser'
@@ -15,12 +16,14 @@ import { defaultHistoryConfig } from '@/channels/schema'
 import { channelKeyId } from '@/channels/types'
 import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 import type { CronFile, CronJob, LoadCronResult, Scheduler } from '@/cron'
+import { createPermissionService } from '@/permissions'
 import { exportGithubCliStoreForAgent, SecretsBackend } from '@/secrets'
 import type { SessionFactory } from '@/sessions'
 import { rmTempDir } from '@/test-helpers/rm-temp-dir'
 import type { TuiOptions } from '@/tui'
 import type { TunnelManager, TunnelManagerOptions } from '@/tunnels'
 import { WatchStore } from '@/watches/store'
+import { createWatchTool } from '@/watches/tool'
 
 import {
   type LoadCronFn,
@@ -430,6 +433,31 @@ describe('startAgent', () => {
       }
     },
   )
+
+  test('boot makes both GitHub probes available to the watch tool', async () => {
+    running = await startAgent({ port: 0, attachTui: false, cwd: testCwd, loadCron: noCron })
+    const watch = createWatchTool(
+      testCwd,
+      () => ({ kind: 'tui', sessionId: 'test-session' }),
+      createPermissionService(),
+    )
+    for (const bundled of ['github-pr', 'github-issue']) {
+      // A registered probe rejects malformed params before it can schedule a network request.
+      await expect(
+        watch.execute(
+          'create',
+          {
+            action: 'create',
+            description: 'Follow up',
+            probe: { bundled, target: { repo: 'acme/widgets', number: 0 } },
+          },
+          undefined,
+          undefined,
+          {} as never,
+        ),
+      ).rejects.toBeInstanceOf(ZodError)
+    }
+  })
 
   test('keeps the host GitHub CLI store untouched when the agent has no stored credential', async () => {
     const hostHomeDir = await mkdtemp(join(tmpdir(), 'typeclaw-run-host-home-'))

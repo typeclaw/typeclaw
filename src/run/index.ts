@@ -98,7 +98,7 @@ import { setActiveTunnelManager } from '@/tunnels/active'
 import { runtimeTunnels } from '@/typevault/prompt-tunnel'
 import { deliverChannelWakes } from '@/watches/channel'
 import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
-import { ProbeRegistry, createProbeRunner } from '@/watches/runner'
+import { createBundledProbeRegistry, createProbeRunner } from '@/watches/runner'
 import { WatchService } from '@/watches/service'
 import { stopWatchWorkers } from '@/watches/shutdown'
 import { WatchStore } from '@/watches/store'
@@ -516,7 +516,7 @@ async function startAgentRuntime(
   registerBootCleanup(() => inboundJournal.close())
   let recoveryDispatcher: RecoveryDispatcher | undefined
   const store = new WatchStore(cwd)
-  const registry = new ProbeRegistry()
+  const registry = createBundledProbeRegistry()
   const runner = createProbeRunner(
     cwd,
     pluginsLoaded.permissions,
@@ -1190,7 +1190,12 @@ async function startAgentRuntime(
       ? 'delivered'
       : 'failed'
   })
-  const unregister = registerWatchRuntime(cwd, { service: watches, registry })
+  const unregister = registerWatchRuntime(cwd, {
+    service: watches,
+    registry,
+    isAutoEnabled: () => getConfig().watches.auto,
+    resolveGithubCredential: runner.resolveGithubCredential,
+  })
   const stopWatches = async () => {
     unregister()
     await stopWatchWorkers(watches, dispatcher)

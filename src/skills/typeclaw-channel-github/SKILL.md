@@ -327,6 +327,8 @@ Without the `gitExfil` bypass, you can still push to a repo listed in `channels.
 
 For the supported issue form under App auth, TypeClaw mints a short-lived token for the explicit `--repo owner/repo` target and withholds it from sibling commands and shell expansions.
 
+A successful model `bash` create can register a follow-up watch automatically. If bash reports a watch ID, reuse it rather than creating another watch; cancel it via `watch` if follow-up is not needed.
+
 Before you compose the issue/PR body, read `typeclaw-github-contributing` — it covers the target repo's contribution etiquette (fill the issue/PR template if one exists, honor `CONTRIBUTING.md`, match the repo's title conventions, search for duplicates first). Opening an issue or PR that ignores the repo's template reads as careless; following it reads as someone who belongs. That skill applies whenever you open a new issue/PR, whether or not the work arrived through this channel.
 
 ## Self-loop safety
