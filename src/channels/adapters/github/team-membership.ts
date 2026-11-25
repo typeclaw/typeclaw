@@ -11,7 +11,12 @@ import type { GithubAuthContext } from './auth'
 
 const ACTIVE_MEMBERSHIP_STATE = 'active'
 
-export type TeamMembershipChecker = (input: { org: string; slug: string; login: string }) => Promise<boolean>
+export type TeamMembershipChecker = (input: {
+  org: string
+  slug: string
+  login: string
+  requireCurrent?: true
+}) => Promise<boolean>
 
 export function createTeamMembershipChecker(options: {
   token: (context?: GithubAuthContext) => Promise<string>
@@ -20,7 +25,10 @@ export function createTeamMembershipChecker(options: {
   const fetchImpl = options.fetchImpl ?? fetch
   const cache = new Map<string, boolean>()
 
-  return async ({ org, slug, login }) => {
+  return async ({ org, slug, login, requireCurrent }) => {
+    // Withdrawal must not treat a failed or cached membership read as proof
+    // that no review request remains.
+    if (requireCurrent) return lookup(fetchImpl, await options.token({ owner: org }), org, slug, login, true)
     const key = `${org}/${slug}#${login}`
     const cached = cache.get(key)
     if (cached !== undefined) return cached
@@ -37,6 +45,7 @@ async function lookup(
   org: string,
   slug: string,
   login: string,
+  requireCurrent = false,
 ): Promise<boolean> {
   const url = `https://api.github.com/orgs/${encodeURIComponent(org)}/teams/${encodeURIComponent(slug)}/memberships/${encodeURIComponent(login)}`
   let res: Response
@@ -48,11 +57,17 @@ async function lookup(
         'x-github-api-version': '2022-11-28',
       },
     })
-  } catch {
+  } catch (error) {
+    if (requireCurrent) throw error
     return false
   }
   if (res.status === 404) return false
-  if (!res.ok) return false
+  if (!res.ok) {
+    if (requireCurrent) throw new Error(`GitHub team membership ${res.status}`)
+    return false
+  }
   const body = (await res.json().catch(() => null)) as { state?: unknown } | null
+  if (requireCurrent && body?.state !== 'active' && body?.state !== 'pending')
+    throw new Error('GitHub team membership missing or invalid state')
   return typeof body?.state === 'string' && body.state === ACTIVE_MEMBERSHIP_STATE
 }

@@ -303,9 +303,34 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       headers: githubJsonHeaders(token),
     })
     if (!response.ok) throw new Error(`GitHub pending assignees ${response.status}`)
-    const current = z.object({ assignees: z.array(z.object({ login: z.string() })) }).parse(await response.json())
+    const current = z
+      .object({ state: z.enum(['open', 'closed']), assignees: z.array(z.object({ login: z.string() })) })
+      .parse(await response.json())
     const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
-    return current.assignees.some((assignee) => logins.includes(assignee.login))
+    return current.state === 'open' && current.assignees.some((assignee) => logins.includes(assignee.login))
+  }
+  const isCurrentlyRequested = async (workspace: string, prNumber: number): Promise<boolean> => {
+    const token = await authToken({ repoSlug: workspace })
+    const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}/requested_reviewers`, {
+      headers: githubJsonHeaders(token),
+    })
+    if (!response.ok) throw new Error(`GitHub pending reviewers ${response.status}`)
+    const current = z
+      .object({
+        users: z.array(z.object({ login: z.string() })),
+        teams: z.array(z.object({ slug: z.string() })),
+      })
+      .parse(await response.json())
+    const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
+    if (current.users.some((user) => logins.includes(user.login))) return true
+    for (const team of current.teams) {
+      if (
+        selfLogin !== null &&
+        (await isBotInTeam({ org: workspace.split('/')[0]!, slug: team.slug, login: selfLogin, requireCurrent: true }))
+      )
+        return true
+    }
+    return false
   }
   // Shared inbound entry. Both the live webhook handler and the startup
   // reconciliation pass route through this so a replayed PR takes the exact
@@ -364,7 +389,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         workspace,
         prNumber,
         undefined,
-        reason === 'review-request-removed' ? () => isCurrentlyAssigned(workspace, prNumber) : undefined,
+        reason !== undefined ? () => isCurrentlyAssigned(workspace, prNumber) : undefined,
+        reason === 'assignment-removed' ? () => isCurrentlyRequested(workspace, prNumber) : undefined,
       ),
     reviewSubmitted: async (review) => {
       if (pendingReviewStore !== null) await completePendingReview(pendingReviewStore, review, authToken, fetchImpl)

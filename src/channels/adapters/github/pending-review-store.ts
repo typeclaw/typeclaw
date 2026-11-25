@@ -31,6 +31,7 @@ export type PendingReviewStore = {
     prNumber: number,
     expected?: PendingReview,
     isCurrentlyAssigned?: () => Promise<boolean>,
+    isCurrentlyRequested?: () => Promise<boolean>,
   ) => Promise<boolean>
 }
 
@@ -105,12 +106,13 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
         })
         await persist(next)
       }),
-    clear: (repo, prNumber, expected, isCurrentlyAssigned) =>
+    clear: (repo, prNumber, expected, isCurrentlyAssigned, isCurrentlyRequested) =>
       onFileLane(path, async () => {
         const next = await latest()
         const id = key(repo, prNumber)
         const current = next.get(id)
         if (current === undefined) return true
+        if ((await isCurrentlyRequested?.()) === true) return false
         // Read current assignees inside the admission lane, after loading the
         // latest provenance. Recovered payloads can predate a newer assignment.
         if (current.assignmentTriggered === true && (await isCurrentlyAssigned?.()) === true) return false

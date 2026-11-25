@@ -71,7 +71,11 @@ async function fixture(
   let recoveryFinished = Promise.withResolvers<void>()
   let recoveryTick: (() => void) | undefined
   const currentPull = { ...pull, assignees: [] as Array<{ login: string; id: number; type: string }> }
-  const requestedReviewers = { users: [] as Array<{ login: string; id: number; type: string }>, teams: [] }
+  const requestedReviewers = {
+    users: [] as Array<{ login: string; id: number; type: string }>,
+    teams: [] as Array<{ slug: string }>,
+  }
+  const teamMemberships = new Map<string, string>()
   let pullFailure: (() => Response) | undefined
   let requestedReviewersFailure: (() => Response) | undefined
   let comparison = 'behind'
@@ -113,6 +117,10 @@ async function fixture(
         return Response.json({ request: { payload: options.recoveredDelivery ?? options.recoveredRemoval } })
       if (url.endsWith('/requested_reviewers'))
         return requestedReviewersFailure?.() ?? Response.json(requestedReviewers)
+      if (url.includes('/memberships/')) {
+        const state = teamMemberships.get(url.split('/teams/')[1]!.split('/')[0]!)
+        return state === undefined ? new Response(null, { status: 404 }) : Response.json({ state })
+      }
       if (url.includes('/statuses/') && init?.method === 'POST') {
         statuses.push(JSON.parse(String(init.body)) as Record<string, unknown>)
         return Response.json({})
@@ -251,6 +259,7 @@ async function fixture(
     scanRead: scanRead.promise,
     pull: currentPull,
     requestedReviewers,
+    teamMemberships,
     failPull: (failure?: () => Response) => {
       pullFailure = failure
     },
@@ -283,7 +292,7 @@ async function fixture(
       fetchHolds.push({ match, reached: reached.resolve, released: released.promise })
       return { reached: reached.promise, release: released.resolve }
     },
-    deliver: async (action: string, event = 'pull_request', extra: Record<string, unknown> = {}) => {
+    deliver: async (action: string, event = 'pull_request', extra: Record<string, unknown> = {}, delivery?: string) => {
       if (handler === undefined) throw new Error('Adapter not listening')
       const body = JSON.stringify({
         action,
@@ -298,7 +307,7 @@ async function fixture(
           body,
           headers: {
             'x-github-event': event,
-            'x-github-delivery': `${event}-${action}-${++deliveryId}`,
+            'x-github-delivery': delivery ?? `${event}-${action}-${++deliveryId}`,
             'x-hub-signature-256': `sha256=${createHmac('sha256', 'test-secret').update(body).digest('hex')}`,
           },
         }),
@@ -552,18 +561,19 @@ test.each([
 })
 
 test.each(
-  ['assigned', 'review_requested'].flatMap((action) => [
-    { action, name: 'HTTP failure', response: () => new Response('unavailable', { status: 503 }) },
-    { action, name: 'invalid JSON', response: () => new Response('{') },
-    { action, name: 'missing state', response: () => Response.json({}) },
+  ['assigned', 'review_requested', 'review_requested PR state'].flatMap((source) => [
+    { source, name: 'HTTP failure', response: () => new Response('unavailable', { status: 503 }) },
+    { source, name: 'invalid JSON', response: () => new Response('{') },
+    { source, name: 'missing state', response: () => Response.json({}) },
     {
-      action,
+      source,
       name: 'invalid state',
       response: () => Response.json({ assignees: [{}], users: {}, teams: [] }),
     },
   ]),
-)('retries a recovered $action after $name', async ({ action, response }) => {
+)('retries a recovered $source after $name', async ({ source, response }) => {
   // #given
+  const action = source === 'assigned' ? 'assigned' : 'review_requested'
   const bot = { login: 'bot', id: 1, type: 'User' }
   const f = await fixture(undefined, {
     recoveredDelivery: {
@@ -581,7 +591,7 @@ test.each(
   await f.scanRead
   f.pull.assignees = [bot]
   f.requestedReviewers.users = [bot]
-  const failRead = action === 'assigned' ? f.failPull : f.failRequestedReviewers
+  const failRead = source === 'review_requested' ? f.failRequestedReviewers : f.failPull
   failRead(response)
 
   // #when
@@ -664,6 +674,175 @@ test.each(['assigned', 'review_requested'])(
     }
   },
 )
+
+test.each(['remove-first', 'unassign-first'] as const)('retires both withdrawals in %s order', async (order) => {
+  // #given
+  const turn = Promise.withResolvers<void>()
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, { prompt: () => turn.promise })
+  cleanups.push(async () => turn.resolve())
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
+  for (const action of ['assigned', 'review_requested']) {
+    const admitted = f.nextRoute()
+    await f.deliver(action, 'pull_request', { assignee: bot, requested_reviewer: bot, pull_request: f.pull })
+    await admitted
+  }
+  const recorded = await f.store.list()
+  const reviewer = `withdraw-order-${order}`
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+    reviewer,
+  )
+  try {
+    // #when: the first withdrawal must preserve the remaining request.
+    const actions =
+      order === 'remove-first' ? ['review_request_removed', 'unassigned'] : ['unassigned', 'review_request_removed']
+    for (const [index, action] of actions.entries()) {
+      if (action === 'unassigned') f.pull.assignees = []
+      else f.requestedReviewers.users = []
+      const stopped = f.nextRoute()
+      await f.deliver(action, 'pull_request', {
+        assignee: bot,
+        requested_reviewer: bot,
+        // Deliberately stale: the API, rather than this payload, owns current state.
+        pull_request: { ...pull, assignees: [bot], updated_at: `2026-01-01T00:0${index + 1}:00Z` },
+      })
+      if (index === 0) {
+        expect(await f.store.list()).toEqual(recorded)
+        expect(f.routed).toHaveLength(2)
+        if (action === 'unassigned') expect(f.calls.some((url) => url.endsWith('/requested_reviewers'))).toBe(true)
+      } else {
+        expect(await f.store.list()).toEqual([])
+        await stopped
+      }
+    }
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
+    expect(f.routed.at(-1)?.text).toContain('You can stop any in-progress review.')
+    await f.adapter.stop()
+    await f.router.stop()
+    const next = await fixture(f.dir)
+    next.config.review.on = 'review_requested'
+    await next.adapter.start()
+    await next.scanRead
+    expect(await next.store.list()).toEqual([])
+    expect(next.routed).toEqual([])
+  } finally {
+    await githubReviewChecks.reviewerSettled(reviewer, { kind: 'cancelled', reason: 'test cleanup' })
+  }
+})
+
+test.each([
+  { login: 'bot', app: false },
+  { login: 'bot[bot]', app: true },
+  { login: 'bot', app: true },
+])('unassignment checks current requests and assignments for $login under app=$app', async ({ login, app }) => {
+  // #given
+  const f = await fixture(undefined, app ? { app: true } : {})
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  await f.scanRead
+  await f.store.record({ ...pending, assignmentTriggered: true })
+  const assignee = { login, id: 1, type: 'User' }
+  const stalePayload = { assignee, pull_request: { ...pull, assignees: [assignee] } }
+  f.pull.assignees = [assignee]
+
+  // #when: a newer assignment defeats the stale unassignment.
+  await f.deliver('unassigned', 'pull_request', stalePayload)
+
+  // #then
+  expect(await f.store.list()).toHaveLength(1)
+  expect(f.routed).toEqual([])
+
+  // #when: a separate current team request still owns the work.
+  f.pull.assignees = []
+  f.requestedReviewers.teams = [{ slug: 'reviewers' }]
+  f.teamMemberships.set('reviewers', 'active')
+  await f.deliver('unassigned', 'pull_request', stalePayload)
+
+  // #then
+  expect(await f.store.list()).toHaveLength(1)
+  expect(f.routed).toEqual([])
+
+  // #when: the last request is withdrawn.
+  f.requestedReviewers.teams = []
+  const stopped = f.nextRoute()
+  await f.deliver('unassigned', 'pull_request', stalePayload)
+
+  // #then
+  expect(await f.store.list()).toEqual([])
+  await stopped
+  expect(f.routed.at(-1)?.eventKind).toBe('pull_request:unassigned')
+  expect(f.routed.at(-1)?.githubPendingReview).toBeUndefined()
+})
+
+test.each(['reviewers', 'assignees'])('retries the same unassignment after a failed current %s read', async (read) => {
+  // #given
+  const f = await fixture()
+  await f.adapter.start()
+  await f.scanRead
+  await f.store.record({ ...pending, assignmentTriggered: true })
+  const payload = { assignee: { login: 'bot', id: 1, type: 'User' } }
+  const fail = read === 'reviewers' ? f.failRequestedReviewers : f.failPull
+  fail(() => new Response('unavailable', { status: 503 }))
+
+  // #when
+  await expect(f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')).rejects.toThrow('503')
+
+  // #then
+  expect(await f.store.list()).toHaveLength(1)
+  expect(f.routeAttempts).toEqual([])
+  fail()
+  const stopped = f.nextRoute()
+  await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
+  await stopped
+  expect(await f.store.list()).toEqual([])
+  await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
+  expect(f.routeAttempts).toHaveLength(1)
+})
+
+test.each(['assigned', 'review_requested'])('does not recover %s after the PR closes', async (action) => {
+  // #given
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, {
+    recoveredDelivery: {
+      action,
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: { ...pull, assignees: [bot] },
+      assignee: bot,
+      requested_reviewer: bot,
+      sender: { login: 'alice', id: 10, type: 'User' },
+    },
+  })
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
+  await f.adapter.start()
+  await f.scanRead
+  f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
+  await f.store.record({ ...pending, assignmentTriggered: true })
+
+  // #when
+  f.pull.state = 'closed'
+  await f.deliver('closed', 'pull_request', { pull_request: f.pull })
+  expect(await f.store.list()).toEqual([])
+  const recovered = f.nextRoute()
+  await f.recoverRemoval()
+  if (f.routeAttempts.length > 0) await recovered
+
+  // #then
+  expect(f.routeAttempts).toEqual([])
+  expect(await f.store.list()).toEqual([])
+  expect(f.statuses).toEqual([])
+})
 
 test.each([
   ['2026-01-03T00:00:00Z', 'DISMISSED', true],
@@ -803,6 +982,7 @@ test.each([
   await f.adapter.start()
   await f.scanRead
   f.pull.assignees = [bot]
+  f.requestedReviewers.users = [bot]
   let admitted = f.nextRoute()
   await f.deliver('assigned', 'pull_request', { assignee: bot, pull_request: f.pull })
   expect((await admitted).kind).toBe('accepted')
@@ -830,6 +1010,7 @@ test.each([
       await admitted
     }
     const stopped = f.nextRoute()
+    f.requestedReviewers.users = []
     if (recovered) await f.recoverRemoval()
     else
       await f.deliver('review_request_removed', 'pull_request', {
@@ -874,6 +1055,7 @@ test.each(['bot[bot]', 'bot'])('App assignment cancellation uses current assigne
   const assignee = { login, id: 1, type: 'User' }
   const reviewer = { login: 'bot', id: 2, type: 'User' }
   f.pull.assignees = [assignee]
+  f.requestedReviewers.users = [reviewer]
   let routed = f.nextRoute()
   await f.deliver('assigned', 'pull_request', { assignee, pull_request: f.pull })
   expect((await routed).kind).toBe('accepted')
@@ -896,6 +1078,7 @@ test.each(['bot[bot]', 'bot'])('App assignment cancellation uses current assigne
   f.pull.assignees = [{ login: 'someone-else', id: 3, type: 'User' }]
   await f.deliver('unassigned', 'pull_request', { assignee, pull_request: f.pull })
   routed = f.nextRoute()
+  f.requestedReviewers.users = []
   await f.deliver('review_request_removed', 'pull_request', {
     requested_reviewer: reviewer,
     pull_request: { ...f.pull, assignees: [assignee], updated_at: '2026-01-01T00:04:00Z' },

@@ -191,6 +191,7 @@ export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [
   'pull_request.ready_for_review',
   'pull_request.review_requested',
   'pull_request.assigned',
+  'pull_request.unassigned',
   'pull_request.review_request_removed',
   'pull_request.synchronize',
   'discussion.created',
@@ -271,6 +272,23 @@ const GITHUB_EVENT_ALLOWLIST_V5 = [
   'pull_request_review.submitted',
 ] as const
 
+//   - v6: added assigned (the default just before unassigned was added).
+const GITHUB_EVENT_ALLOWLIST_V6 = [
+  'issue_comment.created',
+  'pull_request_review_comment.created',
+  'discussion_comment.created',
+  'issues.opened',
+  'pull_request.opened',
+  'pull_request.converted_to_draft',
+  'pull_request.ready_for_review',
+  'pull_request.review_requested',
+  'pull_request.assigned',
+  'pull_request.review_request_removed',
+  'pull_request.synchronize',
+  'discussion.created',
+  'pull_request_review.submitted',
+] as const
+
 // Every event-allowlist that `channel add` / `init` has ever seeded verbatim
 // into typeclaw.json, oldest first, current default last. The legacy-shape
 // migration uses this to tell a seeded default (safe to strip so the config
@@ -284,6 +302,7 @@ export const SEEDED_GITHUB_EVENT_ALLOWLISTS: readonly (readonly string[])[] = [
   GITHUB_EVENT_ALLOWLIST_V3,
   GITHUB_EVENT_ALLOWLIST_V4,
   GITHUB_EVENT_ALLOWLIST_V5,
+  GITHUB_EVENT_ALLOWLIST_V6,
   DEFAULT_GITHUB_EVENT_ALLOWLIST,
 ]
 

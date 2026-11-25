@@ -246,6 +246,7 @@ pull_request.converted_to_draft
 pull_request.ready_for_review
 pull_request.review_requested
 pull_request.assigned
+pull_request.unassigned
 pull_request.review_request_removed
 pull_request.synchronize
 discussion.created
@@ -285,10 +286,19 @@ prevent self-review loops. Assignees on issues do not trigger PR reviews.
 become ready; explicit requests and assignments still work. `review.on: "off"`
 disables all dedicated review triggers, including assignments.
 
-The default `eventAllowlist` includes `pull_request.assigned`. If you maintain a
-custom list, add that entry to enable assignment reviews. Restart after adding
+The default `eventAllowlist` includes `pull_request.assigned` and
+`pull_request.unassigned`. If you maintain a custom list, include both to enable
+assignment reviews and their withdrawal. Restart after adding
 it if the previous list had no `pull_request.*` events, so the repository hook
 subscribes to `pull_request`.
+
+Withdrawing a reviewer request preserves work only when an admitted assignment
+still applies. Unassigning the bot or its App decoy checks current assignees and
+requested users and teams through GitHub's API. When both requests have been
+withdrawn, either order clears pending work, cancels its check, and tells the
+agent to stop; it cannot replay on restart. Failed current-state reads remain
+retryable. Recovered assignment and reviewer-request deliveries also require the
+PR to be currently open before starting work.
 
 Assignment reviews depend on the `pull_request.assigned` webhook delivery
 reaching the adapter. Once a delivery is admitted, the pending-review log covers

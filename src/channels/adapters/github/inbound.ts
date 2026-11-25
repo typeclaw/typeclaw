@@ -70,11 +70,11 @@ export type GithubWebhookHandlerOptions = {
   >
   clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
   isCurrentlyAssigned?: (workspace: string, prNumber: number) => Promise<boolean>
-  // False means a current assignment-backed obligation preserved the work.
+  // False means another current review obligation preserved the work.
   clearPendingReview?: (
     workspace: string,
     prNumber: number,
-    reason?: 'review-request-removed',
+    reason?: 'review-request-removed' | 'assignment-removed',
   ) => Promise<boolean | void>
   reviewSubmitted?: (review: { repo: string; prNumber: number; headSha: string; submittedAt: number }) => Promise<void>
 }
@@ -265,14 +265,18 @@ export async function processVerifiedGithubDelivery(
     ...(reviewCommentParent !== null ? { reviewCommentParent } : {}),
   })
   if (classified === null) return
-  if (event === 'pull_request' && action === 'review_request_removed') {
+  if (event === 'pull_request' && (action === 'review_request_removed' || action === 'unassigned')) {
     const prNumber = readNumber(readRecord(payload.pull_request), 'number')
     if (prNumber !== null) {
       // Withdrawn work must not survive in the pending log, or the next boot's
       // pending replay reviews a PR nobody asked for anymore.
       let cleared: boolean | void
       try {
-        cleared = await options.clearPendingReview?.(classified.workspace, prNumber, 'review-request-removed')
+        cleared = await options.clearPendingReview?.(
+          classified.workspace,
+          prNumber,
+          action === 'unassigned' ? 'assignment-removed' : 'review-request-removed',
+        )
       } catch (error) {
         // Current-assignee verification can fail transiently. Let the same
         // delivery retry rather than permanently consuming the withdrawal.
@@ -280,7 +284,11 @@ export async function processVerifiedGithubDelivery(
         throw error
       }
       if (cleared === false) return
-      void githubReviewChecks.cancelPullRequest(classified.workspace, prNumber, 'the review request was removed')
+      void githubReviewChecks.cancelPullRequest(
+        classified.workspace,
+        prNumber,
+        action === 'unassigned' ? 'the review assignment was removed' : 'the review request was removed',
+      )
     }
   }
 
@@ -451,6 +459,16 @@ async function recoveredReviewerIsCurrentlyRequested(
   }
   try {
     const token = await options.authToken({ repoSlug: workspace })
+    if (payload.action === 'review_requested') {
+      const response = await (options.fetchImpl ?? fetch)(
+        `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}`,
+        { headers: githubJsonHeaders(token) },
+      )
+      if (!response.ok) throw new Error(`pull request fetch returned ${response.status}`)
+      const state = readString(readRecord(await response.json()), 'state')
+      if (state !== 'open' && state !== 'closed') throw new Error('pull request response missing state')
+      if (state !== 'open') return false
+    }
     const response = await (options.fetchImpl ?? fetch)(
       `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}/requested_reviewers`,
       { headers: githubJsonHeaders(token) },
@@ -990,7 +1008,12 @@ export function classifyGithubInbound(
     if (number === null || id === null) return null
     const action = readString(payload, 'action')
     const reviewOn = options?.reviewOn ?? 'review_requested'
-    if (action === 'review_requested' || action === 'review_request_removed' || action === 'assigned') {
+    if (
+      action === 'review_requested' ||
+      action === 'review_request_removed' ||
+      action === 'assigned' ||
+      action === 'unassigned'
+    ) {
       // `off` disables the dedicated review trigger: these actions exist
       // only to drive review-request behavior here, so under `off` they wake no
       // session rather than falling through to awareness-only context.
@@ -1113,7 +1136,7 @@ export function classifyGithubInbound(
 }
 
 type ReviewRequestInput = {
-  action: 'review_requested' | 'review_request_removed' | 'assigned'
+  action: 'review_requested' | 'review_request_removed' | 'assigned' | 'unassigned'
   payload: Record<string, unknown>
   pr: Record<string, unknown>
   number: number
@@ -1211,8 +1234,10 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   // otherwise wake a fresh session every time it self-assigns.
   if (sender.login === selfLogin || (decoyLogin !== null && sender.login === decoyLogin)) return null
 
-  const requestedUser = readUser(action === 'assigned' ? payload.assignee : payload.requested_reviewer)
-  const requestedTeam = action === 'assigned' ? null : readReviewerTeam(payload.requested_team)
+  const assignment = action === 'assigned' || action === 'unassigned'
+  const removed = action === 'review_request_removed' || action === 'unassigned'
+  const requestedUser = readUser(assignment ? payload.assignee : payload.requested_reviewer)
+  const requestedTeam = assignment ? null : readReviewerTeam(payload.requested_team)
 
   const isMeAsUser =
     requestedUser !== null &&
@@ -1227,17 +1252,18 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   const verbed =
     action === 'assigned'
       ? `assigned you to review PR #${number}: "${title}".`
-      : action === 'review_requested'
-        ? isMyTeam
-          ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
-          : `requested your review on PR #${number}: "${title}".`
-        : isMyTeam
-          ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
-          : `removed your review request on PR #${number}: "${title}".`
-  const closing =
-    action !== 'review_request_removed'
-      ? ' Please review the changes line-by-line and post your feedback.'
-      : ' You can stop any in-progress review.'
+      : action === 'unassigned'
+        ? `removed your review assignment on PR #${number}: "${title}".`
+        : action === 'review_requested'
+          ? isMyTeam
+            ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
+            : `requested your review on PR #${number}: "${title}".`
+          : isMyTeam
+            ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
+            : `removed your review request on PR #${number}: "${title}".`
+  const closing = !removed
+    ? ' Please review the changes line-by-line and post your feedback.'
+    : ' You can stop any in-progress review.'
   const text = `@${sender.login} ${verbed}${branchSegment}${closing}`
 
   // Synthesize a stable per-event externalMessageId. The PR's `updated_at`
@@ -1254,7 +1280,7 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
     thread: null,
     text,
     externalMessageId,
-    ...(action !== 'review_request_removed' ? pendingReviewMetadata(pr, prId) : {}),
+    ...(!removed ? pendingReviewMetadata(pr, prId) : {}),
     authorId: String(sender.id),
     authorName: sender.login,
     authorIsBot: sender.type === 'Bot',
