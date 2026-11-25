@@ -521,6 +521,25 @@ describe('classifyGithubInbound', () => {
       expect(msg).toBe(null)
     })
 
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw[bot]'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw'],
+    ] as const)(
+      'drops a human assignment under %s auth with self %s and assignee %s on a PR authored by %s',
+      (authType, selfLogin, assigneeLogin, openerLogin) => {
+        // #given
+        const payload = assignedPayload(assigneeLogin)
+        ;(payload.pull_request as Record<string, unknown>).user = { login: openerLogin, id: 99, type: 'User' }
+
+        // #when
+        const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+
+        // #then
+        expect(msg).toBe(null)
+      },
+    )
+
     it('does not derive a decoy under PAT auth', () => {
       // #given
       const payload = assignedPayload('typeclaw')

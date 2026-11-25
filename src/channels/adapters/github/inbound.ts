@@ -1171,6 +1171,7 @@ function mentionsLogin(text: string, login: string): boolean {
 function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null {
   const { action, payload, pr, number, base, selfLogin, authType, teamIsBotMember } = input
   if (selfLogin === null) return null
+  if (action === 'assigned' && isSelfPr(readUser(pr.user), selfLogin, authType)) return null
   const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType)
   const sender = readUser(payload.sender)
   if (sender === null) return null

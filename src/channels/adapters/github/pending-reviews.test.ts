@@ -246,6 +246,32 @@ test.each(['opened', 'ready_for_review', 'review_requested', 'assigned'])(
   },
 )
 
+test('a human assigning the bot its own PR records no pending review', async () => {
+  // #given
+  const f = await fixture()
+  f.config.review.on = 'review_requested'
+  await f.adapter.start()
+  const admissions: Promise<RouteReceipt>[] = []
+  const route = f.router.route.bind(f.router)
+  f.router.route = (...args) => {
+    const admission = route(...args)
+    admissions.push(admission)
+    return admission
+  }
+
+  // #when
+  const response = await f.deliver('assigned', 'pull_request', {
+    pull_request: { ...pull, user: { login: 'bot', id: 1, type: 'User' } },
+    assignee: { login: 'bot', id: 1, type: 'User' },
+  })
+  await Promise.all(admissions)
+
+  // #then
+  expect(response.status).toBe(200)
+  expect(await f.store.list()).toEqual([])
+  expect(admissions).toHaveLength(0)
+})
+
 test('logs an admitted synchronize blocking re-review', async () => {
   const f = await fixture()
   await f.adapter.start()
