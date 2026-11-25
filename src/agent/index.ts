@@ -25,6 +25,7 @@ import {
   type ThinkingLevel,
 } from '@/config'
 import { config } from '@/config/config'
+import { createWatchTool } from '@/watches/tool'
 
 import {
   composeSessionTail,
@@ -364,6 +365,11 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     getOrigin,
     permissions: options.permissions ?? noopPermissionService,
   })
+  const watchTool = createWatchTool(
+    options.plugins?.agentDir ?? process.cwd(),
+    getOrigin,
+    options.permissions ?? noopPermissionService,
+  )
 
   // Subagent built-in tool refs resolve to `ToolDefinition`s (see
   // plugin-tools.ts). Their NAMES narrow the session via `tools:`; their wrapped
@@ -376,9 +382,12 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
     options.bashPolicy === undefined
   const resolvedSubagentBuiltins = declaredRefs
     ? resolveBuiltinToolRefs(
-        declaredRefs.filter((ref) => ref.__builtinTool !== 'coding_agent' || writeCapable),
+        declaredRefs.filter((ref) => !['coding_agent', 'watch'].includes(ref.__builtinTool) || writeCapable),
         options.plugins?.agentDir ?? process.cwd(),
-        new Map([['coding_agent', codingTool]]),
+        new Map<string, ToolDefinition>([
+          ['coding_agent', codingTool],
+          ['watch', watchTool],
+        ]),
       )
     : []
   const subagentBuiltinNames = resolvedSubagentBuiltins.map((t) => t.name)
@@ -470,9 +479,11 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
             }),
           ]
         : [
-            ...buildCoreSystemTools(options.permissions, codingTool).filter(
+            ...buildCoreSystemTools(options.permissions, codingTool, watchTool).filter(
               (tool) =>
-                tool.name !== 'coding_agent' || options.tools === undefined || options.tools.includes('coding_agent'),
+                !['coding_agent', 'watch'].includes(tool.name) ||
+                options.tools === undefined ||
+                options.tools.includes(tool.name),
             ),
             ...(options.mcpManager
               ? buildMcpDispatcherToolDefinitions(options.mcpManager, {
@@ -1200,8 +1211,9 @@ export function buildTodoTools(
 function buildCoreSystemTools(
   permissions: PermissionService | undefined,
   codingTool: ToolDefinition,
+  watchTool: ToolDefinition,
 ): ToolDefinition[] {
-  const definitions = [webSearchTool, webFetchTool, createLookAtTool(permissions), codingTool]
+  const definitions = [webSearchTool, webFetchTool, createLookAtTool(permissions), codingTool, watchTool]
   const byName = new Map(definitions.map((tool) => [tool.name, tool]))
   if (byName.size !== definitions.length || byName.size !== CORE_SYSTEM_TOOL_NAMES.length) {
     throw new Error('core system tool catalog does not match its registered definitions')
