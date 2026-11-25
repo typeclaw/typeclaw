@@ -1,7 +1,7 @@
 import { lstatSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, readdir, rm, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import { hooklessGitArgs } from '@/git/hookless'
 import { type AgentGit, resolveAgentGit } from '@/git/resolve-agent-git'
@@ -17,6 +17,12 @@ export const MAINTENANCE_TIMEOUT_MS = 120_000
 // tmp_pack_* file and fails the whole backup, every cycle. Runtime-owned
 // force-add roots are never skipped.
 export const MAX_UNTRACKED_FILE_BYTES = 50 * 1024 * 1024
+
+// Git's own `prune` removes temp files by age alone (its expiry window); with
+// auto-gc off, the sweep applies the same heuristic with a day of grace. It is a
+// tradeoff, not proof: a writer stalled for longer than this (an `index-pack`
+// waiting on input) would lose its temp file and fail when it resumes.
+export const PACK_DEBRIS_MIN_AGE_MS = 24 * 60 * 60 * 1000
 
 // The two maintenance tasks are gated INDEPENDENTLY because a backup commit with
 // auto-gc disabled (Fix 1) produces LOOSE OBJECTS, not packs:
@@ -340,6 +346,64 @@ export async function runMaintenance(
   )
   if (run.exitCode !== 0) return { ok: false, kind: 'failed', reason: shortErr(run) }
   return { ok: true, kind: 'ran', tasks }
+}
+
+// Removes temp files a killed git process left in the object store
+// (`pack/tmp_*`, `<xx>/tmp_obj_*`). Git writes each of these as one open stream
+// and renames it the moment it completes, so one untouched for a day is presumed
+// abandoned (see PACK_DEBRIS_MIN_AGE_MS for the tradeoff). Repack's `.tmp-<pid>-pack-*` outputs are deliberately left alone:
+// those are finished packs a live repack holds until it installs them, and can
+// legitimately sit unmodified for a long run. Git's own `prune` would
+// clear them, but auto-gc is off and the bounded maintenance never prunes, so a
+// backup whose `git add` keeps timing out would otherwise strand one pack-sized
+// file per cycle. Runs after every backup attempt, failed ones included, under
+// the backup's git lock. Returns the number of files removed; never throws.
+export async function sweepPackDebris(
+  cwd: string,
+  deps: BackupRunnerDeps,
+  options: { now?: number; minAgeMs?: number } = {},
+): Promise<number> {
+  try {
+    const repo = resolveAgentGit(cwd)
+    if (!repo) return 0
+    const located = await deps.gitSpawn([...repo.gitArgs, 'rev-parse', '--git-path', 'objects'], {
+      cwd,
+      timeoutMs: COMMIT_TIMEOUT_MS,
+    })
+    const objectsPath = located.stdout.trim()
+    if (located.exitCode !== 0 || objectsPath.length === 0) return 0
+    const objectsDir = isAbsolute(objectsPath) ? objectsPath : join(cwd, objectsPath)
+    const cutoff = (options.now ?? deps.now?.() ?? Date.now()) - (options.minAgeMs ?? PACK_DEBRIS_MIN_AGE_MS)
+
+    const candidates = (await listNames(join(objectsDir, 'pack')))
+      .filter((name) => name.startsWith('tmp_'))
+      .map((name) => join(objectsDir, 'pack', name))
+    for (const fanout of await listNames(objectsDir)) {
+      if (!/^[0-9a-f]{2}$/.test(fanout)) continue
+      for (const name of await listNames(join(objectsDir, fanout))) {
+        if (name.startsWith('tmp_obj_')) candidates.push(join(objectsDir, fanout, name))
+      }
+    }
+
+    let removed = 0
+    for (const path of candidates) {
+      // Only a regular file is debris; a matching directory or symlink is left
+      // alone rather than followed or recursively removed.
+      const info = await lstat(path).catch(() => undefined)
+      if (info === undefined || !info.isFile() || info.mtimeMs > cutoff) continue
+      await unlink(path).then(
+        () => removed++,
+        () => {},
+      )
+    }
+    return removed
+  } catch {
+    return 0
+  }
+}
+
+async function listNames(dir: string): Promise<string[]> {
+  return readdir(dir).catch(() => [])
 }
 
 // Reads the loose-object (`count:`) and pack (`packs:`) counts from

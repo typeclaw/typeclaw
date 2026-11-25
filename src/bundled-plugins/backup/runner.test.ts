@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { rmSync } from 'node:fs'
-import { chmod, mkdir, mkdtemp, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -14,6 +14,7 @@ import {
   makeDefaultGitSpawn,
   runBackup,
   runMaintenance,
+  sweepPackDebris,
   MAX_UNTRACKED_FILE_BYTES,
   withIndexLockRetry,
 } from './runner'
@@ -1648,6 +1649,74 @@ describe('oversized untracked files', () => {
       expect(tree).not.toContain('download.bin')
       expect((await git(['ls-files', '--', 'download.bin'])).stdout).toBe('')
       expect(warnings.some((m) => m.includes('download.bin'))).toBe(true)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('sweepPackDebris', () => {
+  test('removes stale git temp files and keeps fresh temp files, directories, repack outputs, and real packs', async () => {
+    // given
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-debris-'))
+    try {
+      const git = await initRealRepo(cwd)
+      await writeFile(join(cwd, 'a.txt'), 'a\n')
+      await git(['add', 'a.txt'])
+      await git(['commit', '-qm', 'a'])
+      await git(['repack', '-qad'])
+      const packDir = join(cwd, '.git', 'objects', 'pack')
+      const fanout = join(cwd, '.git', 'objects', 'ab')
+      await mkdir(fanout, { recursive: true })
+      const now = Date.now()
+      const old = new Date(now - 2 * 24 * 60 * 60 * 1000)
+      const realPacks = await readdir(packDir)
+      for (const name of realPacks) await utimes(join(packDir, name), old, old)
+      for (const path of [
+        join(packDir, 'tmp_pack_stale'),
+        join(packDir, '.tmp-123-pack-held'),
+        join(fanout, 'tmp_obj_stale'),
+      ]) {
+        await writeFile(path, 'partial')
+        await utimes(path, old, old)
+      }
+      await writeFile(join(packDir, 'tmp_pack_writing'), 'partial')
+      const staleDir = join(packDir, 'tmp_pack_dir')
+      await mkdir(staleDir)
+      await writeFile(join(staleDir, 'child'), 'x')
+      await utimes(staleDir, old, old)
+
+      // when
+      const removed = await sweepPackDebris(cwd, baseDeps(makeDefaultGitSpawn()), { now })
+
+      // then
+      expect(removed).toBe(2)
+      expect((await readdir(packDir)).sort()).toEqual(
+        [...realPacks, '.tmp-123-pack-held', 'tmp_pack_dir', 'tmp_pack_writing'].sort(),
+      )
+      expect(await readdir(fanout)).toEqual([])
+      await git(['fsck', '--no-progress'])
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('never throws when locating the object store fails', async () => {
+    const cwd = await makeRepo()
+    try {
+      const gitSpawn: GitSpawn = async () => {
+        throw new Error('spawn failed')
+      }
+      expect(await sweepPackDebris(cwd, baseDeps(gitSpawn))).toBe(0)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('is a no-op outside a git repository', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'autobackup-debris-norepo-'))
+    try {
+      expect(await sweepPackDebris(cwd, baseDeps(makeDefaultGitSpawn()))).toBe(0)
     } finally {
       await rm(cwd, { recursive: true, force: true })
     }
