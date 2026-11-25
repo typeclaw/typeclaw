@@ -55,6 +55,26 @@ export function sharedSessionIdForOrigin(origin: SessionOrigin | undefined): str
   return key.slice(0, PROMPT_CACHE_KEY_MAX_LENGTH)
 }
 
+// pi puts the system prompt in the Codex Responses top-level `instructions`.
+// The ChatGPT Codex backend does not serve that field from the prompt cache
+// for every model: on gpt-6.2-sol each follow-up request re-billed the whole
+// system prompt uncached, while the same text as a leading developer input
+// item was served from cache on every follow-up (terra cached both ways).
+// `instructions` keeps pi's own fallback for an empty prompt, so the request
+// shape stays one pi already sends.
+const CODEX_PLACEHOLDER_INSTRUCTIONS = 'You are a helpful assistant.'
+
+export function withInstructionsAsDeveloperInput(payload: unknown): unknown {
+  if (typeof payload !== 'object' || payload === null) return payload
+  const { instructions, input } = payload as { instructions?: unknown; input?: unknown }
+  if (typeof instructions !== 'string' || !Array.isArray(input)) return payload
+  return {
+    ...payload,
+    instructions: CODEX_PLACEHOLDER_INSTRUCTIONS,
+    input: [{ role: 'developer', content: instructions }, ...input],
+  }
+}
+
 // Rewrites only payloads that already carry a string `prompt_cache_key`, so
 // providers without the field and `cacheRetention: 'none'` (which omits it)
 // are left untouched.

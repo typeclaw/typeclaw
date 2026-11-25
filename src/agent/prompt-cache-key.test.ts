@@ -10,7 +10,12 @@ import { __resetConfigForTesting, reloadConfig } from '@/config/config'
 
 import { invalidateProviderAuthCache } from './auth'
 import { createSessionWithDispose } from './index'
-import { promptCacheKeyForOrigin, sharedSessionIdForOrigin, withPromptCacheKey } from './prompt-cache-key'
+import {
+  promptCacheKeyForOrigin,
+  sharedSessionIdForOrigin,
+  withInstructionsAsDeveloperInput,
+  withPromptCacheKey,
+} from './prompt-cache-key'
 import type { SessionOrigin } from './session-origin'
 
 describe('promptCacheKeyForOrigin', () => {
@@ -69,6 +74,25 @@ describe('withPromptCacheKey', () => {
   })
 })
 
+describe('withInstructionsAsDeveloperInput', () => {
+  test('moves the instructions into a leading developer input item', () => {
+    const user = { role: 'user', content: [{ type: 'input_text', text: 'hi' }] }
+
+    expect(withInstructionsAsDeveloperInput({ model: 'm', instructions: 'system prompt', input: [user] })).toEqual({
+      model: 'm',
+      instructions: 'You are a helpful assistant.',
+      input: [{ role: 'developer', content: 'system prompt' }, user],
+    })
+  })
+
+  test('leaves payloads without string instructions and an input list alone', () => {
+    const withoutInstructions = { model: 'm', input: [] }
+    expect(withInstructionsAsDeveloperInput(withoutInstructions)).toBe(withoutInstructions)
+    const withoutInput = { model: 'm', instructions: 'system prompt' }
+    expect(withInstructionsAsDeveloperInput(withoutInput)).toBe(withoutInput)
+  })
+})
+
 describe('session requests', () => {
   let agentDir: string
   const previousCwd = process.cwd()
@@ -105,7 +129,12 @@ describe('session requests', () => {
       affinityHeader?: string
       streamOptions?: Record<string, unknown>
     } = {},
-  ): Promise<{ key: unknown; affinity: string | null; sessionId: string }> {
+  ): Promise<{
+    key: unknown
+    affinity: string | null
+    sessionId: string
+    body: Record<string, unknown> | undefined
+  }> {
     if (provider.model !== undefined) {
       await writeFile(join(agentDir, 'typeclaw.json'), JSON.stringify({ models: { default: provider.model } }))
       reloadConfig(agentDir)
@@ -147,7 +176,7 @@ describe('session requests', () => {
         { sessionId: session.sessionId, ...provider.streamOptions },
       )
       await stream.result()
-      return { key: body?.prompt_cache_key, affinity, sessionId: session.sessionId }
+      return { key: body?.prompt_cache_key, affinity, sessionId: session.sessionId, body }
     } finally {
       globalThis.fetch = previousFetch
       await dispose()
@@ -167,18 +196,39 @@ describe('session requests', () => {
     expect(second.affinity).toBe('typeclaw:subagent:memory-logger')
   })
 
-  test('codex subagent sessions share the session-id header and body key', async () => {
-    const codex = {
-      model: 'openai-codex/gpt-6-luna',
-      secrets: {
-        version: 2,
-        providers: {
-          'openai-codex': { type: 'oauth', access: codexApiKey, refresh: 'r', expires: Date.now() + 3_600_000 },
-        },
+  const codex = {
+    model: 'openai-codex/gpt-6-luna',
+    secrets: {
+      version: 2,
+      providers: {
+        'openai-codex': { type: 'oauth', access: codexApiKey, refresh: 'r', expires: Date.now() + 3_600_000 },
       },
-      affinityHeader: 'session-id',
-      streamOptions: { transport: 'sse' },
-    }
+    },
+    affinityHeader: 'session-id',
+    streamOptions: { transport: 'sse' },
+  }
+
+  test('codex requests carry the system prompt as a leading developer input item', async () => {
+    const probe = await capturePromptCacheKey({ kind: 'subagent', subagent: 'reviewer', parentSessionId: 'a' }, codex)
+
+    expect(probe.body?.instructions).toBe('You are a helpful assistant.')
+    expect((probe.body?.input as unknown[])[0]).toEqual({ role: 'developer', content: 'probe' })
+  })
+
+  test('non-codex requests keep top-level instructions and their input untouched', async () => {
+    // given a plain OpenAI Responses request whose payload carries top-level instructions
+    const origin: SessionOrigin = { kind: 'subagent', subagent: 'reviewer', parentSessionId: 'a' }
+    const baseline = await capturePromptCacheKey(origin)
+    const probe = await capturePromptCacheKey(origin, {
+      streamOptions: { onPayload: (payload: object) => ({ ...payload, instructions: 'sentinel' }) },
+    })
+
+    // then the instructions stay top-level and no developer item is prepended
+    expect(probe.body?.instructions).toBe('sentinel')
+    expect(probe.body?.input).toEqual(baseline.body?.input)
+  })
+
+  test('codex subagent sessions share the session-id header and body key', async () => {
     const first = await capturePromptCacheKey({ kind: 'subagent', subagent: 'explorer', parentSessionId: 'a' }, codex)
     const second = await capturePromptCacheKey({ kind: 'subagent', subagent: 'explorer', parentSessionId: 'b' }, codex)
 
