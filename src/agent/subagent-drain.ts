@@ -42,6 +42,10 @@ export type RunSubagentDrainOptions = {
   // delivered and the loop can reach its fixed point with partial results.
   // Undefined keeps the legacy unbounded behavior.
   maxChildWaitMs?: number
+  // Task ids whose reminder was already delivered. Pass the same set to every
+  // drain of one session so a later drain does not re-deliver a child an earlier
+  // drain reported.
+  delivered?: Set<string>
   // Injectable clock + abort-await seam for tests; production uses real time.
   now?: () => number
 }
@@ -57,8 +61,7 @@ export type RunSubagentDrainOptions = {
 // "spawned nothing" flag is needed. The watch MUST have been started before the
 // initial prompt (see `beginSubagentDrainWatch`) to close the lost-wakeup race.
 export async function runSubagentDrain(watch: SubagentDrainWatch, options: RunSubagentDrainOptions): Promise<void> {
-  const { drain, prompt, cancelled, maxChildWaitMs, now = Date.now } = options
-  const delivered = new Set<string>()
+  const { drain, prompt, cancelled, maxChildWaitMs, delivered = new Set<string>(), now = Date.now } = options
   try {
     while (cancelled === undefined || !cancelled()) {
       expireOverdueChildren(drain, maxChildWaitMs, now)
