@@ -83,9 +83,12 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
         const id = key(entry.repo, entry.prNumber)
         const previous = next.get(id)
         if (previous !== undefined && previous.admittedAt > entry.admittedAt) return
-        const sameObligation = previous?.headSha === entry.headSha && previous.kind === entry.kind
+        const samePullRequest = previous?.prId === entry.prId
+        const sameObligation = samePullRequest && previous.headSha === entry.headSha && previous.kind === entry.kind
+        // An unfinished assignment still backs this PR when boot replay or a
+        // live admission advances its head or review kind. Only a clear ends it.
         const assignmentTriggered =
-          entry.assignmentTriggered ?? (sameObligation ? previous.assignmentTriggered : undefined)
+          entry.assignmentTriggered ?? (samePullRequest ? previous.assignmentTriggered : undefined)
         // Several thread siblings can carry the same push. They share one PR
         // obligation; keep its original admission time for completion checks.
         const sameAdmission =

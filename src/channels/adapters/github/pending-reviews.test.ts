@@ -516,10 +516,13 @@ test.each([
 )
 
 test.each(['closed', 'converted_to_draft'])('clears pending work on %s, even without a live turn', async (action) => {
+  // #given
   const f = await fixture()
   await f.adapter.start()
-  await f.store.record(pending)
+  await f.store.record({ ...pending, assignmentTriggered: true })
+  // #when
   await f.deliver(action)
+  // #then
   expect(await f.store.list()).toEqual([])
 })
 
@@ -568,6 +571,66 @@ test('keeps the pending review and check after assignment then reviewer removal 
     expect(f.routed.map((message) => message.eventKind)).toEqual(['pull_request:assigned'])
   } finally {
     await githubReviewChecks.reviewerSettled('assigned-removal-review', {
+      kind: 'cancelled',
+      reason: 'test cleanup',
+    })
+  }
+})
+
+test('boot replay on a newer head preserves assignment work after reviewer removal', async () => {
+  // #given
+  const turn = Promise.withResolvers<void>()
+  const f = await fixture(undefined, { prompt: () => turn.promise })
+  cleanups.push(async () => turn.resolve())
+  await f.adapter.start()
+  await f.scanRead
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  let admitted = f.nextRoute()
+  await f.deliver('assigned', 'pull_request', {
+    assignee: bot,
+    pull_request: { ...pull, assignees: [bot] },
+  })
+  expect((await admitted).kind).toBe('accepted')
+  admitted = f.nextRoute()
+  await f.deliver('review_requested', 'pull_request', {
+    requested_reviewer: bot,
+    pull_request: { ...pull, assignees: [bot] },
+  })
+  expect((await admitted).kind).toBe('accepted')
+  expect(await f.store.list()).toMatchObject([{ headSha: 'head-one', assignmentTriggered: true }])
+  await f.adapter.stop()
+  await f.router.stop()
+
+  // #when
+  const next = await fixture(f.dir, { prompt: () => turn.promise })
+  next.pull.head = { ...pull.head, sha: 'head-two' }
+  next.config.review.check = true
+  admitted = next.nextRoute()
+  await next.adapter.start()
+  expect((await admitted).kind).toBe('accepted')
+  await next.scanRead
+  const replayed = await next.store.list()
+  const routed = [...next.routed]
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: 'head-two' },
+    'boot-assignment-review',
+  )
+  try {
+    await next.deliver('review_request_removed', 'pull_request', {
+      requested_reviewer: bot,
+      pull_request: { ...next.pull, assignees: [bot], updated_at: '2026-01-01T00:01:00Z' },
+    })
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(await next.store.list()).toEqual(replayed)
+    expect(replayed).toMatchObject([{ headSha: 'head-two', assignmentTriggered: true }])
+    expect(next.statuses.map((status) => status.state)).toEqual(['pending'])
+    expect(next.routed).toEqual(routed)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.eventKind).toBe('pull_request:reconcile')
+  } finally {
+    await githubReviewChecks.reviewerSettled('boot-assignment-review', {
       kind: 'cancelled',
       reason: 'test cleanup',
     })

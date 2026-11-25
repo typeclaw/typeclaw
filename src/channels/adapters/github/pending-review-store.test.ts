@@ -88,17 +88,51 @@ test('an old completion snapshot cannot erase an assignment upgrade', async () =
   expect(await store.list()).toEqual([{ ...entry, assignmentTriggered: true }])
 })
 
-test('assignment provenance does not leak into a replacement head', async () => {
+test.each(['review', 'rereview'] as const)('assignment provenance survives a replacement head for %s', async (kind) => {
   // #given
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record({ ...entry, assignmentTriggered: true })
-  const newer = { ...entry, headSha: 'head-two', admittedAt: 200 }
+  const newer = { ...entry, kind, headSha: 'head-two', admittedAt: 200 }
 
   // #when
   await store.record(newer)
 
   // #then
-  expect(await store.list()).toEqual([newer])
+  expect(await store.list()).toEqual([{ ...newer, assignmentTriggered: true }])
+  expect(await store.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(false)
+})
+
+test.each(['cleared', 'different-pr'] as const)(
+  'assignment provenance does not leak into %s work',
+  async (replacement) => {
+    // #given
+    const store = await loadPendingReviewStore(agentDir, logger)
+    await store.record({ ...entry, assignmentTriggered: true })
+    if (replacement === 'cleared') await store.clear(entry.repo, entry.prNumber)
+    const newer = { ...entry, prId: replacement === 'different-pr' ? 701 : entry.prId, admittedAt: 200 }
+
+    // #when
+    await store.record(newer)
+
+    // #then
+    expect(await store.list()).toEqual([newer])
+    expect(await store.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(true)
+  },
+)
+
+test('a legacy record advancing its head gains no assignment provenance', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+  const reloaded = await loadPendingReviewStore(agentDir, logger)
+  const newer = { ...entry, headSha: 'head-two', admittedAt: 200 }
+
+  // #when
+  await reloaded.record(newer)
+
+  // #then
+  expect(await reloaded.list()).toEqual([newer])
+  expect(await reloaded.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')).toBe(true)
 })
 
 test('withdrawal sees another instance assignment admission but closure still clears it', async () => {
