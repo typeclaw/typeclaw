@@ -23,7 +23,7 @@ import type { SessionEntry } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 
 import type { AgentSession, SessionOriginRef } from '@/agent'
-import { LiveSubagentRegistry } from '@/agent/live-subagents'
+import { LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
 import { createChannelLookAtTool } from '@/agent/multimodal/look-at'
 import { detectProviderError } from '@/agent/provider-error'
 import type { RestartHandoff } from '@/agent/restart-handoff'
@@ -36,6 +36,7 @@ import { createChannelFetchAttachmentTool } from '@/agent/tools/channel-fetch-at
 import { createChannelHistoryTool } from '@/agent/tools/channel-history'
 import { createChannelReplyTool } from '@/agent/tools/channel-reply'
 import { createPostGithubReviewTool } from '@/agent/tools/post-github-review'
+import { createSubagentOutputTool } from '@/agent/tools/subagent-output'
 import {
   __resetReviewObserverForTest,
   recordReview,
@@ -48,6 +49,10 @@ import { createPermissionService } from '@/permissions/permissions'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { createHookBus, type HookBus, type SessionIdleEvent } from '@/plugin'
 import { waitFor } from '@/test-helpers/wait-for'
+import { deliverChannelWakes } from '@/watches/channel'
+import { WakeDispatcher } from '@/watches/delivery'
+import { WatchService } from '@/watches/service'
+import { WatchStore } from '@/watches/store'
 
 import { createDiscordHistoryCallback } from './adapters/discord'
 import { createSlackHistoryCallback as createSlackUserHistoryCallback } from './adapters/slack'
@@ -151,6 +156,7 @@ class FakeSession {
   public entriesById = new Map<string, SessionEntry>()
   public onPrompt: ((text: string) => void | Promise<void>) | undefined
   public onContinue: (() => void | Promise<void>) | undefined
+  public preflight?: () => Promise<void>
   public continued = 0
   public contextRefreshes = 0
   public isCompacting = false
@@ -171,6 +177,7 @@ class FakeSession {
     readonly signal: AbortSignal
     state: { messages: Array<{ role: string; stopReason?: string }> }
     continue(): Promise<void>
+    prompt(text: string): Promise<void>
     abort(): void
     afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>
     streamFunction: StreamFn
@@ -186,6 +193,12 @@ class FakeSession {
         return this.controller.signal
       },
       state: { messages: [] },
+      prompt: async (text) => {
+        this.agent.controller = new AbortController()
+        this.emit({ type: 'agent_start' })
+        this.prompts.push(text)
+        await this.onPrompt?.(text)
+      },
       continue: async (): Promise<void> => {
         this.continued++
         await this.onContinue?.()
@@ -249,9 +262,8 @@ class FakeSession {
   private subscribers = new Set<(event: Record<string, unknown> & { type: string }) => void>()
 
   prompt = async (text: string): Promise<void> => {
-    this.prompts.push(text)
-    this.agent.controller = new AbortController()
-    await this.onPrompt?.(text)
+    if (this.preflight) await this.preflight()
+    await this.agent.prompt(text)
   }
   abort = async (): Promise<void> => {
     this.aborted++
@@ -332,6 +344,7 @@ function connectCoreAgent(session: FakeSession, coreAgent: Agent): void {
   })
   session.agent = {
     controller: fallbackController,
+    prompt: session.agent.prompt,
     get signal(): AbortSignal {
       return coreAgent.signal ?? fallbackController.signal
     },
@@ -557,7 +570,7 @@ function makeRouter(
     onReload?: () => Promise<string>
     onRestart?: (ctx?: RestartCommandContext) => Promise<string>
     saveChannelSessions?: (agentDir: string, sessions: readonly ChannelSessionRecord[]) => Promise<void>
-    newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
+    newestRunningChildSubagentStartedAt?: CreateChannelRouterOptions['newestRunningChildSubagentStartedAt']
     cancelRunningSubagentsByWorkKey?: CreateChannelRouterOptions['cancelRunningSubagentsByWorkKey']
     runIdleContinuation?: CreateChannelRouterOptions['runIdleContinuation']
     recordTurnOutcome?: CreateChannelRouterOptions['recordTurnOutcome']
@@ -569,6 +582,7 @@ function makeRouter(
     handoffRetryByteLimit?: number
     backgroundObligations?: BackgroundObligationStore
     inboundJournal?: InboundJournal
+    isWatchVerdictPending?: CreateChannelRouterOptions['isWatchVerdictPending']
     reviewOutbound?: CreateChannelRouterOptions['reviewOutbound']
     outboundReviewerActive?: () => boolean
   } = {},
@@ -583,6 +597,7 @@ function makeRouter(
     ...(options.outboundReviewerActive ? { outboundReviewerActive: options.outboundReviewerActive } : {}),
     ...(options.backgroundObligations !== undefined ? { backgroundObligations: options.backgroundObligations } : {}),
     ...(options.inboundJournal !== undefined ? { inboundJournal: options.inboundJournal } : {}),
+    isWatchVerdictPending: options.isWatchVerdictPending,
     configForAdapter: () => options.config ?? baseConfig,
     ...(options.configuredAliases !== undefined ? { configuredAliases: options.configuredAliases } : {}),
     ...(options.ensureLiveTimeoutMs !== undefined ? { ensureLiveTimeoutMs: options.ensureLiveTimeoutMs } : {}),
@@ -669,6 +684,980 @@ function inbound(over: Partial<InboundMessage> = {}): InboundMessage {
     ...over,
   }
 }
+
+describe('channel watch wakes', () => {
+  for (const adapter of ['slack-bot', 'discord-bot'] as const)
+    for (const warm of [false, true]) {
+      test(`${adapter} ${warm ? 'live' : 'cold'} journals once and prompts as the requester, not a chat participant`, async () => {
+        const dir = await tempDir(),
+          originRefs: SessionOriginRef[] = []
+        const { router, sessions } = makeRouter(dir, {
+          originRefs,
+          onSessionCreated: (s) => {
+            s.onPrompt = () => s.setAssistantText('NO_REPLY')
+          },
+        })
+        const key = {
+          adapter,
+          workspace: 'workspace',
+          chat: 'topic',
+          thread: adapter === 'slack-bot' ? 'thread' : null,
+        }
+        router.registerSelfIdentity(adapter, () => ({ id: 'bot' }))
+        if (warm) {
+          await router.route(
+            inbound({
+              ...key,
+              accountIdentity: fallbackChannelAccountIdentity(adapter, key.workspace, 'bot'),
+              authorId: 'other',
+            }),
+          )
+          await router.__testing!.flushDebounce(key)
+        }
+        const target = {
+          kind: 'channel',
+          key,
+          requester: { authorId: 'requester', authorAdapter: adapter },
+          room: { kind: 'thread', parentChat: 'parent' },
+          isDm: false,
+        } as const
+        const result = { watchId: 'report', description: 'Build', key: 'run', summary: '/stop', final: false }
+        const actor = Promise.withResolvers<SessionOrigin | undefined>()
+        if (warm)
+          sessions[0]!.onPrompt = () => {
+            actor.resolve(originRefs[0]!.current)
+            sessions[0]!.setAssistantText('NO_REPLY')
+          }
+        await deliverChannelWakes(router, target, [result, { ...result, key: 'next', summary: '준비됨' }])
+        if (!warm)
+          sessions[0]!.onPrompt = () => {
+            actor.resolve(originRefs[0]!.current)
+            sessions[0]!.setAssistantText('NO_REPLY')
+          }
+        await router.__testing!.flushDebounce(key)
+        const origin = await actor.promise
+        expect(origin).toMatchObject({ kind: 'channel', ...key, lastInboundAuthorId: 'requester', room: target.room })
+        expect(origin?.kind === 'channel' && origin.participants?.some((p) => p.authorId === 'requester')).toBe(false)
+        const prompt = sessions[0]!.prompts.at(-1)!
+        expect(prompt).toContain('준비됨')
+        expect(prompt).toContain('/stop')
+        expect(prompt.match(/<system-reminder>/g)).toHaveLength(1)
+        expect(prompt).not.toContain('## Current message')
+        await deliverChannelWakes(router, target, [result])
+        await router.__testing!.flushDebounce(key)
+        expect(sessions).toHaveLength(1)
+        expect(sessions[0]!.prompts).toHaveLength(warm ? 2 : 1)
+        await router.stop()
+      })
+    }
+  test('revoked requester cannot open a cold session or borrow a live speaker role', async () => {
+    const dir = await tempDir()
+    const permissions = createPermissionService({
+      roles: { member: { match: [{ kind: 'channel', platform: 'discord', author: 'allowed' }] } },
+    })
+    const { router, sessions } = makeRouter(dir, {
+      permissions,
+      onSessionCreated: (s) => {
+        s.onPrompt = () => s.setAssistantText('NO_REPLY')
+      },
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const target = {
+      kind: 'channel',
+      key: KEY,
+      requester: { authorId: 'revoked', authorAdapter: KEY.adapter },
+    } as const
+    const wake = { watchId: 'job', description: 'Check', summary: 'Ready', key: 'run', final: false }
+    await deliverChannelWakes(router, target, [wake])
+    expect(sessions).toBeEmpty()
+    await router.route(inboundForSelf('bot', { authorId: 'allowed' }))
+    await router.__testing!.flushDebounce(KEY)
+    await deliverChannelWakes(router, target, [wake])
+    await router.__testing!.flushDebounce(KEY)
+    expect(sessions[0]!.prompts).toHaveLength(1)
+    await router.stop()
+  })
+
+  for (const held of [
+    'human',
+    'watch-hook',
+    'mixed-watch-hook',
+    'mixed-sdk-preflight',
+    'permission-hook',
+    'account-preflight',
+    'mixed-account',
+    'stop-preflight',
+  ] as const)
+    test(`invalidating an admitted verdict during ${held} prevents its prompt and suppresses its row`, async () => {
+      const dir = await tempDir(),
+        store = new WatchStore(dir),
+        journal = new InboundJournal(dir)
+      const service = new WatchService(
+        store,
+        async () => ({ verdict: 'quiet' }),
+        async () => {},
+        () => {},
+      )
+      const target = {
+        kind: 'channel',
+        key: KEY,
+        requester: { authorId: 'watcher', authorAdapter: KEY.adapter },
+      } as const
+      const id = await service.create({
+        description: 'Build',
+        mode: 'judge',
+        probe: { command: 'true' },
+        createdByRole: 'member',
+        createdByOrigin: { kind: 'channel', ...KEY },
+        wakeTarget: target,
+      })
+      const key = crypto.randomUUID(),
+        wake = { watchId: id, key, description: 'Build', summary: 'Ready', final: false }
+      await store.update((rows) => {
+        rows[0]!.pending.push({ key, summary: wake.summary, final: false })
+      })
+      const sibling = { ...wake, watchId: crypto.randomUUID(), key: crypto.randomUUID(), summary: 'Sibling ready' }
+      const mixed = held.startsWith('mixed-')
+      if (mixed)
+        await store.update((rows) =>
+          rows.push({
+            ...rows[0]!,
+            id: sibling.watchId,
+            pending: [{ key: sibling.key, summary: sibling.summary, final: false }],
+          }),
+        )
+      const entered = Promise.withResolvers<void>(),
+        release = Promise.withResolvers<void>()
+      const hooks = createHookBus()
+      hooks.runSessionTurnStart = async (event) => {
+        if (
+          held.endsWith('hook') &&
+          event.origin?.kind === 'channel' &&
+          event.origin.lastInboundAuthorId === 'watcher'
+        ) {
+          entered.resolve()
+          await release.promise
+        }
+      }
+      let allowed = true,
+        bot = 'bot'
+      const { router, sessions } = makeRouter(dir, {
+        permissions: { ...grantAllPermissions, has: (_, permission) => permission !== 'channel.respond' || allowed },
+        hooks,
+        inboundJournal: journal,
+        isWatchVerdictPending: (watchId, key) => store.isVerdictPending(watchId, key),
+        onSessionCreated: (s) => {
+          if (held.endsWith('preflight'))
+            s.preflight = async () => {
+              entered.resolve()
+              await release.promise
+            }
+          s.onPrompt = async (text) => {
+            if ((held === 'human' || held === 'mixed-account') && !text.includes('Follow-up probe results')) {
+              entered.resolve()
+              await release.promise
+              s.setAssistantText('NO_REPLY')
+            } else s.setAssistantText('Watch reply')
+          }
+        },
+      })
+      const sent: string[] = []
+      router.registerSelfIdentity(KEY.adapter, () => ({ id: bot }))
+      router.registerOutbound(KEY.adapter, async (m) => {
+        sent.push(m.text!)
+        return { ok: true }
+      })
+      try {
+        if (held === 'human' || held === 'mixed-account') await router.route(inboundForSelf('bot'))
+        else await deliverChannelWakes(router, target, mixed ? [wake, sibling] : [wake])
+        const drain = router.__testing!.flushDebounce(KEY)
+        await entered.promise
+        if (held === 'human' || held === 'mixed-account') await deliverChannelWakes(router, target, [wake])
+        const row = journal.list().find((r) => r.reference?.messageId === `watch:${id}:${key}`)
+        expect(row?.phase).toBe('admitted')
+        if (held === 'mixed-account') {
+          bot = 'replacement'
+          await deliverChannelWakes(router, target, [sibling])
+        } else if (held === 'permission-hook') allowed = false
+        else if (held === 'account-preflight') bot = 'replacement'
+        else if (held === 'stop-preflight') await router.route(inboundForSelf(bot, { text: '/stop' }))
+        else await service.change(id, 'cancel')
+        release.resolve()
+        await drain
+        if (held === 'mixed-account') {
+          // Both admissions returned queued. On the next tick the dispatcher
+          // must acknowledge both outcomes, not redeliver the old one as B.
+          const ticks: Array<() => Promise<void>> = []
+          const dispatcher = new WakeDispatcher(store, (_target, batch) => deliverChannelWakes(router, target, batch), {
+            now: () => 0,
+            after: (_ms, fn) => {
+              ticks.push(fn)
+              return () => {}
+            },
+          })
+          try {
+            expect(store.records.map((w) => w.pending.length)).toEqual([1, 1])
+            dispatcher.notify()
+            await ticks.shift()!()
+            await router.__testing!.flushDebounce(KEY)
+            expect(store.records.map((w) => w.pending.length)).toEqual([0, 0])
+            expect(journal.list().filter((r) => r.reference?.messageId === `watch:${id}:${key}`)).toHaveLength(1)
+          } finally {
+            await dispatcher.stop()
+          }
+        }
+        const prompts = sessions[0]!.prompts.filter((p) => p.includes('Follow-up probe results'))
+        if (mixed) {
+          expect(prompts).toHaveLength(1)
+          expect(prompts[0]).toContain(sibling.watchId)
+          expect(prompts[0]).not.toContain(id)
+          expect(sent).toEqual(['Watch reply'])
+        } else {
+          expect(prompts).toBeEmpty()
+          expect(sent).toEqual(held === 'stop-preflight' ? ['Stopped the current turn.'] : [])
+        }
+        expect(journal.get(row!.inputId)).toMatchObject({
+          phase: 'closed',
+          outcome: {
+            kind: 'intentionally-suppressed',
+            reason:
+              held === 'permission-hook'
+                ? 'watch-permission-denied'
+                : held === 'account-preflight' || held === 'mixed-account'
+                  ? 'watch-account-changed'
+                  : held === 'stop-preflight'
+                    ? 'user-stop'
+                    : 'watch-cancelled',
+          },
+        })
+      } finally {
+        release.resolve()
+        await router.stop()
+        await journal.close()
+      }
+    })
+
+  test('a watch cannot resume after the requester loses permission during provider backoff', async () => {
+    const backoff = Promise.withResolvers<void>()
+    let allowed = true
+    const { router, sessions } = makeRouter(await tempDir(), {
+      permissions: { ...grantAllPermissions, has: (_, permission) => permission !== 'channel.respond' || allowed },
+      onRetryBackoffStart: backoff.resolve,
+      retryRandom: () => 0.5,
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    try {
+      await deliverChannelWakes(
+        router,
+        { kind: 'channel', key: KEY, requester: { authorId: 'owner', authorAdapter: KEY.adapter } },
+        [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+      )
+      const s = sessions[0]!
+      const history = [{ role: 'user' }, { role: 'toolResult' }, { role: 'assistant', stopReason: 'error' }]
+      s.onPrompt = () => {
+        s.emit({ type: 'tool_execution_start' })
+        s.agent.state.messages = history
+        s.emit({
+          type: 'message_end',
+          message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket closed 1000' },
+        })
+        s.setAssistantMidTurn('', 'error')
+      }
+      s.onContinue = () => s.setAssistantText('Watch reply')
+      const drain = router.__testing!.flushDebounce(KEY)
+      await backoff.promise
+      allowed = false
+      await drain
+      expect(s.continued).toBe(0)
+      expect(s.agent.state.messages).toEqual(history)
+      expect(sent).toBeEmpty()
+    } finally {
+      await router.stop()
+    }
+  })
+
+  test('a verdict waits for account identity before and after admission and survives restart before agent start', async () => {
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir, {
+      onSessionCreated: (s) => {
+        s.onPrompt = () => s.setAssistantText('NO_REPLY')
+      },
+    })
+    const store = new WatchStore(dir)
+    const target = { kind: 'channel', key: KEY, requester: { authorId: 'member', authorAdapter: KEY.adapter } } as const
+    const result = { key: crypto.randomUUID(), summary: 'Build finished', final: true }
+    await store.update((rows) => {
+      rows.push({
+        id: crypto.randomUUID(),
+        description: 'Build',
+        probe: { command: 'true' },
+        createdByRole: 'member',
+        createdByOrigin: { kind: 'channel', ...KEY },
+        wakeTarget: target,
+        mode: 'judge',
+        status: 'done',
+        createdAt: 0,
+        nextRunAt: 1,
+        deadline: 2,
+        consecutiveWakes: 0,
+        consecutiveFailures: 0,
+        pending: [result],
+      })
+    })
+    const timers: Array<() => Promise<void>> = []
+    const makeDispatcher = (store: WatchStore, destination: ChannelRouter) =>
+      new WakeDispatcher(store, (_target, wakes) => deliverChannelWakes(destination, target, wakes), {
+        now: () => 0,
+        after: (_ms, fn) => {
+          timers.push(fn)
+          return () => {}
+        },
+      })
+    const dispatcher = makeDispatcher(store, router)
+    dispatcher.notify()
+    await timers.shift()!()
+    expect(store.records[0]!.pending).toEqual([result])
+    expect(sessions).toBeEmpty()
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    await timers.shift()!() // failure backoff
+    await timers.shift()!() // coalesced delivery
+    expect(store.records[0]!.pending).toEqual([result])
+    expect(sessions[0]!.prompts).toBeEmpty()
+    const withdrawn = { ...result, key: crypto.randomUUID() }
+    const cancelledId = crypto.randomUUID()
+    await store.update((rows) => rows.push({ ...rows[0]!, id: cancelledId, status: 'active', pending: [withdrawn] }))
+    await deliverChannelWakes(router, target, [{ ...withdrawn, watchId: cancelledId, description: 'Withdrawn' }])
+    const canceller = new WatchService(
+      store,
+      async () => ({ verdict: 'quiet' }),
+      async () => {},
+      () => {},
+    )
+    await canceller.change(cancelledId, 'cancel')
+    await dispatcher.stop()
+    await router.stop()
+    timers.length = 0
+
+    const restored = new WatchStore(dir)
+    await restored.restore()
+    expect(restored.records[0]!.pending).toEqual([result])
+    const obligations = new BackgroundObligationStore(dir)
+    const journal = new InboundJournal(dir, { backgroundObligations: obligations })
+    const outbox = new RecoveryOutbox(dir)
+    await journal.importOldEpoch(outbox)
+    expect(await outbox.list()).toBeEmpty()
+    const findAdmission = (messageId: string) => journal.list().find((row) => row.reference?.messageId === messageId)
+    const withdrawnId = `watch:${cancelledId}:${withdrawn.key}`
+    expect(findAdmission(withdrawnId)?.phase).toBe('admitted')
+    await journal.reconcileWatchAdmissions(
+      new Set(restored.records.flatMap((w) => w.pending.map((p) => `watch:${w.id}:${p.key}`))),
+    )
+    expect(findAdmission(withdrawnId)).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'intentionally-suppressed', reason: 'watch-cancelled' },
+    })
+    expect(findAdmission(`watch:${restored.records[0]!.id}:${result.key}`)?.phase).toBe('admitted')
+    const after = makeRouter(dir, { inboundJournal: journal, backgroundObligations: obligations })
+    const self = () => ({ id: 'bot' })
+    after.router.registerSelfIdentity(KEY.adapter, self)
+    const resumed = makeDispatcher(restored, after.router)
+    resumed.notify()
+    await timers.shift()!() // requeue the body behind the existing admission
+    await timers.shift()!() // another retry before start must not enqueue it twice
+    expect(restored.records[0]!.pending).toEqual([result])
+    const s = after.sessions[0]!
+    const admitted = findAdmission(`watch:${restored.records[0]!.id}:${result.key}`)!
+    after.router.unregisterSelfIdentity(KEY.adapter, self)
+    await after.router.__testing!.flushDebounce(KEY)
+    expect(s.prompts).toBeEmpty()
+    expect(journal.get(admitted.inputId)).toEqual(admitted)
+    expect(restored.records[0]!.pending).toEqual([result])
+    after.router.registerSelfIdentity(KEY.adapter, self)
+    await timers.shift()!() // the same account requeues the still-open admission
+    s.onPrompt = async () => {
+      await timers.shift()!() // acknowledge the start without waiting for a reply
+      s.setAssistantText('NO_REPLY')
+    }
+    await after.router.__testing!.flushDebounce(KEY)
+    expect(restored.records[0]!.pending).toBeEmpty()
+    expect(s.prompts).toHaveLength(1)
+    expect(s.prompts[0]).toContain(result.summary)
+    await resumed.stop()
+    await after.router.stop()
+    await journal.close()
+  })
+
+  test('an owner watch can reply without claiming the waiting member request or becoming its completion actor', async () => {
+    const dir = await tempDir()
+    const backgroundObligations = new BackgroundObligationStore(dir, { epoch: 'watch-proof' })
+    const journal = new InboundJournal(dir, { backgroundObligations })
+    const permissions = createPermissionService({
+      roles: {
+        owner: { match: [{ kind: 'channel', platform: 'discord', author: 'owner' }] },
+        member: { match: [{ kind: 'channel', platform: 'discord', author: 'member' }] },
+      },
+    })
+    const originRefs: SessionOriginRef[] = []
+    let running: number | null = 1000
+    const { router, sessions } = makeRouter(dir, {
+      backgroundObligations,
+      inboundJournal: journal,
+      permissions,
+      originRefs,
+      newestRunningChildSubagentStartedAt: () => running,
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    const human = await router.route(inboundForSelf('bot', { authorId: 'member' }))
+    if (human.kind !== 'accepted') throw new Error('expected durable request')
+    const session = sessions[0]!
+    session.onPrompt = async () => {
+      const accountIdentity = await router.getRecoveryAccountIdentity(KEY.adapter, KEY.workspace)
+      if (!accountIdentity) throw new Error('expected authenticated adapter')
+      await router.acceptBackgroundResponse({
+        parentSessionId: 'ses_fake_1',
+        key: KEY,
+        taskId: 'child',
+        subagentName: 'explorer',
+        startedAt: 1000,
+        accountIdentity,
+      })
+      strandOnUnansweredToolUse(session, 'child')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    const original = journal.get(human.inputId)
+    expect(original?.phase).toBe('turn-owned')
+    const roles: string[] = []
+    let watchIds: string[] = []
+    session.onPrompt = async () => {
+      roles.push(permissions.describe(originRefs[0]!.current!).role)
+      const accountIdentity = await router.getRecoveryAccountIdentity(KEY.adapter, KEY.workspace)
+      if (!accountIdentity) throw new Error('expected authenticated adapter')
+      await router.acceptBackgroundResponse({
+        parentSessionId: 'ses_fake_1',
+        key: KEY,
+        taskId: 'watch-child',
+        subagentName: 'explorer',
+        startedAt: 1000,
+        accountIdentity,
+      })
+      const inboundCoverage = await router.captureInboundResultCoverage!('ses_fake_1')
+      watchIds = inboundCoverage.map((r) => r.inputId)
+      const text = 'Build finished.'
+      await router.send({ ...KEY, text })
+      const context = terminalReplyContext(text)
+      await session.agent.afterToolCall!({
+        ...context,
+        result: { ...context.result, details: { ok: true, inboundCoverage } },
+      })
+      session.setAssistantMidTurn(text, 'aborted')
+    }
+    await deliverChannelWakes(
+      router,
+      { kind: 'channel', key: KEY, requester: { authorId: 'owner', authorAdapter: KEY.adapter } },
+      [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+    )
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent).toEqual(['Build finished.'])
+    expect(watchIds).toHaveLength(1)
+    expect(journal.get(watchIds[0]!)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    expect(journal.get(human.inputId)).toEqual(original)
+    expect(router.__testing!.getLiveAuthorState(KEY)?.lastTurnAuthorId).toBe('member')
+    expect(router.clearSticky(KEY).cleared).toBe(0)
+
+    // Both children were accepted. The watch child finishes while the member
+    // is still waiting; only that child's obligation can be answered here.
+    session.onPrompt = async () => {
+      roles.push(permissions.describe(originRefs[0]!.current!).role)
+      const inboundCoverage = await router.captureInboundResultCoverage!('ses_fake_1')
+      const backgroundCoverage = await router.captureBackgroundResultCoverage!('ses_fake_1')
+      const text = 'Watch child finished.'
+      await router.send({ ...KEY, text })
+      const reply = terminalReplyContext(text)
+      await session.agent.afterToolCall!({
+        ...reply,
+        result: { ...reply.result, details: { ok: true, inboundCoverage, backgroundCoverage } },
+      })
+      session.setAssistantMidTurn(text, 'aborted')
+    }
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'watch-child',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+    expect(sent.at(-1)).toBe('Watch child finished.')
+    expect(await backgroundObligations.lookup('ses_fake_1', 'watch-child')).toMatchObject({
+      phase: 'closed',
+      outcome: { kind: 'delivered' },
+    })
+    expect(journal.get(human.inputId)).toEqual(original)
+    expect(await backgroundObligations.lookup('ses_fake_1', 'child')).toMatchObject({ phase: 'accepted' })
+    expect(router.clearSticky(KEY).cleared).toBe(0)
+
+    // Even a different *human* last speaker is not an obligation's principal.
+    session.onPrompt = () => strandOnUnansweredToolUse(session, 'waiting')
+    await router.route(inboundForSelf('bot', { authorId: 'owner' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(router.__testing!.getLiveAuthorState(KEY)?.lastTurnAuthorId).toBe('owner')
+    running = null
+    session.onPrompt = () => {
+      roles.push(permissions.describe(originRefs[0]!.current!).role)
+      session.setAssistantText('NO_REPLY')
+    }
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'child',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 1,
+    })
+    await waitFor(() => roles.length === 3)
+    expect(roles).toEqual(['owner', 'owner', 'member'])
+    await router.stop()
+    await journal.close()
+  })
+
+  for (const watchOwnsChild of [false, true]) {
+    test(`cross-lineage result read preserves the ${watchOwnsChild ? 'watch' : 'human'} completion wake`, async () => {
+      const dir = await tempDir()
+      const backgroundObligations = new BackgroundObligationStore(dir)
+      const journal = new InboundJournal(dir, { backgroundObligations })
+      const registry = new LiveSubagentRegistry(),
+        parentSessionId = 'ses_fake_1',
+        taskId = 'check'
+      const originRefs: SessionOriginRef[] = []
+      const { router, sessions } = makeRouter(dir, {
+        backgroundObligations,
+        inboundJournal: journal,
+        originRefs,
+        newestRunningChildSubagentStartedAt: (id, lineage) =>
+          newestRunningBackgroundChildStartedAt(registry.list({ parentSessionId: id }), lineage),
+      })
+      router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+      const sent: string[] = []
+      router.registerOutbound(KEY.adapter, async (m) => {
+        sent.push(m.text!)
+        return { ok: true }
+      })
+      const watch = () =>
+        deliverChannelWakes(
+          router,
+          { kind: 'channel', key: KEY, requester: { authorId: 'owner', authorAdapter: KEY.adapter } },
+          [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+        )
+      const human = () => router.route(inboundForSelf('bot', { authorId: 'member' }))
+      const output = createSubagentOutputTool({
+        liveRegistry: registry,
+        permissions: grantAllPermissions,
+        callerSessionId: parentSessionId,
+        getOrigin: () => originRefs[0]!.current,
+        router,
+      })
+      try {
+        const first = watchOwnsChild ? await watch() : await human()
+        const s = sessions[0]!
+        s.onPrompt = async () => {
+          const { watchTurnId } = await router.acceptBackgroundResponse({
+            parentSessionId,
+            key: KEY,
+            taskId,
+            subagentName: 'explorer',
+            startedAt: 1000,
+            accountIdentity: (await router.getRecoveryAccountIdentity(KEY.adapter, KEY.workspace))!,
+          })
+          registry.register({
+            taskId,
+            parentSessionId,
+            sessionId: 'child',
+            subagentName: 'explorer',
+            startedAt: 1000,
+            background: true,
+            watchTurnId,
+            status: 'running',
+            abort: async () => {},
+          })
+          strandOnUnansweredToolUse(s)
+        }
+        await router.__testing!.flushDebounce(KEY)
+        if (watchOwnsChild) await human()
+        else await watch()
+        const readers: string[] = []
+        let snapshot: unknown, foreignCoverage: unknown
+        s.onPrompt = async () => {
+          const origin = originRefs[0]!.current
+          readers.push(origin?.kind === 'channel' ? origin.lastInboundAuthorId! : '')
+          if (readers.length === 1) {
+            registry.recordCompletion(taskId, { ok: true, durationMs: 1, finalMessage: 'check passed' })
+            await router.injectSubagentCompletionReminder({
+              parentSessionId,
+              taskId,
+              subagent: 'explorer',
+              ok: true,
+              durationMs: 1,
+            })
+            snapshot = (await output.execute('read', { task_id: taskId }, undefined, undefined, {} as never)).details
+            foreignCoverage = await router.captureBackgroundResultCoverage!(parentSessionId)
+            s.setAssistantText('NO_REPLY')
+            return
+          }
+          const inboundCoverage = await router.captureInboundResultCoverage!(parentSessionId)
+          const backgroundCoverage = await router.captureBackgroundResultCoverage!(parentSessionId)
+          const text = 'The check passed.'
+          await router.send({ ...KEY, text })
+          const reply = terminalReplyContext(text)
+          await s.agent.afterToolCall!({
+            ...reply,
+            result: { ...reply.result, details: { ok: true, inboundCoverage, backgroundCoverage } },
+          })
+          s.setAssistantMidTurn(text, 'aborted')
+        }
+        await router.__testing!.flushDebounce(KEY)
+        expect(snapshot).toMatchObject({ ok: true, finalMessage: 'check passed' })
+        expect(foreignCoverage).toEqual([])
+        expect(readers).toEqual(watchOwnsChild ? ['member', 'owner'] : ['owner', 'member'])
+        expect(sent).toEqual(['The check passed.'])
+        expect(await backgroundObligations.lookup(parentSessionId, taskId)).toMatchObject({
+          phase: 'closed',
+          outcome: { kind: 'delivered' },
+        })
+        if (typeof first !== 'string' && first.kind === 'accepted')
+          expect(journal.get(first.inputId)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      } finally {
+        await router.stop()
+        await journal.close()
+      }
+    })
+  }
+
+  test('stopping a watch in the turn-start hook preserves the next human request for its child', async () => {
+    const dir = await tempDir()
+    const backgroundObligations = new BackgroundObligationStore(dir)
+    const journal = new InboundJournal(dir, { backgroundObligations })
+    const hooks = createHookBus()
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    hooks.runSessionTurnStart = async (event) => {
+      if (event.origin?.kind === 'channel' && event.origin.lastInboundAuthorId === 'watcher') {
+        entered.resolve()
+        await release.promise
+      }
+    }
+    let running: number | null = null
+    const { router, sessions } = makeRouter(dir, {
+      hooks,
+      backgroundObligations,
+      inboundJournal: journal,
+      newestRunningChildSubagentStartedAt: () => running,
+    })
+    const parentSessionId = 'ses_fake_1',
+      taskId = 'check'
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    router.registerOutbound(KEY.adapter, async () => ({ ok: true }))
+    try {
+      await deliverChannelWakes(
+        router,
+        { kind: 'channel', key: KEY, requester: { authorId: 'watcher', authorAdapter: KEY.adapter } },
+        [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+      )
+      const drain = router.__testing!.flushDebounce(KEY)
+      await entered.promise
+      await router.route(inboundForSelf('bot', { text: '/stop' }))
+      const human = await router.route(inboundForSelf('bot', { authorId: 'member', text: 'Check the build' }))
+      if (human.kind !== 'accepted') throw new Error('expected a fresh request')
+      const s = sessions[0]!
+      s.onPrompt = async () => {
+        running = 1000
+        await router.acceptBackgroundResponse({
+          parentSessionId,
+          key: KEY,
+          taskId,
+          subagentName: 'explorer',
+          startedAt: running,
+          accountIdentity: (await router.getRecoveryAccountIdentity(KEY.adapter, KEY.workspace))!,
+        })
+        strandOnUnansweredToolUse(s)
+      }
+      release.resolve()
+      await drain
+      expect(s.prompts).toHaveLength(1)
+      expect(s.prompts[0]).toContain('Check the build')
+      expect(journal.get(human.inputId)?.phase).toBe('turn-owned')
+      running = null
+      s.onPrompt = async () => {
+        const inboundCoverage = await router.captureInboundResultCoverage!(parentSessionId)
+        const backgroundCoverage = await router.captureBackgroundResultCoverage!(parentSessionId)
+        const text = 'The build passed.'
+        await router.send({ ...KEY, text })
+        const reply = terminalReplyContext(text)
+        await s.agent.afterToolCall!({
+          ...reply,
+          result: { ...reply.result, details: { ok: true, inboundCoverage, backgroundCoverage } },
+        })
+        s.setAssistantMidTurn(text, 'aborted')
+      }
+      await router.injectSubagentCompletionReminder({
+        parentSessionId,
+        taskId,
+        subagent: 'explorer',
+        ok: true,
+        durationMs: 1,
+      })
+      await router.__testing!.flushDebounce(KEY)
+      expect(journal.get(human.inputId)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+    } finally {
+      release.resolve()
+      await router.stop()
+      await journal.close()
+    }
+  })
+
+  test('a human completion retries its fetched result while a later watch child is still running', async () => {
+    const dir = await tempDir(),
+      registry = new LiveSubagentRegistry()
+    const backgroundObligations = new BackgroundObligationStore(dir)
+    const journal = new InboundJournal(dir, { backgroundObligations })
+    const nowRef = { value: 1000 },
+      parentSessionId = 'ses_fake_1'
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      backgroundObligations,
+      inboundJournal: journal,
+      newestRunningChildSubagentStartedAt: (id, scope) =>
+        newestRunningBackgroundChildStartedAt(registry.list({ parentSessionId: id }), scope),
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    const start = async (taskId: string) => {
+      const accountIdentity = await router.getRecoveryAccountIdentity(KEY.adapter, KEY.workspace)
+      if (!accountIdentity) throw new Error('expected adapter account')
+      const { watchTurnId } = await router.acceptBackgroundResponse({
+        parentSessionId,
+        key: KEY,
+        taskId,
+        subagentName: 'explorer',
+        startedAt: nowRef.value,
+        accountIdentity,
+      })
+      registry.register({
+        taskId,
+        sessionId: taskId,
+        subagentName: 'explorer',
+        parentSessionId,
+        watchTurnId,
+        background: true,
+        startedAt: nowRef.value,
+        status: 'running',
+        abort: async () => {},
+      })
+    }
+    try {
+      const human = await router.route(inboundForSelf('bot', { authorId: 'member' }))
+      if (human.kind !== 'accepted') throw new Error('expected admission')
+      const s = sessions[0]!
+      s.onPrompt = async () => {
+        await start('human-child')
+        strandOnUnansweredToolUse(s)
+      }
+      await router.__testing!.flushDebounce(KEY)
+      nowRef.value++
+      s.onPrompt = async () => {
+        await start('watch-child')
+        s.setAssistantText('NO_REPLY')
+      }
+      await deliverChannelWakes(
+        router,
+        { kind: 'channel', key: KEY, requester: { authorId: 'owner', authorAdapter: KEY.adapter } },
+        [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+      )
+      await router.__testing!.flushDebounce(KEY)
+      registry.recordCompletion('human-child', { ok: true, durationMs: 1 })
+      let attempts = 0
+      s.onPrompt = async () => {
+        if (++attempts === 1) {
+          await router.attachBackgroundResultCoverage({ parentSessionId, taskId: 'human-child' })
+          strandOnUnansweredToolUse(s, 'fetched')
+          return
+        }
+        const inboundCoverage = await router.captureInboundResultCoverage!(parentSessionId)
+        const backgroundCoverage = await router.captureBackgroundResultCoverage!(parentSessionId)
+        const text = 'The check passed.'
+        await router.send({ ...KEY, text })
+        const reply = terminalReplyContext(text)
+        await s.agent.afterToolCall!({
+          ...reply,
+          result: { ...reply.result, details: { ok: true, inboundCoverage, backgroundCoverage } },
+        })
+        s.setAssistantMidTurn(text, 'aborted')
+      }
+      await router.injectSubagentCompletionReminder({
+        parentSessionId,
+        taskId: 'human-child',
+        subagent: 'explorer',
+        ok: true,
+        durationMs: 1,
+      })
+      await router.__testing!.flushDebounce(KEY)
+      expect(sent).toEqual(['The check passed.'])
+      expect(attempts).toBe(2)
+      expect(journal.get(human.inputId)).toMatchObject({ phase: 'closed', outcome: { kind: 'delivered' } })
+      expect(registry.get('watch-child')?.status).toBe('running')
+    } finally {
+      await router.stop()
+      await journal.close()
+    }
+  })
+
+  test('a watch retry keeps its requester without granting sticky or setting the last speaker', async () => {
+    const originRefs: SessionOriginRef[] = []
+    const { router, sessions } = makeRouter(await tempDir(), { originRefs })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    await deliverChannelWakes(
+      router,
+      { kind: 'channel', key: KEY, requester: { authorId: 'requester', authorAdapter: KEY.adapter } },
+      [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: false }],
+    )
+    const actors: (string | undefined)[] = []
+    const s = sessions[0]!
+    s.onPrompt = () => {
+      const origin = originRefs[0]!.current
+      actors.push(origin?.kind === 'channel' ? origin.lastInboundAuthorId : undefined)
+      if (actors.length === 1) emptyStopAfterToolWork(s)
+      else s.setAssistantText('Build finished.')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    expect(actors).toEqual(['requester', 'requester'])
+    expect(sent).toEqual(['Build finished.'])
+    expect(router.clearSticky(KEY).cleared).toBe(0)
+    expect(router.__testing!.getLiveAuthorState(KEY)?.lastTurnAuthorId).toBeNull()
+    await router.stop()
+  })
+
+  test('a fresh member turn retires the queued owner retry without settling the member request', async () => {
+    const dir = await tempDir()
+    const backgroundObligations = new BackgroundObligationStore(dir)
+    const journal = new InboundJournal(dir, { backgroundObligations })
+    const parentSessionId = 'ses_fake_1'
+    let memberId: string | undefined
+    let childStartedAt: number | null = null
+    let queuedBeforeMember: number | undefined
+    const hooks = createHookBus()
+    const { router, sessions } = makeRouter(dir, {
+      hooks,
+      inboundJournal: journal,
+      backgroundObligations,
+      newestRunningChildSubagentStartedAt: () => childStartedAt,
+    })
+    hooks.runSessionTurnEnd = async () => {
+      if (memberId) return
+      queuedBeforeMember = router.__testing!.pendingReminderCount(KEY)
+      const receipt = await router.route(inbound({ authorId: 'member', text: 'Please check the build' }))
+      if (receipt.kind === 'accepted') memberId = receipt.inputId
+    }
+    await router.route(inbound({ authorId: 'owner' }))
+    const session = sessions[0]!
+    session.onPrompt = async (text) => {
+      if (session.prompts.length === 1) emptyStopAfterToolWork(session)
+      else if (text.includes('Please check the build')) {
+        childStartedAt = 1000
+        await router.acceptBackgroundResponse({
+          parentSessionId,
+          key: KEY,
+          taskId: 'build-check',
+          subagentName: 'explorer',
+          startedAt: childStartedAt,
+          accountIdentity: 'proof-account',
+        })
+        strandOnUnansweredToolUse(session, 'build-check')
+      } else {
+        const inboundCoverage = await router.captureInboundResultCoverage!(parentSessionId)
+        const reply = terminalReplyContext('Owner result')
+        await session.agent.afterToolCall!({
+          ...reply,
+          result: { ...reply.result, details: { ok: true, inboundCoverage } },
+        })
+        session.setAssistantMidTurn('Owner result', 'aborted')
+      }
+    }
+    try {
+      await router.__testing!.flushDebounce(KEY)
+      expect(queuedBeforeMember).toBe(1)
+      expect(journal.get(memberId!)?.phase).toBe('turn-owned')
+      expect(session.prompts).toHaveLength(2)
+      expect(session.prompts[1]).not.toContain(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE)
+    } finally {
+      await router.stop()
+      await journal.close()
+    }
+  })
+
+  test('a member completion queued before an owner retry runs under its own actor in a separate prompt', async () => {
+    const originRefs: SessionOriginRef[] = []
+    const { router, sessions } = makeRouter(await tempDir(), { originRefs })
+    const parentSessionId = 'ses_fake_1'
+    await router.route(inbound({ authorId: 'member' }))
+    const s = sessions[0]!
+    s.onPrompt = async () => {
+      await router.acceptBackgroundResponse({
+        parentSessionId,
+        key: KEY,
+        taskId: 'child',
+        subagentName: 'explorer',
+        startedAt: 1000,
+        accountIdentity: 'proof-account',
+      })
+      s.setAssistantText('NO_REPLY')
+    }
+    await router.__testing!.flushDebounce(KEY)
+    const turns: Array<{ actor: string | undefined; completion: boolean; retry: boolean }> = []
+    s.onPrompt = async (text) => {
+      const origin = originRefs[0]!.current
+      turns.push({
+        actor: origin?.kind === 'channel' ? origin.lastInboundAuthorId : undefined,
+        completion: text.includes('child') && text.includes('explorer'),
+        retry: text.includes(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE),
+      })
+      if (turns.length === 1) {
+        await router.injectSubagentCompletionReminder({
+          parentSessionId,
+          taskId: 'child',
+          subagent: 'explorer',
+          ok: true,
+          durationMs: 1,
+        })
+        emptyStopAfterToolWork(s)
+      } else s.setAssistantText('NO_REPLY')
+    }
+    await router.route(inbound({ authorId: 'owner' }))
+    await router.__testing!.flushDebounce(KEY)
+    expect(turns).toEqual([
+      { actor: 'owner', completion: false, retry: false },
+      { actor: 'owner', completion: false, retry: true },
+      { actor: 'member', completion: true, retry: false },
+    ])
+    await router.stop()
+  })
+})
 
 function inboundForSelf(userId: string, over: Partial<InboundMessage> = {}): InboundMessage {
   const event = inbound(over)
@@ -5369,7 +6358,7 @@ describe('ChannelRouter channel-turn protocol', () => {
     )
   })
 
-  test('empty-stop-after-tool-work: once armed, a bare-empty retry that obeys the no-re-run nudge keeps spending budget to fallback', async () => {
+  test('empty-stop-after-tool-work: a watch before the human retry preserves its budget through fallback', async () => {
     const dir = await tempDir()
     const logs: string[] = []
     const sent: Array<{ text: string }> = []
@@ -5379,20 +6368,31 @@ describe('ChannelRouter channel-turn protocol', () => {
       return { ok: true }
     })
 
-    await router.route(inbound({ isBotMention: true, text: 'check this' }))
-    let calls = 0
-    sessions[0]!.onPrompt = () => {
-      calls++
-      // given: attempt 1 does tool work then whiffs (arms the cause); the retry nudge
-      // says "do not re-run tools", so later attempts whiff bare-empty with no new tools
-      if (calls === 1) emptyStopAfterToolWork(sessions[0]!)
-      else sessions[0]!.setAssistantText('')
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    await router.route(inboundForSelf('bot', { text: 'check this' }))
+    const session = sessions[0]!
+    session.onPrompt = async () => {
+      if (session.prompts.length === 1) {
+        // Admit the watch before returning the human's first empty stop. Its
+        // reminder will run before the retry that validation is about to queue.
+        await deliverChannelWakes(
+          router,
+          { kind: 'channel', key: KEY, requester: { authorId: 'watcher', authorAdapter: KEY.adapter } },
+          [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+        )
+        emptyStopAfterToolWork(session)
+      } else if (session.prompts.at(-1)!.includes('Follow-up probe results')) {
+        session.setAssistantText('NO_REPLY')
+      } else {
+        session.setAssistantText('') // Obey the retry nudge: no new tool call.
+      }
     }
     await router.__testing!.flushDebounce(KEY)
 
     // then: the armed cause persists — bare-empty retries keep consuming the budget
     // and the user gets the visible fallback instead of silent dead air
-    expect(sessions[0]!.prompts).toHaveLength(1 + MAX_EMPTY_TURN_RETRIES)
+    expect(session.prompts.at(-1)).toContain('Follow-up probe results')
+    expect(session.prompts).toHaveLength(2 + MAX_EMPTY_TURN_RETRIES)
     expect(
       logs.filter((m) => m.includes('empty_turn_retry') && m.includes('cause=empty_stop_after_tool_work')).length,
     ).toBe(MAX_EMPTY_TURN_RETRIES)
@@ -17709,33 +18709,46 @@ describe('ChannelRouter continue_after_reply:true empty-stop recovery (phrase-in
     expect(logs.some((m) => m.includes('empty_turn_fallback cause='))).toBe(false)
   })
 
-  test('no continuation available: willingness exhaustion still posts the fallback exactly once', async () => {
-    // The genuine-strand invariant. No continuation is queued after exhaustion, so
-    // the staged fallback resolves to a single visible post — the human is never
-    // left on dead air.
-    const dir = await tempDir()
-    const logs: string[] = []
-    const sent: string[] = []
-    const { router, sessions } = makeRouter(dir, { logs })
-    router.registerOutbound('discord-bot', async (msg) => {
-      sent.push(msg.text ?? '')
-      return { ok: true }
+  for (const queueWatch of [false, true])
+    test(`no human continuation available: willingness exhaustion posts one fallback (queued watch: ${queueWatch})`, async () => {
+      // The genuine-strand invariant. No continuation is queued after exhaustion, so
+      // the staged fallback resolves to a single visible post — the human is never
+      // left on dead air.
+      const dir = await tempDir()
+      const logs: string[] = []
+      const sent: string[] = []
+      const { router, sessions } = makeRouter(dir, { logs })
+      router.registerOutbound('discord-bot', async (msg) => {
+        sent.push(msg.text ?? '')
+        return { ok: true }
+      })
+
+      router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+      await router.route(inboundForSelf('bot', { text: 'please check' }))
+      let attempt = 0
+      sessions[0]!.onPrompt = async (text) => {
+        if (text.includes('Follow-up probe results')) {
+          sessions[0]!.setAssistantText('NO_REPLY')
+          return
+        }
+        attempt++
+        if (queueWatch && attempt === 1 + MAX_WILLINGNESS_NUDGES)
+          await deliverChannelWakes(
+            router,
+            { kind: 'channel', key: KEY, requester: { authorId: 'watcher', authorAdapter: KEY.adapter } },
+            [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+          )
+        await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
+      }
+      await router.__testing!.flushDebounce(KEY)
+
+      expect(sent.filter((s) => s === EMPTY_TURN_FALLBACK_TEXT)).toHaveLength(1)
+      if (queueWatch) expect(sessions[0]!.prompts.at(-1)).toContain('Follow-up probe results')
+      expect(logs.some((m) => m.includes('empty_turn_fallback_staged'))).toBe(true)
+      expect(
+        logs.some((m) => m.includes('empty_turn_fallback cause=empty_stop_after_continue_reply_nudges_exhausted')),
+      ).toBe(true)
     })
-
-    await router.route(inbound({ text: 'please check' }))
-    let attempt = 0
-    sessions[0]!.onPrompt = async () => {
-      attempt++
-      await continueReplyThenStrand(sessions[0]!, router, `바로 볼게 (${attempt})`, String(attempt))
-    }
-    await router.__testing!.flushDebounce(KEY)
-
-    expect(sent.filter((s) => s === EMPTY_TURN_FALLBACK_TEXT)).toHaveLength(1)
-    expect(logs.some((m) => m.includes('empty_turn_fallback_staged'))).toBe(true)
-    expect(
-      logs.some((m) => m.includes('empty_turn_fallback cause=empty_stop_after_continue_reply_nudges_exhausted')),
-    ).toBe(true)
-  })
 
   test('continuation also strands: the deferred fallback posts exactly once once no continuation remains', async () => {
     // Stage the fallback, defer it while a continuation is queued, then let that
@@ -18491,6 +19504,47 @@ describe('ChannelRouter continue_after_reply:true empty-stop recovery (phrase-in
     expect(sessions[0]!.prompts[1]).toContain('bg_reviewer')
     expect(sent).toEqual([])
   })
+
+  for (const failure of ['provider', 'empty'] as const)
+    test(`a watch wake stays silent after ${failure} failure`, async () => {
+      const logs: string[] = [],
+        sent: string[] = []
+      const { router } = makeRouter(await tempDir(), {
+        logs,
+        onSessionCreated: (s) => {
+          s.onPrompt = () => {
+            if (failure === 'empty') emptyStopAfterToolWork(s)
+            else {
+              s.emit({
+                type: 'message_end',
+                message: { role: 'assistant', stopReason: 'error', errorMessage: 'server_is_overloaded' },
+              })
+              s.setAssistantMidTurn('', 'error')
+            }
+          }
+        },
+      })
+      router.registerOutbound(KEY.adapter, async (m) => {
+        sent.push(m.text ?? '')
+        return { ok: true }
+      })
+      router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+      await deliverChannelWakes(
+        router,
+        { kind: 'channel', key: KEY, requester: { authorId: 'speaker', authorAdapter: KEY.adapter } },
+        [{ watchId: 'job', key: 'run', description: 'Check', summary: 'Ready', final: false }],
+      )
+      await router.__testing!.flushDebounce(KEY)
+      expect(
+        logs.some((l) =>
+          l.includes(
+            `${failure === 'provider' ? 'provider_error_notice' : 'empty_turn_fallback'}_suppressed reason=background_wake_turn`,
+          ),
+        ),
+      ).toBe(true)
+      expect(sent).toBeEmpty()
+      await router.stop()
+    })
 
   test('a finished-subagent completion wake that exhausts its empty-turn retries posts no fallback', async () => {
     // given: the wake keeps whiffing after tool work until the retry budget runs out
@@ -22358,7 +23412,7 @@ describe('ChannelRouter durable background response coverage', () => {
     }
   })
 
-  for (const reopen of ['inbound', 'restart-resume'] as const) {
+  for (const reopen of ['inbound', 'restart-resume', 'watch-first'] as const) {
     test(`restored ${reopen} reports lost children once without channel output`, async () => {
       const dir = await tempDir()
       const before = new BackgroundObligationStore(dir, { epoch: 'before-restart' })
@@ -22447,11 +23501,21 @@ describe('ChannelRouter durable background response coverage', () => {
               })
               await waitFor(() => state.sessions[0]?.prompts.length === 1)
             } else {
-              await state.router.route(inbound())
+              if (reopen === 'watch-first') {
+                state.router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+                await deliverChannelWakes(
+                  state.router,
+                  { kind: 'channel', key: KEY, requester: { authorId: 'watcher', authorAdapter: KEY.adapter } },
+                  [{ watchId: 'build', key: epoch, description: 'Build', summary: 'Ready', final: true }],
+                )
+                await state.router.__testing!.flushDebounce(KEY)
+                expect(state.sessions[0]?.prompts[0]).not.toContain('bg_lost')
+              }
+              await state.router.route(reopen === 'watch-first' ? inboundForSelf('bot') : inbound())
               await state.router.__testing?.flushDebounce(KEY)
             }
             expect(calls[0]?.existingSessionId).toBe('ses_fake_1')
-            const prompt = state.sessions[0]?.prompts[0]
+            const prompt = state.sessions[0]?.prompts.at(-1)
             expect(prompt?.includes('bg_lost')).toBe(epoch === 'after-restart')
             for (const taskId of [
               'bg_other_parent',
@@ -22462,7 +23526,7 @@ describe('ChannelRouter durable background response coverage', () => {
             ])
               expect(prompt).not.toContain(taskId)
             if (epoch === 'after-restart') expect(prompt).not.toContain('bg_running')
-            await state.router.route(inbound())
+            await state.router.route(reopen === 'watch-first' ? inboundForSelf('bot') : inbound())
             await state.router.__testing?.flushDebounce(KEY)
             expect(state.sessions[0]?.prompts.at(-1)).not.toContain('bg_lost')
             expect(sent).toEqual([])

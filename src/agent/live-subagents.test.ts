@@ -480,6 +480,20 @@ describe('attachProgressCapture', () => {
 })
 
 describe('newestRunningBackgroundChildStartedAt', () => {
+  test('turn waits count only their own children; session lifetime counts all running children', () => {
+    const children = [
+      makeLive({ background: true, startedAt: 1, watchTurnId: 'build' }),
+      makeLive({ background: true, startedAt: 2, watchTurnId: 'build' }),
+      makeLive({ background: true, startedAt: 3, watchTurnId: 'deploy' }),
+      makeLive({ background: true, startedAt: 4 }),
+    ]
+    expect(newestRunningBackgroundChildStartedAt(children, 'build')).toBe(2)
+    expect(newestRunningBackgroundChildStartedAt(children, 'deploy')).toBe(3)
+    expect(newestRunningBackgroundChildStartedAt(children, 'other')).toBeNull()
+    expect(newestRunningBackgroundChildStartedAt(children, null)).toBe(4)
+    expect(newestRunningBackgroundChildStartedAt(children.slice(0, 3), null)).toBeNull()
+    expect(newestRunningBackgroundChildStartedAt(children.slice(0, 3))).toBe(3)
+  })
   function child(over: Partial<LiveSubagent>): LiveSubagent {
     return {
       taskId: 'bg_t',

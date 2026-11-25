@@ -9,6 +9,27 @@ import { createRecoveryNotice } from './recovery-notice'
 import { RecoveryOutbox } from './recovery-outbox'
 const target = { adapter: 'discord-bot' as const, workspace: 'w', chat: 'c', thread: 't' }
 const acceptance = { taskId: 'task', parentSessionId: 'parent', target, accountIdentity: 'actor' }
+test('a valid generation does not authorize another watch or an ordinary turn to take or close a result', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'obligation-lineage-'))
+  try {
+    const store = new BackgroundObligationStore(dir)
+    const accepted = await store.accept({ ...acceptance, watchOrigin: { turnId: 'build', isDm: false } })
+    const ready = (await store.resultReady(accepted.obligationId))!
+    const owner = { target, turnId: 'completion', watchTurnId: 'build' }
+    await expect(store.claim([ready], { ...owner, watchTurnId: null })).rejects.toThrow('lineage')
+    const claimed = await store.claim([ready], owner)
+    const outcome = { kind: 'delivered' as const, decisionId: 'reply' }
+    await expect(store.move(claimed, { ...owner, fromTurnId: owner.turnId, watchTurnId: 'deploy' })).rejects.toThrow(
+      'lineage',
+    )
+    await expect(store.settle(claimed, outcome, undefined, null)).rejects.toThrow('lineage')
+    expect((await store.get(accepted.obligationId))?.phase).toBe('turn-owned')
+    await store.settle(claimed, outcome, undefined, owner.watchTurnId)
+    expect((await store.get(accepted.obligationId))?.phase).toBe('closed')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 test('completion never resurrects, captured generations fence outcomes and application receipts repair idempotently', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'obligation-'))
   try {

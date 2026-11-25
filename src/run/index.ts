@@ -572,8 +572,8 @@ async function startAgentRuntime(
     claimHandler: claimController.claimHandler,
     githubTokenBridge,
     stream,
-    newestRunningChildSubagentStartedAt: (sessionId) =>
-      newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId })),
+    newestRunningChildSubagentStartedAt: (sessionId, watchTurnId) =>
+      newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId }), watchTurnId),
     cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()

@@ -62,6 +62,8 @@ export async function promptPersistentTurnWithFallback(opts: {
   overloadBackoffMs?: (attempt: number) => number
   onRetryBackoffStart?: () => void
   beforeAttempt?: (ref: ModelRef) => void
+  // After retry backoff, before either helper edits the transcript for continue().
+  beforeResume?: () => void
   onAttemptFailed?: (attempt: PersistentTurnAttempt) => void
   // Fired the first time an attempt starts executing a tool. Callers use it to
   // learn that the turn stopped being silent even when the turn ultimately
@@ -139,6 +141,7 @@ export async function promptPersistentTurnWithFallback(opts: {
             const retried = retryAfterCompletedToolResult
               ? await retryTurnAfterCompletedToolResult(opts.session, {
                   attempt: retry - 1,
+                  beforeResume: opts.beforeResume,
                   authorize: () => opts.authorizeRetryAfterCompletedToolResult?.() === true,
                   ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
                   ...(opts.retryRandom !== undefined ? { random: opts.retryRandom } : {}),
@@ -146,6 +149,7 @@ export async function promptPersistentTurnWithFallback(opts: {
                 })
               : await retryTurnOnPersistentSession(opts.session, {
                   attempt: retry - 1,
+                  beforeResume: opts.beforeResume,
                   ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
                 })
             // The safe continue-recipe couldn't apply: keep the PREVIOUS failure

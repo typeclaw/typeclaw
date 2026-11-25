@@ -41,11 +41,14 @@ import { CORE_PERMISSIONS, type MatchableOrigin, type PermissionService } from '
 import type { ChannelOutboundBeforeEvent, ChannelOutboundOrigin, HookBus } from '@/plugin'
 import { extractClaimCode } from '@/role-claim'
 import type { Stream } from '@/stream'
+import { renderWatchReminder } from '@/watches/delivery'
 
 import { adapterNamespace } from './adapter-namespace'
 import { extractMentionedUserIds } from './adapters/mention-hints'
 import {
   BackgroundObligationStore,
+  belongsToBackgroundLineage,
+  lifecycleCoverage,
   type BackgroundObligation,
   type BackgroundObligationRef,
 } from './background-obligations'
@@ -86,7 +89,7 @@ import {
   validateGithubReviewRound,
 } from './github-review-verdict-coordinator'
 import { renderPrVerdictStandDownReminder } from './github-verdict-activity'
-import { InboundJournal, type InboundRecord, type InboundRef } from './inbound-journal'
+import { InboundJournal, isQueuedWatch, type InboundRecord, type InboundRef } from './inbound-journal'
 import { takeLostBackgroundContext } from './lost-background-context'
 import {
   MEMBERSHIP_COLD_FETCH_TIMEOUT_MS,
@@ -729,6 +732,7 @@ export type { ChannelHandoffResult } from './session-handoff'
 const CONVERSATION_ORIGIN_WINDOW_MS = 30 * 60_000
 
 type QueuedInbound = {
+  room?: InboundMessage['room']
   inputId: string
   text: string
   referenceContext?: InboundReferenceContext
@@ -811,9 +815,19 @@ type ChannelAgentSession = AgentSession & { getAbortReason?: () => string | unde
 // TEXT was rejected: a wakeup body that happened to equal a nudge constant
 // would silently misclassify, and every future enqueue site would inherit the
 // default instead of being forced to choose.
-type PendingSystemReminder = {
+type ReminderActor = {
+  authorId?: string
+  authorAdapter: AdapterId
+  parentChat?: string
+}
+
+type WatchRequester = ReminderActor & { room?: InboundMessage['room']; isDm: boolean; originTurnId?: string }
+
+type PendingSystemReminder = ({ kind: 'retry'; turnId: string } | { kind: 'wakeup' }) & {
   text: string
-  kind: 'retry' | 'wakeup'
+  actor?: ReminderActor
+  watch?: WatchRequester
+  watchInput?: { inputId: string; result: NonNullable<InboundMessage['watchResult']> }
   githubReviewRoundKey?: string
   backgroundObligationId?: string
   // Set on a todo-continuation nudge, so the turn that consumes it is charged
@@ -826,12 +840,19 @@ type PendingSystemReminder = {
   backgroundRetry?: {
     turnId: string
     obligationIds: string[]
-    emptyTurnRetries: number
-    toolLeakRetries: number
-    willingnessNudges: number
-    nextPromptMaxTokens: number | undefined
+    retryState: ReturnType<typeof snapshotRetryState>
   }
 }
+
+// Keep the retry cause with its budget and one-shot prompt override, whether
+// parking an ordinary turn for a watch or resuming a retry on a successor.
+const snapshotRetryState = (live: LiveSession) => ({
+  emptyStopAfterToolWorkArmed: live.emptyStopAfterToolWorkArmed,
+  emptyTurnRetries: live.emptyTurnRetries,
+  toolLeakRetries: live.toolLeakRetries,
+  willingnessNudges: live.willingnessNudges,
+  nextPromptMaxTokens: live.nextPromptMaxTokens,
+})
 
 // Identity-only snapshot of the deferred durable coverage a session reloaded
 // mid-obligation still owes (typically a turn waiting on a running background
@@ -869,7 +890,95 @@ type PendingReloadHandoff = {
 
 const STOP_COMMAND_REPLY = 'Stopped the current turn.'
 
-const retryReminder = (text: string): PendingSystemReminder => ({ text, kind: 'retry' })
+const reminderInputIds = (r: PendingSystemReminder): string[] =>
+  r.watchInput ? [r.watchInput.inputId] : (r.inboundRetry?.inputIds ?? [])
+
+const completionActor = (row: BackgroundObligation): ReminderActor | undefined =>
+  row.principal.kind === 'channel'
+    ? {
+        authorId: row.principal.lastInboundAuthorId,
+        authorAdapter: row.principal.lastInboundAuthorAdapter ?? row.principal.adapter,
+        parentChat: row.principal.parentChat,
+      }
+    : undefined
+
+function completionOwnership(row: BackgroundObligation) {
+  const actor = completionActor(row)
+  return {
+    backgroundObligationId: row.obligationId,
+    actor,
+    ...(row.watchOrigin && actor
+      ? {
+          watch: {
+            ...actor,
+            room: row.watchOrigin.room,
+            isDm: row.watchOrigin.isDm,
+            originTurnId: row.watchOrigin.turnId,
+          },
+        }
+      : {}),
+  }
+}
+
+const sameActor = (a: ReminderActor | undefined, b: ReminderActor | undefined): boolean =>
+  a?.authorId === b?.authorId && a?.authorAdapter === b?.authorAdapter && a?.parentChat === b?.parentChat
+
+const hasOrdinaryContinuation = (live: LiveSession) =>
+  live.promptQueue.length > 0 || live.pendingSystemReminders.some((r) => !r.watch)
+
+const watchLineage = (watch: WatchRequester | undefined, turnId: string) =>
+  watch ? (watch.originTurnId ?? turnId) : null
+const activeLineage = (live: LiveSession) => watchLineage(live.watchRequester, live.backgroundTurnId)
+
+function selectTurnReminders(pending: PendingSystemReminder[], trigger: QueuedInbound | undefined, adapter: AdapterId) {
+  // Finish an ordinary retry before admitting another principal's work into
+  // the active turn. In particular a queued watch is not a continuation.
+  const ordinary = pending.filter((r) => !r.watch)
+  const retry = ordinary.find((r) => r.kind === 'retry')
+  const first =
+    pending.find((r) => r.watch && r.kind === 'retry') ?? retry ?? ordinary[0] ?? (trigger ? undefined : pending[0])
+  const watch = first?.watch
+  if (watch) {
+    // Finish an in-progress watch retry before unrelated queued work. Fresh
+    // verdicts can share a prompt only within a contiguous requester group.
+    const queued = []
+    if (!first.watchInput)
+      queued.push(first) // A retry or child completion owns only its own work.
+    else
+      for (const reminder of pending) {
+        if (
+          !reminder.watchInput ||
+          !sameActor(reminder.watch, watch) ||
+          reminder.watch?.isDm !== watch.isDm ||
+          reminder.watch.room?.kind !== watch.room?.kind
+        )
+          break
+        queued.push(reminder)
+      }
+    return { queued, watch, actor: watch }
+  }
+  const actor = trigger
+    ? {
+        authorId: trigger.authorId,
+        authorAdapter: trigger.authorAdapter ?? adapter,
+        parentChat: trigger.room?.parentChat,
+      }
+    : first?.actor
+  const queued = ordinary.filter((r) => (!r.actor || sameActor(actor, r.actor)) && !(retry && r.backgroundObligationId))
+  return { queued, actor: trigger ? undefined : actor, watch: undefined }
+}
+
+const retryReminder = (live: LiveSession, text: string): PendingSystemReminder => ({
+  text,
+  kind: 'retry',
+  turnId: live.backgroundTurnId,
+  actor: live.reminderActor ?? {
+    authorId: live.currentTurnAuthorId ?? live.lastTurnAuthorId ?? undefined,
+    authorAdapter: live.currentTurnAuthorId === null ? live.lastTurnAuthorAdapter : live.currentTurnAuthorAdapter,
+    parentChat: live.room?.parentChat,
+  },
+  watch: live.watchRequester,
+})
 
 const wakeupReminder = (text: string): PendingSystemReminder => ({ text, kind: 'wakeup' })
 
@@ -991,6 +1100,10 @@ type LiveSession = {
   // True when THIS turn's batch carries a cross-session handoff inbound. The
   // handoff loop guard: a handoff-started turn cannot hand off again.
   currentTurnHandoff: boolean
+  reminderActor?: ReminderActor
+  watchRequester?: WatchRequester
+  // /stop must still see the ordinary claims while a watch has the prompt.
+  parkedCoverage?: { inboundCoverage: string[]; backgroundCoverage: string[] }
   // Whether the most recent inbound was private, for handoff context framing.
   lastInboundIsDm: boolean
   // Hint each recently visited conversation only once in this session.
@@ -1519,7 +1632,7 @@ export type ChannelRouter = {
     accountIdentity: string
     triggeringAuthorId?: string
     parentChat?: string
-  }) => Promise<BackgroundObligationRef>
+  }) => Promise<BackgroundObligationRef & { watchTurnId?: string }>
   suppressUnstartedBackgroundResponse: (ref: BackgroundObligationRef, reason: string) => Promise<void>
   attachBackgroundResultCoverage: (args: { parentSessionId: string; taskId: string }) => Promise<void>
   captureBackgroundResultCoverage?: (parentSessionId: string) => Promise<BackgroundObligationRef[]>
@@ -1860,6 +1973,7 @@ export type AliasesProvider = () => readonly string[]
 
 export type CreateChannelRouterOptions = {
   onHumanInbound?: (origin: SessionOrigin) => void
+  isWatchVerdictPending?: (watchId: string, runId: string) => boolean
   agentDir: string
   bootEpoch?: string
   backgroundObligations?: BackgroundObligationStore
@@ -1960,7 +2074,7 @@ export type CreateChannelRouterOptions = {
   // crossed the stuck backstop cannot unpin the session while a more recently
   // spawned child is still inside its window. Production wiring forwards the
   // LiveSubagentRegistry; omitted (tests, no-subagent setups) means no pin.
-  newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
+  newestRunningChildSubagentStartedAt?: (sessionId: string, watchTurnId?: string | null) => number | null
   cancelRunningSubagentsByWorkKey?: (
     workKey: string,
     reason: string,
@@ -2407,9 +2521,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // lands after teardown, so GC/rollover defer to this. Crossing the backstop is
   // an anomaly (a wedged, timeout-less child), logged at warn. `label` only
   // annotates the override log.
-  const isPinnedByRunningChild = (sessionId: string, keyId: string, label: string): boolean => {
-    const childStartedAt = newestRunningChildSubagentStartedAt(sessionId)
-    if (childStartedAt === null) return false
+  const isPinnedByRunningChild = (
+    sessionId: string,
+    keyId: string,
+    label: string,
+    watchTurnId?: string | null,
+    since = -Infinity,
+  ): boolean => {
+    const childStartedAt = newestRunningChildSubagentStartedAt(sessionId, watchTurnId)
+    if (childStartedAt === null || childStartedAt < since) return false
     const pinnedForMs = now() - childStartedAt
     if (pinnedForMs <= SESSION_CHILD_STUCK_BACKSTOP_MS) return true
     logger.warn(
@@ -2437,9 +2557,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // under a new session ID owns none of them in the registry.
     parentSessionId = live.sessionId,
   ): boolean => {
-    const childStartedAt = newestRunningChildSubagentStartedAt(parentSessionId)
-    if (childStartedAt === null || childStartedAt < startedAt) return false
-    return isPinnedByRunningChild(parentSessionId, live.keyId, label)
+    const watchTurnId = activeLineage(live)
+    // Watch ownership is exact: an older sibling can predate the prompt that
+    // consumes its peer's completion. Ordinary episodes retain the time fence.
+    return isPinnedByRunningChild(parentSessionId, live.keyId, label, watchTurnId, watchTurnId ? -Infinity : startedAt)
   }
 
   const shouldRolloverLive = (live: LiveSession, idleMs: number): boolean => {
@@ -2481,7 +2602,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const pendingReloadHandoffInputIds = (pending: PendingReloadHandoff): string[] => [
     ...(pending.coverage?.inboundIds ?? []),
     ...pending.inbounds.flatMap((input) => (input.inputId ? [input.inputId] : [])),
-    ...pending.reminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
+    ...pending.reminders.flatMap(reminderInputIds),
   ]
 
   const pendingReloadHandoffBackgroundIds = (pending: PendingReloadHandoff): string[] => [
@@ -2552,6 +2673,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     inputIds: readonly string[],
     backgroundIds: readonly string[],
     ownerSessionId?: string,
+    lineage?: string | null,
   ): Promise<void> => {
     await ready
     inboundJournal.assertAvailable()
@@ -2562,6 +2684,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const ref of inboundJournal.resolve([...new Set(inputIds)])) {
       const row = inboundJournal.get(ref.inputId)
       if (!row || row.phase === 'closed' || row.transfer) continue
+      if (isQueuedWatch(row)) continue // The watch store can still redeliver this body.
       const identity = recoveryNoticePartitionKey({
         target,
         accountIdentity: row.accountIdentity,
@@ -2579,6 +2702,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const id of new Set(backgroundIds)) {
       const row = await backgroundObligations.get(id)
       if (!row || row.phase === 'closed' || row.transfer || channelKeyId(row.target) !== channelKeyId(target)) continue
+      if (lineage !== undefined && !belongsToBackgroundLineage(row, lineage)) continue
       const ref = { obligationId: id, generation: row.generation }
       const group = groups.get(
         recoveryNoticePartitionKey({
@@ -2614,12 +2738,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const inputIds = new Set([
       ...live.inboundCoverage,
       ...live.promptQueue.map((input) => input.inputId),
-      ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+      ...live.pendingSystemReminders.flatMap(reminderInputIds),
     ])
     const mismatchedInputs = new Set<string>()
     for (const id of inputIds) {
       const row = inboundJournal.get(id)
-      if (row && row.phase !== 'closed' && row.accountIdentity !== currentAccount) mismatchedInputs.add(id)
+      if (row && row.phase !== 'closed' && !isQueuedWatch(row) && row.accountIdentity !== currentAccount)
+        mismatchedInputs.add(id)
     }
     const backgroundIds = new Set([
       ...live.backgroundCoverage,
@@ -2647,6 +2772,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.inboundCoverage = live.inboundCoverage.filter((id) => !mismatchedInputs.has(id))
     retireBackgroundCache(live, mismatchedBackground)
     live.pendingSystemReminders = live.pendingSystemReminders.filter((reminder) => {
+      if (reminder.watchInput && mismatchedInputs.has(reminder.watchInput.inputId)) return false
       if (reminder.inboundRetry)
         reminder.inboundRetry.inputIds = reminder.inboundRetry.inputIds.filter((id) => !mismatchedInputs.has(id))
       return (
@@ -2676,6 +2802,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // current generation; one closed, transferred or re-owned elsewhere does not.
   const isHeldByLiveTurn = (live: LiveSession, row: InboundRecord | BackgroundObligation | undefined): boolean =>
     row?.phase === 'turn-owned' &&
+    (!('obligationId' in row) || belongsToBackgroundLineage(row, activeLineage(live))) &&
     !row.transfer &&
     row.claim?.turnId === live.backgroundTurnId &&
     row.claim.ownerSessionId === live.backgroundTurnOwnerSessionId &&
@@ -2696,7 +2823,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (isHeldByLiveTurn(live, await backgroundObligations.get(id))) backgroundIds.push(id)
       }
       if (inputIds.length > 0 || backgroundIds.length > 0) {
-        await transferLostCoverageInLane(live.key, inputIds, backgroundIds, live.backgroundTurnOwnerSessionId)
+        await transferLostCoverageInLane(
+          live.key,
+          inputIds,
+          backgroundIds,
+          live.backgroundTurnOwnerSessionId,
+          activeLineage(live),
+        )
       }
     }
     live.inboundCoverage = []
@@ -2741,7 +2874,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       [
         ...live.inboundCoverage,
         ...live.promptQueue.map((input) => input.inputId),
-        ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+        ...live.pendingSystemReminders.flatMap(reminderInputIds),
       ],
       [
         ...live.backgroundCoverage,
@@ -2754,7 +2887,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const hasCoverage = live.inboundCoverage.length > 0 || live.backgroundCoverage.length > 0
     const deferredToBackground =
       hasCoverage &&
-      (live.pendingSystemReminders.some((reminder) => reminder.backgroundObligationId !== undefined) ||
+      (live.pendingSystemReminders.some(
+        (reminder) => !reminder.watch && reminder.backgroundObligationId !== undefined,
+      ) ||
         awaitsDeferredChild(live, 'reload-handoff'))
     if (hasCoverage && !deferredToBackground) await transferHeldCoverageInLane(live)
     const inbounds = live.promptQueue.slice()
@@ -2912,7 +3047,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return true
   }
 
-  const adoptPendingReloadHandoff = (live: LiveSession): void => {
+  const adoptPendingReloadHandoff = async (live: LiveSession): Promise<void> => {
     const pending = pendingReloadHandoffs.get(live.keyId)
     if (pending === undefined) return
     const ageMs = now() - pending.retainedAt
@@ -2924,6 +3059,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // busy session leaves them pending (still bounded by expiry) rather than
     // mixing two lineages in one cache.
     const coverage = pending.coverage
+    const retry = pending.reminders.find((r) => r.kind === 'retry' && !r.watch)
+    const inheritedIds = coverage?.backgroundIds ?? retry?.backgroundRetry?.obligationIds ?? []
+    const ordinaryIds: string[] = []
+    for (const id of inheritedIds) {
+      const row = await backgroundObligations.get(id)
+      if (row && belongsToBackgroundLineage(row, null)) ordinaryIds.push(id)
+    }
+    if (pendingReloadHandoffs.get(live.keyId) !== pending || live.destroyed) return
     const adoptCoverage =
       coverage !== null &&
       !live.draining &&
@@ -2946,6 +3089,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.promptQueue.push(...pending.inbounds)
     live.contextBuffer.push(...pending.observed)
     live.pendingSystemReminders.push(...pending.reminders)
+    // A retry-only reload handoff resumes the source turn, not the successor's
+    // initial random turn ID. Restore its claims too: if fresh input wins the
+    // race, normal fresh-turn bookkeeping must still account for that debt.
+    if (!coverage && retry?.kind === 'retry' && live.turnSeq === 0 && !live.draining) {
+      live.backgroundTurnId = retry.turnId
+      live.backgroundTurnOwnerSessionId = pending.sessionId
+      live.inboundCoverage = [...(retry.inboundRetry?.inputIds ?? [])]
+      live.backgroundCoverage = ordinaryIds
+      const row = live.inboundCoverage[0] ? inboundJournal.get(live.inboundCoverage[0]) : undefined
+      if (row && row.phase !== 'closed') live.turnAccountIdentity = row.accountIdentity
+    }
     if (adoptCoverage) {
       // Identity caches only. The journal claims stay with the source turn until
       // this session's in-lane consume revalidates and moves them, which happens
@@ -2953,7 +3107,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // any retry lineage valid. A coverage-only handoff never prompts by itself: the
       // child's completion (or the next real input) is what wakes this session.
       live.inboundCoverage = [...coverage.inboundIds]
-      live.backgroundCoverage = [...coverage.backgroundIds]
+      live.backgroundCoverage = ordinaryIds
       live.backgroundTurnId = coverage.turnId
       live.backgroundTurnOwnerSessionId = coverage.ownerSessionId
       live.logicalTurnStartedAt = coverage.logicalTurnStartedAt
@@ -2996,7 +3150,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // A resume that finds the key already live is a no-op for reopening: the
       // session is up, so just hand it back and let the caller enqueue the wake.
       if (resumeTarget !== undefined) {
-        adoptPendingReloadHandoff(existing)
+        await adoptPendingReloadHandoff(existing)
         return existing
       }
       // The 60-minute idle rollover decision lives in
@@ -3036,7 +3190,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
         }
       } else {
-        adoptPendingReloadHandoff(existing)
+        await adoptPendingReloadHandoff(existing)
         return existing
       }
     }
@@ -3504,7 +3658,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         await unwindInstalledLive(keyId, live)
         throw new Error(`[channels] ${keyId}: superseded live session creation discarded`)
       }
-      adoptPendingReloadHandoff(live)
+      await adoptPendingReloadHandoff(live)
       logger.info(`[channels] ${keyId}: ensureLive done (${phase})`)
       return live
     })().finally(() => {
@@ -3845,6 +3999,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const row = await backgroundObligations.get(id)
       if (
         !row ||
+        !belongsToBackgroundLineage(row, activeLineage(live)) ||
         row.transfer ||
         channelKeyId(row.target) !== live.keyId ||
         (row.phase !== 'result-ready' && row.phase !== 'turn-owned')
@@ -3858,13 +4013,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return refs
   }
 
-  const retireBackgroundCache = (live: LiveSession, covered: Set<string>): void => {
+  const retireBackgroundCache = (live: LiveSession, covered: Set<string>, lineage?: string | null): void => {
+    const mayRetire = (r: PendingSystemReminder) =>
+      lineage === undefined || watchLineage(r.watch, r.kind === 'retry' ? r.turnId : live.backgroundTurnId) === lineage
     live.backgroundCoverage = live.backgroundCoverage.filter((id) => !covered.has(id))
     live.pendingSystemReminders = live.pendingSystemReminders.filter(
-      (reminder) => !reminder.backgroundObligationId || !covered.has(reminder.backgroundObligationId),
+      (reminder) =>
+        !mayRetire(reminder) || !reminder.backgroundObligationId || !covered.has(reminder.backgroundObligationId),
     )
     for (const reminder of live.pendingSystemReminders) {
-      if (reminder.backgroundRetry) {
+      if (reminder.backgroundRetry && mayRetire(reminder)) {
         reminder.backgroundRetry.obligationIds = reminder.backgroundRetry.obligationIds.filter((id) => !covered.has(id))
       }
     }
@@ -3906,14 +4064,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         )
       : currentInbound.filter((ref) => isClaimedByCurrentTurn(live, inboundJournal.get(ref.inputId)))
     if (inboundRefs.length > 0) {
-      await inboundJournal.settle(inboundRefs, { kind, decisionId: randomUUID(), reason }, refs, live.key)
+      await inboundJournal.settle(
+        inboundRefs,
+        { kind, decisionId: randomUUID(), reason },
+        refs,
+        live.key,
+        activeLineage(live),
+      )
     } else if (refs.length > 0) {
       inboundJournal.assertAvailable()
-      await backgroundObligations.settle(refs, { kind, decisionId: randomUUID(), reason })
+      await backgroundObligations.settle(
+        refs,
+        { kind, decisionId: randomUUID(), reason },
+        undefined,
+        activeLineage(live),
+      )
     }
     const retiredInbound = new Set(inboundRefs.map((ref) => ref.inputId))
     live.inboundCoverage = live.inboundCoverage.filter((id) => !retiredInbound.has(id))
-    retireBackgroundCache(live, new Set(refs.map((ref) => ref.obligationId)))
+    retireBackgroundCache(live, new Set(refs.map((ref) => ref.obligationId)), activeLineage(live))
   }
 
   const settleBackgroundCoverage = async (
@@ -4208,7 +4377,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   // resets the budget.
   const maybeContinueTodosChannel = async (live: LiveSession): Promise<void> => {
     if (live.destroyed) return
-    if (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) return
+    if (hasOrdinaryContinuation(live)) return
     // Joined to the outcome-write chain so a concurrent /stop's durable abort is
     // ORDERED AFTER this decision's own state write instead of racing it. The
     // decision itself awaits disk, so the stop marker is re-read at delivery
@@ -4229,7 +4398,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // Self-continuation of the SAME work episode, not external injection:
             // `qualifyingWorkThisLogicalTurn` must survive it so a follow-up reply
             // can still cite the durable work this turn already did.
-            live.pendingSystemReminders.push({ ...retryReminder(text), todoContinuation: true })
+            live.pendingSystemReminders.push({ ...retryReminder(live, text), todoContinuation: true })
           },
           onDecision: (result) => {
             const line = describeContinuationDecision(result)
@@ -4381,7 +4550,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // spawned) is the model's next chance to close the thread with real
     // content. Posting the canned fallback now strands the verdict that turn is
     // about to deliver, so re-evaluate at the end of that turn instead.
-    if (live.pendingSystemReminders.length > 0 || live.promptQueue.length > 0) {
+    if (hasOrdinaryContinuation(live)) {
       logger.info(
         `[channels] ${live.keyId} github_thread_closeout_deferred pr=${closeout.prNumber} root=${closeout.rootCommentId} reason=reprompt_queued`,
       )
@@ -4395,6 +4564,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       )
       live.pendingSystemReminders.push(
         retryReminder(
+          live,
           `<system-reminder>\nThis session still owes a close-out on GitHub PR #${closeout.prNumber}, ` +
             `review thread root comment ${closeout.rootCommentId}. Your previous turn sent no reply to that thread. ` +
             `Call channel_reply now with an explicit resolve_review_thread choice: true if the concern is addressed, ` +
@@ -4437,7 +4607,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       return
     }
-    if (live.promptQueue.length > 0 || live.pendingSystemReminders.length > 0) {
+    if (hasOrdinaryContinuation(live)) {
       // A re-prompt is still queued: keep both the stage and the pending signal for
       // the next resolution — the turn hasn't finished.
       logger.info(
@@ -4499,6 +4669,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const buildLiveOrigin = (live: LiveSession): SessionOrigin => {
     const membership = readMembership(live.key, live.room)
     const self = resolveSelfIdentity(live.key)
+    const parentChat = live.reminderActor ? live.reminderActor.parentChat : live.room?.parentChat
     return {
       kind: 'channel',
       adapter: live.key.adapter,
@@ -4510,7 +4681,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       isDm: live.lastInboundIsDm,
       ...(live.room ? { room: live.room } : {}),
       ...(live.githubReviewRound !== null ? { githubReviewRound: live.githubReviewRound } : {}),
-      ...(live.room?.parentChat !== undefined ? { parentChat: live.room.parentChat } : {}),
+      ...(parentChat !== undefined ? { parentChat } : {}),
       ...(live.room?.parentChatName !== undefined ? { parentChatName: live.room.parentChatName } : {}),
       ...(live.currentTurnAuthorId !== null ? { lastInboundAuthorId: live.currentTurnAuthorId } : {}),
       ...(live.currentTurnAuthorAdapter !== live.key.adapter
@@ -4695,10 +4866,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     for (const group of partitions.values()) {
       const outcome = { kind: 'intentionally-suppressed' as const, decisionId: randomUUID(), reason: 'user-stop' }
       if (group.inbound.length > 0) {
-        await inboundJournal.settle(group.inbound, outcome, group.background, target)
+        await inboundJournal.settle(group.inbound, outcome, group.background, target, lifecycleCoverage)
       } else {
         inboundJournal.assertAvailable()
-        await backgroundObligations.settle(group.background, outcome)
+        await backgroundObligations.settle(group.background, outcome, undefined, lifecycleCoverage)
       }
       for (const ref of group.inbound) withdrawn.inbound.add(ref.inputId)
       for (const ref of group.background) withdrawn.background.add(ref.obligationId)
@@ -4743,7 +4914,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             ...new Set([
               ...live.inboundCoverage,
               ...live.promptQueue.flatMap((input) => (input.inputId ? [input.inputId] : [])),
-              ...live.pendingSystemReminders.flatMap((r) => r.inboundRetry?.inputIds ?? []),
+              ...live.pendingSystemReminders.flatMap(reminderInputIds),
+              ...(live.parkedCoverage?.inboundCoverage ?? []),
             ]),
           ]
           const withdrawn = { inbound: new Set<string>(), background: new Set<string>() }
@@ -4753,6 +4925,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               [...live.inboundCoverage, ...(pending ? pendingReloadHandoffInputIds(pending) : [])],
               [
                 ...live.backgroundCoverage,
+                ...(live.parkedCoverage?.backgroundCoverage ?? []),
                 ...live.pendingSystemReminders.flatMap((r) =>
                   r.backgroundObligationId ? [r.backgroundObligationId] : [],
                 ),
@@ -5132,10 +5305,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const backgroundRefs = background.map((row) => ({ obligationId: row.obligationId, generation: row.generation }))
     const outcome = { kind: 'intentionally-suppressed' as const, decisionId: randomUUID(), reason }
     if (inboundRefs.length > 0) {
-      await inboundJournal.settle(inboundRefs, outcome, backgroundRefs, live.key)
+      await inboundJournal.settle(inboundRefs, outcome, backgroundRefs, live.key, activeLineage(live))
     } else if (backgroundRefs.length > 0) {
       inboundJournal.assertAvailable()
-      await backgroundObligations.settle(backgroundRefs, outcome)
+      await backgroundObligations.settle(backgroundRefs, outcome, undefined, activeLineage(live))
     }
   }
 
@@ -5144,8 +5317,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       restartShutdownPending ||
       live.destroyed ||
       live.pendingTeardown ||
-      live.promptQueue.length > 0 ||
-      live.pendingSystemReminders.length > 0 ||
+      hasOrdinaryContinuation(live) ||
       live.stagedFallbackCause !== null ||
       live.githubReviewThreadCloseout !== null ||
       live.nextInboundContinuationTurnId === live.backgroundTurnId ||
@@ -5222,6 +5394,34 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.qualifyingWorkThisLogicalTurn = false
   }
 
+  // pi-coding-agent 1.5.2 awaits prompt preparation and before_agent_start
+  // before handing messages to agent.prompt. Reject at that handoff, before
+  // agent_start, transcript insertion, and the first provider request.
+  const gateWatchDispatch = (
+    live: LiveSession,
+    stopVersion: number,
+    requester: SessionOrigin,
+    queued: readonly PendingSystemReminder[],
+  ) => {
+    inboundJournal.assertAvailable()
+    if (live.backgroundStopVersion !== stopVersion) return 'user-stop'
+    const account = currentAccountIdentityFor(live.key)
+    if (!permissions.has(requester, CORE_PERMISSIONS.channelRespond)) return 'watch-permission-denied'
+    if (!queued.length && account !== undefined && account !== live.turnAccountIdentity) return 'watch-account-changed'
+    const rejected = new Map<PendingSystemReminder, string>()
+    for (const reminder of queued) {
+      const input = reminder.watchInput
+      if (!input) continue
+      const row = inboundJournal.get(input.inputId)
+      if (row?.phase !== 'admitted' || (account !== undefined && row.accountIdentity !== account))
+        rejected.set(reminder, 'watch-account-changed')
+      else if (options.isWatchVerdictPending?.(input.result.watchId, input.result.key) === false)
+        rejected.set(reminder, 'watch-cancelled')
+    }
+    if (rejected.size) return rejected
+    if (account === undefined) return 'watch-account-unavailable'
+  }
+
   const runDrain = async (live: LiveSession): Promise<void> => {
     live.draining = true
     try {
@@ -5236,6 +5436,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         !live.destroyed &&
         !live.pendingTeardown
       ) {
+        // A watch may exit at any await before prompt(), including after /stop.
+        // Restore its parked state before this loop can claim another batch.
+        using iteration = new DisposableStack()
         live.typingTimedOut = false
         // Each turn starts with no held reactions; the model re-requests them
         // via channel_react during this turn, and the finally flushes or drops.
@@ -5256,7 +5459,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             [
               ...live.inboundCoverage,
               ...live.promptQueue.map((input) => input.inputId),
-              ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
+              ...live.pendingSystemReminders.flatMap(reminderInputIds),
             ],
             [
               ...live.backgroundCoverage,
@@ -5290,6 +5493,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           )
           retireBackgroundCache(live, staleBackground)
           live.pendingSystemReminders = live.pendingSystemReminders.filter((reminder) => {
+            // Fresh input supersedes the previous turn's retry regardless of
+            // speaker. A wakeup or an isolated watch retry is independent work.
+            if (
+              reminder.kind === 'retry' &&
+              !reminder.watch &&
+              (live.promptQueue.length > 0 || reminder.turnId !== live.backgroundTurnId)
+            )
+              return false
+            if (reminder.watchInput && !stillUntransferred(reminder.watchInput.inputId)) return false
             if (reminder.inboundRetry)
               reminder.inboundRetry.inputIds = reminder.inboundRetry.inputIds.filter(stillUntransferred)
             return (
@@ -5299,10 +5511,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             )
           })
           if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
-          const batchCount = live.promptQueue.length
-          const observedCount = live.contextBuffer.length
-          const reminderCount = live.pendingSystemReminders.length
-          const queued = live.pendingSystemReminders.slice(0, reminderCount)
+          const { queued, watch, actor } = selectTurnReminders(
+            live.pendingSystemReminders,
+            live.promptQueue.at(-1),
+            live.key.adapter,
+          )
+          const batchCount = watch ? 0 : live.promptQueue.length
+          const observedCount = watch ? 0 : live.contextBuffer.length
+          const selected = new Set(queued)
           const eligible = new Set<PendingSystemReminder>()
           const refs: BackgroundObligationRef[] = []
           const readyRows: BackgroundObligation[] = []
@@ -5316,6 +5532,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             // wins: retire the obsolete entry instead of poisoning later input.
             if (
               !row ||
+              !belongsToBackgroundLineage(row, watch?.originTurnId ?? null) ||
               row.phase !== 'result-ready' ||
               row.claim ||
               row.transfer ||
@@ -5335,7 +5552,64 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           const inputIds = live.promptQueue
             .slice(0, batchCount)
             .flatMap((input) => (input.inputId ? [input.inputId] : []))
+          inputIds.push(...queued.flatMap((r) => (r.watchInput ? [r.watchInput.inputId] : [])))
           const inboundRefs = await inboundJournal.resolve(inputIds)
+          if (watch) {
+            // Swap only live bookkeeping. The journal never moves the ordinary
+            // turn's claims, and /stop retains access to both sets of IDs.
+            const parked = {
+              ...snapshotRetryState(live),
+              inboundCoverage: live.inboundCoverage,
+              backgroundCoverage: live.backgroundCoverage,
+              backgroundTurnId: live.backgroundTurnId,
+              backgroundTurnOwnerSessionId: live.backgroundTurnOwnerSessionId,
+              turnAccountIdentity: live.turnAccountIdentity,
+              coverageDeferredSince: live.coverageDeferredSince,
+              coverageDeferredParentSessionId: live.coverageDeferredParentSessionId,
+              nextInboundContinuationTurnId: live.nextInboundContinuationTurnId,
+              backgroundWakeLogicalTurn: live.backgroundWakeLogicalTurn,
+              logicalTurnStartedAt: live.logicalTurnStartedAt,
+              promisedWorkOutstandingThisLogicalTurn: live.promisedWorkOutstandingThisLogicalTurn,
+              statusOutputOutstandingThisLogicalTurn: live.statusOutputOutstandingThisLogicalTurn,
+              providerErrorSilencedThisLogicalTurn: live.providerErrorSilencedThisLogicalTurn,
+              stagedFallbackCause: live.stagedFallbackCause,
+              githubReviewThreadCloseout: live.githubReviewThreadCloseout,
+              githubReviewRound: live.githubReviewRound,
+              room: live.room,
+              lastInboundIsDm: live.lastInboundIsDm,
+              currentTurnAuthorId: live.currentTurnAuthorId,
+              currentTurnAuthorIds: live.currentTurnAuthorIds,
+              currentTurnAuthorAdapter: live.currentTurnAuthorAdapter,
+              currentTurnReactionRef: live.currentTurnReactionRef,
+              pendingQuoteCandidate: live.pendingQuoteCandidate,
+              pendingUserTurnSignal: live.pendingUserTurnSignal,
+              lastQuestionSignal: live.lastQuestionSignal,
+              currentTurnHandoff: live.currentTurnHandoff,
+              reminderActor: live.reminderActor,
+            }
+            const priorOrigin = live.originRef.current
+            iteration.defer(() => {
+              Object.assign(live, parked)
+              live.originRef.current = priorOrigin
+              live.parkedCoverage = undefined
+              live.watchRequester = undefined
+            })
+            live.parkedCoverage = parked
+            live.inboundCoverage = []
+            live.backgroundCoverage = []
+            live.coverageDeferredSince = null
+            live.coverageDeferredParentSessionId = null
+            live.nextInboundContinuationTurnId = null
+            live.stagedFallbackCause = null
+            live.githubReviewThreadCloseout = null
+            live.githubReviewRound = null
+            live.promisedWorkOutstandingThisLogicalTurn = false
+            live.statusOutputOutstandingThisLogicalTurn = false
+            live.pendingUserTurnSignal = null
+            live.lastQuestionSignal = null
+            live.logicalTurnStartedAt = now()
+            live.backgroundWakeLogicalTurn = true
+          }
           let carriedBackground: BackgroundObligationRef[] = []
           if (live.inboundCoverage.length === 0 && live.backgroundCoverage.length === 0) {
             live.coverageDeferredSince = null
@@ -5356,14 +5630,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             for (const id of new Set(live.backgroundCoverage)) cached.push(await backgroundObligations.get(id))
             const held = cached.filter(
               (row): row is InboundRecord | BackgroundObligation =>
-                row?.phase === 'turn-owned' &&
-                !row.transfer &&
-                row.claim?.turnId === live.backgroundTurnId &&
-                row.claim.ownerSessionId === sourceOwner &&
-                row.claim.epoch === inboundJournal.epoch &&
-                row.claim.generation === row.generation &&
-                channelKeyId(row.target) === live.keyId &&
-                row.accountIdentity === sourceAccount,
+                row?.phase === 'turn-owned' && isHeldByLiveTurn(live, row) && row.accountIdentity === sourceAccount,
             )
             const deferred = held.flatMap((row) => ('inputId' in row ? [row] : []))
             const deferredBackground = held.flatMap((row) => ('obligationId' in row ? [row] : []))
@@ -5383,6 +5650,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             const awaitingDeferredWork =
               readyRows.some(
                 (row) =>
+                  !row.watchOrigin &&
                   parents.includes(row.parentSessionId) &&
                   row.accountIdentity === sourceAccount &&
                   row.acceptedAt >= deferredSince,
@@ -5410,7 +5678,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                 )
                 await settleAbandonedSilentlyInLane(live, deferred, deferredBackground, silentEnd.reason)
               } else {
-                await transferLostCoverageInLane(live.key, live.inboundCoverage, live.backgroundCoverage, sourceOwner)
+                await transferLostCoverageInLane(
+                  live.key,
+                  live.inboundCoverage,
+                  live.backgroundCoverage,
+                  sourceOwner,
+                  activeLineage(live),
+                )
               }
               live.coverageDeferredSince = null
               live.coverageDeferredParentSessionId = null
@@ -5433,6 +5707,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                     [],
                     deferredBackground.map((row) => row.obligationId),
                     sourceOwner,
+                    activeLineage(live),
                   )
                 }
               }
@@ -5454,10 +5729,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             }
           }
           if (fresh) live.nextInboundContinuationTurnId = null
-          const owner = { turnId, ownerSessionId: live.sessionId, target: live.key }
+          const owner = {
+            turnId,
+            ownerSessionId: live.sessionId,
+            target: live.key,
+            watchTurnId: watchLineage(watch, turnId),
+          }
           const claimedCoverage =
             inboundRefs.length > 0
-              ? await inboundJournal.claim(inboundRefs, owner, refs)
+              ? watch
+                ? { inboundRefs, backgroundRefs: [] }
+                : await inboundJournal.claim(inboundRefs, owner, refs)
               : {
                   inboundRefs: [],
                   backgroundRefs: refs.length > 0 ? await backgroundObligations.claim(refs, owner) : [],
@@ -5471,6 +5753,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               const row = await backgroundObligations.get(id)
               if (
                 !row ||
+                !belongsToBackgroundLineage(row, owner.watchTurnId) ||
                 row.transfer ||
                 row.phase !== 'turn-owned' ||
                 row.claim?.turnId !== carried.turnId ||
@@ -5505,10 +5788,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.backgroundCoverage.push(...claimed.map((ref) => ref.obligationId))
           if (carried) {
             live.backgroundCoverage = [...moved, ...claimed].map((ref) => ref.obligationId)
-            live.emptyTurnRetries = carried.emptyTurnRetries
-            live.toolLeakRetries = carried.toolLeakRetries
-            live.willingnessNudges = carried.willingnessNudges
-            live.nextPromptMaxTokens = carried.nextPromptMaxTokens
+            Object.assign(live, carried.retryState)
           }
           const carriedWake = fresh ? undefined : queued.find((r) => r.backgroundWake !== undefined)?.backgroundWake
           if (carriedWake !== undefined) live.backgroundWakeLogicalTurn = carriedWake
@@ -5521,18 +5801,25 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             ownedInput?.accountIdentity ??
             ownedBackground?.accountIdentity ??
             (fresh ? undefined : live.turnAccountIdentity)
+          live.pendingSystemReminders = live.pendingSystemReminders.filter((r) => !selected.has(r))
+          const results = queued.flatMap((r) => (r.watchInput ? [r.watchInput.result] : []))
           return {
             batch: live.promptQueue.splice(0, batchCount),
             observed: live.contextBuffer.splice(0, observedCount),
-            reminders: live.pendingSystemReminders
-              .splice(0, reminderCount)
-              .filter((reminder) => eligible.has(reminder)),
+            reminders: results.length
+              ? [wakeupReminder(renderWatchReminder({ kind: 'channel' }, results))]
+              : queued.filter((r) => eligible.has(r)),
+            actor,
+            watch,
+            watchStart: watch && inboundRefs.length ? { refs: inboundRefs, owner, queued } : undefined,
             stopVersion: live.backgroundStopVersion,
           }
         }
         const drained = await backgroundObligations.withTargetLane(live.key, consume)
         if (drained === undefined) break
-        const { batch, observed, reminders, stopVersion } = drained
+        const { batch, observed, reminders, stopVersion, actor, watch } = drained
+        live.watchRequester = watch
+        live.reminderActor = actor
         if (live.backgroundStopVersion !== stopVersion || (batch.length === 0 && reminders.length === 0)) continue
         live.currentTurnAttachments = collectTurnAttachments(observed, batch)
         // A reminder-only iteration carrying externally-injected work opens a
@@ -5573,6 +5860,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.currentTurnAuthorIds = new Set(batch.map((m) => m.authorId))
           live.currentTurnReactionRef = batch[batch.length - 1]!.reactionRef ?? null
           const trigger = batch[batch.length - 1]!
+          live.room = trigger.room
+          live.lastInboundIsDm = trigger.isDm
           if (trigger.githubReviewRound !== undefined) {
             live.githubReviewRound = registerGithubReviewRound(trigger.githubReviewRound, now(), now)
           }
@@ -5680,7 +5969,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.qualifyingWorkThisLogicalTurn = false
           live.promisedWorkOutstandingThisLogicalTurn = false
           live.statusOutputOutstandingThisLogicalTurn = false
-        } else if (live.lastTurnAuthorId !== null) {
+        } else if (actor) {
+          live.currentTurnEngageReactions = []
+          live.currentTurnAuthorId = actor.authorId ?? null
+          live.currentTurnAuthorAdapter = actor.authorAdapter
+          live.currentTurnAuthorIds = new Set(actor.authorId ? [actor.authorId] : [])
+          if (watch || wakeupTurn) {
+            live.currentTurnHandoff = false
+            live.currentTurnReactionRef = null
+            live.pendingQuoteCandidate = null
+          }
+          if (watch) {
+            live.room = watch.room
+            live.lastInboundIsDm = watch.isDm
+          }
+        } else {
           live.currentTurnEngageReactions = []
           // Reminder-only turn (batch.length === 0, reminders.length > 0):
           // restore the author identity from the prior turn so author-
@@ -5698,8 +6001,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.currentTurnAuthorAdapter = live.lastTurnAuthorAdapter
           live.currentTurnHandoff = live.lastTurnHandoff
           live.currentTurnAuthorIds = new Set(live.lastTurnAuthorIds)
-        } else {
-          live.currentTurnEngageReactions = []
         }
         // After the author-identity restore above, which a wakeup turn still needs.
         if (wakeupTurn) beginWakeupTurn(live)
@@ -5712,6 +6013,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // off `lastInboundAuthorId` happens in the tool layer and sees the same
         // live value.
         live.originRef.current = buildLiveOrigin(live)
+        const requesterOrigin = live.originRef.current
         const liveRole = permissions.describe(live.originRef.current).role
 
         const text = composeTurnPrompt(observed, batch, {
@@ -5774,20 +6076,23 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         const retrievalContext = await fireSessionTurnStart(live, retrievalQuery)
         if (live.backgroundStopVersion !== stopVersion) continue
-        const accountMayPrompt = await backgroundObligations.withTargetLane(live.key, async () => {
-          const currentAccount = await transferMismatchedAccountCoverageInLane(live)
-          return (
-            currentAccount === undefined ||
-            live.turnAccountIdentity === undefined ||
-            currentAccount === live.turnAccountIdentity
-          )
-        })
+        const accountMayPrompt =
+          watch ||
+          (await backgroundObligations.withTargetLane(live.key, async () => {
+            const currentAccount = await transferMismatchedAccountCoverageInLane(live)
+            return (
+              currentAccount === undefined ||
+              live.turnAccountIdentity === undefined ||
+              currentAccount === live.turnAccountIdentity
+            )
+          }))
         if (!accountMayPrompt || live.backgroundStopVersion !== stopVersion) continue
         // Taken only once this turn will prompt: the receipt is at-most-once.
-        const restoredContext = live.restoredBackgroundContextPending
-          ? await takeLostBackgroundContext(options.agentDir, backgroundObligations, live.sessionId)
-          : []
-        live.restoredBackgroundContextPending = false
+        let restoredContext: string[] = []
+        if (!watch && live.restoredBackgroundContextPending) {
+          restoredContext = await takeLostBackgroundContext(options.agentDir, backgroundObligations, live.sessionId)
+          live.restoredBackgroundContextPending = false
+        }
         const promptText = [
           ...restoredContext,
           text,
@@ -5795,8 +6100,51 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         ].join('\n\n')
         applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
         live.promptInFlight = true
+        // Admission and even dequeue are too early: a crash before prompt()
+        // would turn a queued verdict into lost-turn recovery. Its durable
+        // claim is the acknowledgment of the first SDK agent_start instead.
+        const start = drained.watchStart
+        let startClaim: Promise<unknown> | undefined
+        const denied = new Error('Watch dispatch denied')
+        let rejection: ReturnType<typeof gateWatchDispatch>
+        const assertDispatch = () => {
+          rejection = gateWatchDispatch(live, stopVersion, requesterOrigin, startClaim ? [] : (start?.queued ?? []))
+          if (rejection) throw denied
+        }
+        if (watch) {
+          const { agent } = live.session
+          const prompt = agent.prompt
+          const resume = agent.continue
+          iteration.defer(() => {
+            agent.prompt = prompt
+            agent.continue = resume
+          })
+          agent.continue = () => {
+            assertDispatch()
+            return resume.call(agent)
+          }
+          agent.prompt = new Proxy(prompt, {
+            apply(fn, self, args) {
+              assertDispatch()
+              return Reflect.apply(fn, self, args)
+            },
+          })
+        }
+        const unsubscribeStart = start
+          ? live.session.subscribe((event) => {
+              if (event.type === 'agent_start' && !startClaim) {
+                startClaim = backgroundObligations.withTargetLane(live.key, () =>
+                  inboundJournal.claim(start.refs, start.owner),
+                )
+                void startClaim.catch((error) =>
+                  logger.error(`[channels] watch start claim failed: ${describeError(error)}`),
+                )
+              }
+            })
+          : undefined
         try {
           const result = await promptPersistentTurnWithFallback({
+            beforeResume: watch ? assertDispatch : undefined,
             refs: resolveFallbackChain(effectiveModels(getConfig(), live.originRef.current), undefined),
             currentModelRef: live.activeModelRef,
             session: live.session,
@@ -5816,6 +6164,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               live.activeModelRef = ref
             },
             beforeAttempt: () => {
+              applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
+              if (watch) return
               inboundJournal.assertAvailable()
               if (live.backgroundStopVersion !== stopVersion) throw new Error('Channel turn stopped before dispatch')
               const currentAccount = currentAccountIdentityFor(live.key)
@@ -5829,7 +6179,6 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                   .catch((error) => logger.error(`[channels] account-change transfer failed: ${describeError(error)}`))
                 throw new Error('Channel turn account identity changed before dispatch')
               }
-              applyTurnThinkingLevel(live.session, retrievalQuery, live.turnThinkingDefault, live.lastQuestionSignal)
             },
             onAttemptFailed: (attempt) => {
               logger.warn(
@@ -5841,7 +6190,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             },
           })
           if (result.success) live.activeModelRef = result.refUsed
-          await validateChannelTurn(live, successfulSendsBeforePrompt)
+          await startClaim
+          if (!start || startClaim) await validateChannelTurn(live, successfulSendsBeforePrompt)
           live.consecutiveAborts = 0
           // Resolve the pending logical-turn signal on a binary rule: ONLY a
           // usable assistant reply (real model prose the user saw) seeds the next
@@ -5879,6 +6229,36 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           logger.info(`[channels] ${live.keyId} prompted elapsed_ms=${now() - promptStart}`)
         } catch (err) {
+          if (err === denied && rejection) {
+            if (rejection === 'watch-account-unavailable' && start && !startClaim) {
+              // The store still owns these bodies. Leave the admissions open
+              // for dispatcher replay, not an immediate retry in this drain.
+              logger.info(`[channels] ${live.keyId}: deferring watch dispatch until adapter identity is ready`)
+              continue
+            }
+            logger.warn(
+              `[channels] ${live.keyId}: watch dispatch suppressed: ${typeof rejection === 'string' ? rejection : [...new Set(rejection.values())].join(', ')}`,
+            )
+            if (start && !startClaim) {
+              const rejected =
+                typeof rejection === 'string' ? new Map(start.queued.map((r) => [r, rejection as string])) : rejection
+              await backgroundObligations.withTargetLane(live.key, async () => {
+                for (const [reminder, reason] of rejected) {
+                  const id = reminder.watchInput!.inputId
+                  if (isQueuedWatch(inboundJournal.get(id)))
+                    await inboundJournal.settle(inboundJournal.resolve([id]), {
+                      kind: 'intentionally-suppressed',
+                      decisionId: randomUUID(),
+                      reason,
+                    })
+                }
+                if (live.backgroundStopVersion === stopVersion)
+                  live.pendingSystemReminders.unshift(...start.queued.filter((r) => !rejected.has(r)))
+              })
+            } else if (typeof rejection === 'string')
+              await settleBackgroundCoverage(live, 'intentionally-suppressed', rejection)
+            continue
+          }
           logger.error(`[channels] ${live.keyId}: prompt threw: ${describeError(err)}`)
           // Fallback is exhausted by now (promptPersistentTurnWithFallback only
           // throws after rotating every eligible ref), so a recognizable provider
@@ -5901,6 +6281,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.pendingUserTurnSignal = null
           live.lastQuestionSignal = null
         } finally {
+          unsubscribeStart?.()
           live.promptInFlight = false
           const sentReplyThisTurn = live.successfulChannelSends > successfulSendsBeforePrompt
           // The eager :eyes: ack is a "looking at this" signal, not a "replied"
@@ -5941,6 +6322,22 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           await fireSessionTurnEnd(live)
         }
         await fireSessionIdle(live)
+        if (watch) {
+          // Watch retries stay within the watch turn. Never offer this prompt
+          // to ordinary todo, fallback, close-out or last-speaker bookkeeping.
+          const retry = live.pendingSystemReminders.find((r) => r.kind === 'retry' && r.watch === watch)
+          if (retry) {
+            retry.inboundRetry = { inputIds: live.inboundCoverage, turnId: live.backgroundTurnId }
+            retry.backgroundRetry = {
+              turnId: live.backgroundTurnId,
+              obligationIds: live.backgroundCoverage,
+              retryState: snapshotRetryState(live),
+            }
+          } else {
+            await settleBackgroundCoverage(live, 'intentionally-suppressed', 'background-wake-turn-ended')
+          }
+          continue
+        }
         const outcomeWriteSucceeded = await awaitLatestTodoOutcomeWrite(live)
         if (!outcomeWriteSucceeded) {
           logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
@@ -5965,20 +6362,21 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         // turn-scoped: a later silent inbound on the carrier thread must not
         // release the round while that reviewer is still running.
         const logicalTurnStillOpen =
-          live.pendingSystemReminders.length > 0 ||
+          hasOrdinaryContinuation(live) ||
           live.stagedFallbackCause !== null ||
           live.promisedWorkOutstandingThisLogicalTurn ||
-          isPinnedByRunningChild(live.sessionId, live.keyId, 'github-review-failover')
+          isAwaitingBackgroundChild(live, 'github-review-failover', -Infinity)
         if (!logicalTurnStillOpen) await failoverGithubReviewRound(live)
         await transferAbandonedTurnCoverage(live)
-        live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
-        if (live.currentTurnAuthorId !== null) {
+        if (batch.length > 0 && live.currentTurnAuthorId !== null) {
+          live.lastTurnAuthorIds = new Set(live.currentTurnAuthorIds)
           live.lastTurnAuthorId = live.currentTurnAuthorId
           live.lastTurnAuthorAdapter = live.currentTurnAuthorAdapter
           live.lastTurnHandoff = live.currentTurnHandoff
         }
       }
     } finally {
+      live.reminderActor = undefined
       live.draining = false
       live.currentTurnAuthorId = null
       live.currentTurnAuthorIds = new Set()
@@ -6010,10 +6408,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const retained = await backgroundObligations.withTargetLane(live.key, async () => {
         await resumePreparedTransfersInLane(
           live.key,
-          [
-            ...live.inboundCoverage,
-            ...live.pendingSystemReminders.flatMap((reminder) => reminder.inboundRetry?.inputIds ?? []),
-          ],
+          [...live.inboundCoverage, ...live.pendingSystemReminders.flatMap(reminderInputIds)],
           [
             ...live.backgroundCoverage,
             ...live.pendingSystemReminders.flatMap((reminder) => reminder.backgroundRetry?.obligationIds ?? []),
@@ -6032,7 +6427,13 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             const ids: string[] = []
             for (const id of reminder.backgroundRetry.obligationIds) {
               const row = await backgroundObligations.get(id)
-              if (row && row.phase !== 'closed' && !row.transfer) ids.push(id)
+              if (
+                row &&
+                row.phase !== 'closed' &&
+                !row.transfer &&
+                belongsToBackgroundLineage(row, watchLineage(reminder.watch, reminder.backgroundRetry.turnId))
+              )
+                ids.push(id)
             }
             reminder.backgroundRetry.obligationIds = ids
           }
@@ -6045,7 +6446,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         live.pendingSystemReminders = reminders
         const retry =
-          live.promptQueue.length === 0 ? live.pendingSystemReminders.find((r) => r.kind === 'retry') : undefined
+          live.promptQueue.length === 0
+            ? live.pendingSystemReminders.find((r) => r.kind === 'retry' && !r.watch)
+            : undefined
         if (retry) {
           // A queued retry already carries this turn's lineage and retry budgets
           // forward; the coverage rides on it rather than as a separate snapshot.
@@ -6056,10 +6459,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             retry.backgroundRetry = {
               turnId: live.backgroundTurnId,
               obligationIds: refs.map((ref) => ref.obligationId),
-              emptyTurnRetries: live.emptyTurnRetries,
-              toolLeakRetries: live.toolLeakRetries,
-              willingnessNudges: live.willingnessNudges,
-              nextPromptMaxTokens: live.nextPromptMaxTokens,
+              retryState: snapshotRetryState(live),
             }
           }
           if (inputIds.length > 0) {
@@ -6239,6 +6639,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const routeInbound = async (event: InboundMessage, onAdmitted?: () => Promise<void>): Promise<RouteReceipt> => {
     const adapterConfig = options.configForAdapter(event.adapter)
     if (!adapterConfig) return { kind: 'denied' }
+    const synthetic = event.handoff === true || event.watch === true
+    if (event.watch && (!adapterConfig.enabled || !event.watchResult)) return { kind: 'denied' }
 
     const key: ChannelKey = {
       adapter: event.adapter,
@@ -6257,7 +6659,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // src/role-claim/match-rule.ts.
     // A handoff's text is delegated context, never control traffic: it must not
     // claim roles or run commands on the requester's behalf.
-    if (event.handoff !== true && claimHandler !== undefined && extractClaimCode(event.text) !== null) {
+    if (!synthetic && claimHandler !== undefined && extractClaimCode(event.text) !== null) {
       const outcome = await claimHandler({
         adapter: event.adapter,
         workspace: event.workspace,
@@ -6291,7 +6693,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
     // Parse once, here, so the public-command fast path (below) and the
     // post-gate command block share one parse and lookup.
-    const parsedCommand = event.handoff === true ? null : commands.parse(event.text)
+    const parsedCommand = synthetic ? null : commands.parse(event.text)
     const commandInfo = parsedCommand === null ? undefined : commands.get(parsedCommand.name)
 
     // Public-command fast path: a known command that is both ungated
@@ -6358,6 +6760,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const generation = liveGeneration
     await ready.catch(() => undefined)
     const accountIdentity = event.accountIdentity ?? (await getRecoveryAccountIdentity(event.adapter, event.workspace))
+    if (event.watch && !accountIdentity) throw new Error('Watch channel account is not ready')
     // The early duplicate lookup and the in-lane admit share this identity and
     // its principal, so a duplicate is checked against the same author
     // provenance admission would record: a different author is a conflict,
@@ -6383,11 +6786,12 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       accountIdentity && inboundJournal.health().available
         ? await backgroundObligations.withTargetLane(key, async () => inboundJournal.lookupAdmission(identity))
         : undefined
-    if (existingAdmission) {
+    if (existingAdmission && !(event.watch && isQueuedWatch(existingAdmission))) {
       if (existingAdmission.phase !== 'closed') await onAdmitted?.()
       return {
         kind: 'duplicate',
         inputId: existingAdmission.inputId,
+        ...(event.watch && existingAdmission.phase === 'turn-owned' ? { watchStarted: true as const } : {}),
         outcome: existingAdmission.phase === 'closed' ? existingAdmission.outcome.kind : undefined,
       }
     }
@@ -6397,14 +6801,55 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // (via its `creating` seed), and the reservation's resume() will skip the
     // synthetic wake since this inbound already triggers the turn.
     const reservation = restartReservations.get(channelKeyId(key))
-    if (reservation !== undefined) reservation.sawInbound = true
+    if (reservation !== undefined && !event.watch) reservation.sawInbound = true
 
-    let live = await ensureLive(key, event.externalMessageId, event.authorId, undefined, event.room, generation)
+    const triggeringAuthor = event.watch ? undefined : event.authorId
+    let live = await ensureLive(key, event.externalMessageId, triggeringAuthor, undefined, event.room, generation)
+    if (event.watch && event.watchResult) {
+      const result = event.watchResult
+      return backgroundObligations.withTargetLane(key, async () => {
+        if (live.destroyed || liveSessions.get(live.keyId) !== live)
+          live = await ensureLive(key, event.externalMessageId, undefined, undefined, event.room)
+        if (isChannelRespondDenied(event)) return { kind: 'denied' }
+        const currentAccount = currentAccountIdentityFor(key)
+        if (currentAccount === undefined) throw new Error('Watch channel account is not ready')
+        if (currentAccount !== accountIdentity) throw new Error('Watch channel account changed before admission')
+        const admission = await inboundJournal.admit({ ...identity, ownerSessionId: live.sessionId })
+        const row = inboundJournal.get(admission.inputId)
+        if (
+          isQueuedWatch(row) &&
+          !live.inboundCoverage.includes(admission.inputId) &&
+          !live.pendingSystemReminders.some((r) => r.watchInput?.inputId === admission.inputId)
+        ) {
+          live.pendingSystemReminders.push({
+            kind: 'wakeup',
+            text: '',
+            watchInput: { inputId: admission.inputId, result },
+            watch: {
+              authorId: event.authorId,
+              authorAdapter: event.authorAdapter ?? key.adapter,
+              parentChat: event.room?.parentChat,
+              room: event.room,
+              isDm: event.isDm,
+            },
+          })
+          if (!live.draining) scheduleDebouncedDrain(live)
+        }
+        if (admission.kind === 'accepted' || !admission.outcome) await onAdmitted?.()
+        return admission.kind === 'accepted'
+          ? admission
+          : {
+              ...admission,
+              outcome: admission.outcome?.kind,
+              ...(row?.phase === 'turn-owned' ? { watchStarted: true as const } : {}),
+            }
+      })
+    }
     live.room = event.room
 
-    const isNewAuthor = event.handoff !== true && !live.participants.some((p) => p.authorId === event.authorId)
+    const isNewAuthor = !synthetic && !live.participants.some((p) => p.authorId === event.authorId)
     // A delegated note is not evidence that its author joined this conversation.
-    if (event.handoff !== true) {
+    if (!synthetic) {
       live.participants = updateParticipants(
         live.participants,
         event.authorId,
@@ -6504,7 +6949,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
       updateLoopGuard(live, event)
 
-      const originNote = event.handoff !== true ? takeConversationOriginNote(live, event) : undefined
+      const originNote = !synthetic ? takeConversationOriginNote(live, event) : undefined
       live.lastInboundIsDm = event.isDm
       enqueue(
         live,
@@ -6534,7 +6979,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const route = async (event: InboundMessage, onAdmitted?: () => Promise<void>): Promise<RouteReceipt> => {
     const receipt = await routeInbound(event, onAdmitted)
-    if (!event.authorIsBot && !event.handoff && receipt.kind !== 'denied')
+    if (!event.authorIsBot && !event.handoff && !event.watch && receipt.kind !== 'denied')
       options.onHumanInbound?.(inboundAuthorOrigin(event))
     if (receipt.kind === 'observed' || receipt.kind === 'control') catchUp.noteObserved(event)
     return receipt
@@ -6665,6 +7110,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         : {}),
       ...(event.routingNote !== undefined ? { routingNote: event.routingNote } : {}),
       ...(event.handoff === true ? { handoff: true as const } : {}),
+      ...(event.room ? { room: event.room } : {}),
       receivedAt: now(),
       ts: event.ts,
     })
@@ -7477,6 +7923,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     const keyId = channelKeyId(accountingTarget)
     const live = liveSessions.get(keyId)
     const originalTurnAccount = activeTurnAccountIdentity(live)
+    const watchReply = live?.watchRequester !== undefined
     const sameAdapterAccountScope =
       accountingTarget.adapter === msg.adapter && accountingTarget.workspace === msg.workspace
     const expectedAccountIdentity =
@@ -7780,7 +8227,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       // turn (matched by `turnSeq`); the next turn re-grants normally.
       const disengagedThisTurn = live.disengagedTurn !== null && live.disengagedTurn === live.turnSeq
       const adapterConfig = options.configForAdapter(msg.adapter)
-      if (adapterConfig && !disengagedThisTurn) {
+      if (adapterConfig && !disengagedThisTurn && !watchReply) {
         const targets = new Set(live.currentTurnAuthorIds.size > 0 ? live.currentTurnAuthorIds : live.lastTurnAuthorIds)
         // A user the agent addresses by @-mention is a reply target too: their
         // next message answers us without re-mentioning the bot. Granting them
@@ -7840,7 +8287,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // A status promise can refer to a child from an earlier logical turn. Gate
     // only willingness recovery session-wide; ordinary empty-turn recovery stays
     // turn-scoped so unrelated later requests still get their own answer.
-    if (isPinnedByRunningChild(live.sessionId, live.keyId, 'willingness_nudge')) {
+    if (isAwaitingBackgroundChild(live, 'willingness_nudge', -Infinity)) {
       logger.info(`[channels] ${live.keyId} willingness_nudge_suppressed cause=awaiting_background_child`)
       return
     }
@@ -7848,7 +8295,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     logger.info(
       `[channels] ${live.keyId} willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES}`,
     )
-    live.pendingSystemReminders.push(retryReminder(WILLINGNESS_NUDGE))
+    live.pendingSystemReminders.push(retryReminder(live, WILLINGNESS_NUDGE))
   }
 
   const armRetainedOutputAckIfEligible = (
@@ -7961,7 +8408,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `[channels] ${live.keyId}: suppressed plain_text_tool_call_leak (nudge ` +
             `attempt=${live.toolLeakRetries}/${MAX_TOOL_LEAK_RETRIES}) text_len=${leakedText.length}`,
         )
-        live.pendingSystemReminders.push(retryReminder(TOOL_CALL_LEAK_NUDGE))
+        live.pendingSystemReminders.push(retryReminder(live, TOOL_CALL_LEAK_NUDGE))
         return
       }
       logger.warn(
@@ -7984,7 +8431,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
             `cause=${cause} abort_reason=${abortReason}`,
         )
-        live.pendingSystemReminders.push(retryReminder(STRANDED_TOOLUSE_CONTINUATION_NUDGE))
+        live.pendingSystemReminders.push(retryReminder(live, STRANDED_TOOLUSE_CONTINUATION_NUDGE))
         return
       }
       await postEmptyTurnFallback(live, exhaustedCause)
@@ -8063,7 +8510,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
               `cause=empty_stop_after_continue_reply`,
           )
-          live.pendingSystemReminders.push(retryReminder(SEND_WILLINGNESS_NUDGE))
+          live.pendingSystemReminders.push(retryReminder(live, SEND_WILLINGNESS_NUDGE))
         } else {
           stageEmptyTurnFallback('empty_stop_after_continue_reply_nudges_exhausted')
         }
@@ -8105,7 +8552,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} send_willingness_nudge attempt=${live.willingnessNudges}/${MAX_WILLINGNESS_NUDGES} ` +
               `cause=empty_stop_after_send_ack`,
           )
-          live.pendingSystemReminders.push(retryReminder(SEND_WILLINGNESS_NUDGE))
+          live.pendingSystemReminders.push(retryReminder(live, SEND_WILLINGNESS_NUDGE))
         } else {
           stageEmptyTurnFallback('empty_stop_after_send_ack_nudges_exhausted')
         }
@@ -8268,7 +8715,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
             `max_tokens=${live.nextPromptMaxTokens ?? CHANNEL_MAX_OUTPUT_TOKENS}`,
         )
-        live.pendingSystemReminders.push(retryReminder(EMPTY_TURN_RETRY_NUDGE))
+        live.pendingSystemReminders.push(retryReminder(live, EMPTY_TURN_RETRY_NUDGE))
         return
       }
       await postEmptyTurnFallback(live, attemptedSendThisTurn ? 'send_thrash' : 'retries_exhausted')
@@ -8303,7 +8750,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
               `cause=cold_start_solo_bare_empty`,
           )
-          live.pendingSystemReminders.push(retryReminder(COLD_START_REPLY_NUDGE))
+          live.pendingSystemReminders.push(retryReminder(live, COLD_START_REPLY_NUDGE))
           return
         }
         await postEmptyTurnFallback(live, 'cold_start_solo_bare_empty_retries_exhausted')
@@ -8339,7 +8786,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             `[channels] ${live.keyId} empty_turn_retry attempt=${live.emptyTurnRetries}/${MAX_EMPTY_TURN_RETRIES} ` +
               `cause=empty_stop_after_tool_work`,
           )
-          live.pendingSystemReminders.push(retryReminder(EMPTY_STOP_AFTER_TOOL_WORK_NUDGE))
+          live.pendingSystemReminders.push(retryReminder(live, EMPTY_STOP_AFTER_TOOL_WORK_NUDGE))
           return
         }
         await postEmptyTurnFallback(live, 'empty_stop_after_tool_work_retries_exhausted')
@@ -8357,7 +8804,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       ) {
         // Recheck at fallback time too: a reminder can already be queued when
         // the running child becomes visible to the router.
-        if (isPinnedByRunningChild(live.sessionId, live.keyId, 'no_reply_after_willingness_nudge')) {
+        if (isAwaitingBackgroundChild(live, 'no_reply_after_willingness_nudge', -Infinity)) {
           logger.info(`[channels] ${live.keyId} empty_turn_suppressed cause=awaiting_background_child`)
           armSilentTurnAck(live, 'awaiting_background_child')
           return
@@ -9085,7 +9532,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Legacy callers without a live parent retain their supplied provenance.
     const live = liveSessions.get(channelKeyId(args.key))
     let principal: MatchableOrigin | undefined
+    let watchOrigin: BackgroundObligation['watchOrigin']
     if (live !== undefined && !live.destroyed && live.sessionId === args.parentSessionId) {
+      if (live.watchRequester)
+        watchOrigin = {
+          turnId: live.watchRequester.originTurnId ?? live.backgroundTurnId,
+          isDm: live.watchRequester.isDm,
+          room: live.watchRequester.room,
+        }
       const authorId = live.currentTurnAuthorId ?? live.lastTurnAuthorId
       const authorAdapter =
         live.currentTurnAuthorId !== null ? live.currentTurnAuthorAdapter : live.lastTurnAuthorAdapter
@@ -9102,8 +9556,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     return backgroundObligations.withTargetLane(args.key, async () => {
       await ready
       inboundJournal.assertAvailable()
-      const row = await backgroundObligations.accept({ ...args, ...(principal !== undefined ? { principal } : {}) })
-      return { obligationId: row.obligationId, generation: row.generation }
+      const row = await backgroundObligations.accept({
+        ...args,
+        watchOrigin,
+        ...(principal !== undefined ? { principal } : {}),
+      })
+      return {
+        obligationId: row.obligationId,
+        generation: row.generation,
+        ...(row.watchOrigin ? { watchTurnId: row.watchOrigin.turnId } : {}),
+      }
     })
   }
 
@@ -9119,11 +9581,16 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const current = await backgroundObligations.get(ref.obligationId)
       if (!current || current.phase === 'closed') return
       if (current.phase !== 'accepted') throw new Error('Background launch already progressed')
-      await backgroundObligations.settle([{ obligationId: current.obligationId, generation: current.generation }], {
-        kind: 'intentionally-suppressed',
-        decisionId: randomUUID(),
-        reason,
-      })
+      await backgroundObligations.settle(
+        [{ obligationId: current.obligationId, generation: current.generation }],
+        {
+          kind: 'intentionally-suppressed',
+          decisionId: randomUUID(),
+          reason,
+        },
+        undefined,
+        current.watchOrigin?.turnId ?? null,
+      )
     })
   }
 
@@ -9139,14 +9606,26 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       const source =
         (await backgroundObligations.lookup(args.parentSessionId, args.taskId)) ??
         (await backgroundObligations.lookupTask(args.taskId, live.key))
-      if (!source || channelKeyId(source.target) !== live.keyId) return
+      // Reading an authorized result is independent of owning the response.
+      // Check before resultReady, claim/move, or removing its completion wake.
+      if (
+        !source ||
+        channelKeyId(source.target) !== live.keyId ||
+        !belongsToBackgroundLineage(source, activeLineage(live))
+      )
+        return
       const row = await backgroundObligations.resultReady(source.obligationId)
       if (!row || row.phase === 'closed' || row.transfer) {
-        retireBackgroundCache(live, new Set([source.obligationId]))
+        retireBackgroundCache(live, new Set([source.obligationId]), activeLineage(live))
         return
       }
       const refs = [{ obligationId: row.obligationId, generation: row.generation }]
-      const owner = { turnId: live.backgroundTurnId, ownerSessionId: live.sessionId, target: live.key }
+      const owner = {
+        turnId: live.backgroundTurnId,
+        ownerSessionId: live.sessionId,
+        target: live.key,
+        watchTurnId: activeLineage(live),
+      }
       if (
         row.claim &&
         (row.claim.turnId !== live.backgroundTurnId ||
@@ -9167,7 +9646,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       }
       // Fetch consumed this result into the active prompt. Its queued wake must
       // not advertise an old owner or start a second prompt for the same result.
-      retireBackgroundCache(live, new Set([row.obligationId]))
+      retireBackgroundCache(live, new Set([row.obligationId]), activeLineage(live))
       live.backgroundCoverage.push(row.obligationId)
     })
   }
@@ -9228,6 +9707,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       error?: string
       hasRecoverableOutput?: boolean
       backgroundObligationId?: string
+      actor?: ReminderActor
+      watch?: WatchRequester
     },
   ): { kind: 'delivered'; keyId: string } => {
     const adapter = live.keyId.split(':', 1)[0] ?? ''
@@ -9249,6 +9730,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'delivered', keyId: live.keyId }
     live.pendingSystemReminders.push({
       ...wakeupReminder(text),
+      actor: args.actor,
+      watch: args.watch,
       ...(args.backgroundObligationId ? { backgroundObligationId: args.backgroundObligationId } : {}),
     })
     // The reminder tells the agent to fetch this result now; clear the
@@ -9343,7 +9826,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         if (row && (!current || current.phase === 'closed' || current.transfer)) return { kind: 'no-live-session' }
         return deliverCompletionReminder(live, {
           ...args,
-          ...(current ? { backgroundObligationId: current.obligationId } : {}),
+          ...(current ? completionOwnership(current) : {}),
         })
       })
     for (const live of liveSessions.values()) {
@@ -9407,7 +9890,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                 adapter: row.target.adapter,
               }),
             ),
-            backgroundObligationId: current.obligationId,
+            ...completionOwnership(current),
           },
         ]
         // The same bounds as retention, checked on the candidate before anything
@@ -10103,7 +10586,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       injectContinuationReminder: (key: ChannelKey, text: string): void => {
         const live = liveSessions.get(channelKeyId(key))
         if (!live) return
-        live.pendingSystemReminders.push(retryReminder(text))
+        live.pendingSystemReminders.push(retryReminder(live, text))
       },
     },
   }

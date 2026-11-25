@@ -259,7 +259,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         origin?.kind === 'channel'
           ? { adapter: origin.adapter, workspace: origin.workspace, chat: origin.chat, thread: origin.thread }
           : undefined
-      let backgroundResponse: { obligationId: string; generation: number } | undefined
+      let backgroundResponse: Awaited<ReturnType<ChannelRouter['acceptBackgroundResponse']>> | undefined
       if (background && origin?.kind === 'channel') {
         if (options.router === undefined) {
           if (pendingWorkKeyRegistration !== undefined) {
@@ -365,6 +365,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         parentSessionId,
         ...(spawnedByRole !== undefined ? { spawnedByRole } : {}),
         background,
+        ...(backgroundResponse?.watchTurnId ? { watchTurnId: backgroundResponse.watchTurnId } : {}),
         // Drafting a PR invalidates every reviewer job for it, regardless of
         // commit or review kind. This is intentionally broader than the
         // reviewer's head/base/kind-aware coalescing key.
