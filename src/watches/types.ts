@@ -43,6 +43,7 @@ export type WatchWakeDelivery = (
   target: WatchWakeTarget,
   wakes: readonly WatchWake[],
   origin: SessionOrigin,
+  signal: AbortSignal,
 ) => Promise<WatchWakeDeliveryResult>
 
 // Trusted in-process probe shipped with TypeClaw. It never shells out; state is

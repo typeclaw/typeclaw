@@ -64,9 +64,8 @@ export function createProbeRunner(
         if (!(err instanceof Error && 'code' in err && err.code === 'ENOENT')) throw err
       }
     },
-    async run(w: WatchRecord, abort: AbortSignal): Promise<ProbeResult> {
+    async run(w: WatchRecord, signal: AbortSignal): Promise<ProbeResult> {
       const origin = watchOrigin(w)
-      const signal = AbortSignal.any([abort, AbortSignal.timeout(120_000)])
       signal.throwIfAborted()
       if ('bundled' in w.probe) {
         const ctx: BundledProbeContext<unknown> = {

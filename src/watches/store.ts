@@ -78,7 +78,9 @@ export const recordSchema = z.object({
   consecutiveFailures: z.int().nonnegative(),
   status: z.enum(['active', 'paused', 'done', 'expired', 'cancelled']),
   state: z.json().optional(),
-  pending: z.array(z.object({ key: z.uuid(), summary: z.string(), final: z.boolean() })),
+  pending: z.array(
+    z.object({ key: z.uuid(), summary: z.string(), final: z.boolean(), sequence: z.int().positive().optional() }),
+  ),
 })
 export type WatchRecord = z.infer<typeof recordSchema>
 
