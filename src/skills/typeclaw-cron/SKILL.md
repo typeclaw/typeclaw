@@ -48,7 +48,7 @@ Tell the user this if they ask about reliability. Do not invent guarantees the r
 }
 ```
 
-When this fires, the runtime opens a **brand new** `AgentSession` (yours, with your IDENTITY/SOUL/AGENTS files loaded), sends it the `prompt` text as if the user typed it, and disposes the session when done.
+When this fires, the runtime opens a **brand new** `AgentSession` (yours, with your IDENTITY/SOUL/AGENTS files loaded), sends it the `prompt` text as if the user typed it, and disposes the session when done. Before disposing, the runtime sends that session one completion check: a run may end only once the job's result is delivered, or once it verified there is nothing to do this time (no change, nothing due; the job's own posting conditions still apply, so a post-only-on-change job stays silent), or when the failing step still fails after a different approach or needs something only a person can supply. So a job prompt does not need its own "if something fails, stop and report" line; if you write one, scope it to real outside blocks (a missing credential, a denied permission), not to every failed step.
 
 What this means for how you write prompts:
 
