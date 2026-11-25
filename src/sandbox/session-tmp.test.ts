@@ -1,6 +1,18 @@
 import { describe, expect, test } from 'bun:test'
+import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 
-import { enterSubagentTmpScope, isUnderTmp, mapVirtualTmpPath, SESSION_TMP_ROOT, sessionTmpDir } from './session-tmp'
+import {
+  enterSubagentTmpScope,
+  ensureSessionTmpDir,
+  holdSessionTmp,
+  isUnderTmp,
+  mapVirtualTmpPath,
+  SESSION_TMP_ROOT,
+  sessionTmpDir,
+} from './session-tmp'
 
 describe('session-tmp path mapping', () => {
   test('sessionTmpDir namespaces by session id under the shared root', () => {
@@ -93,5 +105,80 @@ describe('session-tmp subagent scope', () => {
     second()
     expect(sessionTmpDir('ref-child')).toBe(`${SESSION_TMP_ROOT}/ref-child`)
     releaseReviewer()
+  })
+})
+
+describe('session-tmp lifetime', () => {
+  test('a session scratch dir is discarded when its session releases it', async () => {
+    // given
+    const sessionId = `life-${randomUUID()}`
+    const release = holdSessionTmp(sessionId)
+    const dir = await ensureSessionTmpDir(sessionId)
+    await writeFile(join(dir, 'checkout.txt'), 'x')
+
+    // when
+    await release()
+
+    // then
+    expect(existsSync(dir)).toBe(false)
+  })
+
+  test('a subagent tree keeps its shared scratch until the last session in it releases', async () => {
+    // given
+    const anchor = `tree-${randomUUID()}`
+    const child = `${anchor}-child`
+    const leaveAnchor = enterSubagentTmpScope(anchor, 'tree-channel')
+    const leaveChild = enterSubagentTmpScope(child, anchor)
+    const releaseAnchor = holdSessionTmp(anchor)
+    const releaseChild = holdSessionTmp(child)
+    const dir = await ensureSessionTmpDir(child)
+
+    // when
+    await releaseAnchor()
+
+    // then
+    expect(existsSync(dir)).toBe(true)
+    await releaseChild()
+    expect(existsSync(dir)).toBe(false)
+    leaveChild()
+    leaveAnchor()
+  })
+
+  test('a malformed session id never directs the discard outside the scratch root', async () => {
+    // given
+    const name = `session-tmp-victim-${randomUUID()}`
+    const victim = join(SESSION_TMP_ROOT, '..', name)
+    await mkdir(victim, { recursive: true })
+    await writeFile(join(victim, 'keep.txt'), 'x')
+    const release = holdSessionTmp(`../${name}`)
+
+    try {
+      // when
+      await release()
+
+      // then
+      expect(existsSync(join(victim, 'keep.txt'))).toBe(true)
+    } finally {
+      await rm(victim, { recursive: true, force: true })
+    }
+  })
+
+  test('a session reclaiming its id while the old dir is being discarded gets a fresh dir that survives', async () => {
+    // given
+    const sessionId = `reclaim-${randomUUID()}`
+    const first = holdSessionTmp(sessionId)
+    await writeFile(join(await ensureSessionTmpDir(sessionId), 'old.txt'), 'old')
+
+    // when
+    const discarding = first()
+    const second = holdSessionTmp(sessionId)
+    const dir = await ensureSessionTmpDir(sessionId)
+    await writeFile(join(dir, 'new.txt'), 'new')
+    await discarding
+
+    // then
+    expect(existsSync(join(dir, 'new.txt'))).toBe(true)
+    expect(existsSync(join(dir, 'old.txt'))).toBe(false)
+    await second()
   })
 })

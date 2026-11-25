@@ -49,7 +49,9 @@ export {
 } from './privileged-runtime'
 export {
   ensureSessionTmpDir,
+  holdSessionTmp,
   isUnderTmp,
+  leaseSessionTmp,
   mapVirtualTmpPath,
   SESSION_TMP_ROOT,
   enterSubagentTmpScope,

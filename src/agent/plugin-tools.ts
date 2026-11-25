@@ -50,6 +50,7 @@ import {
   commandNeedsRealProc,
   dependencyBinUnavailableHint,
   ensureSessionTmpDir,
+  leaseSessionTmp,
   isGitControlPath,
   mapVirtualTmpPath,
   resolveHiddenPaths,
@@ -675,6 +676,10 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         cleanupError = undefined
         sandboxedRealProcSucceeded = false
         const attemptArgs = { ...originalArgs }
+        // File tools reach the same scratch dir through the /tmp redirect, so the
+        // whole attempt holds it: a dispose mid-call never discards scratch a
+        // read or write is still using.
+        const releaseTmpLease = leaseSessionTmp(opts.sessionId)
         let spawnEnvContext: BashSpawnEnvContext | undefined
         let managedConfigNotices: string[] = []
         let managedConfigBefore: ManagedConfigSnapshot | undefined
@@ -856,6 +861,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
             (task): task is Promise<void> => task !== undefined,
           )
           const outcomes = await Promise.allSettled(cleanup)
+          // Released only after cleanup settles: write/edit cleanup reopens and
+          // verifies the output, which may live in scratch.
+          releaseTmpLease()
           const failed = outcomes.find((outcome) => outcome.status === 'rejected')
           if (failed?.status === 'rejected') cleanupError = failed.reason
         }
