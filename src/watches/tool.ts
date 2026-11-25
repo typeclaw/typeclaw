@@ -5,6 +5,9 @@ import { zodToToolParameters } from '@/agent/plugin-tools'
 import type { SessionOrigin } from '@/agent/session-origin'
 import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 
+import { detectCreatedGithubTargets } from './detect-created'
+import type { ResolveWatchGithubCredential } from './github-credential'
+import { githubParams } from './probes/github'
 import type { ProbeRegistry } from './runner'
 import type { WatchService } from './service'
 import { probeSchema } from './store'
@@ -29,13 +32,67 @@ const request = z.discriminatedUnion('action', [
 const parameters = createRequest
   .partial()
   .extend({ action: z.enum(['create', 'list', 'rearm', 'cancel']), id: id.optional() })
-type Runtime = { service: WatchService; registry: ProbeRegistry }
+type Runtime = {
+  service: WatchService
+  registry: ProbeRegistry
+  isAutoEnabled?: () => boolean
+  resolveGithubCredential?: ResolveWatchGithubCredential
+}
 const runtimes = new Map<string, Runtime>()
 export function registerWatchRuntime(dir: string, runtime: Runtime) {
   runtimes.set(dir, runtime)
   return () => {
     if (runtimes.get(dir) === runtime) runtimes.delete(dir)
   }
+}
+
+export async function registerWatchesFromBash(
+  dir: string,
+  origin: SessionOrigin,
+  permissions: PermissionService,
+  command: string,
+  output: string,
+): Promise<string[]> {
+  const runtime = runtimes.get(dir)
+  if (!runtime?.isAutoEnabled?.() || !permissions.has(origin, CORE_PERMISSIONS.watchCreate)) return []
+  const targets = detectCreatedGithubTargets(command, output)
+  if (targets.length === 0) return []
+  const wakeTarget = watchTarget(origin)
+  const createdByRole = permissions.resolveRole(origin)
+  const notices: string[] = []
+  for (const { kind, repo, number } of targets) {
+    const label = `${kind === 'github-pr' ? 'PR' : 'issue'} ${repo}#${number}`
+    try {
+      const target = { repo, number }
+      runtime.registry.get(kind).parseParams(target)
+      const credential = await runtime.resolveGithubCredential?.(origin, repo)
+      if (credential?.kind !== 'token') {
+        const reason = credential?.reason ?? 'No GitHub polling credential resolver is available.'
+        notices.push(`Follow-up watch not scheduled for ${label}: ${reason.replace(/\s+/g, ' ').trim()}`)
+        continue
+      }
+      const id = await runtime.service.create(
+        {
+          description: `Follow up on ${label}`,
+          probe: { bundled: kind, target },
+          mode: 'judge',
+          createdByRole,
+          createdByOrigin: origin,
+          wakeTarget,
+        },
+        ({ probe }) => {
+          if (!('bundled' in probe) || probe.bundled !== kind) return false
+          const existing = githubParams.safeParse(probe.target)
+          return existing.success && existing.data.repo === repo && existing.data.number === number
+        },
+      )
+      if (id !== undefined) notices.push(`Follow-up watch registered for ${label}: ${id}`)
+    } catch (error) {
+      console.warn(`[watch] auto-registration failed for ${label}:`, error)
+      notices.push(`Follow-up watch not scheduled for ${label}: credential or watch setup failed.`)
+    }
+  }
+  return notices
 }
 export function createWatchTool(
   dir: string,

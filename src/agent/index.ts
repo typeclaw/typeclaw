@@ -25,7 +25,7 @@ import {
   type ThinkingLevel,
 } from '@/config'
 import { config } from '@/config/config'
-import { createWatchTool } from '@/watches/tool'
+import { createWatchTool, registerWatchesFromBash } from '@/watches/tool'
 
 import {
   composeSessionTail,
@@ -544,6 +544,14 @@ export async function createSessionWithDispose(options: CreateSessionOptions = {
   // stages (plugin hooks, permissions, bashPolicy) when they are absent.
   const builtinPiToolOverrides = buildBuiltinPiToolOverrides({
     getGithubSelf: options.getGithubSelf,
+    onSuccessfulBash: (origin, command, output) =>
+      registerWatchesFromBash(
+        options.plugins?.agentDir ?? process.cwd(),
+        origin,
+        options.permissions ?? noopPermissionService,
+        command,
+        output,
+      ),
     agentDir: options.plugins?.agentDir ?? process.cwd(),
     sessionId: options.plugins?.sessionId ?? sessionManager.getSessionId(),
     hooks: options.plugins?.hooks ?? createHookBus(),

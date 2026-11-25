@@ -14,6 +14,8 @@ import { CORE_PERMISSIONS, type PermissionService } from '@/permissions'
 import type { HookBus } from '@/plugin'
 import { shellQuote } from '@/sandbox'
 
+import { createWatchGithubCredentialResolver } from './github-credential'
+import { bundledProbes } from './probes'
 import { watchOrigin, withWatchDirectory, type WatchRecord } from './store'
 import type { BundledProbe, BundledProbeContext } from './types'
 import { parseProbeOutput, type ProbeResult } from './verdict'
@@ -47,6 +49,12 @@ export class ProbeRegistry {
     return entry
   }
 }
+export function createBundledProbeRegistry(): ProbeRegistry {
+  const registry = new ProbeRegistry()
+  for (const probe of bundledProbes) registry.register(probe)
+  return registry
+}
+
 export function createProbeRunner(
   agentDir: string,
   permissions: PermissionService,
@@ -56,7 +64,9 @@ export function createProbeRunner(
   bashSandboxBoundary?: BashSandboxBoundary,
 ) {
   const root = join(agentDir, 'workspace', '.typeclaw-watches')
+  const resolveGithubCredential = createWatchGithubCredentialResolver(agentDir, permissions, github)
   return {
+    resolveGithubCredential,
     async cleanup(id: string) {
       try {
         await withWatchDirectory(root, false, (parent) => rm(join(parent, id), { recursive: true, force: true }))
@@ -89,15 +99,14 @@ export function createProbeRunner(
         throw new Error('Denied by watch.create; the creator no longer has this permission.')
       signal.throwIfAborted()
       if ('bundled' in w.probe) {
+        const selfLogin = github.getSelf()?.login
         const ctx: BundledProbeContext<unknown> = {
           params: w.probe.target,
           state: w.state,
           lastRunAt: w.lastRunAt,
-          resolveTokenForRepo: async (repo) => {
-            if (github.hasAppTokenResolver()) return github.resolveTokenForRepo(repo)
-            const pat = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
-            return pat ? { kind: 'token', token: pat } : github.resolvePatForRepo(repo)
-          },
+          startedAt: w.createdAt,
+          ...(selfLogin === undefined ? {} : { selfLogin }),
+          resolveTokenForRepo: (repo) => resolveGithubCredential(origin, repo),
           signal,
           fetch,
         }

@@ -318,6 +318,7 @@ export type WrapToolOptions = {
 export type WrapSystemToolOptions = {
   readonly bashCwd?: string
   readonly frameBashOutput?: (command: string) => string
+  readonly onSuccessfulBash?: (origin: SessionOrigin, command: string, output: string) => Promise<readonly string[]>
   readonly getGithubSelf?: GetGithubSelf
   agentDir: string
   sessionId: string
@@ -660,6 +661,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
       let pinnedFiles: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
       let tmpRedirect: TmpRedirect | undefined
       let rawResult: ToolResult | undefined
+      let bashOutput: string | undefined
       let executionError: unknown
       let cleanupError: unknown
       let sandboxedRealProcSucceeded = false
@@ -671,6 +673,7 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         pinnedFiles = undefined
         tmpRedirect = undefined
         rawResult = undefined
+        bashOutput = undefined
         executionError = undefined
         cleanupError = undefined
         sandboxedRealProcSucceeded = false
@@ -806,6 +809,9 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
           } else if (tool.name === 'bash' && managedConfigBefore !== undefined) {
             try {
               executed = await run()
+              if (opts.onSuccessfulBash !== undefined) {
+                bashOutput = executed.content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n')
+              }
             } finally {
               managedConfigRechecked = true
               managedConfigNotices = await recheckManagedConfigAfterBash(managedConfigBefore)
@@ -961,7 +967,22 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         fireLoopAbort(opts.getAbort, 'loop_guard:deferred_block', opts.sessionId)
         throw new Error(resolved.deferredBlock)
       }
-      const hookResult = resolved.result
+      let hookResult = resolved.result
+      if (
+        originalBashCommand !== undefined &&
+        bashOutput !== undefined &&
+        liveOrigin !== undefined &&
+        signal?.aborted !== true &&
+        !bashResultHasNonzeroExit(rawResult)
+      ) {
+        try {
+          const notices = await opts.onSuccessfulBash?.(liveOrigin, originalBashCommand, bashOutput)
+          if (notices?.length) hookResult = appendTextResult(hookResult, notices.join('\n'))
+        } catch (error) {
+          // A failed optional follow-up must not turn a successful GitHub create into a failed bash call.
+          console.warn('[watch] bash follow-up failed:', error)
+        }
+      }
       await opts.hooks.runToolAfter({
         tool: tool.name,
         sessionId: opts.sessionId,

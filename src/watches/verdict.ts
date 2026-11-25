@@ -12,7 +12,7 @@ const jsonVerdict = z.object({
   summary: z.string().optional(),
   next: z.string().optional(),
 })
-export type ProbeResult = WatchVerdict & { state?: WatchRecord['state'] }
+export type ProbeResult = WatchVerdict & { state?: WatchRecord['state']; eventKey?: string }
 export function duration(text: string): number {
   const parsed = parseDuration(text)
   if (!parsed.ok) throw new Error(parsed.reason)
