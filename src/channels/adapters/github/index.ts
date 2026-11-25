@@ -335,7 +335,10 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   // Shared inbound entry. Both the live webhook handler and the startup
   // reconciliation pass route through this so a replayed PR takes the exact
   // same path a real delivery would.
-  const routeInbound = async (message: InboundMessage): Promise<RouteReceipt> => {
+  const routeInbound = async (
+    message: InboundMessage,
+    validateAdmission?: () => Promise<void>,
+  ): Promise<RouteReceipt> => {
     rememberWorkspace(message.workspace, message.chat)
     const store = pendingReviewStore
     const pending = message.githubPendingReview
@@ -350,16 +353,19 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       },
       store !== null && pending !== undefined && prNumber !== undefined
         ? () =>
-            store.record({
-              repo: message.workspace,
-              prNumber: Number(prNumber),
-              ...pending,
-              admittedAt: Date.now(),
-              authorId: message.authorId,
-              authorName: message.authorName,
-              authorIsBot: message.authorIsBot,
-              ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
-            })
+            store.record(
+              {
+                repo: message.workspace,
+                prNumber: Number(prNumber),
+                ...pending,
+                admittedAt: Date.now(),
+                authorId: message.authorId,
+                authorName: message.authorName,
+                authorIsBot: message.authorIsBot,
+                ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
+              },
+              validateAdmission,
+            )
         : undefined,
     )
     // Only newly accepted work runs in this process. The router also invokes the admission

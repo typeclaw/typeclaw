@@ -25,7 +25,7 @@ export type PendingReview = Readonly<z.infer<typeof pendingReviewSchema>>
 export type PendingReviewStore = {
   list: () => Promise<readonly PendingReview[]>
   has: (repo: string, prNumber: number) => boolean
-  record: (entry: PendingReview) => Promise<void>
+  record: (entry: PendingReview, validateAdmission?: () => Promise<void>) => Promise<void>
   clear: (
     repo: string,
     prNumber: number,
@@ -78,8 +78,11 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
   return {
     list: () => onFileLane(path, async () => [...(await latest()).values()]),
     has: (repo, prNumber) => entries.has(key(repo, prNumber)),
-    record: (entry) =>
+    record: (entry, validateAdmission) =>
       onFileLane(path, async () => {
+        // Freshness and persistence share the same lane as close/withdrawal.
+        // A recovered trigger must not recreate work cleared while routing.
+        await validateAdmission?.()
         const next = await latest()
         const id = key(entry.repo, entry.prNumber)
         const previous = next.get(id)

@@ -44,6 +44,44 @@ test('serializes separate instances without losing unrelated admissions', async 
   expect(await first.list()).toHaveLength(2)
 })
 
+test('recovered admission validates inside the lane before a concurrent close clears it', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  const reading = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+
+  // #when
+  const admission = first.record(entry, async () => {
+    reading.resolve()
+    await resume.promise
+  })
+  await reading.promise
+  const closed = second.clear(entry.repo, entry.prNumber)
+  resume.resolve()
+  await admission
+  await closed
+
+  // #then
+  expect(await first.list()).toEqual([])
+})
+
+test('recovered admission rejected after close cannot recreate pending work', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+  await store.clear(entry.repo, entry.prNumber)
+
+  // #when
+  const admission = store.record(entry, async () => {
+    throw new Error('assignment no longer current')
+  })
+
+  // #then
+  await expect(admission).rejects.toThrow('assignment no longer current')
+  expect(await store.list()).toEqual([])
+})
+
 test('late completion and old admission cannot erase a newer head', async () => {
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record(entry)

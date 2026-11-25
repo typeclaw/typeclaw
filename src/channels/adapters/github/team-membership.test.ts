@@ -3,6 +3,22 @@ import { describe, expect, it } from 'bun:test'
 import { createTeamMembershipChecker } from './team-membership'
 
 describe('createTeamMembershipChecker', () => {
+  it.each([403, 404])('current membership treats %s as no qualifying membership', async (status) => {
+    // #given
+    let response = () => Response.json({ state: 'active' })
+    const check = createTeamMembershipChecker({ token: async () => 'tok', fetchImpl: fakeFetch(() => response()) })
+    const team = { org: 'acme', slug: 'reviewers', login: 'typeclaw-bot' }
+    expect(await check(team)).toBe(true)
+
+    // #when
+    response = () => new Response(null, { status })
+
+    // #then
+    expect(await check({ ...team, requireCurrent: true })).toBe(false)
+    response = () => Response.json({ state: 'active' })
+    expect(await check({ ...team, requireCurrent: true })).toBe(true)
+  })
+
   it('current membership reads bypass cached absence and retry failures', async () => {
     // #given
     let response = () => new Response(null, { status: 404 })

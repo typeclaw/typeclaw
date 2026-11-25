@@ -78,6 +78,7 @@ async function fixture(
   const teamMemberships = new Map<string, string>()
   let pullFailure: (() => Response) | undefined
   let requestedReviewersFailure: (() => Response) | undefined
+  let teamMembershipFailure: (() => Response) | undefined
   let comparison = 'behind'
   let fetchWaiters: Array<{ match: (url: string) => boolean; resolve: () => void }> = []
   let fetchHolds: Array<{ match: (url: string) => boolean; reached: () => void; released: Promise<void> }> = []
@@ -118,6 +119,7 @@ async function fixture(
       if (url.endsWith('/requested_reviewers'))
         return requestedReviewersFailure?.() ?? Response.json(requestedReviewers)
       if (url.includes('/memberships/')) {
+        if (teamMembershipFailure !== undefined) return teamMembershipFailure()
         const state = teamMemberships.get(url.split('/teams/')[1]!.split('/')[0]!)
         return state === undefined ? new Response(null, { status: 404 }) : Response.json({ state })
       }
@@ -260,6 +262,9 @@ async function fixture(
     pull: currentPull,
     requestedReviewers,
     teamMemberships,
+    failTeamMembership: (failure?: () => Response) => {
+      teamMembershipFailure = failure
+    },
     failPull: (failure?: () => Response) => {
       pullFailure = failure
     },
@@ -675,69 +680,81 @@ test.each(['assigned', 'review_requested'])(
   },
 )
 
-test.each(['remove-first', 'unassign-first'] as const)('retires both withdrawals in %s order', async (order) => {
-  // #given
-  const turn = Promise.withResolvers<void>()
-  const bot = { login: 'bot', id: 1, type: 'User' }
-  const f = await fixture(undefined, { prompt: () => turn.promise })
-  cleanups.push(async () => turn.resolve())
-  f.config.review.on = 'review_requested'
-  f.config.review.check = true
-  await f.adapter.start()
-  await f.scanRead
-  f.pull.assignees = [bot]
-  f.requestedReviewers.users = [bot]
-  for (const action of ['assigned', 'review_requested']) {
-    const admitted = f.nextRoute()
-    await f.deliver(action, 'pull_request', { assignee: bot, requested_reviewer: bot, pull_request: f.pull })
-    await admitted
-  }
-  const recorded = await f.store.list()
-  const reviewer = `withdraw-order-${order}`
-  await githubReviewChecks.beginReview(
-    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
-    reviewer,
-  )
-  try {
-    // #when: the first withdrawal must preserve the remaining request.
-    const actions =
-      order === 'remove-first' ? ['review_request_removed', 'unassigned'] : ['unassigned', 'review_request_removed']
-    for (const [index, action] of actions.entries()) {
-      if (action === 'unassigned') f.pull.assignees = []
-      else f.requestedReviewers.users = []
-      const stopped = f.nextRoute()
-      await f.deliver(action, 'pull_request', {
-        assignee: bot,
-        requested_reviewer: bot,
-        // Deliberately stale: the API, rather than this payload, owns current state.
-        pull_request: { ...pull, assignees: [bot], updated_at: `2026-01-01T00:0${index + 1}:00Z` },
-      })
-      if (index === 0) {
-        expect(await f.store.list()).toEqual(recorded)
-        expect(f.routed).toHaveLength(2)
-        if (action === 'unassigned') expect(f.calls.some((url) => url.endsWith('/requested_reviewers'))).toBe(true)
-      } else {
-        expect(await f.store.list()).toEqual([])
-        await stopped
-      }
+test.each([
+  { order: 'remove-first', membershipStatus: undefined },
+  { order: 'unassign-first', membershipStatus: undefined },
+  { order: 'remove-first', membershipStatus: 403 },
+  { order: 'remove-first', membershipStatus: 404 },
+])(
+  'retires both withdrawals in $order order with team status $membershipStatus',
+  async ({ order, membershipStatus }) => {
+    // #given
+    const turn = Promise.withResolvers<void>()
+    const bot = { login: 'bot', id: 1, type: 'User' }
+    const f = await fixture(undefined, { prompt: () => turn.promise })
+    cleanups.push(async () => turn.resolve())
+    f.config.review.on = 'review_requested'
+    f.config.review.check = true
+    await f.adapter.start()
+    await f.scanRead
+    f.pull.assignees = [bot]
+    f.requestedReviewers.users = [bot]
+    for (const action of ['assigned', 'review_requested']) {
+      const admitted = f.nextRoute()
+      await f.deliver(action, 'pull_request', { assignee: bot, requested_reviewer: bot, pull_request: f.pull })
+      await admitted
     }
-    await githubReviewChecks.sweep()
+    const recorded = await f.store.list()
+    const reviewer = `withdraw-order-${order}`
+    await githubReviewChecks.beginReview(
+      { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+      reviewer,
+    )
+    try {
+      // #when: the first withdrawal must preserve the remaining request.
+      const actions =
+        order === 'remove-first' ? ['review_request_removed', 'unassigned'] : ['unassigned', 'review_request_removed']
+      for (const [index, action] of actions.entries()) {
+        if (action === 'unassigned') f.pull.assignees = []
+        else f.requestedReviewers.users = []
+        if (membershipStatus !== undefined) {
+          f.requestedReviewers.teams = [{ slug: 'unrelated-codeowners' }]
+          f.failTeamMembership(() => new Response(null, { status: membershipStatus }))
+        }
+        const stopped = f.nextRoute()
+        await f.deliver(action, 'pull_request', {
+          assignee: bot,
+          requested_reviewer: bot,
+          // Deliberately stale: the API, rather than this payload, owns current state.
+          pull_request: { ...pull, assignees: [bot], updated_at: `2026-01-01T00:0${index + 1}:00Z` },
+        })
+        if (index === 0) {
+          expect(await f.store.list()).toEqual(recorded)
+          expect(f.routed).toHaveLength(2)
+          if (action === 'unassigned') expect(f.calls.some((url) => url.endsWith('/requested_reviewers'))).toBe(true)
+        } else {
+          expect(await f.store.list()).toEqual([])
+          await stopped
+        }
+      }
+      await githubReviewChecks.sweep()
 
-    // #then
-    expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
-    expect(f.routed.at(-1)?.text).toContain('You can stop any in-progress review.')
-    await f.adapter.stop()
-    await f.router.stop()
-    const next = await fixture(f.dir)
-    next.config.review.on = 'review_requested'
-    await next.adapter.start()
-    await next.scanRead
-    expect(await next.store.list()).toEqual([])
-    expect(next.routed).toEqual([])
-  } finally {
-    await githubReviewChecks.reviewerSettled(reviewer, { kind: 'cancelled', reason: 'test cleanup' })
-  }
-})
+      // #then
+      expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
+      expect(f.routed.at(-1)?.text).toContain('You can stop any in-progress review.')
+      await f.adapter.stop()
+      await f.router.stop()
+      const next = await fixture(f.dir)
+      next.config.review.on = 'review_requested'
+      await next.adapter.start()
+      await next.scanRead
+      expect(await next.store.list()).toEqual([])
+      expect(next.routed).toEqual([])
+    } finally {
+      await githubReviewChecks.reviewerSettled(reviewer, { kind: 'cancelled', reason: 'test cleanup' })
+    }
+  },
+)
 
 test.each([
   { login: 'bot', app: false },
@@ -783,29 +800,95 @@ test.each([
   expect(f.routed.at(-1)?.githubPendingReview).toBeUndefined()
 })
 
-test.each(['reviewers', 'assignees'])('retries the same unassignment after a failed current %s read', async (read) => {
+test.each(['reviewers', 'assignees', 'team', 'team-network'])(
+  'retries the same unassignment after a failed current %s read',
+  async (read) => {
+    // #given
+    const f = await fixture()
+    await f.adapter.start()
+    await f.scanRead
+    await f.store.record({ ...pending, assignmentTriggered: true })
+    const payload = { assignee: { login: 'bot', id: 1, type: 'User' } }
+    const fail = read.startsWith('team')
+      ? f.failTeamMembership
+      : read === 'reviewers'
+        ? f.failRequestedReviewers
+        : f.failPull
+    if (read.startsWith('team')) f.requestedReviewers.teams = [{ slug: 'reviewers' }]
+    fail(() => {
+      if (read === 'team-network') throw new Error('network 503')
+      return new Response('unavailable', { status: 503 })
+    })
+
+    // #when
+    await expect(f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')).rejects.toThrow('503')
+
+    // #then
+    expect(await f.store.list()).toHaveLength(1)
+    expect(f.routeAttempts).toEqual([])
+    fail()
+    const stopped = f.nextRoute()
+    await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
+    await stopped
+    expect(await f.store.list()).toEqual([])
+    await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
+    expect(f.routeAttempts).toHaveLength(1)
+  },
+)
+
+test.each(['closed', 'unassigned'])('rejects recovered assignment admission after intervening %s', async (action) => {
   // #given
-  const f = await fixture()
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, {
+    recoveredDelivery: {
+      action: 'assigned',
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: { ...pull, assignees: [bot] },
+      assignee: bot,
+      sender: { login: 'alice', id: 10, type: 'User' },
+    },
+  })
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
   await f.adapter.start()
   await f.scanRead
+  f.pull.assignees = [bot]
   await f.store.record({ ...pending, assignmentTriggered: true })
-  const payload = { assignee: { login: 'bot', id: 1, type: 'User' } }
-  const fail = read === 'reviewers' ? f.failRequestedReviewers : f.failPull
-  fail(() => new Response('unavailable', { status: 503 }))
+  const reached = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const settled = Promise.withResolvers<void>()
+  const route = f.router.route.bind(f.router)
+  f.router.route = async (message, onAdmitted) => {
+    try {
+      return await route(
+        message,
+        message.eventKind === 'pull_request:assigned'
+          ? async () => {
+              reached.resolve()
+              await resume.promise
+              await onAdmitted?.()
+            }
+          : onAdmitted,
+      )
+    } finally {
+      if (message.eventKind === 'pull_request:assigned') settled.resolve()
+    }
+  }
 
-  // #when
-  await expect(f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')).rejects.toThrow('503')
+  // #when: pause after the recovery freshness read but before durable admission.
+  await f.recoverRemoval()
+  await reached.promise
+  if (action === 'closed') f.pull.state = 'closed'
+  else f.pull.assignees = []
+  await f.deliver(action, 'pull_request', { assignee: bot, pull_request: f.pull })
+  expect(await f.store.list()).toEqual([])
+  resume.resolve()
+  await settled.promise
 
   // #then
-  expect(await f.store.list()).toHaveLength(1)
-  expect(f.routeAttempts).toEqual([])
-  fail()
-  const stopped = f.nextRoute()
-  await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
-  await stopped
   expect(await f.store.list()).toEqual([])
-  await f.deliver('unassigned', 'pull_request', payload, 'retry-unassign')
-  expect(f.routeAttempts).toHaveLength(1)
+  expect(f.statuses).toEqual([])
 })
 
 test.each(['assigned', 'review_requested'])('does not recover %s after the PR closes', async (action) => {

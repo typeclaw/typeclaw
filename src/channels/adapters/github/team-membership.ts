@@ -26,8 +26,9 @@ export function createTeamMembershipChecker(options: {
   const cache = new Map<string, boolean>()
 
   return async ({ org, slug, login, requireCurrent }) => {
-    // Withdrawal must not treat a failed or cached membership read as proof
-    // that no review request remains.
+    // Withdrawal bypasses cached membership and retries transient failures.
+    // Definitive access denials cannot establish a qualifying team request,
+    // matching the review-trigger path's fail-closed membership convention.
     if (requireCurrent) return lookup(fetchImpl, await options.token({ owner: org }), org, slug, login, true)
     const key = `${org}/${slug}#${login}`
     const cached = cache.get(key)
@@ -61,7 +62,7 @@ async function lookup(
     if (requireCurrent) throw error
     return false
   }
-  if (res.status === 404) return false
+  if (res.status === 403 || res.status === 404) return false
   if (!res.ok) {
     if (requireCurrent) throw new Error(`GitHub team membership ${res.status}`)
     return false

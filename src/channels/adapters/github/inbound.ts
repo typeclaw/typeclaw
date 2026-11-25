@@ -44,7 +44,7 @@ export type GithubWebhookHandlerOptions = {
   // eventAllowlist (the outer "process this webhook?" gate) — this is the inner
   // "does an admitted pull_request event become a review-trigger inbound?" gate.
   reviewOn?: () => GithubReviewOn
-  route: (message: InboundMessage) => Promise<RouteReceipt>
+  route: (message: InboundMessage, validateAdmission?: () => Promise<void>) => Promise<RouteReceipt>
   logger: GithubInboundLogger
   // Optional: resolves whether the bot is a member of the given team. When
   // omitted, team-reviewer requests are silently dropped (the v1 fallback
@@ -317,6 +317,12 @@ export async function processVerifiedGithubDelivery(
           },
           options.allowApprove?.() ?? true,
         ),
+        input.recovered === true && event === 'pull_request' && action === 'assigned' && prNumber !== null
+          ? async () => {
+              if (!(await options.isCurrentlyAssigned?.(routed.workspace, prNumber)))
+                throw new Error('recovered assignment is no longer current')
+            }
+          : undefined,
       ),
     )
     .catch((error: unknown) => {
