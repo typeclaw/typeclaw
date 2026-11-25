@@ -312,6 +312,28 @@ describe('startDaemon', () => {
     throw new Error('GC did not remove dead container in time')
   })
 
+  test('GC waits for a hung Docker probe instead of starting another one every tick', async () => {
+    // given a Docker that never answers the first probe
+    let probes = 0
+    const release = deferred()
+    const exec: DockerExec = async (args) => {
+      if (args[0] !== 'ps') return { exitCode: 1, stdout: '', stderr: 'unknown command' }
+      probes += 1
+      await release.promise
+      return { exitCode: 0, stdout: 'coder\n', stderr: '' }
+    }
+    daemon = await startDaemon({ exec, gcIntervalMs: 20 })
+    await send({ kind: 'register', containerName: 'coder', cwd: '/x' })
+    await waitFor(() => probes === 1)
+
+    // when several ticks pass, no second probe piles up behind it
+    await expectStable(() => probes > 1, { durationMs: 120, intervalMs: 20, description: 'overlapping GC probe' })
+
+    // then probing resumes once Docker answers
+    release.resolve()
+    await waitFor(() => probes > 1)
+  })
+
   test('GC requires gcMissesToDeregister consecutive absences before deregistering', async () => {
     const alive = new Set(['coder'])
     daemon = await startDaemon({ exec: fakeExec(alive), gcIntervalMs: 20, gcMissesToDeregister: 3 })
@@ -413,9 +435,9 @@ describe('startDaemon', () => {
     let reregistering = false
     const exec: DockerExec = async (args) => {
       if (args[0] !== 'ps') return { exitCode: 1, stdout: '', stderr: 'unknown command' }
-      // GC ticks overlap, so a tick started after the re-register would observe
-      // the renewed generation and legitimately deregister it on a "gone"
-      // answer. Only probes that began before it may report gone.
+      // A pass that starts after the held probe finishes observes the renewed
+      // generation and would legitimately deregister it on a "gone" answer.
+      // Only the held probe, which began before the re-register, may report gone.
       if (reregistering) return { exitCode: 1, stdout: '', stderr: 'docker unavailable' }
       probeStarted.resolve()
       await releaseProbe.promise

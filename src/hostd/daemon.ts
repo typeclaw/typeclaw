@@ -902,9 +902,16 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<Daemon> {
     }
   }
 
+  // A wedged Docker never answers, so a tick must not start a pass while the
+  // previous one is still waiting: each overlapping pass would leave another
+  // hung docker client behind, one per interval, until Docker recovers.
+  let gcRunning = false
   const gcTimer = setInterval(() => {
-    if (stopped || cwds.size === 0) return
-    void runGc()
+    if (stopped || cwds.size === 0 || gcRunning) return
+    gcRunning = true
+    void runGc().finally(() => {
+      gcRunning = false
+    })
   }, gcIntervalMs)
 
   const daemonHandle: Daemon = {
