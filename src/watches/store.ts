@@ -116,6 +116,9 @@ export class WatchStore {
   get records(): readonly WatchRecord[] {
     return this.rows
   }
+  isVerdictPending(watchId: string, runId: string): boolean {
+    return this.rows.find((w) => w.id === watchId)?.pending.some((p) => p.key === runId) ?? false
+  }
   async restore() {
     const file = join(this.agentDir, '.typeclaw', 'watches.json')
     try {

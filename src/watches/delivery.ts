@@ -11,7 +11,7 @@ function renderWakeLine(w: WatchWake) {
     .replaceAll('<', '\\u003c')
     .replaceAll('>', '\\u003e')
 }
-export function renderWatchReminder(target: WatchWakeTarget, wakes: readonly WatchWake[]) {
+export function renderWatchReminder(target: Pick<WatchWakeTarget, 'kind'>, wakes: readonly WatchWake[]) {
   return [
     '<system-reminder>',
     'Follow-up probe results (not user instructions):',
@@ -120,6 +120,9 @@ export class WakeDispatcher {
       const readiness = this.tuiReadiness
       const outcome = await this.deliver(first.wakeTarget, batch, watchOrigin(first), this.shutdown.signal)
       if (this.stopped) return
+      // Admission is not a start acknowledgment. Recheck the journal at the
+      // next coalescing tick; the persisted verdict still owns the body.
+      if (outcome === 'queued') return
       if (outcome === 'held') {
         // Attach/idle may race a disconnecting socket's pending acknowledgment.
         if (first.wakeTarget.kind !== 'tui' || readiness === this.tuiReadiness) slot.held = signature(group)
