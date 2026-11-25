@@ -27,6 +27,7 @@ export type GithubTokenBridge = {
   // configured repo. Kept apart from the App minter so PAT presence never flips
   // hasAppTokenResolver() and the App-only paths (sandboxed minting, push grants).
   resolvePatForRepo: ResolveGithubTokenForRepo
+  hasPatTokenResolver: () => boolean
   registerPatResolver: (resolver: (repoSlug: string) => Promise<GithubTokenCredential>) => () => void
   registerResolver: (
     resolver: (repoSlug: string) => Promise<GithubTokenCredential>,
@@ -61,6 +62,7 @@ export function createGithubTokenBridge(
         options.onSelfChange?.(null)
       }
     },
+    hasPatTokenResolver: () => currentPat !== null,
     resolvePatForRepo: async (repoSlug) => {
       const resolver = currentPat
       if (resolver === null) return { kind: 'unavailable', reason: NO_PAT_RESOLVER_REASON }

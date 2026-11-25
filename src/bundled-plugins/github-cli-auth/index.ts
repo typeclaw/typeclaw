@@ -12,8 +12,7 @@ import {
   releaseGithubReviewRoundDismissal,
 } from '@/channels/github-review-verdict-coordinator'
 import type { GithubTokenCredential } from '@/channels/github-token-bridge'
-import { hasEnvKey, readEnvFile } from '@/init/env-file'
-import { CORE_PERMISSIONS } from '@/permissions/builtins'
+import { hasEnvKey } from '@/init/env-file'
 import { definePlugin, type ToolBeforeEvent } from '@/plugin'
 
 import { createGithubEffectiveApprovalResolver, createGithubHeadShaResolver } from './effective-approval'
@@ -38,6 +37,12 @@ import { analyzeGitCommand, createSessionTmpGitResolvers, resolveGhDefaultRepoFr
 import { buildGitCredentialEnv, type GitRepoCredential } from './git-credential-env'
 import { matchesGrantedPush, takeGrantedPush } from './granted-push'
 import { checkGraphqlAuthNudge } from './graphql-auth-nudge'
+import {
+  canUseProcessGithubPat,
+  declaredGithubEnvToken,
+  effectiveGithubEnvToken,
+  inheritedGithubEnvToken,
+} from './pat-policy'
 import { verifyReviewTokenAccount } from './review-account'
 import {
   capturedReviewAccountIdentity,
@@ -112,19 +117,9 @@ export default definePlugin({
     // value without exposing .env/secrets.json to the model. Gate that on the
     // existing credential capability rather than sandbox presence: privileged
     // roles are sandboxed for file masking too.
-    const canUsePat = (origin: SessionOrigin | undefined): boolean =>
-      ctx.permissions.has(origin, CORE_PERMISSIONS.fsSeeSecrets) ||
-      ctx.permissions.has(origin, 'security.bypass.medium')
+    const canUsePat = (origin: SessionOrigin | undefined): boolean => canUseProcessGithubPat(ctx.permissions, origin)
 
-    const effectiveProcessToken = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
-      if (process.env.GH_TOKEN !== undefined && process.env.GH_TOKEN !== '') {
-        return { envName: 'GH_TOKEN', value: process.env.GH_TOKEN }
-      }
-      if (process.env.GITHUB_TOKEN !== undefined && process.env.GITHUB_TOKEN !== '') {
-        return { envName: 'GITHUB_TOKEN', value: process.env.GITHUB_TOKEN }
-      }
-      return undefined
-    }
+    const effectiveProcessToken = () => effectiveGithubEnvToken()
 
     const processPatOverlay = (): Record<string, string> | undefined => {
       const token = effectiveProcessToken()
@@ -144,14 +139,7 @@ export default definePlugin({
     // leaving the declared alias as the one gh sees. Returns the surviving PAT/App
     // token (value snapshotted from process.env, which holds the declared value),
     // or undefined when the operator declared no usable GitHub token in `.env`.
-    const sandboxInheritedGhToken = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
-      for (const envName of ['GH_TOKEN', 'GITHUB_TOKEN'] as const) {
-        if (!hasEnvKey(ctx.agentDir, envName)) continue
-        const value = process.env[envName]
-        if (value !== undefined && value !== '') return { envName, value }
-      }
-      return undefined
-    }
+    const sandboxInheritedGhToken = () => inheritedGithubEnvToken(ctx.agentDir)
 
     // Stricter than sandboxInheritedGhToken(), and deliberately not merged with it.
     // `gh` only needs to know WHICH token the sandbox will hand it, so the live
@@ -162,19 +150,11 @@ export default definePlugin({
     // declared name can carry a credential the operator never wrote to `.env`.
     // Compare against the same literal `readEnvFile` parse Docker's --env-file
     // injects, and fail closed on any mismatch.
-    const declaredGhTokenForGitBroker = (): { envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } | undefined => {
-      const inherited = sandboxInheritedGhToken()
-      if (inherited === undefined) return undefined
-      const declared = readEnvFile(ctx.agentDir).get(inherited.envName)
-      if (declared === undefined || declared === '' || declared !== inherited.value) return undefined
-      return inherited
-    }
-
     const declaredGitCredentialState = ():
       | { kind: 'absent' }
       | { kind: 'invalid' }
       | { kind: 'pat'; envName: 'GH_TOKEN' | 'GITHUB_TOKEN'; value: string } => {
-      const inherited = declaredGhTokenForGitBroker()
+      const inherited = declaredGithubEnvToken(ctx.agentDir)
       if (inherited === undefined) {
         return hasEnvKey(ctx.agentDir, 'GH_TOKEN') || hasEnvKey(ctx.agentDir, 'GITHUB_TOKEN')
           ? { kind: 'invalid' }

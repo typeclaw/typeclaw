@@ -433,17 +433,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       // enter process.env; App consumers mint through the repo-scoped bridge.
       if (options.secrets.auth.type === 'pat') {
         const seedGhToken = async (): Promise<void> => {
-          process.env.GH_TOKEN = await auth.token()
-        }
-        await seedGhToken()
-        const tokenRefreshIntervalMs = options.tokenRefreshIntervalMs ?? DEFAULT_TOKEN_REFRESH_INTERVAL_MS
-        if (tokenRefreshIntervalMs > 0) {
-          const refresh = () => {
-            seedGhToken().catch((err) => {
-              logger.error(`[github] periodic token refresh failed: ${describeError(err)}`)
-            })
-          }
-          tokenRefreshTimer = setIntervalFn(refresh, tokenRefreshIntervalMs)
+          const token = await auth.token()
+          if (started) process.env.GH_TOKEN = token
         }
         // The channel PAT is the agent's own GitHub identity, so lend it to a git push
         // for a configured repo instead of making the operator duplicate it in `.env`.
@@ -460,6 +451,18 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
             }
             return { token: await auth.token() }
           })
+        }
+        // Keep the scope resolver registered for the entire time the channel
+        // PAT is exposed in GH_TOKEN, including across async start/stop.
+        await seedGhToken()
+        const tokenRefreshIntervalMs = options.tokenRefreshIntervalMs ?? DEFAULT_TOKEN_REFRESH_INTERVAL_MS
+        if (tokenRefreshIntervalMs > 0) {
+          const refresh = () => {
+            seedGhToken().catch((err) => {
+              logger.error(`[github] periodic token refresh failed: ${describeError(err)}`)
+            })
+          }
+          tokenRefreshTimer = setIntervalFn(refresh, tokenRefreshIntervalMs)
         }
       }
       if (options.secrets.auth.type === 'app' && options.githubTokenBridge !== undefined) {
@@ -725,6 +728,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
         tokenRefreshTimer.clear()
         tokenRefreshTimer = null
       }
+      if (options.secrets.auth.type === 'pat') delete process.env.GH_TOKEN
       if (unregisterTokenBridge !== null) {
         unregisterTokenBridge()
         unregisterTokenBridge = null
@@ -732,7 +736,6 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
       unregisterSelfBridge?.()
       unregisterSelfBridge = null
       await auth.dispose()
-      if (options.secrets.auth.type === 'pat') delete process.env.GH_TOKEN
       server = null
       selfId = null
       selfLogin = null

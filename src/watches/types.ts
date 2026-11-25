@@ -52,12 +52,17 @@ export type BundledProbeContext<P> = {
   params: P
   state: unknown
   lastRunAt: number | undefined
+  // Creation time (epoch milliseconds), so the first poll can distinguish
+  // history from activity between registration and the first successful poll.
+  startedAt?: number
+  // Channel actor, when it differs from the viewer of the resolved token.
+  selfLogin?: string
   resolveTokenForRepo: ResolveGithubTokenForRepo
   signal: AbortSignal
   fetch: typeof fetch
 }
 
-export type BundledProbeResult = WatchVerdict & { state: unknown }
+export type BundledProbeResult = WatchVerdict & { state: unknown; eventKey?: string }
 
 export type BundledProbe<P = unknown> = {
   readonly kind: string
