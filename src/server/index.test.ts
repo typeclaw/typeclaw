@@ -28,6 +28,8 @@ import { isWindows } from '@/shared'
 import { createStream, type StreamMessage } from '@/stream'
 import { expectStable, waitFor as waitForState } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
+import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
+import { WatchStore } from '@/watches/store'
 
 import type { CommandOutbound, CommandRunner } from './command-runner'
 import { createServer, type ServerLogger } from './index'
@@ -61,6 +63,7 @@ function makeRuntimeWith(opts: { subagents: SubagentRegistry }): PluginRuntime {
 }
 
 type SessionEvent =
+  | { type: 'agent_start' }
   | { type: 'message_update'; assistantMessageEvent: { type: 'text_delta'; delta: string } }
   | { type: 'tool_execution_start'; toolCallId: string; toolName: string; args: unknown }
   | { type: 'tool_execution_end'; toolCallId: string; toolName: string; result: unknown; isError: boolean }
@@ -242,6 +245,142 @@ async function connect(url: string): Promise<{
 }
 
 describe('createServer tool event forwarding', () => {
+  test('watch delivery holds for a detached or busy target, then reaches the attached session', async () => {
+    const attached = Promise.withResolvers<string>(),
+      idle = Promise.withResolvers<string>()
+    let ready = false
+    const session = createFakeSession()
+    const started = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    session.prompt = async () => {
+      session.emit({ type: 'agent_start' })
+      started.resolve()
+      await release.promise
+    }
+    const factory = createServer({
+      port: 0,
+      stream: createStream(),
+      createSession: async () => session,
+      onWatchTargetReady: (id) => {
+        if (ready) idle.resolve(id)
+        else attached.resolve(id)
+      },
+    })
+    server = factory.start()
+    expect(await factory.deliverWatch('unexpected')).toBe('held')
+    const { ws, waitFor } = await connect(`ws://localhost:${server.port}`)
+    const id = await attached.promise
+    ready = true
+    const prompted = waitFor((m) => m.type === 'prompt_started' && m.text === 'probe result')
+    expect(await factory.deliverWatch('probe result')).toBe('delivered')
+    expect(await factory.deliverWatch('second result')).toBe('held')
+    await prompted
+    await started.promise
+    release.resolve()
+    expect(await idle.promise).toBe(id)
+    ws.close()
+  })
+  test('detached wake survives a disconnect during turn setup and starts on the next TUI', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'watch-reconnect-'))
+    const hooks = createHookBus(),
+      entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>()
+    hooks.registerAll('gate', dir, console, {
+      'session.turn.start': async () => {
+        entered.resolve()
+        await release.promise
+      },
+    })
+    const sessions: ReturnType<typeof createFakeSession>[] = []
+    const store = new WatchStore(dir)
+    let tick: (() => Promise<void>) | undefined
+    const dispatcher = new WakeDispatcher(
+      store,
+      async (target, batch) => factory.deliverWatch(renderWatchReminder(target, batch)),
+      {
+        now: () => 0,
+        after: (_ms, fn) => {
+          tick = fn
+          return () => {
+            tick = undefined
+          }
+        },
+      },
+    )
+    const factory = createServer({
+      port: 0,
+      agentDir: dir,
+      stream: createStream(),
+      pluginRuntime: makeRuntime({ registry: EMPTY_REGISTRY, hooks }),
+      onWatchTargetReady: (id) => dispatcher.notify(id),
+      createSession: async () => {
+        const s = createFakeSession()
+        s.prompt = async (text) => {
+          s.promptCalls.push(text)
+          s.emit({ type: 'agent_start' })
+        }
+        sessions.push(s)
+        return s
+      },
+    })
+    server = factory.start()
+    const attach = async () => {
+      const client = await connect(`ws://localhost:${server!.port}`)
+      const connected = await client.waitFor((m) => m.type === 'connected')
+      if (connected.type !== 'connected') throw new Error('not connected')
+      return { ws: client.ws, id: connected.sessionId }
+    }
+    const detach = async (ws: WebSocket) => {
+      const closed = Promise.withResolvers<void>()
+      ws.addEventListener('close', () => closed.resolve(), { once: true })
+      ws.close()
+      await closed.promise
+    }
+    try {
+      const original = await attach()
+      await detach(original.ws)
+      const origin = { kind: 'tui', sessionId: original.id } as const
+      await store.update((rows) =>
+        rows.push({
+          id: crypto.randomUUID(),
+          description: 'Export',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdAt: 0,
+          deadline: 100,
+          createdByRole: 'owner',
+          createdByOrigin: origin,
+          wakeTarget: origin,
+          nextRunAt: 0,
+          consecutiveWakes: 0,
+          consecutiveFailures: 0,
+          status: 'done',
+          pending: [{ key: crypto.randomUUID(), summary: 'Export ready', final: true }],
+        }),
+      )
+      dispatcher.notify()
+      await tick!()
+      expect(store.records[0]?.pending).toHaveLength(1)
+      const interrupted = await attach()
+      const attempt = tick!()
+      await entered.promise
+      await detach(interrupted.ws)
+      await attempt
+      expect(store.records[0]?.pending).toHaveLength(1)
+      release.resolve()
+      const successor = await attach()
+      expect(successor.id).not.toBe(original.id)
+      await tick!()
+      expect(store.records[0]?.pending).toBeEmpty()
+      expect(sessions.map((s) => s.promptCalls.length)).toEqual([0, 0, 1])
+      expect(sessions[2]?.promptCalls[0]).toContain('Export ready')
+      await detach(successor.ws)
+    } finally {
+      release.resolve()
+      await dispatcher.stop()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
   test('rejects TUI websocket upgrades without the expected token', async () => {
     const built = createServer({ port: 0, createSession: async () => createFakeSession(), tuiToken: 'secret' }).start()
     server = built

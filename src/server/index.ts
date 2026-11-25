@@ -74,6 +74,8 @@ export type ServerLogger = {
 }
 
 export type ServerOptions = {
+  onWatchTargetReady?: (sessionId: string) => void
+  onWatchUserPrompt?: (sessionId: string) => void
   readonly getGithubSelf?: CreateSessionOptions['getGithubSelf']
   port: number
   reloadAll?: ReloadAllFn
@@ -198,6 +200,9 @@ type QueuedPrompt = {
 }
 
 type SessionState = {
+  watchReceipt?: (result: 'delivered' | 'held' | 'failed') => void
+  promptingWatch?: boolean
+  onWatchTargetReady?: () => void
   session: AgentSession & { resetLoopGuard?: () => void }
   activeModelRef: ReturnType<typeof resolveFallbackChain>[number]
   // The session's creation-time thinking level, captured once. An escalated turn
@@ -300,6 +305,8 @@ function encodeBase64(bytes: Uint8Array): string {
 
 export function createServer({
   getGithubSelf,
+  onWatchTargetReady,
+  onWatchUserPrompt,
   port,
   reloadAll,
   reloadRegistry,
@@ -328,6 +335,7 @@ export function createServer({
   runIdleContinuation: todoIdleContinuation = runIdleContinuation,
 }: ServerOptions) {
   const sessionStates = new WeakMap<Ws, SessionState>()
+  const attached = new Map<string, Set<Ws>>()
   const initializingSessions = new WeakMap<Ws, Promise<void>>()
   const callIdToWs = new Map<string, AnyOwnerWs>()
 
@@ -590,6 +598,7 @@ export function createServer({
               origin,
               sessionManager,
               drainQueue: [],
+              onWatchTargetReady: () => onWatchTargetReady?.(sessionFileId),
               draining: false,
               unsubBroadcast: null,
               unsubPrompts: null,
@@ -648,6 +657,10 @@ export function createServer({
               state.unsubPrompts = stream.subscribe({ target: { kind: 'session', sessionId: sessionFileId } }, (msg) =>
                 enqueuePrompt(ws, state, msg, agentDir, logger, stream),
               )
+              const clients = attached.get(sessionFileId) ?? new Set()
+              clients.add(ws)
+              attached.set(sessionFileId, clients)
+              state.onWatchTargetReady?.()
 
               state.unsubBroadcast = stream.subscribe({ target: { kind: 'broadcast' } }, (msg) => {
                 routeSubagentCompletionReminder(state, msg, stream)
@@ -861,6 +874,7 @@ export function createServer({
 
           if (msg.type === 'prompt') {
             if (!state) return
+            onWatchUserPrompt?.(state.sessionFileId)
             if (stream) {
               stream.publish({
                 target: { kind: 'session', sessionId: state.sessionFileId },
@@ -966,6 +980,13 @@ export function createServer({
           try {
             state?.unsubBroadcast?.()
             state?.unsubPrompts?.()
+            if (state) {
+              state.watchReceipt?.('held')
+              const clients = attached.get(state.sessionFileId)
+              clients?.delete(ws)
+              if (!clients?.size) attached.delete(state.sessionFileId)
+              if (attached.size) state.onWatchTargetReady?.()
+            }
             state?.unsubClaim?.()
             if (state?.activeClaimCode !== null && state?.activeClaimCode !== undefined && claimController) {
               claimController.cancelClaim(state.activeClaimCode)
@@ -1010,7 +1031,38 @@ export function createServer({
     return bunServer
   }
 
-  return { start }
+  return {
+    start,
+    async deliverWatch(text: string): Promise<'held' | 'delivered' | 'failed'> {
+      if (!stream) return 'held'
+      for (const [sessionId, clients] of attached) {
+        // Session stream messages multicast: choose exactly one idle receiver.
+        if (clients.size !== 1) continue
+        const ws = [...clients][0]!
+        const state = sessionStates.get(ws)
+        if (
+          ws.readyState !== WebSocket.OPEN ||
+          !state ||
+          state.draining ||
+          state.drainQueue.length ||
+          state.watchReceipt
+        )
+          continue
+        const receipt = Promise.withResolvers<'held' | 'delivered' | 'failed'>()
+        state.watchReceipt = (result) => {
+          state.watchReceipt = undefined
+          receipt.resolve(result)
+        }
+        stream.publish({
+          target: { kind: 'session', sessionId },
+          payload: { kind: 'prompt', text, delivery: 'queue' },
+          meta: { source: 'watch' },
+        })
+        return receipt.promise
+      }
+      return 'held'
+    },
+  }
 }
 
 function isWebSocketUpgrade(req: Request): boolean {
@@ -1022,6 +1074,9 @@ function forwardSessionEvents(ws: Ws, state: SessionState, logger: ServerLogger,
 
   state.session.subscribe((event) => {
     switch (event.type) {
+      case 'agent_start':
+        if (state.promptingWatch && ws.readyState === WebSocket.OPEN) state.watchReceipt?.('delivered')
+        break
       case 'message_update':
         if (event.assistantMessageEvent.type === 'text_delta') {
           send(ws, { type: 'text_delta', delta: event.assistantMessageEvent.delta })
@@ -1249,7 +1304,7 @@ async function drain(
         await recordTurnStart({
           agentDir,
           origin: state.origin,
-          isRealUserTurn: item.source !== TODO_CONTINUATION_SOURCE,
+          isRealUserTurn: item.source !== TODO_CONTINUATION_SOURCE && item.source !== 'watch',
         }).catch((err) => logger.error(`[server] ${state.sessionFileId}: todo turn-start failed: ${describeErr(err)}`))
       }
 
@@ -1263,6 +1318,7 @@ async function drain(
         break
       }
       state.lastUsage = null
+      state.promptingWatch = item.source === 'watch'
       try {
         const turnText =
           retrievalContext.results.length > 0
@@ -1280,6 +1336,9 @@ async function drain(
             state.activeModelRef = ref
           },
           beforeAttempt: () => {
+            // Model selection can await after the socket check at turn start.
+            if (item.source === 'watch' && ws.readyState !== WebSocket.OPEN)
+              throw new Error('TUI disconnected before watch prompt')
             applyTurnThinkingLevel(state.session, item.text, state.turnThinkingDefault, state.lastQuestionSignal)
           },
           onAttemptFailed: (attempt) => {
@@ -1292,7 +1351,7 @@ async function drain(
         // Only real user turns move the signal: a usable turn seeds it, a failed
         // leaf CLEARS it (else an older question leaks across the failed turn).
         // Todo-continuation turns are not user turns, so they leave it untouched.
-        if (item.source !== TODO_CONTINUATION_SOURCE) {
+        if (item.source !== TODO_CONTINUATION_SOURCE && item.source !== 'watch') {
           state.lastQuestionSignal = tuiTurnLeafFailed(state.session) ? null : getQuestionSignal(item.text)
         }
         send(ws, doneMessage(state))
@@ -1300,6 +1359,9 @@ async function drain(
         const message = err instanceof Error ? err.message : String(err)
         logger.error(`[server] ${state.sessionFileId}: prompt failed: ${message}`)
         send(ws, { type: 'error', message })
+      } finally {
+        if (state.promptingWatch) state.watchReceipt?.('failed')
+        state.promptingWatch = false
       }
       await fireTurnEnd()
       await fireIdle()
@@ -1329,7 +1391,9 @@ async function drain(
       }
     }
   } finally {
+    state.watchReceipt?.(ws.readyState === WebSocket.OPEN ? 'failed' : 'held')
     state.draining = false
+    state.onWatchTargetReady?.()
   }
 }
 
