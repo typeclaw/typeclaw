@@ -7,8 +7,16 @@ import type { AgentSession } from '@/agent'
 import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import { createHookBus, type HookBus } from '@/plugin'
 import { createStream } from '@/stream'
+import { WakeDispatcher } from '@/watches/delivery'
+import { WatchStore } from '@/watches/store'
 
-import { createCronConsumer, CRON_COMPLETION_CHECK_PROMPT, type CronConsumerLogger, type CronSession } from './consumer'
+import {
+  createCronConsumer,
+  CRON_COMPLETION_CHECK_PROMPT,
+  runUnattendedPrompt,
+  type CronConsumerLogger,
+  type CronSession,
+} from './consumer'
 import type { CronJob, ExecJob, HandlerJob, PromptJob } from './schema'
 
 async function waitForFile(path: string): Promise<string> {
@@ -1474,6 +1482,81 @@ function completeBackgroundChild(
 }
 
 describe('createCronConsumer background subagents', () => {
+  for (const stage of ['model', 'child drain'] as const)
+    test(`fresh wake shutdown during ${stage} disposes the session and retains the reminder`, async () => {
+      const store = new WatchStore(root)
+      const sessionId = 'fresh-session',
+        pending = { key: crypto.randomUUID(), summary: 'Ready', final: true }
+      await store.update((rows) =>
+        rows.push({
+          id: crypto.randomUUID(),
+          description: 'Export',
+          probe: { command: 'true' },
+          mode: 'judge',
+          createdAt: 0,
+          deadline: 100,
+          createdByRole: 'member',
+          createdByOrigin: { kind: 'cron', jobId: 'job', jobKind: 'prompt' },
+          wakeTarget: { kind: 'fresh' },
+          nextRunAt: 0,
+          consecutiveWakes: 0,
+          consecutiveFailures: 0,
+          status: 'done',
+          pending: [pending],
+        }),
+      )
+      const liveRegistry = new ObservedRegistry(),
+        stream = createStream(),
+        modelStarted = Promise.withResolvers<void>()
+      const parked = stage === 'model' ? modelStarted.promise : liveRegistry.arm()
+      const events: string[] = []
+      const session = stubAgentSession()
+      session.abort = async () => {
+        events.push('abort')
+      }
+      let fire!: () => Promise<void>
+      const dispatcher = new WakeDispatcher(
+        store,
+        async (_target, [wake], _origin, signal) => {
+          const delivered = await runUnattendedPrompt(
+            { id: 'job', prompt: wake!.summary },
+            async () => ({
+              session,
+              backgroundDrain: { liveRegistry, sessionId, stream },
+              prompt: async () => {
+                if (stage === 'model') {
+                  modelStarted.resolve()
+                  await new Promise<void>(() => {})
+                } else registerBackgroundChild(liveRegistry, sessionId)
+              },
+              dispose: () => {
+                events.push('dispose')
+              },
+            }),
+            silentLogger,
+            signal,
+          )
+          return delivered ? 'delivered' : 'failed'
+        },
+        {
+          now: () => 0,
+          after: (_ms, fn) => {
+            fire = fn
+            return () => {}
+          },
+        },
+      )
+      dispatcher.notify()
+      const delivery = fire()
+      await parked
+      await dispatcher.stop()
+      events.push('later cleanup')
+      await delivery
+      expect(events).toEqual(['abort', 'dispose', 'later cleanup'])
+      const restored = new WatchStore(root)
+      await restored.restore()
+      expect(restored.records[0]?.pending).toEqual([pending])
+    }, 5000)
   test('keeps the session live while a background child runs, then delivers its completion before disposing', async () => {
     // given: a cron turn that spawns a background child and ends while it still runs
     const stream = createStream()

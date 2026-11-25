@@ -257,6 +257,7 @@ export async function promptWithSameRefRetryOnly(
   text: string,
   promptOpts?: Parameters<AgentSession['prompt']>[1],
   opts: {
+    signal?: AbortSignal
     retryPolicy?: RetryPolicy
     random?: () => number
     now?: () => number
@@ -285,6 +286,7 @@ export async function promptWithSameRefRetryOnly(
     let overloadWindowStartedAt: number | undefined
     let nextDelayMs: number | undefined
     for (let attempt = 0; ; attempt++) {
+      opts.signal?.throwIfAborted()
       softError = undefined
       let hardError: Error | undefined
       try {
@@ -293,6 +295,7 @@ export async function promptWithSameRefRetryOnly(
         } else if (
           !(await retryTurnOnPersistentSession(session, {
             attempt: attempt - 1,
+            signal: opts.signal,
             ...(nextDelayMs !== undefined ? { delayMs: nextDelayMs } : {}),
           }))
         ) {

@@ -1,3 +1,5 @@
+import { raceWithAbortSignal } from '@earendil-works/pi-ai/utils/abort'
+
 import type { AgentSession } from '@/agent'
 import { applyTurnThinkingLevel } from '@/agent/attention-escalation'
 import { promptWithFallback, resolveFallbackChain } from '@/agent/model-fallback'
@@ -241,16 +243,16 @@ async function runPrompt(
   // under the `default` profile today). Single-ref configs produce a length-1
   // chain; multi-ref configs (e.g. `"default": ["openai/...", "fireworks/..."]`)
   // drive the retry-on-failure loop inside `runPromptOnce`.
-  const refs = resolveFallbackChain(getConfig().models, undefined)
-  return runPromptOnce(job, refs, createSessionForCron, logger)
+  return runUnattendedPrompt(job, (ref) => createSessionForCron(job, ref), logger)
 }
 
-async function runPromptOnce(
-  job: PromptJob,
-  refs: ModelRef[],
-  createSessionForCron: (job: PromptJob, refOverride?: ModelRef) => Promise<CronSession>,
+export async function runUnattendedPrompt(
+  job: Pick<PromptJob, 'id' | 'prompt'>,
+  createSession: (ref: ModelRef) => Promise<CronSession>,
   logger: CronConsumerLogger,
+  signal?: AbortSignal,
 ): Promise<boolean> {
+  const refs = resolveFallbackChain(getConfig().models, undefined)
   // Per-attempt lifecycle: every session we create gets full
   // turn-start → turn-end → session-end → dispose bracketing, regardless of
   // whether the helper chose it as the final session or disposed it as a
@@ -267,12 +269,22 @@ async function runPromptOnce(
     refs,
     text: job.prompt,
     createSessionForRef: async (ref) => {
-      const created = await createSessionForCron(job, ref)
+      signal?.throwIfAborted()
+      const created = await createSession(ref)
+      if (signal?.aborted) {
+        created.dispose?.()
+        signal.throwIfAborted()
+      }
       lastSession = created
       // Started before the prompt so a child that completes mid-turn is latched.
       const drainWatch =
         created.backgroundDrain !== undefined ? beginSubagentDrainWatch(created.backgroundDrain) : undefined
       lastDrainWatch = drainWatch
+      const cancel = () => {
+        drainWatch?.stop()
+        void created.session?.abort().catch((e) => logger.warn(`[cron] ${job.id}: abort failed: ${describe(e)}`))
+      }
+      signal?.addEventListener('abort', cancel, { once: true })
       const turnEvent =
         created.hooks && created.sessionId !== undefined && created.agentDir !== undefined
           ? {
@@ -287,7 +299,17 @@ async function runPromptOnce(
       // `# Memory` section). Empty for non-vector agents.
       const retrievalContext = { results: '' }
       if (created.hooks && turnEvent !== undefined) {
-        await created.hooks.runSessionTurnStart({ ...turnEvent, userPrompt: job.prompt, retrievalContext })
+        try {
+          const setup = created.hooks.runSessionTurnStart({ ...turnEvent, userPrompt: job.prompt, retrievalContext })
+          await (signal ? raceWithAbortSignal(setup, signal) : setup)
+        } catch (error) {
+          // Fallback doesn't own this session until the factory returns. A
+          // blocked retrieval hook must not hold its resources or shutdown.
+          signal?.removeEventListener('abort', cancel)
+          drainWatch?.stop()
+          created.dispose?.()
+          throw error
+        }
       }
       // Cron sessions are created fresh per fallback attempt, so the live getter
       // is still the creation-time default here — safe to read without a separate
@@ -308,8 +330,13 @@ async function runPromptOnce(
       // regular method that reads `this._eventListeners`. Destructuring drops
       // the receiver.
       const sessionForHelper: AgentSession = {
-        prompt: (text: string) =>
-          created.prompt(retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text),
+        prompt: (text: string) => {
+          signal?.throwIfAborted()
+          const turn = created.prompt(
+            retrievalContext.results.length > 0 ? `${text}\n\n${retrievalContext.results}` : text,
+          )
+          return signal ? raceWithAbortSignal(turn, signal) : turn
+        },
         subscribe: created.session?.subscribe.bind(created.session) ?? (() => () => {}),
       } as unknown as AgentSession
       return {
@@ -318,25 +345,31 @@ async function runPromptOnce(
         // session created (success or failure), then disposes the underlying
         // resources. Hooks that throw are logged but don't prevent disposal.
         dispose: async () => {
+          signal?.removeEventListener('abort', cancel)
           drainWatch?.stop()
-          if (created.hooks && turnEvent !== undefined) {
-            try {
-              await created.hooks.runSessionTurnEnd(turnEvent)
-            } catch (e) {
-              logger.warn(`[cron] ${job.id}: turn-end hook threw: ${describe(e)}`)
+          try {
+            if (created.hooks && turnEvent !== undefined) {
+              try {
+                const end = created.hooks.runSessionTurnEnd(turnEvent)
+                await (signal ? raceWithAbortSignal(end, signal) : end)
+              } catch (e) {
+                if (!signal?.aborted) logger.warn(`[cron] ${job.id}: turn-end hook threw: ${describe(e)}`)
+              }
             }
-          }
-          if (created.hooks && created.sessionId !== undefined) {
-            try {
-              await created.hooks.runSessionEnd({
-                sessionId: created.sessionId,
-                ...(created.origin !== undefined ? { origin: created.origin } : {}),
-              })
-            } catch (e) {
-              logger.warn(`[cron] ${job.id}: session-end hook threw: ${describe(e)}`)
+            if (created.hooks && created.sessionId !== undefined) {
+              try {
+                const end = created.hooks.runSessionEnd({
+                  sessionId: created.sessionId,
+                  ...(created.origin !== undefined ? { origin: created.origin } : {}),
+                })
+                await (signal ? raceWithAbortSignal(end, signal) : end)
+              } catch (e) {
+                if (!signal?.aborted) logger.warn(`[cron] ${job.id}: session-end hook threw: ${describe(e)}`)
+              }
             }
+          } finally {
+            created.dispose?.()
           }
-          created.dispose?.()
         },
       }
     },
@@ -360,68 +393,76 @@ async function runPromptOnce(
   // handled by the helper's per-attempt dispose calls.
   let reminderFailed = false
   if (result.success && lastSession !== null) {
-    const finalSession: CronSession = lastSession
-    // Follow-up turns stay on this session so the original cron prompt is not replayed.
-    const promptFinal = async (text: string): Promise<void> => {
-      if (finalSession.session === undefined) {
-        await finalSession.prompt(text)
-        return
+    try {
+      const finalSession: CronSession = lastSession
+      // Follow-up turns stay on this session so the original cron prompt is not replayed.
+      const promptFinal = async (text: string): Promise<void> => {
+        if (finalSession.session === undefined) {
+          const turn = finalSession.prompt(text)
+          await (signal ? raceWithAbortSignal(turn, signal) : turn)
+          return
+        }
+        const reminder = promptWithSameRefRetryOnly(finalSession.session, text, undefined, { signal })
+        const turn = await (signal ? raceWithAbortSignal(reminder, signal) : reminder)
+        if (!turn.success) throw turn.lastError ?? new Error('follow-up turn failed')
       }
-      const turn = await promptWithSameRefRetryOnly(finalSession.session, text)
-      if (!turn.success) throw turn.lastError ?? new Error('follow-up turn failed')
-    }
-    // A reminder turn is where the delegated work gets reported, so a provider
-    // failure there (thrown, or soft via message_end) fails the run.
-    const promptReminder = async (text: string): Promise<void> => {
-      try {
-        await promptFinal(text)
-      } catch (e) {
-        reminderFailed = true
-        logger.error(`[cron] ${job.id}: background subagent reminder turn failed: ${describe(e)}`)
+      // A reminder turn is where the delegated work gets reported, so a provider
+      // failure there (thrown, or soft via message_end) fails the run.
+      const promptReminder = async (text: string): Promise<void> => {
+        try {
+          await promptFinal(text)
+        } catch (e) {
+          reminderFailed = true
+          logger.error(`[cron] ${job.id}: background subagent reminder turn failed: ${describe(e)}`)
+        }
       }
-    }
-    // Shared by both drains so the one after the check does not re-deliver a
-    // child the first already reported.
-    const delivered = new Set<string>()
-    const drainBackground = async (watch: SubagentDrainWatch | undefined): Promise<void> => {
-      if (finalSession.backgroundDrain === undefined || watch === undefined) return
-      await runSubagentDrain(watch, {
-        drain: finalSession.backgroundDrain,
-        prompt: promptReminder,
-        maxChildWaitMs: DRAIN_MAX_CHILD_WAIT_MS,
-        delivered,
-      })
-    }
-    await drainBackground(lastDrainWatch)
-    if (!reminderFailed) {
-      // Started before the check so a child the check turn spawns is drained too.
-      const checkWatch =
-        finalSession.backgroundDrain !== undefined ? beginSubagentDrainWatch(finalSession.backgroundDrain) : undefined
-      // Like the job turn and its reminder turns, the check has no deadline of its
-      // own; the job stays in flight until it settles. Its failure is logged and
-      // does not fail a run whose own turn succeeded.
-      try {
-        await promptFinal(CRON_COMPLETION_CHECK_PROMPT)
-      } catch (e) {
-        logger.warn(`[cron] ${job.id}: completion check turn failed: ${describe(e)}`)
-      }
-      await drainBackground(checkWatch)
-    }
-    if (finalSession.hooks && finalSession.sessionId !== undefined) {
-      try {
-        await finalSession.hooks.runSessionIdle({
-          sessionId: finalSession.sessionId,
-          parentTranscriptPath: finalSession.getTranscriptPath?.(),
-          idleMs: 0,
-          ...(finalSession.origin !== undefined ? { origin: finalSession.origin } : {}),
+      // Shared by both drains so the one after the check does not re-deliver a
+      // child the first already reported.
+      const delivered = new Set<string>()
+      const drainBackground = async (watch: SubagentDrainWatch | undefined): Promise<void> => {
+        if (finalSession.backgroundDrain === undefined || watch === undefined) return
+        await runSubagentDrain(watch, {
+          drain: finalSession.backgroundDrain,
+          prompt: promptReminder,
+          cancelled: () => signal?.aborted === true,
+          maxChildWaitMs: DRAIN_MAX_CHILD_WAIT_MS,
+          delivered,
         })
-      } catch (e) {
-        logger.warn(`[cron] ${job.id}: session-idle hook threw: ${describe(e)}`)
       }
+      await drainBackground(lastDrainWatch)
+      const watchWake = finalSession.origin?.kind === 'cron' && finalSession.origin.jobKind === 'watch'
+      if (!watchWake && !reminderFailed && !signal?.aborted) {
+        // Started before the check so a child the check turn spawns is drained too.
+        const checkWatch =
+          finalSession.backgroundDrain !== undefined ? beginSubagentDrainWatch(finalSession.backgroundDrain) : undefined
+        // Like the job turn and its reminder turns, the check has no deadline of its
+        // own; the job stays in flight until it settles. Its failure is logged and
+        // does not fail a run whose own turn succeeded.
+        try {
+          await promptFinal(CRON_COMPLETION_CHECK_PROMPT)
+        } catch (e) {
+          logger.warn(`[cron] ${job.id}: completion check turn failed: ${describe(e)}`)
+        }
+        await drainBackground(checkWatch)
+      }
+      if (!signal?.aborted && finalSession.hooks && finalSession.sessionId !== undefined) {
+        try {
+          const idle = finalSession.hooks.runSessionIdle({
+            sessionId: finalSession.sessionId,
+            parentTranscriptPath: finalSession.getTranscriptPath?.(),
+            idleMs: 0,
+            ...(finalSession.origin !== undefined ? { origin: finalSession.origin } : {}),
+          })
+          await (signal ? raceWithAbortSignal(idle, signal) : idle)
+        } catch (e) {
+          if (!signal?.aborted) logger.warn(`[cron] ${job.id}: session-idle hook threw: ${describe(e)}`)
+        }
+      }
+    } finally {
+      await result.dispose()
     }
-    await result.dispose()
   }
-  return result.success && !reminderFailed
+  return !signal?.aborted && result.success && !reminderFailed
 }
 
 // Sent once at the end of every prompt run. An unattended run has no human to
