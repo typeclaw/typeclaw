@@ -29,6 +29,9 @@ import { createStream, type StreamMessage } from '@/stream'
 import { expectStable, waitFor as waitForState } from '@/test-helpers/wait-for'
 import type { TunnelManager, TunnelState } from '@/tunnels'
 import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
+import { ProbeRegistry } from '@/watches/runner'
+import { registerWatchRuntime } from '@/watches/runtime'
+import { WatchService } from '@/watches/service'
 import { WatchStore } from '@/watches/store'
 
 import type { CommandOutbound, CommandRunner } from './command-runner'
@@ -245,6 +248,127 @@ async function connect(url: string): Promise<{
 }
 
 describe('createServer tool event forwarding', () => {
+  test('TUI idle waits for the linked wake acknowledgment before injecting continuation', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'watch-todo-idle-'))
+    const store = new WatchStore(dir)
+    const service = new WatchService(
+      store,
+      async () => ({ verdict: 'quiet' }),
+      async () => {},
+      () => {},
+    )
+    const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
+    const releaseDelivery = Promise.withResolvers<void>()
+    const waitingForAck = Promise.withResolvers<'waiting'>()
+    const enteredIdle = Promise.withResolvers<'idle'>()
+    // Await calls .then on a Promise subclass, giving this test a causal
+    // checkpoint without sleeping or letting the acknowledgment commit early.
+    class ObservedAcknowledgment extends Promise<void> {
+      static override get [Symbol.species]() {
+        return Promise
+      }
+      override then<T = void, R = never>(
+        onfulfilled?: ((value: void) => T | PromiseLike<T>) | null,
+        onrejected?: ((reason: unknown) => R | PromiseLike<R>) | null,
+      ) {
+        waitingForAck.resolve('waiting')
+        return super.then(onfulfilled, onrejected)
+      }
+    }
+    let tick: (() => Promise<void>) | undefined
+    let delivery: Promise<void> | undefined
+    const dispatcher = new WakeDispatcher(
+      store,
+      async (target, batch, _origin, _signal, acknowledgment) => {
+        const observed = new ObservedAcknowledgment((resolve) => void acknowledgment.then(resolve))
+        const receipt = await factory.deliverWatch(renderWatchReminder(target, batch), observed)
+        await releaseDelivery.promise
+        return receipt
+      },
+      {
+        now: () => 0,
+        after: (_ms, fn) => {
+          tick = fn
+          return () => {
+            tick = undefined
+          }
+        },
+      },
+    )
+    const origin = { kind: 'tui', sessionId: 'seed' } as const
+    const scope = resolveTodoScope(origin)
+    if (!scope) throw new Error('Expected the TUI todo scope')
+    const waiting = 'Merge after checks'
+    const idleDecisions: boolean[] = []
+    const session = createFakeSession()
+    const factory = createServer({
+      port: 0,
+      agentDir: dir,
+      stream: createStream(),
+      createSession: async () => session,
+      onWatchTargetReady: (id) => dispatcher.notify(id),
+      runIdleContinuation: async (args) => {
+        if (session.promptCalls.length === 2) enteredIdle.resolve('idle')
+        const injected = await runIdleContinuation(args)
+        idleDecisions.push(injected)
+        return injected
+      },
+    })
+    try {
+      await service.create({
+        description: 'Wait for CI',
+        probe: { command: 'true' },
+        mode: 'judge',
+        createdByRole: 'owner',
+        createdByOrigin: origin,
+        wakeTarget: origin,
+        waitsFor: waiting,
+      })
+      await writeTodos(dir, scope, [{ content: waiting, status: 'pending' }])
+      await recordTurnOutcome({ agentDir: dir, origin, turnId: 'seed', stopReason: 'stop' })
+      server = factory.start()
+      const { ws, waitFor } = await connect(`ws://localhost:${server.port}`)
+      await waitFor((m) => m.type === 'connected', 30_000)
+      ws.send(JSON.stringify({ type: 'prompt', text: 'Merge when checks pass' }))
+      await waitForState(() => session.promptCalls.length === 1)
+      session.resolvePrompt()
+      await waitForState(() => idleDecisions.length === 1)
+      expect(idleDecisions).toEqual([false])
+
+      await store.update((rows) => {
+        const watch = rows[0]
+        if (!watch) throw new Error('Expected a persisted watch')
+        watch.pending.push({ key: crypto.randomUUID(), summary: 'Checks passed', final: false })
+      })
+      dispatcher.notify()
+      if (!tick) throw new Error('Expected a scheduled wake delivery')
+      delivery = tick()
+      await waitForState(() => session.promptCalls.length === 2)
+      expect(session.promptCalls[1]).toContain('Checks passed')
+      session.emit({ type: 'agent_start' })
+      session.resolvePrompt()
+
+      expect(await Promise.race([waitingForAck.promise, enteredIdle.promise])).toBe('waiting')
+      expect(store.records[0]?.waitsFor).toBe(waiting)
+      releaseDelivery.resolve()
+      await delivery
+      await waitForState(() => session.promptCalls.length === 3)
+      expect(session.promptCalls[2]).toContain('Incomplete todo items remain')
+      expect(idleDecisions).toEqual([false, true])
+      await writeTodos(dir, scope, [])
+      session.resolvePrompt()
+      await waitForState(() => idleDecisions.length === 3)
+      ws.close()
+    } finally {
+      releaseDelivery.resolve()
+      server?.stop(true)
+      await delivery
+      await dispatcher.stop()
+      unregister()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('watch delivery holds for a detached or busy target, then reaches the attached session', async () => {
     const attached = Promise.withResolvers<string>(),
       idle = Promise.withResolvers<string>()

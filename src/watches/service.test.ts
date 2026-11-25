@@ -167,6 +167,29 @@ test('the service delivers the next comment from the same issue author even when
     await service.stop()
   }
 })
+test.each([
+  [{ verdict: 'done' }, 'Watch finished; Review the export may proceed.'],
+  [{ verdict: 'done', wake: false, summary: 'Export available' }, 'Export available'],
+] satisfies [ProbeResult, string][])(
+  'a linked watch queues a final wake after quiet then %j',
+  async (done, summary) => {
+    let result: ProbeResult = { verdict: 'quiet' }
+    const { clock, store, service } = await fixture(async () => result)
+    try {
+      await service.create({ ...input, waitsFor: 'Review the export' })
+      await clock.next()
+      expect(store.records[0]).toMatchObject({ status: 'active', pending: [] })
+
+      result = done
+      await clock.next()
+
+      expect(store.records[0]).toMatchObject({ status: 'done', pending: [{ final: true, summary }] })
+    } finally {
+      await service.stop()
+    }
+  },
+)
+
 test('duplicate wakes become quiet; rearmed done+wake bypasses the duplicate budget', async () => {
   let result: ProbeResult = { verdict: 'wake', summary: 'same' }
   const { clock, store, service, ended } = await fixture(async () => result)
@@ -179,7 +202,7 @@ test('duplicate wakes become quiet; rearmed done+wake bypasses the duplicate bud
     await clock.next()
   }
   expect(store.records[0]?.status).toBe('paused')
-  await service.change(id, 'rearm')
+  await service.change(id, 'rearm', tui)
   result = { verdict: 'done', wake: true, summary: '4' }
   await clock.next()
   expect(store.records[0]?.pending.at(-1)).toMatchObject({ final: true, summary: '4' })
@@ -440,6 +463,74 @@ test('a paused watch keeps its original deadline, including across a restart', a
   expect(restarted.store.records[0]).toMatchObject({ status: 'expired', consecutiveFailures: 0 })
   expect(restarted.store.records[0]?.pending.at(-1)?.final).toBe(true)
 })
+test.each([true, false])(
+  'owner cancellation from TUI (linked: %s) only wakes a different conversation with a link',
+  async (linked) => {
+    let notify = () => {}
+    const { clock, store, service } = await fixture(
+      async () => ({ verdict: 'quiet' }),
+      () => notify(),
+    )
+    const channel = {
+      kind: 'channel',
+      adapter: 'discord-bot',
+      workspace: 'workspace',
+      chat: 'room',
+      thread: null,
+      lastInboundAuthorId: 'requester',
+    } as const
+    const target = watchTarget(channel)
+    const delivered: Array<{ target: unknown; wakes: readonly WatchWake[] }> = []
+    const dispatcher = new WakeDispatcher(
+      store,
+      async (target, wakes) => {
+        delivered.push({ target, wakes })
+        return 'delivered'
+      },
+      clock,
+    )
+    notify = () => dispatcher.notify()
+    const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
+    const tool = createWatchTool(dir, () => tui, createPermissionService())
+    try {
+      const local = await service.create({ ...input, waitsFor: 'Review local export' })
+      const remote = await service.create({
+        ...input,
+        createdByOrigin: channel,
+        wakeTarget: target,
+        ...(linked ? { waitsFor: 'Review channel export' } : {}),
+      })
+      await tool.execute('cancel-local', { action: 'cancel', id: local }, undefined, undefined, {} as never)
+      await tool.execute('cancel-remote', { action: 'cancel', id: remote }, undefined, undefined, {} as never)
+      const restored = new WatchStore(dir)
+      await restored.restore()
+      expect(restored.records[0]?.pending).toEqual([])
+      expect(restored.records[1]?.pending).toHaveLength(linked ? 1 : 0)
+      if (linked) await clock.next()
+      expect(delivered).toEqual(
+        linked
+          ? [
+              {
+                target,
+                wakes: [
+                  expect.objectContaining({
+                    watchId: remote,
+                    final: true,
+                    summary: expect.stringContaining('cancelled'),
+                  }),
+                ],
+              },
+            ]
+          : [],
+      )
+    } finally {
+      unregister()
+      await dispatcher.stop()
+      await service.stop()
+    }
+  },
+)
+
 test('guest cannot create, member can, and a different conversation cannot cancel', async () => {
   const { service } = await fixture(async () => ({ verdict: 'quiet' }))
   const unregister = registerWatchRuntime(dir, { service, registry: new ProbeRegistry() })
@@ -466,9 +557,11 @@ test('guest cannot create, member can, and a different conversation cannot cance
   try {
     await expect(call(create)).rejects.toThrow('watch.create')
     actor = { ...actor, spawnedByRole: 'member' }
-    const { details } = await call(create)
+    const waitsFor = 'Review  the checks'
+    const { details } = await call({ ...create, waitsFor })
     const restored = new WatchStore(dir)
     await restored.restore()
+    expect(restored.records[0]?.waitsFor).toBe(waitsFor)
     expect(restored.records[0]?.wakeTarget).toMatchObject({
       kind: 'channel',
       isDm: false,

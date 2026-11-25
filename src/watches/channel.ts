@@ -13,6 +13,7 @@ export async function deliverChannelWakes(
     return 'failed' as const
   }
   let queued = false
+  const deniedKeys: string[] = []
   for (const wake of wakes) {
     // Deduplicate individual verdicts, not the batch: another result can
     // join the pending slot between a crash and its replay.
@@ -39,11 +40,13 @@ export async function deliverChannelWakes(
     })
     if (receipt.kind === 'denied') {
       console.info(`[watch] ${wake.watchId}: channel wake denied; not posted`)
+      deniedKeys.push(wake.key)
       continue
     }
     if (receipt.kind !== 'accepted' && receipt.kind !== 'duplicate')
       throw new Error(`Watch inbound was not admitted: ${receipt.kind}`)
     if (receipt.kind === 'accepted' || (!receipt.outcome && !receipt.watchStarted)) queued = true
   }
-  return queued ? ('queued' as const) : ('delivered' as const)
+  if (queued) return 'queued' as const
+  return deniedKeys.length ? { deniedKeys } : ('delivered' as const)
 }

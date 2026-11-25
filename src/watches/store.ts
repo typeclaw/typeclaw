@@ -64,6 +64,7 @@ export const probeSchema = z.union([
 export const recordSchema = z.object({
   id: z.uuid(),
   description: z.string().min(1).max(1024),
+  waitsFor: z.string().min(1).optional(),
   probe: probeSchema,
   mode: z.enum(['judge', 'diff']),
   createdAt: z.number(),
@@ -118,6 +119,20 @@ export class WatchStore {
   }
   isVerdictPending(watchId: string, runId: string): boolean {
     return this.rows.find((w) => w.id === watchId)?.pending.some((p) => p.key === runId) ?? false
+  }
+  async acknowledgeWakes(keys: ReadonlySet<string>): Promise<boolean> {
+    if (!this.rows.some((watch) => watch.pending.some((wake) => keys.has(wake.key)))) return false
+    let releasedLink = false
+    await this.update((rows) => {
+      for (const watch of rows) {
+        if (watch.waitsFor !== undefined && watch.pending.some((wake) => keys.has(wake.key))) {
+          delete watch.waitsFor
+          releasedLink = true
+        }
+        watch.pending = watch.pending.filter((wake) => !keys.has(wake.key))
+      }
+    })
+    return releasedLink
   }
   async restore() {
     const file = join(this.agentDir, '.typeclaw', 'watches.json')

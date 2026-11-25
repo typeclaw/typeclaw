@@ -18,6 +18,10 @@ Use `watch` when the question is â€œhas anything happened that needs attention?â
 
 **Judge mode** (default): exit `0` for quiet, `10` to wake, `20` to finish silently or `30` to finish and wake. Stdout supplies the summary; alternatively end stdout with JSON such as `{"verdict":"wake","summary":"Export needs credentials","next":"15m"}`. A JSON `done` verdict ends silently unless it includes `"wake":true`. Deadline expiry always sends a final reminder. Other exits are failures. A command can specify `cwd`. Make side effects idempotent: execution is at least once, not exactly once.
 
+**Waiting on a todo:** On `create`, set `waitsFor` to the exact content of a pending todo in this conversation, for example `"waitsFor": "Review the export"`, only if the item cannot progress until the watch reports. Todo continuation parks only when every incomplete item is linked to an active watch that wakes the conversation. An unlinked item can still continue, and paused or automatically registered watches do not count. The next delivered or permission-denied wake clears the link even if the watch keeps running. A denied wake does not start a turn. If you still need to wait, create another watch with `waitsFor`.
+
+A still-linked watch wakes on completion even for exit `20` or a JSON `done` without `"wake":true`. Cancelling it from another conversation sends a final reminder to its original target. Cancelling in the target conversation is quiet.
+
 **Diff mode**: set `"mode":"diff"` for a command whose stable stdout is the state of interest. The first successful output establishes a baseline; subsequent changes wake with a unified diff. Do not use diff for multi-step statuses where most transitions require no action.
 
 ## GitHub follow-up

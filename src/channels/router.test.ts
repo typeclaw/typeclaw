@@ -881,7 +881,7 @@ describe('channel watch wakes', () => {
         } else if (held === 'permission-hook') allowed = false
         else if (held === 'account-preflight') bot = 'replacement'
         else if (held === 'stop-preflight') await router.route(inboundForSelf(bot, { text: '/stop' }))
-        else await service.change(id, 'cancel')
+        else await service.change(id, 'cancel', target)
         release.resolve()
         await drain
         if (held === 'mixed-account') {
@@ -1038,7 +1038,7 @@ describe('channel watch wakes', () => {
       async () => {},
       () => {},
     )
-    await canceller.change(cancelledId, 'cancel')
+    await canceller.change(cancelledId, 'cancel', target)
     await dispatcher.stop()
     await router.stop()
     timers.length = 0

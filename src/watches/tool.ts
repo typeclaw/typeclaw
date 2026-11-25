@@ -18,6 +18,7 @@ const createRequest = z.strictObject({
   probe: probeSchema,
   mode: z.enum(['judge', 'diff']).optional(),
   deadline: z.string().optional(),
+  waitsFor: z.string().min(1).optional(),
 })
 const id = z.uuid()
 const request = z.discriminatedUnion('action', [
@@ -88,7 +89,7 @@ export function createWatchTool(
     name: 'watch',
     label: 'Watch',
     description:
-      'Create a follow-up probe; list, cancel or rearm a paused watch. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true. next and deadline are durations like 5m or 2d. Other exits fail. A channel wake returns to the original conversation as a system reminder.',
+      'Create a follow-up probe; list, cancel or rearm a paused watch. On create, set waitsFor to the exact text of a pending todo in this conversation only if it cannot progress until the watch reports. A linked watch always wakes on completion. Probes are at-least-once: side effects must be idempotent. Use judge mode for multi-step statuses, not diff (wakes on changed stdout). Exit 0 quiet, 10 wake, 20 finish silently unless linked, 30 finish and wake. Or end stdout with JSON {verdict:"quiet"|"wake"|"done",wake?,summary?,next?}; done is silent unless wake is true or the watch is linked. next and deadline are durations like 5m or 2d. Other exits fail. A channel wake returns to the original conversation as a system reminder.',
     parameters: zodToToolParameters(parameters),
     async execute(_id, args) {
       const input = request.parse(args)
@@ -141,7 +142,7 @@ export function createWatchTool(
         if (!row) throw new Error('No such watch in this conversation')
         if (input.action === 'rearm' && role !== 'owner' && row.createdByRole !== role)
           throw new Error('Cannot rearm as another role')
-        await service.change(input.id, input.action)
+        await service.change(input.id, input.action, target)
         details = { id: input.id, status: input.action === 'cancel' ? 'cancelled' : 'active' }
       }
       return { content: [{ type: 'text', text: JSON.stringify(details) }], details }
