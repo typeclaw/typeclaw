@@ -11,6 +11,8 @@ This skill is the **etiquette of contributing to a GitHub repo**. It is not abou
 
 ## The rule
 
+When a PR or issue needs follow-up, use an explicit `watch` in judge mode rather than polling in repeated LLM turns. A pending check is not by itself a reason to wake. There is no automatic registration; channel-target wakes are currently held.
+
 **Before you open an issue or PR, find the repo's contribution conventions and follow them. If a template exists, fill it — don't bypass it. If a CONTRIBUTING file exists, read it and honor it. Match the title style the repo already uses.**
 
 The principle underneath all five rules below: **the repo already told you how it wants contributions; your job is to look before you write, not to impose your defaults.**
