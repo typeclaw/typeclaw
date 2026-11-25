@@ -8,7 +8,7 @@ import { LiveSubagentRegistry } from '@/agent/live-subagents'
 import { createHookBus, type HookBus } from '@/plugin'
 import { createStream } from '@/stream'
 
-import { createCronConsumer, type CronConsumerLogger, type CronSession } from './consumer'
+import { createCronConsumer, CRON_COMPLETION_CHECK_PROMPT, type CronConsumerLogger, type CronSession } from './consumer'
 import type { CronJob, ExecJob, HandlerJob, PromptJob } from './schema'
 
 async function waitForFile(path: string): Promise<string> {
@@ -276,7 +276,7 @@ describe('createCronConsumer', () => {
     publishCron(stream, promptJob('greet', 'say hi'))
     await new Promise((r) => setImmediate(r))
 
-    expect(factory.callsByJob.get('greet')).toEqual([expect.stringContaining('say hi')])
+    expect(factory.callsByJob.get('greet')).toEqual([expect.stringContaining('say hi'), CRON_COMPLETION_CHECK_PROMPT])
 
     consumer.stop()
   })
@@ -489,6 +489,7 @@ describe('createCronConsumer', () => {
       cwd: root,
       createSessionForCron: async (job) => ({
         prompt: async (text) => {
+          if (text === CRON_COMPLETION_CHECK_PROMPT) return
           calls.push(`${job.id}:${text}`)
           await new Promise<void>((resolve) => {
             releaseBox.fn = resolve
@@ -625,7 +626,7 @@ describe('createCronConsumer', () => {
     publishCron(stream, promptJob('once', 'hi'))
     await new Promise((r) => setImmediate(r))
 
-    expect(factory.callsByJob.get('once')).toEqual([expect.stringContaining('hi')])
+    expect(factory.callsByJob.get('once')).toEqual([expect.stringContaining('hi'), CRON_COMPLETION_CHECK_PROMPT])
 
     consumer.stop()
   })
@@ -706,7 +707,7 @@ describe('createCronConsumer', () => {
     await new Promise((r) => setImmediate(r))
 
     // then
-    expect(factory.callsByJob.get('plain')).toEqual([expect.stringContaining('hello')])
+    expect(factory.callsByJob.get('plain')).toEqual([expect.stringContaining('hello'), CRON_COMPLETION_CHECK_PROMPT])
     expect(newSessionMessages).toEqual([])
 
     consumer.stop()
@@ -760,11 +761,12 @@ describe('createCronConsumer', () => {
     await new Promise((r) => setImmediate(r))
 
     // then
-    expect(events).toHaveLength(3)
+    expect(events).toHaveLength(4)
     expect(events[0]).toStartWith('prompt:')
     expect(events[0]).toContain('do work')
-    expect(events[1]).toBe('idle:cron-sess-1:/tmp/transcript-1.jsonl')
-    expect(events[2]).toBe('end:cron-sess-1')
+    expect(events[1]).toBe(`prompt:${CRON_COMPLETION_CHECK_PROMPT}`)
+    expect(events[2]).toBe('idle:cron-sess-1:/tmp/transcript-1.jsonl')
+    expect(events[3]).toBe('end:cron-sess-1')
 
     consumer.stop()
   })
@@ -1088,11 +1090,15 @@ describe('createCronConsumer model fallback', () => {
 
       // then: the consumer called createSessionForCron once per ref in chain
       // order, and the second attempt's prompt was actually invoked
-      expect(calls).toHaveLength(3)
+      expect(calls).toHaveLength(4)
       expect(calls[0]).toBe('fb:openai/gpt-5.4-nano')
       expect(calls[1]).toBe('fb:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo')
       expect(calls[2]).toMatch(/^fb:fireworks\/accounts\/fireworks\/routers\/kimi-k2p6-turbo:ok:/)
       expect(calls[2]).toContain('do thing')
+      // the completion check runs on the session that handled the turn
+      expect(calls[3]).toBe(
+        `fb:fireworks/accounts/fireworks/routers/kimi-k2p6-turbo:ok:${CRON_COMPLETION_CHECK_PROMPT}`,
+      )
 
       consumer.stop()
     } finally {
@@ -1508,10 +1514,86 @@ describe('createCronConsumer background subagents', () => {
     completeBackgroundChild(stream, liveRegistry, sessionId)
     await disposal.promise
 
-    // then: the session got the completion reminder before it was disposed
-    expect(prompts).toHaveLength(2)
+    // then: the session got the completion reminder, then the completion check, before it was disposed
+    expect(prompts).toHaveLength(3)
     expect(prompts[1]).toContain('bg_child')
+    expect(prompts[2]).toBe(CRON_COMPLETION_CHECK_PROMPT)
     expect(events).toEqual(['dispose'])
+  })
+
+  test('a background child the completion check spawns is drained before the session is disposed', async () => {
+    // given: the job turn spawns nothing; the completion check turn spawns a background child
+    const stream = createStream()
+    const liveRegistry = new LiveSubagentRegistry()
+    const sessionId = 'ses_cron'
+    const prompts: string[] = []
+    const disposal = Promise.withResolvers<void>()
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      logger: silentLogger,
+      createSessionForCron: async () => ({
+        prompt: async (text) => {
+          prompts.push(text)
+          if (text !== CRON_COMPLETION_CHECK_PROMPT) return
+          registerBackgroundChild(liveRegistry, sessionId)
+          completeBackgroundChild(stream, liveRegistry, sessionId)
+        },
+        dispose: () => disposal.resolve(),
+        backgroundDrain: { stream, sessionId, liveRegistry },
+      }),
+    })
+    consumer.start()
+
+    // when
+    publishCron(stream, promptJob('check-spawns', 'retry the export'))
+    await disposal.promise
+
+    // then: the child's completion reached the session after the check and before disposal
+    expect(prompts).toHaveLength(3)
+    expect(prompts[1]).toBe(CRON_COMPLETION_CHECK_PROMPT)
+    expect(prompts[2]).toContain('bg_child')
+  })
+
+  test('a failed completion check turn is logged and does not fail a run whose own turn succeeded', async () => {
+    // given: the job turn succeeds and only the completion check throws
+    const stream = createStream()
+    const info: string[] = []
+    const warnings: string[] = []
+    const runEnded = Promise.withResolvers<void>()
+    let disposed = false
+    const consumer = createCronConsumer({
+      stream,
+      cwd: root,
+      logger: {
+        ...silentLogger,
+        info: (m) => {
+          info.push(m)
+          if (m.includes('run ended')) runEnded.resolve()
+        },
+        warn: (m) => warnings.push(m),
+      },
+      createSessionForCron: async () => ({
+        prompt: async (text) => {
+          if (text === CRON_COMPLETION_CHECK_PROMPT) throw new Error('provider overloaded')
+        },
+        dispose: () => {
+          disposed = true
+        },
+      }),
+    })
+    consumer.start()
+
+    // when
+    publishCron(stream, promptJob('check-fails', 'send the digest'))
+    await runEnded.promise
+
+    // then
+    expect(info.at(-1)).toContain('outcome=success')
+    expect(warnings.some((w) => w.includes('completion check turn failed') && w.includes('provider overloaded'))).toBe(
+      true,
+    )
+    expect(disposed).toBe(true)
   })
 
   test('a provider soft error on the reminder turn fails the cron run and still disposes the session', async () => {

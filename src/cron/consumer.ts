@@ -361,28 +361,51 @@ async function runPromptOnce(
   let reminderFailed = false
   if (result.success && lastSession !== null) {
     const finalSession: CronSession = lastSession
-    if (finalSession.backgroundDrain !== undefined && lastDrainWatch !== undefined) {
-      // A reminder turn is where the delegated work gets reported, so a
-      // provider failure there (thrown, or soft via message_end) fails the run.
-      // Retries stay on this session so the original cron prompt is not replayed.
-      const promptReminder = async (text: string): Promise<void> => {
-        try {
-          if (finalSession.session === undefined) {
-            await finalSession.prompt(text)
-            return
-          }
-          const turn = await promptWithSameRefRetryOnly(finalSession.session, text)
-          if (!turn.success) throw turn.lastError ?? new Error('reminder turn failed')
-        } catch (e) {
-          reminderFailed = true
-          logger.error(`[cron] ${job.id}: background subagent reminder turn failed: ${describe(e)}`)
-        }
+    // Follow-up turns stay on this session so the original cron prompt is not replayed.
+    const promptFinal = async (text: string): Promise<void> => {
+      if (finalSession.session === undefined) {
+        await finalSession.prompt(text)
+        return
       }
-      await runSubagentDrain(lastDrainWatch, {
+      const turn = await promptWithSameRefRetryOnly(finalSession.session, text)
+      if (!turn.success) throw turn.lastError ?? new Error('follow-up turn failed')
+    }
+    // A reminder turn is where the delegated work gets reported, so a provider
+    // failure there (thrown, or soft via message_end) fails the run.
+    const promptReminder = async (text: string): Promise<void> => {
+      try {
+        await promptFinal(text)
+      } catch (e) {
+        reminderFailed = true
+        logger.error(`[cron] ${job.id}: background subagent reminder turn failed: ${describe(e)}`)
+      }
+    }
+    // Shared by both drains so the one after the check does not re-deliver a
+    // child the first already reported.
+    const delivered = new Set<string>()
+    const drainBackground = async (watch: SubagentDrainWatch | undefined): Promise<void> => {
+      if (finalSession.backgroundDrain === undefined || watch === undefined) return
+      await runSubagentDrain(watch, {
         drain: finalSession.backgroundDrain,
         prompt: promptReminder,
         maxChildWaitMs: DRAIN_MAX_CHILD_WAIT_MS,
+        delivered,
       })
+    }
+    await drainBackground(lastDrainWatch)
+    if (!reminderFailed) {
+      // Started before the check so a child the check turn spawns is drained too.
+      const checkWatch =
+        finalSession.backgroundDrain !== undefined ? beginSubagentDrainWatch(finalSession.backgroundDrain) : undefined
+      // Like the job turn and its reminder turns, the check has no deadline of its
+      // own; the job stays in flight until it settles. Its failure is logged and
+      // does not fail a run whose own turn succeeded.
+      try {
+        await promptFinal(CRON_COMPLETION_CHECK_PROMPT)
+      } catch (e) {
+        logger.warn(`[cron] ${job.id}: completion check turn failed: ${describe(e)}`)
+      }
+      await drainBackground(checkWatch)
     }
     if (finalSession.hooks && finalSession.sessionId !== undefined) {
       try {
@@ -400,6 +423,35 @@ async function runPromptOnce(
   }
   return result.success && !reminderFailed
 }
+
+// Sent once at the end of every prompt run. An unattended run has no human to
+// say "keep going", and agents report a fixable failure (their own wrong
+// command, a step too large for its timeout) as if the job were blocked. This
+// is the check a goal loop runs before it lets an agent stop: a run may end as
+// done or as a block that survived a different approach, not on a first failure.
+export const CRON_COMPLETION_CHECK_PROMPT = [
+  '---',
+  '**[SYSTEM MESSAGE — not from a human]**',
+  '',
+  'This scheduled run has not reached a completion check yet. Keep working toward the result the job',
+  'asks for. You may end this run only as one of:',
+  "- done: the job's result is delivered, or you verified there is nothing to do this time (no change,",
+  "  nothing due), and you can point to the evidence. The job's own posting conditions still apply: a",
+  '  job that posts only when something changed posts nothing after a verified no-change run;',
+  '- blocked: the failing step still fails after you tried a different approach to it in this run (a',
+  '  corrected command, a smaller batch, a retry, another source), or only a person can supply what is',
+  '  missing (a credential that does not exist, a permission you were denied). One failed attempt is',
+  '  not a block.',
+  'Post only if you have a new result or new findings since your last message in this run; otherwise',
+  'end without posting. A blocked report you already posted stands; do not restate it. Never force past a',
+  'permission, credential, or site protection, and never repeat an action that must not run twice (a',
+  'send, a purchase, a booking, a deploy). If such an action may already have taken effect, for example',
+  'it timed out, check its outcome without repeating it; if you cannot confirm that repeating it is',
+  'safe, end as blocked and say what to check.',
+  '',
+  'Do not acknowledge or reply to this notice.',
+  '---',
+].join('\n')
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
