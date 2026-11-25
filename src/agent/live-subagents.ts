@@ -19,6 +19,8 @@ export type LiveSubagent = {
   sessionId: string
   subagentName: string
   parentSessionId?: string
+  // From the accepted channel obligation, not inferred from the current speaker.
+  watchTurnId?: string
   workKey?: string
   // Role that resolved at spawn time, captured for the provenance cap on
   // subagent_output/subagent_cancel. Absent when no permission service was
@@ -53,10 +55,18 @@ const releasedAbort = async (): Promise<void> => {}
 // cannot unpin a parent while a more recently spawned sibling is still inside its
 // window. Foreground children are excluded on purpose: they return inline, so a
 // parent is never left waiting on one.
-export function newestRunningBackgroundChildStartedAt(children: readonly LiveSubagent[]): number | null {
+// Omitted: session lifetime. null: ordinary channel work. An ID: precisely
+// this watch turn's descendants, including siblings of a completed child.
+export function newestRunningBackgroundChildStartedAt(
+  children: readonly LiveSubagent[],
+  watchTurnId?: string | null,
+): number | null {
   return children.reduce<number | null>(
     (newest, child) =>
-      child.status === 'running' && child.background === true && (newest === null || child.startedAt > newest)
+      child.status === 'running' &&
+      child.background === true &&
+      (watchTurnId === undefined || (child.watchTurnId ?? null) === watchTurnId) &&
+      (newest === null || child.startedAt > newest)
         ? child.startedAt
         : newest,
     null,

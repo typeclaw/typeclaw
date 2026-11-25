@@ -1,3 +1,5 @@
+import type { WatchWake } from '@/watches/types'
+
 import type { RecoveryFailure, RecoveryRecord } from './continuity-types'
 import type { AdapterId } from './schema'
 
@@ -74,7 +76,7 @@ export type GithubReviewThreadCloseout = {
 
 export type RouteReceipt =
   | { kind: 'accepted'; inputId: string; generation: number }
-  | { kind: 'duplicate'; inputId: string; outcome?: 'delivered' | 'intentionally-suppressed' }
+  | { kind: 'duplicate'; inputId: string; outcome?: 'delivered' | 'intentionally-suppressed'; watchStarted?: true }
   | { kind: 'observed' }
   | { kind: 'denied' }
   | { kind: 'control' }
@@ -110,6 +112,8 @@ export type InboundMessage = {
   // own session in another chat delegated this work here. The turn it starts
   // cannot hand off again (loop guard) and is never a reply-anchor target.
   handoff?: true
+  watch?: true
+  watchResult?: WatchWake & { key: string }
   // Runtime-only provenance for a handoff; platform adapters omit this.
   authorAdapter?: AdapterId
   // Prompt-only context for replied-to / quoted / linked messages. Kept out

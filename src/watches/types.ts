@@ -37,11 +37,11 @@ export type WatchWake = {
   final: boolean
 }
 
-export type WatchWakeDeliveryResult = 'delivered' | 'held' | 'failed'
+export type WatchWakeDeliveryResult = 'delivered' | 'queued' | 'held' | 'failed'
 
 export type WatchWakeDelivery = (
   target: WatchWakeTarget,
-  wakes: readonly WatchWake[],
+  wakes: readonly (WatchWake & { key: string })[],
   origin: SessionOrigin,
   signal: AbortSignal,
 ) => Promise<WatchWakeDeliveryResult>

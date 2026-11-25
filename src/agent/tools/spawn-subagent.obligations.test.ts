@@ -50,7 +50,7 @@ function fixture(
 }
 
 test('channel child cannot start before durable response admission, without a transcript prerequisite', async () => {
-  const accepted = Promise.withResolvers<{ obligationId: string; generation: number }>()
+  const accepted = Promise.withResolvers<{ obligationId: string; generation: number; watchTurnId: string }>()
   const f = fixture({
     acceptBackgroundResponse: () => accepted.promise,
     suppressUnstartedBackgroundResponse: async () => {},
@@ -58,9 +58,10 @@ test('channel child cannot start before durable response admission, without a tr
   const result = f.spawn()
   await Promise.resolve()
   expect(f.launches()).toBe(0)
-  accepted.resolve({ obligationId: 'obligation', generation: 1 })
+  accepted.resolve({ obligationId: 'obligation', generation: 1, watchTurnId: 'watch-turn' })
   expect((await result).details).toMatchObject({ ok: true, mode: 'background' })
   expect(f.launches()).toBe(1)
+  expect(f.registry.get('task')?.watchTurnId).toBe('watch-turn')
   f.done.resolve()
 })
 

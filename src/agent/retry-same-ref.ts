@@ -149,7 +149,13 @@ type ContinuableAgent = {
 // no `agent.continue`) fails CLOSED — the caller falls back / surfaces instead.
 export async function retryTurnOnPersistentSession(
   session: AgentSession,
-  opts: { attempt: number; signal?: AbortSignal; random?: () => number; delayMs?: number } = { attempt: 0 },
+  opts: {
+    attempt: number
+    signal?: AbortSignal
+    random?: () => number
+    delayMs?: number
+    beforeResume?: () => void
+  } = { attempt: 0 },
 ): Promise<boolean> {
   const agent = (session as { agent?: ContinuableAgent }).agent
   if (!agent || typeof agent.continue !== 'function') return false
@@ -160,6 +166,7 @@ export async function retryTurnOnPersistentSession(
 
   await sleep(opts.delayMs ?? retryBackoffMs(opts.attempt, opts.random), opts.signal)
   if (opts.signal?.aborted) return false
+  opts.beforeResume?.()
 
   // Drop only a trailing assistant error leaf; a trailing user message is already
   // the shape continue() wants, so leave it untouched (and never re-appended).
@@ -182,6 +189,7 @@ export async function retryTurnAfterCompletedToolResult(
     signal?: AbortSignal
     random?: () => number
     authorize: () => boolean
+    beforeResume?: () => void
     onBackoffStart?: () => void
     // Overrides the ordinary jittered backoff, exactly as in
     // retryTurnOnPersistentSession. A capacity retry has already chosen its
@@ -203,6 +211,7 @@ export async function retryTurnAfterCompletedToolResult(
   // while we slept. Mutation is safe only while the exact tail still holds.
   const messages = agent.state?.messages
   if (!hasCompletedToolResultErrorTail(messages)) return false
+  opts.beforeResume?.()
   if (opts.authorize() !== true) return false
 
   const originalMessages = messages

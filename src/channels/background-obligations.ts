@@ -28,6 +28,7 @@ export type BackgroundObligation = BackgroundObligationRef & {
   accountIdentity: string
   target: ChannelKey
   principal: MatchableOrigin
+  watchOrigin?: WatchLaunchOrigin
   acceptedAt: number
   epoch: string
   phase: 'accepted' | 'result-ready' | 'turn-owned' | 'notice-prepared' | 'notice-owned' | 'closed'
@@ -46,6 +47,7 @@ export type BackgroundAcceptance = {
   target?: ChannelKey
   key?: ChannelKey
   principal?: MatchableOrigin
+  watchOrigin?: WatchLaunchOrigin
   triggeringAuthorId?: string
   parentChat?: string
   acceptedAt?: number
@@ -54,6 +56,13 @@ export type BackgroundAcceptance = {
   legacyGeneration?: string
 }
 export type BackgroundDecision = { transitionId: string; decisionDigest: string }
+// Only lifecycle authorities (e.g. /stop and a frozen recovery receipt) may
+// settle across turns. Omitting lineage on a turn operation means ordinary.
+export const lifecycleCoverage = Symbol('lifecycle coverage')
+// null is ordinary channel work; a string is one originating watch turn.
+export function belongsToBackgroundLineage(row: BackgroundObligation, lineage: string | null): boolean {
+  return (row.watchOrigin?.turnId ?? null) === lineage
+}
 const queues = new Map<string, Promise<void>>()
 /**
  * Process-wide lookup index per store directory, shared by every instance in this process. One
@@ -91,6 +100,18 @@ async function syncDirectory(path: string) {
 }
 const nonempty = z.string().min(1)
 const generation = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+const watchLaunchOrigin = z.strictObject({
+  turnId: nonempty,
+  isDm: z.boolean(),
+  room: z
+    .strictObject({
+      kind: z.literal('thread'),
+      parentChat: z.string().optional(),
+      parentChatName: z.string().optional(),
+    })
+    .optional(),
+})
+type WatchLaunchOrigin = z.infer<typeof watchLaunchOrigin>
 const backgroundSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -102,6 +123,7 @@ const backgroundSchema = z
     accountIdentity: nonempty,
     target: z.unknown(),
     principal: z.unknown(),
+    watchOrigin: watchLaunchOrigin.optional(),
     acceptedAt: z.number().finite().nonnegative(),
     epoch: nonempty,
     phase: z.enum(['accepted', 'result-ready', 'turn-owned', 'notice-prepared', 'notice-owned', 'closed']),
@@ -142,6 +164,7 @@ function parse(value: unknown): BackgroundObligation {
   backgroundSchema.parse(value)
   // The shared notice parser below validates the opaque target/principal/transfer fields.
   const row = value as BackgroundObligation
+  if (row.watchOrigin && row.principal.kind !== 'channel') throw new Error('Invalid watch launch principal')
   // Reuse the shared destination/principal validator without creating any send intent.
   createRecoveryNotice({
     target: row.target,
@@ -404,7 +427,10 @@ export class BackgroundObligationStore {
       this.check()
       const existing = await this.read(obligationId)
       if (existing) {
-        if (JSON.stringify(existing.principal) !== JSON.stringify(principal))
+        if (
+          JSON.stringify(existing.principal) !== JSON.stringify(principal) ||
+          existing.watchOrigin?.turnId !== input.watchOrigin?.turnId
+        )
           throw new Error('Conflicting background acceptance')
         try {
           await syncDirectory(this.directory)
@@ -424,6 +450,7 @@ export class BackgroundObligationStore {
         accountIdentity: input.accountIdentity,
         target,
         principal,
+        ...(input.watchOrigin ? { watchOrigin: input.watchOrigin } : {}),
         acceptedAt: input.acceptedAt ?? input.startedAt ?? (this.options.now ?? Date.now)(),
         epoch: this.epoch,
         phase: 'accepted',
@@ -504,13 +531,15 @@ export class BackgroundObligationStore {
   }
   async claim(
     refs: BackgroundObligationRef[],
-    owner: { turnId: string; ownerSessionId?: string; target: ChannelKey },
+    owner: { turnId: string; ownerSessionId?: string; target: ChannelKey; watchTurnId?: string | null },
     decision?: BackgroundDecision,
   ): Promise<BackgroundObligationRef[]> {
     this.check()
     // Validate all coverage before publishing any owner. Caller holds target lane until caches update.
     for (const ref of refs) {
       const row = await this.get(ref.obligationId)
+      if (row && !belongsToBackgroundLineage(row, owner.watchTurnId ?? null))
+        throw new Error('Invalid background claim lineage')
       const applied =
         decision &&
         row?.applications.find(
@@ -575,12 +604,20 @@ export class BackgroundObligationStore {
   }
   async move(
     refs: BackgroundObligationRef[],
-    owner: { fromTurnId: string; turnId: string; ownerSessionId?: string; target: ChannelKey },
+    owner: {
+      fromTurnId: string
+      turnId: string
+      ownerSessionId?: string
+      target: ChannelKey
+      watchTurnId?: string | null
+    },
     decision?: BackgroundDecision,
   ): Promise<BackgroundObligationRef[]> {
     const identity = decision ?? { transitionId: randomUUID(), decisionDigest: hash(['move', refs, owner]) }
     for (const ref of refs) {
       const row = await this.get(ref.obligationId)
+      if (row && !belongsToBackgroundLineage(row, owner.watchTurnId ?? null))
+        throw new Error('Invalid background move lineage')
       const applied = row?.applications.find(
         (item) =>
           item.transitionId === identity.transitionId &&
@@ -639,10 +676,13 @@ export class BackgroundObligationStore {
     refs: BackgroundObligationRef[],
     outcome: NonNullable<BackgroundObligation['outcome']>,
     decision?: BackgroundDecision,
+    lineage: string | null | typeof lifecycleCoverage = null,
   ) {
     const identity = decision ?? { transitionId: outcome.decisionId, decisionDigest: hash(['outcome', refs, outcome]) }
     for (const ref of refs) {
       const row = await this.get(ref.obligationId)
+      if (row && lineage !== lifecycleCoverage && !belongsToBackgroundLineage(row, lineage))
+        throw new Error('Invalid background outcome lineage')
       const applied = row?.applications.find(
         (item) =>
           item.transitionId === identity.transitionId &&
@@ -776,12 +816,17 @@ export class BackgroundObligationStore {
       if (row?.phase === 'closed') continue
       if (!row || row.transfer?.deliveryId !== record.deliveryId)
         throw new Error('Recovery receipt does not match background transfer')
-      await this.settle([ref], {
-        kind: record.state === 'delivered' ? 'delivered' : 'intentionally-suppressed',
-        decisionId: record.suppression?.decisionId ?? `recovery:${record.deliveryId}`,
-        deliveryId: record.deliveryId,
-        reason: record.suppression?.reason,
-      })
+      await this.settle(
+        [ref],
+        {
+          kind: record.state === 'delivered' ? 'delivered' : 'intentionally-suppressed',
+          decisionId: record.suppression?.decisionId ?? `recovery:${record.deliveryId}`,
+          deliveryId: record.deliveryId,
+          reason: record.suppression?.reason,
+        },
+        undefined,
+        lifecycleCoverage,
+      )
     }
   }
   async suppressNoticeCoverage(record: RecoveryRecord, decision: { decisionId: string; reason: string }) {
@@ -814,7 +859,12 @@ export class BackgroundObligationStore {
       }
     }
     if (refs.length)
-      await this.settle(refs, { kind: 'intentionally-suppressed', ...decision, deliveryId: record.deliveryId })
+      await this.settle(
+        refs,
+        { kind: 'intentionally-suppressed', ...decision, deliveryId: record.deliveryId },
+        undefined,
+        lifecycleCoverage,
+      )
   }
   async migrateLegacy(reader: LegacyBackgroundHandoffReader, outbox: RecoveryOutbox) {
     this.check()

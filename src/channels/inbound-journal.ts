@@ -7,7 +7,7 @@ import { z } from 'zod'
 
 import type { MatchableOrigin } from '../permissions/resolve'
 import type { BackgroundObligation, BackgroundObligationRef, BackgroundObligationStore } from './background-obligations'
-import { parseBackgroundObligation } from './background-obligations'
+import { belongsToBackgroundLineage, lifecycleCoverage, parseBackgroundObligation } from './background-obligations'
 import { parseRecoveryRecord, recoveryPayload } from './continuity-types'
 import type { RecoveryNoticeCause, RecoveryRecord } from './continuity-types'
 import { createRecoveryNotice, recoveryNoticePartitionKey } from './recovery-notice'
@@ -68,7 +68,13 @@ export type InboundAdmission = {
 }
 /** The schema-1 row every decision line carries in full, closed rows included. */
 type JournalRow = Omit<OpenInboundRecord, 'phase'> & { phase: InboundRecord['phase']; outcome?: InboundOutcome }
-type Owner = { turnId: string; ownerSessionId?: string; target: ChannelKey; fromTurnId?: string }
+type Owner = {
+  turnId: string
+  ownerSessionId?: string
+  target: ChannelKey
+  fromTurnId?: string
+  watchTurnId?: string | null
+}
 type Change = { expected: InboundRef; row: JournalRow }
 type BackgroundChange = { expected: BackgroundObligationRef; row: BackgroundObligation }
 type Decision = {
@@ -349,7 +355,9 @@ const slackMessageKey = (input: {
   messageId?: string
   eventKind: string
 }) =>
-  (input.target.adapter === 'slack' || input.target.adapter === 'slack-bot') && input.messageId
+  input.eventKind !== 'watch' &&
+  (input.target.adapter === 'slack' || input.target.adapter === 'slack-bot') &&
+  input.messageId
     ? digest([
         'slack-message',
         input.root,
@@ -399,6 +407,9 @@ function storedEventKind(identity: string): string | undefined {
   }
   return Array.isArray(tuple) && tuple.length === 6 && typeof tuple[4] === 'string' && tuple[4] ? tuple[4] : undefined
 }
+// The watch store, not the recovery outbox, owns the body until agent_start.
+export const isQueuedWatch = (row: InboundRecord | undefined): boolean =>
+  row?.phase === 'admitted' && storedEventKind(row.identity) === 'watch'
 /** The closed form of a full row: identity, terminal state and fences only. */
 function tombstone(row: JournalRow): ClosedInboundRecord {
   const messageKey = storedSlackMessageKey(row)
@@ -943,6 +954,7 @@ export class InboundJournal {
             current.accountIdentity,
             current.target,
             current.principal,
+            current.watchOrigin,
             current.epoch,
             current.acceptedAt,
           ]) !==
@@ -953,6 +965,7 @@ export class InboundJournal {
             next.accountIdentity,
             next.target,
             next.principal,
+            next.watchOrigin,
             next.epoch,
             next.acceptedAt,
           ])
@@ -1091,7 +1104,9 @@ export class InboundJournal {
     const root = dirname(dirname(this.path))
     const identity = canonical([
       root,
-      input.accountIdentity,
+      // A probe run is runtime-issued, not an account-scoped platform message.
+      // Keep the first account on the row as a dispatch fence, not a replay key.
+      input.eventKind === 'watch' ? null : input.accountIdentity,
       channelKeyId(input.target),
       input.messageId ?? input.receiptId,
       input.eventKind,
@@ -1183,7 +1198,12 @@ export class InboundJournal {
       return row
     })
   }
-  private async backgroundCoverage(refs: BackgroundObligationRef[], target: ChannelKey, inbound: OpenInboundRecord[]) {
+  private async backgroundCoverage(
+    refs: BackgroundObligationRef[],
+    target: ChannelKey,
+    inbound: OpenInboundRecord[],
+    lineage?: string | null,
+  ) {
     if (refs.length && !this.background) throw new Error('Missing background store')
     const seen = new Set<string>()
     const rows: BackgroundObligation[] = []
@@ -1192,6 +1212,7 @@ export class InboundJournal {
       if (
         !row ||
         seen.has(ref.obligationId) ||
+        (lineage !== undefined && !belongsToBackgroundLineage(row, lineage)) ||
         row.generation !== ref.generation ||
         row.phase === 'closed' ||
         channelKeyId(row.target) !== channelKeyId(target) ||
@@ -1263,7 +1284,7 @@ export class InboundJournal {
       const repeated = await this.repeated(decisionId, requestDigest)
       if (repeated) return repeated
       const rows = this.coverage(refs, owner.target)
-      const bg = await this.backgroundCoverage(brefs, owner.target, rows)
+      const bg = await this.backgroundCoverage(brefs, owner.target, rows, owner.watchTurnId ?? null)
       for (const row of [...rows, ...bg]) {
         if (
           row.transfer ||
@@ -1309,7 +1330,13 @@ export class InboundJournal {
       return this.result(next, nextBg)
     })
   }
-  settle(refs: InboundRef[], outcome: InboundOutcome, brefs: BackgroundObligationRef[] = [], target?: ChannelKey) {
+  settle(
+    refs: InboundRef[],
+    outcome: InboundOutcome,
+    brefs: BackgroundObligationRef[] = [],
+    target?: ChannelKey,
+    lineage: string | null | typeof lifecycleCoverage = null,
+  ) {
     return this.serialized(async () => {
       const requestDigest = digest(['outcome-decided', refs, outcome, brefs, target])
       const repeated = await this.repeated(outcome.decisionId, requestDigest)
@@ -1323,7 +1350,12 @@ export class InboundJournal {
         throw new Error('Missing outcome target')
       }
       const rows = this.coverage(refs, destination)
-      const bg = await this.backgroundCoverage(brefs, destination, rows)
+      const bg = await this.backgroundCoverage(
+        brefs,
+        destination,
+        rows,
+        lineage === lifecycleCoverage ? undefined : lineage,
+      )
       const next = rows.map((row) => ({
         ...row,
         generation: row.generation + 1,
@@ -1479,6 +1511,27 @@ export class InboundJournal {
     const { existing } = this.existingAdmission(input)
     return existing ? copy(existing) : undefined
   }
+  // Boot only, after watches.json is restored and before its dispatcher starts.
+  // The watch store is authoritative for bodies; an admission by itself is not
+  // replayable. Never turn a withdrawn synthetic verdict into a recovery notice.
+  async reconcileWatchAdmissions(pendingMessageIds: ReadonlySet<string>) {
+    await this.initialize()
+    this.assertAvailable()
+    for (const row of this.rows.values()) {
+      if (
+        row.phase !== 'admitted' ||
+        row.epoch === this.epoch ||
+        !isQueuedWatch(row) ||
+        pendingMessageIds.has(row.reference?.messageId ?? '')
+      )
+        continue
+      await this.settle([{ inputId: row.inputId, generation: row.generation }], {
+        kind: 'intentionally-suppressed',
+        decisionId: randomUUID(),
+        reason: 'watch-cancelled',
+      })
+    }
+  }
   /**
    * Boot transfer of inbound authority no live turn can still answer. Issued transfers re-import
    * unchanged first, so a late matching row forms its own notice instead of mutating one. Remaining
@@ -1509,7 +1562,7 @@ export class InboundJournal {
       await (background ? background.withTargetLane(target, reimport) : reimport())
     }
     const owedInbound = (row: InboundRecord | undefined): row is OpenInboundRecord =>
-      !!row && row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
+      !!row && row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch && !isQueuedWatch(row)
     const owedBackground = (row: BackgroundObligation | undefined): row is BackgroundObligation =>
       !!row && row.phase !== 'closed' && !row.transfer && row.epoch !== this.epoch
     const partitions = new Map<string, { target: ChannelKey; inputIds: string[]; backgroundIds: string[] }>()
@@ -1615,7 +1668,7 @@ export class InboundJournal {
         if (row.phase !== 'closed') bg.push({ obligationId: c.id, generation: c.generation })
       }
     }
-    if (refs.length || bg.length) await this.settle(refs, outcome, bg, record.target)
+    if (refs.length || bg.length) await this.settle(refs, outcome, bg, record.target, lifecycleCoverage)
   }
   /**
    * Starts growth-driven compaction once boot recovery has finished. A compaction is queued on the

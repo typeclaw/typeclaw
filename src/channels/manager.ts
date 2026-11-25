@@ -65,6 +65,7 @@ export type ChannelManagerOptions = {
   channelsConfigRef: () => ChannelsConfig
   onRecoveryReady?: () => void
   onHumanInbound?: import('./router').CreateChannelRouterOptions['onHumanInbound']
+  isWatchVerdictPending?: import('./router').CreateChannelRouterOptions['isWatchVerdictPending']
   // Plain-text names the agent answers to in channel engagement (the
   // `alias` field in `typeclaw.json`), forwarded to the router as
   // `configuredAliases`. Read live on every inbound so an `applied`-class
@@ -147,7 +148,7 @@ export type ChannelManagerOptions = {
   // session whose background subagent is still running (the next inbound would
   // otherwise spawn a duplicate child). Production wiring (src/run/index.ts)
   // supplies it from the LiveSubagentRegistry; tests omit it.
-  newestRunningChildSubagentStartedAt?: (sessionId: string) => number | null
+  newestRunningChildSubagentStartedAt?: import('./router').CreateChannelRouterOptions['newestRunningChildSubagentStartedAt']
   // Forwarded to the router so an adapter-triggered work invalidation can stop
   // independent background sessions that a parent AgentSession abort cannot reach.
   cancelRunningSubagentsByWorkKey?: (
@@ -258,6 +259,7 @@ export function createChannelManager(options: ChannelManagerOptions): ChannelMan
   const env = options.env ?? process.env
   const router = createChannelRouter({
     onHumanInbound: options.onHumanInbound,
+    isWatchVerdictPending: options.isWatchVerdictPending,
     agentDir: options.agentDir,
     ...(options.backgroundObligations ? { backgroundObligations: options.backgroundObligations } : {}),
     ...(options.inboundJournal ? { inboundJournal: options.inboundJournal } : {}),

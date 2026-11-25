@@ -96,6 +96,7 @@ import { createTui as createTuiDefault, type TuiOptions } from '@/tui'
 import { createTunnelManager, type TunnelManager, type TunnelManagerOptions } from '@/tunnels'
 import { setActiveTunnelManager } from '@/tunnels/active'
 import { runtimeTunnels } from '@/typevault/prompt-tunnel'
+import { deliverChannelWakes } from '@/watches/channel'
 import { WakeDispatcher, renderWatchReminder } from '@/watches/delivery'
 import { ProbeRegistry, createProbeRunner } from '@/watches/runner'
 import { WatchService } from '@/watches/service'
@@ -538,6 +539,7 @@ async function startAgentRuntime(
     onHumanInbound: (origin) => {
       void watches.progress(watchTarget(origin)).catch((e) => console.warn('[watch] inbound:', e))
     },
+    isWatchVerdictPending: (watchId, runId) => store.isVerdictPending(watchId, runId),
     // Resolve the live bus at delivery time so plugin reloads take effect
     // without rebuilding adapters, and no subscribers means no snapshot work.
     slackBotMessageObserver: {
@@ -572,8 +574,8 @@ async function startAgentRuntime(
     claimHandler: claimController.claimHandler,
     githubTokenBridge,
     stream,
-    newestRunningChildSubagentStartedAt: (sessionId) =>
-      newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId })),
+    newestRunningChildSubagentStartedAt: (sessionId, watchTurnId) =>
+      newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId }), watchTurnId),
     cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()
@@ -1174,8 +1176,7 @@ async function startAgentRuntime(
   const dispatcher = new WakeDispatcher(store, async (target, wakes, origin, signal) => {
     if (target.kind === 'channel') {
       if (deliverChannelWatch) return deliverChannelWatch(target, wakes, origin, signal)
-      console.info(`[watch] holding ${wakes.length} channel wake(s); channel delivery not installed`)
-      return 'held'
+      return deliverChannelWakes(channelManager.router, target, wakes)
     }
     const prompt = renderWatchReminder(target, wakes)
     if (target.kind === 'tui') return serverFactory.deliverWatch(prompt)
@@ -1195,7 +1196,18 @@ async function startAgentRuntime(
     await stopWatchWorkers(watches, dispatcher)
   }
   registerBootCleanup(stopWatches)
-  await watches.start()
+  await watches.start(async () => {
+    const pending = new Set(
+      store.records.flatMap((w) =>
+        w.wakeTarget.kind === 'channel' ? w.pending.map((p) => `watch:${w.id}:${p.key}`) : [],
+      ),
+    )
+    // Like background-obligation boot: a journal failure must not block startup; an unsettled
+    // withdrawn row stays admitted and is reconciled on the next boot.
+    await inboundJournal
+      .reconcileWatchAdmissions(pending)
+      .catch((error) => console.warn(`[run] watch admission reconciliation failed: ${error}`))
+  })
   registerBootCleanup(() => server?.stop(true))
   server = serverFactory.start()
 

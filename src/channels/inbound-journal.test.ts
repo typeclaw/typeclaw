@@ -78,6 +78,38 @@ test('close before initialization runs never creates a journal or admits work', 
   expect(journal.health().available).toBe(false)
 })
 
+test('watch replay keeps its first account and its terminal outcome after compaction and reopen', async () => {
+  const dir = await directory()
+  const watch = { ...input, eventKind: 'watch', messageId: 'watch:build:run' }
+  const replacement = { ...watch, accountIdentity: 'replacement' }
+  const journal = new InboundJournal(dir)
+  const first = await journal.admit(watch)
+  if (first.kind !== 'accepted') throw new Error('Expected first watch admission')
+  const outcome = {
+    kind: 'intentionally-suppressed' as const,
+    reason: 'watch-account-changed',
+    decisionId: randomUUID(),
+  }
+  try {
+    expect(await journal.admit(replacement)).toMatchObject({ kind: 'duplicate', inputId: first.inputId })
+    expect(journal.lookupAdmission(replacement)).toMatchObject({
+      phase: 'admitted',
+      accountIdentity: watch.accountIdentity,
+    })
+    await journal.settle(journal.resolve([first.inputId]), outcome)
+    await journal.compact()
+  } finally {
+    await journal.close()
+  }
+  const reopened = new InboundJournal(dir)
+  try {
+    expect(await reopened.admit(replacement)).toMatchObject({ kind: 'duplicate', inputId: first.inputId, outcome })
+    expect((await reopened.admit({ ...replacement, messageId: 'watch:build:next' })).kind).toBe('accepted')
+  } finally {
+    await reopened.close()
+  }
+})
+
 test('shutdown at initialization boundaries cannot reopen a torn journal after directory teardown', async () => {
   for (const boundary of ['initialization-directory-created', 'initialization-read'] as const) {
     const dir = await directory()
