@@ -1,7 +1,7 @@
 import { toRef } from '@/channels/adapters/webex-id-ref'
 import { MEMBERSHIP_FRESHNESS_MS, type MembershipCount } from '@/channels/membership'
 import type { AdapterId } from '@/channels/schema'
-import type { ChannelSelfIdentity, GithubReviewFollowupRound, ReactionRef } from '@/channels/types'
+import type { ChannelSelfIdentity, GithubReviewFollowupRound, InboundMessage, ReactionRef } from '@/channels/types'
 
 export type ChannelParticipant = {
   authorId: string
@@ -27,7 +27,7 @@ export type SessionOrigin =
   | {
       kind: 'cron'
       jobId: string
-      jobKind: 'prompt' | 'exec' | 'subagent' | 'handler'
+      jobKind: 'prompt' | 'exec' | 'subagent' | 'handler' | 'watch'
       scheduledByRole?: string
       scheduledByOrigin?: SessionOrigin | { kind: 'config-file' }
     }
@@ -39,6 +39,8 @@ export type SessionOrigin =
       chat: string
       chatName?: string
       thread: string | null
+      isDm?: boolean
+      room?: InboundMessage['room']
       githubReviewRound?: GithubReviewFollowupRound
       parentChat?: string
       parentChatName?: string
@@ -368,11 +370,13 @@ function renderTuiOrigin(): string {
   ].join('\n')
 }
 
-function renderCronOrigin(origin: { jobId: string; jobKind: 'prompt' | 'exec' | 'subagent' | 'handler' }): string {
+function renderCronOrigin(origin: Extract<SessionOrigin, { kind: 'cron' }>): string {
   return [
     '## Session origin',
     '',
-    'You are running an unattended cron job.',
+    origin.jobKind === 'watch'
+      ? 'A follow-up probe woke this unattended session.'
+      : 'You are running an unattended cron job.',
     '',
     `- Job ID:   \`${origin.jobId}\``,
     `- Job kind: ${origin.jobKind}`,

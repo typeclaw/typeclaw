@@ -18,7 +18,7 @@ export type SessionMetaPayload = {
 
 export type MinimalSessionOrigin =
   | { kind: 'tui' }
-  | { kind: 'cron'; jobId: string; jobKind: 'prompt' | 'exec' | 'subagent' | 'handler' }
+  | Pick<Extract<SessionOrigin, { kind: 'cron' }>, 'kind' | 'jobId' | 'jobKind'>
   | {
       kind: 'channel'
       adapter: string

@@ -1,7 +1,7 @@
 import type { SessionOrigin } from '@/agent/session-origin'
 import type { ResolveGithubTokenForRepo } from '@/channels/github-token-bridge'
 import type { AdapterId } from '@/channels/schema'
-import type { ChannelKey } from '@/channels/types'
+import type { ChannelKey, InboundMessage } from '@/channels/types'
 
 // What one probe run decided. `done` ends the watch; `wake` (or `done` with
 // `wake: true`) starts one LLM turn on the watch's wake target with `summary`.
@@ -20,6 +20,8 @@ export type WatchWakeTarget =
   | {
       kind: 'channel'
       key: ChannelKey
+      isDm?: boolean
+      room?: InboundMessage['room']
       // The human whose request created the watch. The wake is authored as
       // them so the router re-resolves their current role at wake time.
       requester: { authorId: string; authorAdapter: AdapterId; authorName?: string }

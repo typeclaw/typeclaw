@@ -77,7 +77,7 @@ export type InspectClientMessage =
 // keeps the two structurally in sync; drift fails typecheck.
 export type LiveSessionOriginPayload =
   | { kind: 'tui' }
-  | { kind: 'cron'; jobId: string; jobKind: 'prompt' | 'exec' | 'subagent' | 'handler' }
+  | { kind: 'cron'; jobId: string; jobKind: 'prompt' | 'exec' | 'subagent' | 'handler' | 'watch' }
   | {
       kind: 'channel'
       adapter: string
