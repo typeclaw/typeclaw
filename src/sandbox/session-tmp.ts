@@ -12,9 +12,10 @@ const { basename, dirname, isAbsolute, join, relative, resolve } = posix
 // force-committed by typeclaw, and scratch must never be committed. A per-session
 // subdir of /tmp gives `/tmp` semantics without either sharing the whole
 // container /tmp into a sandboxed role or persisting anything into the project
-// surface. The container /tmp only dies with the container, and agents run for
-// weeks, so a dir is discarded when its last live session releases it and
-// periodically swept (`sweepSessionTmp`) for anything a crash left behind.
+// surface. The root is a per-agent named volume (src/container/start.ts), so it
+// outlives the container, and agents run for weeks; a dir is discarded when its
+// last live session releases it and periodically swept (`sweepSessionTmp`) for
+// anything a crash or a restart left behind.
 export const SESSION_TMP_ROOT = '/tmp/typeclaw-session'
 
 // A dir that no live session holds but that was touched this recently is left

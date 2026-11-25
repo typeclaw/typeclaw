@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { accessSync, constants as fsConstants, existsSync, realpathSync, statSync } from 'node:fs'
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -32,7 +32,13 @@ import {
   readInstalledTypeclawVersionFromAgent,
 } from '@/init/auto-upgrade'
 import { resolveBaseImageVersion, resolveTypeclawSpec, typeclawCheckoutRoot } from '@/init/cli-version'
-import { buildDockerfile, classifyDockerfileAppend, DOCKERFILE } from '@/init/dockerfile'
+import {
+  buildDockerfile,
+  classifyDockerfileAppend,
+  DOCKERFILE,
+  ENTRYPOINT_SHIM_LABEL,
+  entrypointShimHash,
+} from '@/init/dockerfile'
 import { ensureDepsInstalled, type EnsureDepsResult } from '@/init/ensure-deps'
 import { readEnvFile } from '@/init/env-file'
 import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
@@ -41,6 +47,7 @@ import { refreshPackageJson } from '@/init/packagejson'
 import { reconcilePluginDeps } from '@/init/reconcile-plugin-deps'
 import { runBunUpdate, type UpdateRunner } from '@/init/run-bun-install'
 import { linkWindowsDevTypeclaw, resolveBunLinkedPackage, type RunBunLink } from '@/init/windows-dev-link'
+import { SESSION_TMP_ROOT } from '@/sandbox/session-tmp'
 import {
   provisionGithubCliStore,
   type GithubCliProvisionResult,
@@ -683,6 +690,8 @@ async function runStart({
     }
 
     const previousImageId = await inspectImageId(exec, imageTagValue)
+    const staleEntrypoint =
+      previousImageId !== null && (await inspectImageEntrypointShim(exec, imageTagValue)) !== entrypointShimHash()
 
     // First attempt uses the user's preferred host port (8973 by default, or
     // whatever they passed via --port / typeclaw.json). If it's already bound
@@ -704,7 +713,7 @@ async function runStart({
       cwd,
       hostPort,
       imageExists: previousImageId !== null,
-      forceBuild: forceBuild || dockerfileRefresh.changed,
+      forceBuild: forceBuild || dockerfileRefresh.changed || staleEntrypoint,
       hostdControl,
       publishHost,
       tuiToken,
@@ -1281,6 +1290,14 @@ export async function planStart({
 
   runArgs.push(...dockerBindMount({ src: cwd, dst: '/agent' }))
 
+  // Session scratch lives on a per-agent named volume, not the container's
+  // writable layer. Model bash fills it with checkouts and installs (tens of GB
+  // on a busy agent), and `docker rm` deleting a layer that size stalls every
+  // other container operation on the engine for minutes, so a restart of one
+  // agent froze the whole fleet. `docker rm` leaves a volume alone; the
+  // runtime's own sweeper reclaims stale scratch in the background instead.
+  runArgs.push('--mount', `type=volume,src=${sessionScratchVolumeName(cwd, containerName)},dst=${SESSION_TMP_ROOT}`)
+
   if (shouldMirrorDevSource(devSourcePath, cwd, platform)) {
     runArgs.push(...dockerBindMount({ src: devSourcePath, dst: devSourcePath, readonly: true }))
   } else if (shouldMountWindowsDevSource(devSourcePath, cwd, platform)) {
@@ -1595,6 +1612,30 @@ export async function refreshGitignore(cwd: string): Promise<void> {
 // alongside in that module and is used by persistMigratedConfig to pair
 // the migration write with a commit on every read path, not only here.
 export const commitSystemFile = commitSystemFileShared
+
+// Container names come from the folder basename, so two agent folders with the
+// same name share one. The volume outlives the container, so it is keyed by the
+// canonical agent path too: a different folder never inherits another agent's
+// scratch, while restarts of the same folder keep reusing its volume.
+function sessionScratchVolumeName(cwd: string, containerName: string): string {
+  const agentId = createHash('sha256')
+    .update(realpathSync(resolve(cwd)))
+    .digest('hex')
+    .slice(0, 12)
+  return `typeclaw-${containerName}-${agentId}-session-tmp`
+}
+
+async function inspectImageEntrypointShim(exec: DockerExec, tag: string): Promise<string | null> {
+  const result = await exec([
+    'image',
+    'inspect',
+    '--format',
+    `{{index .Config.Labels "${ENTRYPOINT_SHIM_LABEL}"}}`,
+    tag,
+  ])
+  if (result.exitCode !== 0) return null
+  return result.stdout.trim() || null
+}
 
 async function inspectImageId(exec: DockerExec, tag: string): Promise<string | null> {
   const result = await exec(['image', 'inspect', '--format', '{{.Id}}', tag])
