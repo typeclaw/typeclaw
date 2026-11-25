@@ -69,7 +69,12 @@ export type GithubWebhookHandlerOptions = {
     | { kind: 'no-live-session' }
   >
   clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
-  clearPendingReview?: (workspace: string, prNumber: number) => Promise<void>
+  // False means a current assignment-backed obligation preserved the work.
+  clearPendingReview?: (
+    workspace: string,
+    prNumber: number,
+    reason?: 'review-request-removed',
+  ) => Promise<boolean | void>
   reviewSubmitted?: (review: { repo: string; prNumber: number; headSha: string; submittedAt: number }) => Promise<void>
 }
 
@@ -248,7 +253,8 @@ export async function processVerifiedGithubDelivery(
     if (prNumber !== null) {
       // Withdrawn work must not survive in the pending log, or the next boot's
       // pending replay reviews a PR nobody asked for anymore.
-      await options.clearPendingReview?.(classified.workspace, prNumber)
+      const cleared = await options.clearPendingReview?.(classified.workspace, prNumber, 'review-request-removed')
+      if (cleared === false) return
       void githubReviewChecks.cancelPullRequest(classified.workspace, prNumber, 'the review request was removed')
     }
   }
@@ -1188,18 +1194,6 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
     (requestedUser.login === selfLogin || (decoyLogin !== null && requestedUser.login === decoyLogin))
   const isMyTeam = requestedTeam !== null && teamIsBotMember === true
   if (!isMeAsUser && !isMyTeam) return null
-
-  // Assignment and reviewer requests share pending work and a check. Removing
-  // only the reviewer request must not stop a review still owed by assignment.
-  if (
-    action === 'review_request_removed' &&
-    Array.isArray(pr.assignees) &&
-    pr.assignees.some((assignee) => {
-      const user = readUser(assignee)
-      return user !== null && (user.login === selfLogin || (decoyLogin !== null && user.login === decoyLogin))
-    })
-  )
-    return null
 
   const title = readString(pr, 'title') ?? `#${number}`
   const head = readString(readRecord(pr.head), 'ref')

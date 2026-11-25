@@ -51,7 +51,10 @@ const pull = {
 }
 
 // Passing an existing dir starts the next process on the same agent folder.
-async function fixture(existingDir?: string, options: { prompt?: () => Promise<void> } = {}) {
+async function fixture(
+  existingDir?: string,
+  options: { prompt?: () => Promise<void>; recoveredRemoval?: Record<string, unknown> } = {},
+) {
   const dir = existingDir ?? (await mkdtemp(join(tmpdir(), 'github-pending-reviews-')))
   const store = await loadPendingReviewStore(dir, logger)
   const calls: string[] = []
@@ -60,6 +63,8 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
   const timeline: Array<Record<string, unknown>> = []
   const allowedAuthors = new Set<string>()
   const scanRead = Promise.withResolvers<void>()
+  const recoveryFinished = Promise.withResolvers<void>()
+  let recoveryTick: (() => void) | undefined
   const currentPull = { ...pull }
   let comparison = 'behind'
   let fetchWaiters: Array<{ match: (url: string) => boolean; resolve: () => void }> = []
@@ -77,6 +82,22 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
         await hold.released
       }
       if (url.endsWith('/user')) return Response.json({ login: 'bot', id: 1 })
+      if (url.endsWith('/hooks') && init?.method === 'POST') return Response.json({ id: 1 })
+      if (url.includes('/hooks?')) return Response.json([])
+      if (url.endsWith('/hooks/1') && init?.method === 'DELETE') return new Response(null, { status: 204 })
+      if (url.includes('/hooks/1/deliveries?'))
+        return Response.json([
+          {
+            id: 11,
+            guid: 'old-removal',
+            event: 'pull_request',
+            status_code: 502,
+            delivered_at: new Date().toISOString(),
+          },
+        ])
+      if (url.endsWith('/hooks/1/deliveries/11'))
+        return Response.json({ request: { payload: options.recoveredRemoval } })
+      if (url.endsWith('/requested_reviewers')) return Response.json({ users: [], teams: [] })
       if (url.includes('/statuses/') && init?.method === 'POST') {
         statuses.push(JSON.parse(String(init.body)) as Record<string, unknown>)
         return Response.json({})
@@ -154,7 +175,12 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
     router,
     agentDir: dir,
     configRef: () => config,
-    logger,
+    logger: {
+      ...logger,
+      info: (message) => {
+        if (message.includes('recovered 1 missed delivery')) recoveryFinished.resolve()
+      },
+    },
     fetchImpl,
     secrets: { auth: { type: 'pat', token: { value: 'test-token' } }, webhookSecret: { value: 'test-secret' } },
     httpListenImpl: (_port, callback) => {
@@ -162,7 +188,11 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
       return { stop: async () => {} }
     },
     tokenRefreshIntervalMs: 0,
-    deliveryRecoveryIntervalMs: 0,
+    deliveryRecoveryIntervalMs: options.recoveredRemoval === undefined ? 0 : 1,
+    setInterval: (callback) => {
+      recoveryTick = callback
+      return { clear: () => {} }
+    },
     reconcileIntervalMs: 0,
     webhookRegistrationDelayMs: 0,
   })
@@ -186,6 +216,11 @@ async function fixture(existingDir?: string, options: { prompt?: () => Promise<v
     scanRead: scanRead.promise,
     pull: currentPull,
     routed,
+    recoverRemoval: async () => {
+      if (recoveryTick === undefined) throw new Error('Recovery not configured')
+      recoveryTick()
+      await recoveryFinished.promise
+    },
     setComparison: (status: string) => {
       comparison = status
     },
@@ -547,6 +582,88 @@ test('keeps pending work when another reviewer is removed', async () => {
     requested_reviewer: { login: 'other-reviewer', id: 2, type: 'User' },
   })
   expect(await f.store.list()).toEqual([pending])
+})
+
+test('cancels a withdrawn request when assignment was not admitted by the allowlist', async () => {
+  // #given
+  const f = await fixture()
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
+  f.config.eventAllowlist = ['pull_request.review_requested', 'pull_request.review_request_removed']
+  await f.adapter.start()
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const requested = f.nextRoute()
+  await f.deliver('review_requested', 'pull_request', { requested_reviewer: bot })
+  expect((await requested).kind).toBe('accepted')
+  await f.deliver('assigned', 'pull_request', { assignee: bot, pull_request: { ...pull, assignees: [bot] } })
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+    'unadmitted-assignment-review',
+  )
+
+  try {
+    // #when
+    await f.deliver('review_request_removed', 'pull_request', {
+      requested_reviewer: bot,
+      pull_request: { ...pull, assignees: [bot] },
+    })
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(await f.store.list()).toEqual([])
+    expect(f.statuses.map((status) => status.state)).toEqual(['pending', 'success'])
+    expect(f.statuses[1]?.description).toBe('Not reviewed: the review request was removed')
+  } finally {
+    await githubReviewChecks.reviewerSettled('unadmitted-assignment-review', {
+      kind: 'cancelled',
+      reason: 'test cleanup',
+    })
+  }
+})
+
+test('preserves a newer assignment obligation when an older removal is recovered', async () => {
+  // #given
+  const bot = { login: 'bot', id: 1, type: 'User' }
+  const f = await fixture(undefined, {
+    recoveredRemoval: {
+      action: 'review_request_removed',
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: { ...pull, assignees: [] },
+      requested_reviewer: bot,
+      sender: { login: 'alice', id: 10, type: 'User' },
+    },
+  })
+  f.config.webhookUrl = 'https://example.com/github'
+  f.config.review.on = 'review_requested'
+  f.config.review.check = true
+  await f.adapter.start()
+  const assigned = f.nextRoute()
+  await f.deliver('assigned', 'pull_request', {
+    assignee: bot,
+    pull_request: { ...pull, assignees: [bot], updated_at: '2026-01-01T00:01:00Z' },
+  })
+  expect((await assigned).kind).toBe('accepted')
+  const recorded = await f.store.list()
+  await githubReviewChecks.beginReview(
+    { repo: pending.repo, pullRequest: pending.prNumber, headSha: pending.headSha },
+    'recovered-assignment-review',
+  )
+
+  try {
+    // #when
+    await f.recoverRemoval()
+    await githubReviewChecks.sweep()
+
+    // #then
+    expect(await f.store.list()).toEqual(recorded)
+    expect(f.statuses.map((status) => status.state)).toEqual(['pending'])
+    expect(f.routed.map((message) => message.eventKind)).toEqual(['pull_request:assigned'])
+  } finally {
+    await githubReviewChecks.reviewerSettled('recovered-assignment-review', {
+      kind: 'cancelled',
+      reason: 'test cleanup',
+    })
+  }
 })
 
 test('clears pending work through the registered review submitter before it returns', async () => {

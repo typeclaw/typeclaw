@@ -315,6 +315,7 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
               authorId: message.authorId,
               authorName: message.authorName,
               authorIsBot: message.authorIsBot,
+              ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
             })
         : undefined,
     )
@@ -339,9 +340,8 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     logger,
     route: routeInbound,
     abortGithubPrTurn: options.router.abortGithubPrTurn,
-    clearPendingReview: async (workspace, prNumber) => {
-      await pendingReviewStore?.clear(workspace, prNumber)
-    },
+    clearPendingReview: async (workspace, prNumber, reason) =>
+      pendingReviewStore?.clear(workspace, prNumber, undefined, reason),
     reviewSubmitted: async (review) => {
       if (pendingReviewStore !== null) await completePendingReview(pendingReviewStore, review, authToken, fetchImpl)
     },

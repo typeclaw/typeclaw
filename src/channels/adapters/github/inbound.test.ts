@@ -386,22 +386,25 @@ describe('classifyGithubInbound', () => {
       ['pat', 'typeclaw-bot', 'typeclaw-bot'],
       ['app', 'typeclaw[bot]', 'typeclaw[bot]'],
       ['app', 'typeclaw[bot]', 'typeclaw'],
-    ] as const)('drops removal under %s auth while %s remains assigned as %s', (authType, selfLogin, assigneeLogin) => {
-      // #given
-      const payload = reviewRequestRemovedPayload({
-        reviewerLogin: authType === 'app' ? 'typeclaw' : selfLogin,
-      })
-      ;(payload.pull_request as Record<string, unknown>).assignees = [
-        { login: 'someone-else', id: 10, type: 'User' },
-        { login: assigneeLogin, id: 99, type: 'User' },
-      ]
+    ] as const)(
+      'classifies removal under %s auth independently of %s assigned as %s',
+      (authType, selfLogin, assigneeLogin) => {
+        // #given
+        const payload = reviewRequestRemovedPayload({
+          reviewerLogin: authType === 'app' ? 'typeclaw' : selfLogin,
+        })
+        ;(payload.pull_request as Record<string, unknown>).assignees = [
+          { login: 'someone-else', id: 10, type: 'User' },
+          { login: assigneeLogin, id: 99, type: 'User' },
+        ]
 
-      // #when
-      const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+        // #when
+        const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
 
-      // #then
-      expect(msg).toBe(null)
-    })
+        // #then
+        expect(msg?.text).toContain('You can stop any in-progress review.')
+      },
+    )
 
     it('still emits a cleanup signal when only another user remains assigned', () => {
       // #given
@@ -1117,6 +1120,49 @@ describe('createGithubWebhookHandler — review.on wiring', () => {
 })
 
 describe('createGithubWebhookHandler — pull_request.assigned', () => {
+  it.each([
+    ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+    ['app', 'typeclaw[bot]', 'typeclaw[bot]'],
+    ['app', 'typeclaw[bot]', 'typeclaw'],
+  ] as const)(
+    'preserves admitted assignment work under %s auth for %s via %s',
+    async (authType, selfLogin, reviewerLogin) => {
+      // #given
+      const routed: InboundMessage[] = []
+      const withdrawals: unknown[][] = []
+      const handler = createGithubWebhookHandler({
+        webhookSecret: 'secret',
+        dedup: createDeliveryDedup(),
+        allowlist: () => [...DEFAULT_GITHUB_EVENT_ALLOWLIST],
+        selfId: () => '99',
+        selfLogin: () => selfLogin,
+        authType: () => authType,
+        logger,
+        clearPendingReview: async (...args) => {
+          withdrawals.push(args)
+          return false
+        },
+        route: async (msg) => {
+          routed.push(msg)
+          return { kind: 'observed' }
+        },
+      })
+
+      // #when
+      await handler(
+        signedRequest(
+          JSON.stringify(reviewRequestRemovedPayload({ reviewerLogin })),
+          'pull_request',
+          'assigned-removal',
+        ),
+      )
+
+      // #then
+      expect(withdrawals).toEqual([['acme/project', 7, 'review-request-removed']])
+      expect(routed).toHaveLength(0)
+    },
+  )
+
   it.each([
     ['pat', 'typeclaw-bot', 'typeclaw-bot'],
     ['app', 'typeclaw[bot]', 'typeclaw'],

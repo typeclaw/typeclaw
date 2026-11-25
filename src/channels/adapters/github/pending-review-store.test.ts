@@ -61,6 +61,63 @@ test('same-head sibling admissions preserve the obligation admission time', asyn
   expect(await store.list()).toEqual([entry])
 })
 
+test('assignment admission upgrades the same obligation and survives reload and request admission', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+
+  // #when
+  await store.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+  const reloaded = await loadPendingReviewStore(agentDir, logger)
+  await reloaded.record({ ...entry, admittedAt: 300 })
+
+  // #then
+  expect(await reloaded.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+})
+
+test('an old completion snapshot cannot erase an assignment upgrade', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+
+  // #when
+  await store.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+  await store.clear(entry.repo, entry.prNumber, entry)
+
+  // #then
+  expect(await store.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+})
+
+test('assignment provenance does not leak into a replacement head', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record({ ...entry, assignmentTriggered: true })
+  const newer = { ...entry, headSha: 'head-two', admittedAt: 200 }
+
+  // #when
+  await store.record(newer)
+
+  // #then
+  expect(await store.list()).toEqual([newer])
+})
+
+test('withdrawal sees another instance assignment admission but closure still clears it', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  await first.record(entry)
+  await second.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+
+  // #when
+  const cleared = await first.clear(entry.repo, entry.prNumber, undefined, 'review-request-removed')
+
+  // #then
+  expect(cleared).toBe(false)
+  expect(await first.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+  expect(await second.clear(entry.repo, entry.prNumber)).toBe(true)
+  expect(await first.list()).toEqual([])
+})
+
 test('same-head requester replacement is not cleared by an older snapshot on the same clock', async () => {
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record(entry)

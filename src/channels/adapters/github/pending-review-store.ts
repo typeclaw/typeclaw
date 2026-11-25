@@ -16,6 +16,8 @@ const pendingReviewSchema = z.object({
   authorId: z.string().min(1),
   authorName: z.string(),
   authorIsBot: z.boolean(),
+  // Absent on legacy records and work admitted without an assignment trigger.
+  assignmentTriggered: z.literal(true).optional(),
 })
 
 export type PendingReview = Readonly<z.infer<typeof pendingReviewSchema>>
@@ -24,7 +26,12 @@ export type PendingReviewStore = {
   list: () => Promise<readonly PendingReview[]>
   has: (repo: string, prNumber: number) => boolean
   record: (entry: PendingReview) => Promise<void>
-  clear: (repo: string, prNumber: number, expected?: PendingReview) => Promise<void>
+  clear: (
+    repo: string,
+    prNumber: number,
+    expected?: PendingReview,
+    reason?: 'review-request-removed',
+  ) => Promise<boolean>
 }
 
 type Logger = { warn: (message: string) => void }
@@ -76,25 +83,33 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
         const id = key(entry.repo, entry.prNumber)
         const previous = next.get(id)
         if (previous !== undefined && previous.admittedAt > entry.admittedAt) return
+        const sameObligation = previous?.headSha === entry.headSha && previous.kind === entry.kind
+        const assignmentTriggered =
+          entry.assignmentTriggered ?? (sameObligation ? previous.assignmentTriggered : undefined)
         // Several thread siblings can carry the same push. They share one PR
         // obligation; keep its original admission time for completion checks.
-        if (
-          previous?.headSha === entry.headSha &&
-          previous.kind === entry.kind &&
+        const sameAdmission =
+          sameObligation &&
           previous.authorId === entry.authorId &&
           previous.authorName === entry.authorName &&
           previous.authorIsBot === entry.authorIsBot
-        )
-          return
-        next.set(id, entry)
+        if (sameAdmission && previous.assignmentTriggered === assignmentTriggered) return
+        next.set(id, {
+          ...entry,
+          ...(sameAdmission ? { admittedAt: previous.admittedAt } : {}),
+          ...(assignmentTriggered === true ? { assignmentTriggered } : {}),
+        })
         await persist(next)
       }),
-    clear: (repo, prNumber, expected) =>
+    clear: (repo, prNumber, expected, reason) =>
       onFileLane(path, async () => {
         const next = await latest()
         const id = key(repo, prNumber)
         const current = next.get(id)
-        if (current === undefined) return
+        if (current === undefined) return true
+        // Decide on the latest persisted obligation inside the admission lane,
+        // never on an old removal payload's snapshot of the PR's assignees.
+        if (reason === 'review-request-removed' && current.assignmentTriggered === true) return false
         if (
           expected !== undefined &&
           (current.prId !== expected.prId ||
@@ -103,11 +118,13 @@ export async function loadPendingReviewStore(agentDir: string, logger: Logger = 
             current.admittedAt !== expected.admittedAt ||
             current.authorId !== expected.authorId ||
             current.authorName !== expected.authorName ||
-            current.authorIsBot !== expected.authorIsBot)
+            current.authorIsBot !== expected.authorIsBot ||
+            current.assignmentTriggered !== expected.assignmentTriggered)
         )
-          return
+          return false
         next.delete(id)
         await persist(next)
+        return true
       }),
   }
 }
