@@ -48,12 +48,14 @@ In agent mode the typing indicator becomes Slack's agent session status (`agents
 
 Routing is the same in both modes: a DM is one session, and channel threads stay sticky.
 
+While an agent session is working, Slack shows a stop button (the manifest subscribes to `agent_session_stopped`). Clicking it runs `/stop` with the same `session.control` permission check, for that thread in a channel or for the conversation in a DM; a stopped turn's session returns to `active`.
+
 To turn an existing app into an agent, open **[api.slack.com/apps](https://api.slack.com/apps) → your app → App Manifest**:
 
 - **Plain app** (no `assistant_view` or `agent_view` in its manifest): add the `features.agent_view` block and the `assistant:write` scope from the [manifest](/docs/guides/add-a-channel).
 - **App already using Slack's older Assistant view** (`features.assistant_view`): this switch is one-way. Slack cannot move the app back to the Assistant view, and users must hard-refresh Slack to see the change. Following Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/), replace `assistant_view` with `agent_view` and rename `assistant_description` to `agent_description`.
 
-In both cases, also set `features.app_home.agent_tasks_enabled: false`. Slack turns the agent Tasks tab on by default, and TypeClaw does not handle Slack-scheduled tasks. Then reinstall the app to grant the new scope and run `typeclaw restart`. Slack may require a paid plan for some agent features.
+In both cases, also set `features.app_home.agent_tasks_enabled: false` and add the `agent_session_stopped` bot event from the manifest. Slack turns the agent Tasks tab on by default, and TypeClaw does not handle Slack-scheduled tasks. Then reinstall the app to grant the new scope and run `typeclaw restart`. Slack may require a paid plan for some agent features.
 
 ## Own-reaction cleanup
 

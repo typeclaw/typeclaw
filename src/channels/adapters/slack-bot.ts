@@ -1,7 +1,10 @@
 import {
   SlackBotClient,
   SlackBotListener,
+  type SlackBotListenerEventMap,
   type SlackFile,
+  type SlackSocketModeEventsApiArgs,
+  type SlackSocketModeGenericEvent,
   type SlackSocketModeSlashCommandArgs,
 } from 'agent-messenger/slackbot'
 
@@ -80,6 +83,7 @@ import { enrichSlackReferenceContext } from './slack-bot-reference'
 import {
   buildSlashAckPayload,
   commandResultReply,
+  parseAgentSessionStopped,
   parseSlashCommand,
   parseThreadCommand,
   SLACK_SLASH_REPLY_FAILED,
@@ -322,6 +326,63 @@ export function createThreadCommandHandler(
     }
     return { kind: 'executed' }
   }
+}
+
+export type AgentSessionStoppedHandlerDeps = {
+  router: Pick<ChannelRouter, 'executeCommand'>
+  teamId: () => string | null
+  logger: SlackBotAdapterLoggerLike
+}
+
+// Slack retries an unacked delivery under a new envelope but the same
+// `event_id`; this many recent ids comfortably covers the retry window.
+const AGENT_STOP_EVENT_ID_MEMORY = 256
+
+// Slack's native stop button runs the same /stop as `!stop` in that thread,
+// including its permission gate. The session status is left to the turn:
+// a stopped turn's router-owned typing stop sets it `active`, and a denied
+// click leaves a still-running turn correctly `processing`.
+//
+// The handler outlives socket reconnects, so its event-id memory does too: a
+// retried click must not stop a newer turn the user started in the thread.
+export function createAgentSessionStoppedHandler(
+  deps: AgentSessionStoppedHandlerDeps,
+): (event: SlackSocketModeGenericEvent, eventId: string | undefined) => Promise<void> {
+  const seenEventIds = new Set<string>()
+  return async (event, eventId) => {
+    // Reserve before the first await so a retry racing the original drops.
+    if (eventId !== undefined) {
+      if (seenEventIds.has(eventId)) {
+        deps.logger.info(`[slack-bot] agent_session_stopped dropped: duplicate delivery event_id=${eventId}`)
+        return
+      }
+      seenEventIds.add(eventId)
+      if (seenEventIds.size > AGENT_STOP_EVENT_ID_MEMORY) {
+        seenEventIds.delete(seenEventIds.values().next().value!)
+      }
+    }
+    const teamId = deps.teamId()
+    const command = teamId === null ? null : parseAgentSessionStopped(event, teamId)
+    if (command === null) {
+      deps.logger.warn('[slack-bot] agent_session_stopped dropped: missing team, channel, thread, or user')
+      return
+    }
+    try {
+      const result = await deps.router.executeCommand(command.key, 'stop', { invokerId: command.invokerId })
+      deps.logger.info(
+        `[slack-bot] agent stop button invoker=${command.invokerId} channel=${command.key.chat} thread=${command.key.thread} result=${result.kind}`,
+      )
+    } catch (err) {
+      deps.logger.error(`[slack-bot] agent stop button failed: ${describeError(err)}`)
+    }
+  }
+}
+
+function isAgentSessionStopped(
+  args: SlackBotListenerEventMap['slack_event'][0],
+): args is SlackSocketModeEventsApiArgs<SlackSocketModeGenericEvent> {
+  const event = (args as { event?: unknown }).event
+  return typeof event === 'object' && event !== null && (event as { type?: unknown }).type === 'agent_session_stopped'
 }
 
 // app_mention payloads omit channel_type and never carry a subtype, so we
@@ -1585,6 +1646,12 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     },
   })
 
+  const handleAgentSessionStopped = createAgentSessionStoppedHandler({
+    router: options.router,
+    teamId: () => teamId,
+    logger,
+  })
+
   // Gate raw edits before dedupe, commands and reference enrichment. `source`
   // is the listener that delivered the event: app_mention promotion rewrites
   // its type to 'message', so it cannot be recovered from the event itself.
@@ -1807,6 +1874,22 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         // "didn't respond in time" even though the abort succeeded.
         inflightInbounds++
         void handleSlashCommand(args).finally(() => {
+          inflightInbounds--
+          if (inflightInbounds === 0 && stopWaiters.length > 0) {
+            const waiters = stopWaiters
+            stopWaiters = []
+            for (const w of waiters) w()
+          }
+        })
+      })
+      // The SDK has no typed listener for agent events; `slack_event` carries
+      // every Events API delivery, and its ack is idempotent per envelope.
+      listener.on('slack_event', (args) => {
+        if (!isAgentSessionStopped(args)) return
+        args.ack()
+        inflightInbounds++
+        const eventId = typeof args.body?.event_id === 'string' ? args.body.event_id : undefined
+        void handleAgentSessionStopped(args.event, eventId).finally(() => {
           inflightInbounds--
           if (inflightInbounds === 0 && stopWaiters.length > 0) {
             const waiters = stopWaiters

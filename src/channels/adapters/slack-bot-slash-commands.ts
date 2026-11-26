@@ -119,6 +119,30 @@ export function parseThreadCommand(
   }
 }
 
+// A click on Slack's native agent stop button (`agent_session_stopped`); the
+// clicker is the invoker the /stop permission gate checks. In a channel the
+// event names the exact session thread, so it targets that thread like
+// `!stop`. A DM is one flat session whose status is anchored on a message ts,
+// so a DM click keys on the conversation (`thread: null`) and the router
+// resolves the DM's live session, refusing if several are live.
+export function parseAgentSessionStopped(
+  event: Readonly<Record<string, unknown>>,
+  teamId: string,
+): ParsedSlackSlashCommand | null {
+  const { channel, thread_ts: threadTs, user } = event
+  if (typeof user !== 'string' || user === '') return null
+  if (typeof channel !== 'string' || channel === '') return null
+  if (typeof threadTs !== 'string' || threadTs === '') return null
+  const isDm = SLACK_DM_CHANNEL_PREFIXES.some((prefix) => channel.startsWith(prefix))
+  return {
+    name: 'stop',
+    key: isDm
+      ? { adapter: 'slack-bot', workspace: '@dm', chat: channel, thread: null }
+      : { adapter: 'slack-bot', workspace: teamId, chat: channel, thread: threadTs },
+    invokerId: user,
+  }
+}
+
 export const SLACK_SLASH_REPLY_ABORTED = 'Stopped the current turn.'
 export const SLACK_SLASH_REPLY_NO_LIVE_SESSION = 'Nothing to stop — no active turn in this channel.'
 export const SLACK_SLASH_REPLY_FAILED = 'Could not stop the current turn (internal error).'

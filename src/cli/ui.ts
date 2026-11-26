@@ -352,7 +352,16 @@ export const SLACK_APP_MANIFEST = {
   },
   settings: {
     event_subscriptions: {
-      bot_events: ['app_mention', 'message.channels', 'message.groups', 'message.im', 'message.mpim'],
+      // `agent_session_stopped` is what makes Slack show the native stop
+      // button on a working agent session; the adapter routes it to /stop.
+      bot_events: [
+        'agent_session_stopped',
+        'app_mention',
+        'message.channels',
+        'message.groups',
+        'message.im',
+        'message.mpim',
+      ],
     },
     socket_mode_enabled: true,
   },
