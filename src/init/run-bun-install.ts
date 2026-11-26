@@ -3,11 +3,9 @@ export type InstallResult = { ok: true } | { ok: false; reason: string }
 const INSTALL_TIMEOUT_MS = 300_000
 
 export type InstallRunnerOptions = {
-  // Append `--force` to the bun install argv to bypass the cache for
-  // `file:` / `link:` deps. Bun treats name+version of a `file:` dep as a
-  // cache hit even after the source on disk has changed, so changes to a
-  // locally-linked typeclaw never propagate into <agent>/node_modules until
-  // either the typeclaw version is bumped or the install is forced.
+  // Append `--force` to the bun install argv to bypass the package cache and
+  // re-install every package. Not needed to refresh a `file:` dep: a plain
+  // install already re-copies it from its current source.
   force?: boolean
   timeoutMs?: number
   spawn?: typeof Bun.spawn
@@ -33,11 +31,6 @@ export async function runBunInstall(cwd: string, opts?: InstallRunnerOptions): P
     // the bug are non-trivial. Hoisted is the fallback strategy bun shipped
     // before 1.3 — slightly slower for huge monorepos, indistinguishable
     // for an agent folder, and not affected by the bug.
-    //
-    // `--force` is conditional: it bypasses the package cache so file:/link:
-    // deps re-copy their current on-disk source into node_modules. Bun's
-    // file-dep cache is keyed on name+version, so without --force, edits to
-    // a `file:..` typeclaw never reach the container after the first install.
     return await runTimedBunProcess({
       cmd: opts?.force ? ['bun', 'install', '--linker=hoisted', '--force'] : ['bun', 'install', '--linker=hoisted'],
       cwd,

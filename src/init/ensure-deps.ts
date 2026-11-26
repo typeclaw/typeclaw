@@ -16,13 +16,41 @@ export type EnsureDepsOptions = {
   install?: InstallRunner
   detect?: (cwd: string) => Promise<readonly string[]>
   // Skip the pre-install drift detection and run `bun install --force`
-  // unconditionally. Used by `typeclaw start --build` when the agent declares
-  // typeclaw via `file:` or `link:`: bun's file-dep cache otherwise treats
-  // unchanged name+version as a cache hit even after the source on disk has
-  // changed, so the post-install re-detect at the bottom (the silent-no-op
-  // guard) stays — `--force` does NOT excuse us from verifying the install
-  // actually populated the agent's node_modules/.
+  // unconditionally. The post-install re-detect at the bottom (the
+  // silent-no-op guard) stays — `--force` does NOT excuse us from verifying
+  // the install actually populated the agent's node_modules/.
   force?: boolean
+  // Run a plain `bun install` even when nothing is missing. A plain install
+  // re-copies `file:` deps from their current source, so a stale copy needs
+  // this, not `--force`, which re-installs every package and is several times
+  // slower when many agents restart at once.
+  refresh?: boolean
+  // Test seam for the longest a warm refresh waits behind the one ahead of it.
+  maxQueueWaitMs?: number
+}
+
+// Warm refreshes started by one CLI run go through this queue one at a time.
+// `compose start`/`restart` start every agent concurrently, and concurrent
+// installs on one host contend on bun's shared cache and the disk: seven agents
+// refreshing a `file:` typeclaw took about 51s in parallel against 26s back to
+// back. Only warm refreshes queue (nothing missing, no `--force`). Cold and
+// forced installs stay independent. A warm refresh can still need the registry
+// (a bumped pin whose old version is installed, an evicted cache entry), and
+// telling those apart up front is guesswork, so instead no refresh waits more
+// than WARM_REFRESH_MAX_WAIT_MS behind the one ahead of it: the queue is a speed
+// optimization and must never hold a restart behind a stalled install.
+const WARM_REFRESH_MAX_WAIT_MS = 30_000
+let warmRefreshQueue: Promise<unknown> = Promise.resolve()
+
+function queueWarmRefresh<T>(run: () => Promise<T>, maxWaitMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const waitCap = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, maxWaitMs)
+  })
+  const turn = Promise.race([warmRefreshQueue, waitCap]).finally(() => clearTimeout(timer))
+  const queued = turn.then(run)
+  warmRefreshQueue = queued.catch(() => {})
+  return queued
 }
 
 export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<EnsureDepsResult> {
@@ -30,11 +58,16 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
   const install = options.install ?? runBunInstall
   const detect = options.detect ?? detectMissingDeps
   const force = options.force ?? false
+  const refresh = options.refresh ?? false
 
   const missing = force ? [] : await detect(cwd)
-  if (!force && missing.length === 0) return { ok: true, installed: false }
+  if (!force && !refresh && missing.length === 0) return { ok: true, installed: false }
 
-  const result = await install(cwd, { force })
+  const runInstall = () => install(cwd, { force })
+  const result =
+    !force && missing.length === 0
+      ? await queueWarmRefresh(runInstall, options.maxQueueWaitMs ?? WARM_REFRESH_MAX_WAIT_MS)
+      : await runInstall()
   if (!result.ok) return { ok: false, reason: result.reason, missing }
 
   // Re-probe: `bun install` returns 0 even when a file:-linked dep's own

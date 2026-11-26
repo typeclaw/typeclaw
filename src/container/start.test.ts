@@ -4508,7 +4508,7 @@ process.exit(0)`,
     expect(ensureCalls).toEqual([{ force: false }])
   })
 
-  test('file: typeclaw dep -> ensureDeps forced only when the checkout moved since the last install', async () => {
+  test('file: typeclaw dep -> ensureDeps refreshes without --force only when the checkout moved since the last install', async () => {
     // given: an agent whose file: dep points at a real git checkout
     const checkout = await mkdtemp(join(tmpdir(), 'typeclaw-local-src-'))
     try {
@@ -4521,7 +4521,7 @@ process.exit(0)`,
       const store = join(root, 'node_modules', '.bun', 'typeclaw@file', 'node_modules', 'typeclaw')
       await mkdir(store, { recursive: true })
       await symlink(store, join(root, 'node_modules', 'typeclaw'))
-      const ensureCalls: Array<{ force?: boolean } | undefined> = []
+      const ensureCalls: Array<{ force?: boolean; refresh?: boolean } | undefined> = []
       const runStart = () =>
         start({
           cwd: root,
@@ -4549,11 +4549,11 @@ process.exit(0)`,
 
       // then
       expect(ensureCalls).toEqual([
-        { force: true },
+        { force: false, refresh: true },
         { force: false },
-        { force: true },
-        { force: true },
-        { force: true },
+        { force: false, refresh: true },
+        { force: false, refresh: true },
+        { force: false, refresh: true },
       ])
     } finally {
       await rm(checkout, { recursive: true, force: true })

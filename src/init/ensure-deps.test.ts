@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { detectMissingDeps, ensureDepsInstalled } from './ensure-deps'
+import { type InstallResult, runBunInstall, runBunUpdate } from './run-bun-install'
 
 let root: string
 
@@ -269,6 +270,45 @@ describe('ensureDepsInstalled', () => {
     expect(installOptsSeen).toEqual([{ force: false }])
   })
 
+  test('refresh=true runs a plain install even when nothing is missing', async () => {
+    const installOptsSeen: Array<{ force?: boolean } | undefined> = []
+    const result = await ensureDepsInstalled({
+      cwd: root,
+      refresh: true,
+      detect: async () => [],
+      install: async (_cwd, opts) => {
+        installOptsSeen.push(opts)
+        return { ok: true }
+      },
+    })
+
+    expect(installOptsSeen).toEqual([{ force: false }])
+    expect(result).toMatchObject({ ok: true, installed: true })
+  })
+
+  test('refresh re-copies a changed file: dependency through a real bun install', async () => {
+    // given: an agent with a local file: dependency (no deps of its own, so no network) installed once
+    const source = join(root, 'local-dep')
+    const agent = join(root, 'agent')
+    await writePackageJson(source, { name: 'local-dep', version: '1.0.0' })
+    await writeFile(join(source, 'index.js'), 'export const value = 1\n')
+    await writePackageJson(agent, { name: 'agent', private: true, dependencies: { 'local-dep': 'file:../local-dep' } })
+    expect(await ensureDepsInstalled({ cwd: agent })).toEqual({ ok: true, installed: true })
+
+    // when: without a version bump, a source file is atomically replaced and a new one is added, then the copy is refreshed
+    await writeFile(join(source, 'index.js.next'), 'export const value = 2\n')
+    await rename(join(source, 'index.js.next'), join(source, 'index.js'))
+    await writeFile(join(source, 'added.js'), 'export const added = true\n')
+    const result = await ensureDepsInstalled({ cwd: agent, refresh: true })
+
+    // then: the installed copy holds the new bytes. Bun may link each file of a file: dependency to its source
+    // instead of copying it, which makes the replaced file current without an install; only an install adds the new file.
+    const installed = join(agent, 'node_modules', 'local-dep')
+    expect(result).toEqual({ ok: true, installed: true })
+    expect(await readFile(join(installed, 'index.js'), 'utf8')).toBe('export const value = 2\n')
+    expect(await readFile(join(installed, 'added.js'), 'utf8')).toBe('export const added = true\n')
+  }, 60_000)
+
   test('force=true still re-detects post-install (silent no-op guard preserved)', async () => {
     // given: force install succeeds, but the deps the runner was supposed to
     // populate did not appear. The re-detect guard must still fire under
@@ -286,5 +326,169 @@ describe('ensureDepsInstalled', () => {
     if (result.ok) throw new Error('expected failure')
     expect(result.reason).toContain('still missing')
     expect(result.reason).toContain('typeclaw')
+  })
+})
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => {}
+  const promise = new Promise<T>((settle) => {
+    resolve = settle
+  })
+  return { promise, resolve }
+}
+
+// Every pending microtask (async detect, the queue hand-off) runs before an
+// immediate fires, so this lets started work show up without waiting on time.
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
+
+const nothingMissing = async (): Promise<readonly string[]> => []
+
+describe('ensureDepsInstalled concurrency', () => {
+  test('concurrent warm refreshes run one at a time', async () => {
+    // given: an install whose runs finish only when the test releases them
+    const events: string[] = []
+    const releases = new Map<string, (result: InstallResult) => void>()
+    let closing = false
+    const install = async (cwd: string): Promise<InstallResult> => {
+      events.push(`start ${cwd}`)
+      if (closing) return { ok: true }
+      const release = deferred<InstallResult>()
+      releases.set(cwd, release.resolve)
+      const result = await release.promise
+      events.push(`end ${cwd}`)
+      return result
+    }
+
+    try {
+      // when: two warm refreshes start together
+      const first = ensureDepsInstalled({ cwd: 'a', refresh: true, detect: nothingMissing, install })
+      const second = ensureDepsInstalled({ cwd: 'b', refresh: true, detect: nothingMissing, install })
+      await settle()
+
+      // then: the second starts only after the first finished
+      expect(events).toEqual(['start a'])
+      releases.get('a')?.({ ok: true })
+      expect(await first).toEqual({ ok: true, installed: true })
+      await settle()
+      expect(events).toEqual(['start a', 'end a', 'start b'])
+      releases.get('b')?.({ ok: true })
+      expect(await second).toEqual({ ok: true, installed: true })
+    } finally {
+      closing = true
+      for (const release of releases.values()) release({ ok: false, reason: 'released' })
+    }
+  })
+
+  test('a stalled warm refresh does not hold back cold or forced installs', async () => {
+    // given: a warm refresh whose install never finishes on its own
+    const stalled = deferred<InstallResult>()
+    let warmStarted = false
+    try {
+      const warm = ensureDepsInstalled({
+        cwd: 'warm',
+        refresh: true,
+        detect: nothingMissing,
+        install: async () => {
+          warmStarted = true
+          return stalled.promise
+        },
+      })
+      await settle()
+      expect(warmStarted).toBe(true)
+
+      // when: a cold install (a dep is missing) and a forced install start behind it
+      let coldDetects = 0
+      const settled: string[] = []
+      void ensureDepsInstalled({
+        cwd: 'cold',
+        detect: async () => (coldDetects++ === 0 ? ['zod'] : []),
+        install: async () => ({ ok: true }),
+      }).then((result) => settled.push(`cold ${result.ok}`))
+      void ensureDepsInstalled({
+        cwd: 'forced',
+        force: true,
+        detect: nothingMissing,
+        install: async () => ({ ok: true }),
+      }).then((result) => settled.push(`forced ${result.ok}`))
+      await settle()
+
+      // then: both finished while the warm refresh is still running
+      expect(settled.sort()).toEqual(['cold true', 'forced true'])
+      stalled.resolve({ ok: true })
+      expect(await warm).toEqual({ ok: true, installed: true })
+    } finally {
+      stalled.resolve({ ok: false, reason: 'released' })
+    }
+  })
+
+  test('a warm refresh stops waiting behind a stalled one after the wait cap', async () => {
+    // given: a warm refresh that stalls, as one resolving a bumped registry pin can while its local copy is stale
+    const stalled = deferred<InstallResult>()
+    let stalledEnded = false
+    try {
+      void ensureDepsInstalled({
+        cwd: 'stalled',
+        refresh: true,
+        detect: nothingMissing,
+        install: async () => {
+          const result = await stalled.promise
+          stalledEnded = true
+          return result
+        },
+      })
+
+      // when: another agent's warm refresh queues behind it with a short wait cap
+      const refresh = await ensureDepsInstalled({
+        cwd: 'healthy',
+        refresh: true,
+        maxQueueWaitMs: 1,
+        detect: nothingMissing,
+        install: async () => ({ ok: true }),
+      })
+
+      // then: it ran once the cap passed, while the stalled refresh is still running
+      expect(refresh).toEqual({ ok: true, installed: true })
+      expect(stalledEnded).toBe(false)
+    } finally {
+      stalled.resolve({ ok: false, reason: 'released' })
+    }
+  })
+
+  test('a stalled bun update does not hold back a warm refresh', async () => {
+    // given: a `bun update` child that exits only when released, and a refresh child that exits at once
+    const closed = (): ReadableStream<Uint8Array> =>
+      new ReadableStream({
+        start(controller) {
+          controller.close()
+        },
+      })
+    const fakeChild = (exited: Promise<number>, kill: () => void) =>
+      (() => ({ exited, stdout: closed(), stderr: closed(), kill })) as unknown as typeof Bun.spawn
+    const updateExit = deferred<number>()
+    const refreshExit = deferred<number>()
+    const updateSpawn = fakeChild(updateExit.promise, () => updateExit.resolve(137))
+    const refreshSpawn = fakeChild(refreshExit.promise, () => refreshExit.resolve(137))
+    refreshExit.resolve(0)
+    try {
+      const update = runBunUpdate('updating', 'typeclaw', { timeoutMs: 600_000, spawn: updateSpawn })
+
+      // when: another agent refreshes its local copy through the real install runner meanwhile
+      const settled: string[] = []
+      void ensureDepsInstalled({
+        cwd: 'refreshing',
+        refresh: true,
+        detect: nothingMissing,
+        install: (cwd, opts) => runBunInstall(cwd, { ...opts, timeoutMs: 600_000, spawn: refreshSpawn }),
+      }).then((result) => settled.push(`refresh ${result.ok}`))
+      await settle()
+
+      // then: the refresh finished while the update is still running
+      expect(settled).toEqual(['refresh true'])
+      updateExit.resolve(0)
+      expect(await update).toEqual({ ok: true })
+    } finally {
+      updateExit.resolve(137)
+      refreshExit.resolve(137)
+    }
   })
 })
