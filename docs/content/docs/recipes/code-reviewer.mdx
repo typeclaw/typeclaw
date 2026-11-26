@@ -99,7 +99,7 @@ A **PAT-backed** bot needs none of this: it's already a real user you can reques
 
 ## The review runs
 
-When the decoy is requested, the agent wakes and delegates the analysis to the bundled **`reviewer`** subagent — read-only tools, a `deep` model profile, and a 5-minute timeout. It's the right delegation target here: `explorer` runs on a fast model and stays shallow, and `operator` needs elevated permissions a public GitHub session doesn't have. The reviewer returns line-anchored findings the agent turns into a review payload. See [/reference/bundled-plugins](/docs/reference/bundled-plugins) for the subagent inventory.
+When the decoy is requested, the agent wakes and delegates the analysis to the bundled **`reviewer`** subagent — read-only tools, a `deep` model profile, and a 30-minute timeout. It's the right delegation target here: `explorer` runs on a fast model and stays shallow, and `operator` needs elevated permissions a public GitHub session doesn't have. The reviewer returns line-anchored findings the agent turns into a review payload. Besides the code itself, it checks intent and decision alignment: whether the change delivers what the requester and the linked issues asked for, and whether it contradicts a current project decision recorded in the repo, its history, or the agent's memory (memory is cross-checked against a reliable source before it backs a finding). See [/reference/bundled-plugins](/docs/reference/bundled-plugins) for the subagent inventory.
 
 You don't script any of this. The review request lands, the agent reads the diff, spawns the reviewer, and posts back on its own — the same loop `@typeey` runs on every requested PR.
 
