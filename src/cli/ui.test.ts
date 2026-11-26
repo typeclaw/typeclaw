@@ -590,6 +590,12 @@ describe('printSlackAppManifestSetup', () => {
     expect(manifestNames).toEqual(new Set(SLACK_SLASH_COMMAND_NAMES))
   })
 
+  test('manifest declares the app a Slack agent so the adapter can enter agent mode', () => {
+    expect(SLACK_APP_MANIFEST.features.agent_view.agent_description.length).toBeLessThanOrEqual(300)
+    expect(SLACK_APP_MANIFEST.oauth_config.scopes.bot).toContain('assistant:write')
+    expect(SLACK_APP_MANIFEST.features.app_home.agent_tasks_enabled).toBe(false)
+  })
+
   test('manifest grants the `commands` scope so slash_commands envelopes can route', () => {
     expect(SLACK_APP_MANIFEST.oauth_config.scopes.bot).toContain('commands')
   })
