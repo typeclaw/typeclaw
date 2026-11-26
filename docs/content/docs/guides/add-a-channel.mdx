@@ -47,10 +47,16 @@ After installing, you get the **bot token** (`xoxb-…`) under **OAuth & Permiss
 ```yaml
 display_information:
   name: TypeClaw
+features:
+  app_home:
+    agent_tasks_enabled: false
+  agent_view:
+    agent_description: Your TypeClaw agent. Message it here or mention it in a channel.
 oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      - assistant:write
       - channels:history
       - channels:read
       - chat:write
@@ -78,7 +84,7 @@ settings:
   socket_mode_enabled: true
 ```
 
-Every scope here maps one-to-one to something the adapter actually does — `chat:write` to send, `reactions:write` to react, `files:read`/`files:write` for attachments, the `*:history`/`*:read` pairs to read channel context and members, and `users:read`/`team:read` to resolve author and workspace names.
+Every scope here maps one-to-one to something the adapter actually does — `chat:write` to send, `reactions:write` to react, `files:read`/`files:write` for attachments, the `*:history`/`*:read` pairs to read channel context and members, and `users:read`/`team:read` to resolve author and workspace names. `agent_view` (which grants `assistant:write`) makes the bot a Slack agent; see [Agent mode](/docs/reference/slack-bot#agent-mode).
 
 </Accordion>
 
