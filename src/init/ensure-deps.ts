@@ -16,13 +16,15 @@ export type EnsureDepsOptions = {
   install?: InstallRunner
   detect?: (cwd: string) => Promise<readonly string[]>
   // Skip the pre-install drift detection and run `bun install --force`
-  // unconditionally. Used by `typeclaw start --build` when the agent declares
-  // typeclaw via `file:` or `link:`: bun's file-dep cache otherwise treats
-  // unchanged name+version as a cache hit even after the source on disk has
-  // changed, so the post-install re-detect at the bottom (the silent-no-op
-  // guard) stays — `--force` does NOT excuse us from verifying the install
-  // actually populated the agent's node_modules/.
+  // unconditionally. The post-install re-detect at the bottom (the
+  // silent-no-op guard) stays — `--force` does NOT excuse us from verifying
+  // the install actually populated the agent's node_modules/.
   force?: boolean
+  // Run a plain `bun install` even when nothing is missing. A plain install
+  // re-copies `file:` deps from their current source, so a stale copy needs
+  // this, not `--force`, which re-installs every package and is several times
+  // slower when many agents restart at once.
+  refresh?: boolean
 }
 
 export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<EnsureDepsResult> {
@@ -30,9 +32,10 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
   const install = options.install ?? runBunInstall
   const detect = options.detect ?? detectMissingDeps
   const force = options.force ?? false
+  const refresh = options.refresh ?? false
 
   const missing = force ? [] : await detect(cwd)
-  if (!force && missing.length === 0) return { ok: true, installed: false }
+  if (!force && !refresh && missing.length === 0) return { ok: true, installed: false }
 
   const result = await install(cwd, { force })
   if (!result.ok) return { ok: false, reason: result.reason, missing }

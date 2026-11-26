@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -268,6 +268,45 @@ describe('ensureDepsInstalled', () => {
 
     expect(installOptsSeen).toEqual([{ force: false }])
   })
+
+  test('refresh=true runs a plain install even when nothing is missing', async () => {
+    const installOptsSeen: Array<{ force?: boolean } | undefined> = []
+    const result = await ensureDepsInstalled({
+      cwd: root,
+      refresh: true,
+      detect: async () => [],
+      install: async (_cwd, opts) => {
+        installOptsSeen.push(opts)
+        return { ok: true }
+      },
+    })
+
+    expect(installOptsSeen).toEqual([{ force: false }])
+    expect(result).toMatchObject({ ok: true, installed: true })
+  })
+
+  test('refresh re-copies a changed file: dependency through a real bun install', async () => {
+    // given: an agent with a local file: dependency (no deps of its own, so no network) installed once
+    const source = join(root, 'local-dep')
+    const agent = join(root, 'agent')
+    await writePackageJson(source, { name: 'local-dep', version: '1.0.0' })
+    await writeFile(join(source, 'index.js'), 'export const value = 1\n')
+    await writePackageJson(agent, { name: 'agent', private: true, dependencies: { 'local-dep': 'file:../local-dep' } })
+    expect(await ensureDepsInstalled({ cwd: agent })).toEqual({ ok: true, installed: true })
+
+    // when: without a version bump, a source file is atomically replaced and a new one is added, then the copy is refreshed
+    await writeFile(join(source, 'index.js.next'), 'export const value = 2\n')
+    await rename(join(source, 'index.js.next'), join(source, 'index.js'))
+    await writeFile(join(source, 'added.js'), 'export const added = true\n')
+    const result = await ensureDepsInstalled({ cwd: agent, refresh: true })
+
+    // then: the installed copy holds the new bytes. Bun may link each file of a file: dependency to its source
+    // instead of copying it, which makes the replaced file current without an install; only an install adds the new file.
+    const installed = join(agent, 'node_modules', 'local-dep')
+    expect(result).toEqual({ ok: true, installed: true })
+    expect(await readFile(join(installed, 'index.js'), 'utf8')).toBe('export const value = 2\n')
+    expect(await readFile(join(installed, 'added.js'), 'utf8')).toBe('export const added = true\n')
+  }, 60_000)
 
   test('force=true still re-detects post-install (silent no-op guard preserved)', async () => {
     // given: force install succeeds, but the deps the runner was supposed to

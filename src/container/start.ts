@@ -222,7 +222,7 @@ export type StartOptions = {
   // so known-good control values and rollback survive IPC congestion.
   // See type docs.
   currentHostDaemon?: CurrentHostDaemon
-  ensureDeps?: (cwd: string, opts?: { force?: boolean }) => Promise<EnsureDepsResult>
+  ensureDeps?: (cwd: string, opts?: { force?: boolean; refresh?: boolean }) => Promise<EnsureDepsResult>
   // Test seam for host embedding model provisioning. Production callers use
   // the file-locked host cache downloader.
   ensureModels?: () => Promise<void>
@@ -594,11 +594,9 @@ async function runStart({
     // `Cannot find package 'x'` because the agent folder is bind-mounted into
     // /agent and the container has no node_modules of its own.
     //
-    // Force-reinstall ONLY when --build is set AND typeclaw is declared via
-    // a local link. Bun's file-dep cache otherwise serves stale source on
-    // subsequent installs (PR #243 dogfooding wasted three rebuilds + a
-    // manual version bump before this gate existed). Registry-spec users
-    // skip the force path because their install is already cache-correct.
+    // `--build` with typeclaw declared via a local link keeps its full
+    // `--force` reinstall. Registry-spec users skip that path because their
+    // install is already cache-correct.
 
     // Materialize typeclaw.json#plugins into package.json BEFORE ensureDeps so
     // the drift detector below sees the newly-written deps as missing and
@@ -624,16 +622,21 @@ async function runStart({
     //
     // A `file:` dep is a snapshot copy taken at install time, so pulling or
     // editing the checkout leaves the agent running old code until something
-    // re-copies it. Fingerprint the checkout and force a reinstall only when it
-    // moved since the last install, so routine restarts stay fast.
+    // re-copies it. Fingerprint the checkout and run a plain install only when
+    // it moved since the last install, so routine restarts stay fast. A plain
+    // install already re-copies `file:` deps; `--force` would re-install every
+    // package, which made a fleet `compose restart` after a pull several times
+    // slower.
     const staleLocalFingerprint = await staleLocalTypeclawCopyFingerprint(cwd)
     const forceDepsReinstall =
-      staleLocalFingerprint !== null ||
       (forceBuild && (await hasLocallyLinkedTypeclawDep(cwd))) ||
       pluginReconcile.changed ||
       outcomeRequiresForceInstall(upgrade) ||
       registeredWindowsLink
-    const deps = await ensureDeps(cwd, { force: forceDepsReinstall })
+    const deps = await ensureDeps(cwd, {
+      force: forceDepsReinstall,
+      ...(staleLocalFingerprint !== null && !forceDepsReinstall ? { refresh: true } : {}),
+    })
     if (!deps.ok) {
       return { ok: false, reason: `dependency install failed: ${deps.reason}` }
     }
@@ -1897,12 +1900,10 @@ export function shouldMountWindowsDevSource(
 
 // True when the agent's package.json declares typeclaw via `file:` or
 // `link:` — i.e. a developer is iterating on the typeclaw source via a
-// locally-linked checkout. `bun install` keys its file-dep cache on
-// name+version, so it treats a stale cached copy as a cache hit even
-// after the source on disk has changed. `typeclaw start --build` uses
-// this gate to force `bun install --force` only in dev: registry-spec
-// users (`^X.Y.Z`, `~X.Y.Z`, exact pins) pay nothing because their
-// install path is already cache-correct.
+// locally-linked checkout. `typeclaw start --build` uses this gate to keep
+// its full `bun install --force` reinstall for local dependencies:
+// registry-spec users (`^X.Y.Z`, `~X.Y.Z`, exact pins) pay nothing because
+// their install path is already cache-correct.
 async function hasLocallyLinkedTypeclawDep(cwd: string): Promise<boolean> {
   const spec = await readTypeclawDepSpec(cwd)
   return spec !== null && (spec.startsWith('file:') || spec.startsWith('link:'))
