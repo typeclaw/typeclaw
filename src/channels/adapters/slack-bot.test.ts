@@ -11,7 +11,7 @@ import { InboundJournal } from '@/channels/inbound-journal'
 import { MEMBERSHIP_CACHE_TRANSIENT_TTL_MS } from '@/channels/membership'
 import { createChannelRouter, type ChannelRouter } from '@/channels/router'
 import { channelsSchema, defaultHistoryConfig } from '@/channels/schema'
-import type { ChannelKey, FetchHistoryResult, HistoryCallback, OutboundMessage } from '@/channels/types'
+import type { ChannelKey, FetchHistoryResult, HistoryCallback, OutboundMessage, TypingCallback } from '@/channels/types'
 import { SLACK_APP_MANIFEST } from '@/cli/ui'
 import { noopPermissionService } from '@/permissions'
 import { createHookBus, type ChannelMessageObservedEvent } from '@/plugin'
@@ -128,6 +128,7 @@ describe('createSlackBotAdapter', () => {
       token: 'xoxb-test',
       appToken: 'xapp-test',
       logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: (async () => new Response('{"ok":true}')) as unknown as typeof fetch,
       createClient: () =>
         ({
           login: async () => {},
@@ -162,6 +163,85 @@ describe('createSlackBotAdapter', () => {
 
     await adapter.stop()
     expect(adapter.isConnected()).toBe(false)
+  })
+
+  test('an agent-enabled token drives typing through agent sessions', async () => {
+    // given a token whose auth.test reports assistant:write
+    const listener = new FakeSlackBotListener()
+    const calls: Array<{ url: string; body: string }> = []
+    const router = lifecycleRouter()
+    let typing: TypingCallback | undefined
+    router.registerTyping = (_adapter, callback) => {
+      typing = callback
+    }
+    const adapter = createSlackBotAdapter({
+      router,
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), body: String(init?.body ?? '') })
+        return new Response('{"ok":true}', { headers: { 'x-oauth-scopes': 'assistant:write,chat:write' } })
+      }) as unknown as typeof fetch,
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'U0123456789', team_id: 'T0123456789' }),
+          setAssistantStatus: async () => {
+            throw new Error('legacy status must not be used in agent mode')
+          },
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+    })
+    await adapter.start()
+
+    // when a DM turn ticks
+    await typing!({
+      adapter: 'slack-bot',
+      workspace: '@dm',
+      chat: 'D0DM',
+      thread: null,
+      typingThread: '1.000100',
+      phase: 'tick',
+    })
+
+    // then the session goes processing on the inbound message
+    const status = calls.find((c) => c.url.endsWith('/agents.sessions.setStatus'))
+    expect(Object.fromEntries(new URLSearchParams(status!.body))).toEqual({
+      channel_id: 'D0DM',
+      thread_ts: '1.000100',
+      status: 'processing',
+    })
+    await adapter.stop()
+  })
+
+  test('a failed agent-mode probe still starts the adapter as a plain app', async () => {
+    const listener = new FakeSlackBotListener()
+    const warns: string[] = []
+    const infos: string[] = []
+    const adapter = createSlackBotAdapter({
+      router: lifecycleRouter(),
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m), error: () => {} },
+      fetchImpl: (async () => {
+        throw new Error('network down')
+      }) as unknown as typeof fetch,
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'U0123456789', team_id: 'T0123456789' }),
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+    })
+
+    await adapter.start()
+
+    expect(warns.some((m) => m.includes('agent mode probe failed') && m.includes('network down'))).toBe(true)
+    expect(infos).toContain('[slack-bot] agent mode off')
+    await adapter.stop()
   })
 })
 
@@ -497,6 +577,108 @@ describe('createSlackTypingTracker', () => {
     await tracker.clearAfterSend('C0', null)
     await tracker.clearAfterSend('C0', undefined)
     await tracker.clearAfterSend('C0', '')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('agent mode maps typing to agent session processing/active instead of the assistant status', async () => {
+    // given
+    const { client, calls } = makeDeferredClient()
+    const sessionCalls: string[] = []
+    const tracker = createSlackTypingTracker({
+      client,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      agentSession: {
+        enabled: () => true,
+        setStatus: async (chat, threadTs, status) => {
+          sessionCalls.push(`${chat}/${threadTs}:${status}`)
+        },
+        fallback: async () => {
+          throw new Error('fallback must not run when the session call succeeds')
+        },
+      },
+    })
+    // when
+    await tracker.setStatus('D0', 'T0', 'is typing...')
+    await tracker.clearAfterSend('D0', 'T0')
+    // then
+    expect(sessionCalls).toEqual(['D0/T0:processing', 'D0/T0:active'])
+    expect(calls).toHaveLength(0)
+  })
+
+  test('a refused agent session call falls back to the bounded assistant status, never the SDK call', async () => {
+    // given
+    const { client, calls } = makeDeferredClient()
+    const warns: string[] = []
+    const fallbacks: string[] = []
+    const tracker = createSlackTypingTracker({
+      client,
+      logger: { info: () => {}, warn: (m) => warns.push(m), error: () => {} },
+      agentSession: {
+        enabled: () => true,
+        setStatus: async () => {
+          throw new Error('not_allowed')
+        },
+        fallback: async (chat, threadTs, status) => {
+          fallbacks.push(`${chat}/${threadTs}:${status}`)
+        },
+      },
+    })
+    // when
+    await tracker.setStatus('C0', 'T0', 'is typing...')
+    // then
+    expect(fallbacks).toEqual(['C0/T0:is typing...'])
+    expect(calls).toHaveLength(0)
+    expect(warns.some((m) => m.includes('not_allowed'))).toBe(true)
+  })
+
+  test('when the session call and its fallback both fail, the queued clear still settles', async () => {
+    // given a session call that is refused and a fallback that hits its deadline
+    const { client } = makeDeferredClient()
+    const fallbacks: string[] = []
+    const tracker = createSlackTypingTracker({
+      client,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      agentSession: {
+        enabled: () => true,
+        setStatus: async () => {
+          throw new Error('not_allowed')
+        },
+        fallback: async (_chat, _threadTs, status) => {
+          fallbacks.push(status)
+          throw new DOMException('The operation timed out.', 'TimeoutError')
+        },
+      },
+    })
+    // when a typing call and the post-send clear queue on the same thread
+    const typing = tracker.setStatus('C0', 'T0', 'is typing...')
+    const clear = tracker.clearAfterSend('C0', 'T0')
+    await Promise.all([typing, clear])
+    // then both reached Slack in order and neither held the queue
+    expect(fallbacks).toEqual(['is typing...', ''])
+  })
+
+  test('a refused agent session call in a DM skips the fallback so no Agent View thread opens', async () => {
+    // given
+    const { client, calls } = makeDeferredClient()
+    const fallbacks: string[] = []
+    const tracker = createSlackTypingTracker({
+      client,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      agentSession: {
+        enabled: () => true,
+        setStatus: async () => {
+          throw new Error('not_allowed')
+        },
+        fallback: async (_chat, _threadTs, status) => {
+          fallbacks.push(status)
+        },
+      },
+    })
+    // when
+    await tracker.setStatus('D0', '1.000100', 'is typing...')
+    await tracker.clearAfterSend('D0', '1.000100')
+    // then
+    expect(fallbacks).toHaveLength(0)
     expect(calls).toHaveLength(0)
   })
 

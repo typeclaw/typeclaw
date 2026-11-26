@@ -51,6 +51,12 @@ import { addSlackMentionHints } from './mention-hints'
 import { withOutboundAccount } from './outbound-account'
 import { createBotRecoveryCallbacks, sendBotRecovery } from './recovery-correlation'
 import { downloadSlackAttachment, type SlackAttachmentFetch } from './slack-attachment-download'
+import {
+  fetchSlackAgentMode,
+  setSlackAgentSessionStatus,
+  setSlackAssistantStatus,
+  type SlackAgentSessionStatus,
+} from './slack-bot-agent-session'
 import { createSlackAuthorResolver, type SlackAuthorResolver } from './slack-bot-author-resolver'
 import { createSlackChannelResolver } from './slack-bot-channel-resolver'
 import {
@@ -402,11 +408,43 @@ export type SlackTypingTracker = {
   clearAfterSend: (chat: string, threadTs: string | null | undefined) => Promise<void>
 }
 
+// In agent mode the same 'is typing...'/'' lifecycle drives Slack's agent
+// session instead (`processing`/`active`), which adds the native "Working…"
+// UX. A refused session call falls back to the legacy status so an install
+// whose agent feature Slack does not serve still shows typing. The fallback is
+// its own bounded call so agent mode never waits on the SDK's unbounded one.
+export type SlackAgentSessionStatusSetter = {
+  enabled: () => boolean
+  setStatus: (chat: string, threadTs: string, status: SlackAgentSessionStatus) => Promise<void>
+  fallback: (chat: string, threadTs: string, status: string) => Promise<void>
+}
+
 export function createSlackTypingTracker(deps: {
   client: Pick<SlackBotClient, 'setAssistantStatus'>
   logger: SlackBotAdapterLogger
+  agentSession?: SlackAgentSessionStatusSetter
 }): SlackTypingTracker {
-  const { client, logger } = deps
+  const { client, logger, agentSession } = deps
+  const send = async (chat: string, threadTs: string, status: string): Promise<void> => {
+    if (agentSession?.enabled()) {
+      try {
+        await agentSession.setStatus(chat, threadTs, status === '' ? 'active' : 'processing')
+      } catch (err) {
+        // In Agent View, `assistant.threads.setStatus` opens the thread it
+        // targets. A flat DM's status is anchored on the inbound message while
+        // the reply posts top-level, so the fallback would open a thread the
+        // reply never lands in. DMs go without status rather than risk that.
+        if (chat.startsWith('D')) {
+          logger.warn(`[slack-bot] agent session status failed in a DM; no fallback: ${describeError(err)}`)
+          return
+        }
+        logger.warn(`[slack-bot] agent session status failed, using assistant status: ${describeError(err)}`)
+        await agentSession.fallback(chat, threadTs, status)
+      }
+      return
+    }
+    await client.setAssistantStatus(chat, threadTs, status)
+  }
   const queues = new Map<string, Promise<void>>()
   // Monotonic per-tracker counter so the three lifecycle log lines for one
   // call (queued → sent → ok) can be correlated by id even when many calls
@@ -427,7 +465,7 @@ export function createSlackTypingTracker(deps: {
       .catch(() => {})
       .then(() => {
         logger.info(`[slack-bot] typing call=${callId} sending`)
-        return client.setAssistantStatus(chat, threadTs, status)
+        return send(chat, threadTs, status)
       })
       .then(() => {
         logger.info(`[slack-bot] typing call=${callId} ok`)
@@ -1394,6 +1432,7 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
   let listener: SlackBotListener | null = null
   let botUserId: string | null = null
   let teamId: string | null = null
+  let agentMode = false
   let socketConnected = false
   let started = false
   let inflightInbounds = 0
@@ -1416,7 +1455,17 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
     return `${workspacePart} ${chatPart}`
   }
 
-  const typingTracker = createSlackTypingTracker({ client, logger })
+  const typingTracker = createSlackTypingTracker({
+    client,
+    logger,
+    agentSession: {
+      enabled: () => agentMode,
+      setStatus: (chat, threadTs, status) =>
+        setSlackAgentSessionStatus(options.token, fetchImpl, { chat, threadTs, status }),
+      fallback: (chat, threadTs, status) =>
+        setSlackAssistantStatus(options.token, fetchImpl, { chat, threadTs, status }),
+    },
+  })
 
   const typingCallback = createTypingCallback({
     typingTracker,
@@ -1687,6 +1736,13 @@ export function createSlackBotAdapter(options: SlackBotAdapterOptions): SlackBot
         logger.error(`[slack-bot] auth.test failed: ${describeError(err)}`)
         throw err
       }
+      // A failed probe keeps the plain-app behavior rather than failing start:
+      // agent mode only adds UX on top of a working adapter.
+      agentMode = await fetchSlackAgentMode(options.token, fetchImpl).catch((err: unknown) => {
+        logger.warn(`[slack-bot] agent mode probe failed; running as a plain app: ${describeError(err)}`)
+        return false
+      })
+      logger.info(`[slack-bot] agent mode ${agentMode ? 'on' : 'off'}`)
 
       listener =
         options.createListener?.(client, options.appToken) ??

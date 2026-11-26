@@ -262,6 +262,15 @@ export const SLACK_APP_MANIFEST = {
       home_tab_enabled: false,
       messages_tab_enabled: true,
       messages_tab_read_only_enabled: false,
+      // Slack turns the agent Tasks tab on by default; TypeClaw does not
+      // handle Slack-scheduled tasks (it has its own cron), so hide it.
+      agent_tasks_enabled: false,
+    },
+    // Declares the app a Slack agent: AGENT label, top-bar entry, and Slack's
+    // "Working…" session status. Grants `assistant:write`, which the adapter
+    // probes to switch its typing status to agent sessions.
+    agent_view: {
+      agent_description: 'Your TypeClaw agent. Message it here or mention it in a channel.',
     },
     // Slash commands listed here appear in Slack's compose-box picker with
     // their description as a tooltip. `url` is required by Slack's manifest
@@ -315,6 +324,7 @@ export const SLACK_APP_MANIFEST = {
       // commands registered in `features` would silently fail to route.
       bot: [
         'app_mentions:read',
+        'assistant:write',
         'channels:history',
         'channels:join',
         'channels:read',

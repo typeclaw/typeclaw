@@ -40,6 +40,21 @@ CLI: `typeclaw channel add slack-bot` (interactive), `typeclaw channel set slack
   for the full scope list.
 </Callout>
 
+## Agent mode
+
+An app created from the TypeClaw manifest is a Slack **agent** (`features.agent_view`): Slack labels it AGENT instead of APP and adds it to the top-bar agent entry point. At start the adapter checks whether the bot token holds `assistant:write`, which Slack grants only to agents, and logs `agent mode on` or `agent mode off`.
+
+In agent mode the typing indicator becomes Slack's agent session status (`agents.sessions.setStatus`): `processing` while the agent works, which shows Slack's "Working…" UX, and `active` when the turn ends. If Slack refuses the session call (for example, an app still on Slack's older Assistant view, which also holds `assistant:write`), the adapter falls back to the plain typing status in channel threads. In a DM it shows no status instead, because the plain status would open a thread in Slack's agent view that the reply is not posted in. Without `assistant:write`, typing uses `assistant.threads.setStatus`.
+
+Routing is the same in both modes: a DM is one session, and channel threads stay sticky.
+
+To turn an existing app into an agent, open **[api.slack.com/apps](https://api.slack.com/apps) → your app → App Manifest**:
+
+- **Plain app** (no `assistant_view` or `agent_view` in its manifest): add the `features.agent_view` block and the `assistant:write` scope from the [manifest](/docs/guides/add-a-channel).
+- **App already using Slack's older Assistant view** (`features.assistant_view`): this switch is one-way. Slack cannot move the app back to the Assistant view, and users must hard-refresh Slack to see the change. Following Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/), replace `assistant_view` with `agent_view` and rename `assistant_description` to `agent_description`.
+
+In both cases, also set `features.app_home.agent_tasks_enabled: false`. Slack turns the agent Tasks tab on by default, and TypeClaw does not handle Slack-scheduled tasks. Then reinstall the app to grant the new scope and run `typeclaw restart`. Slack may require a paid plan for some agent features.
+
 ## Own-reaction cleanup
 
 The adapter removes only the authenticated account's reaction with `reactions.remove`, using the original channel, message timestamp, and normalized emoji. `no_reaction` is successful absence. Account rotation blocks cleanup belonging to the old identity; replies do not await cleanup transport. Protected acknowledgments survive temporary cleanup and reboot. The same own-removal contract applies to the [Slack user adapter](/docs/reference/slack).
@@ -52,7 +67,7 @@ The adapter removes only the authenticated account's reaction with `reactions.re
 | Multi-chunk messages     | yes       | Additional chunks thread under the first                                                                                                                                                                |
 | Reactions (add + remove) | yes       | Requires `reactions:write` scope                                                                                                                                                                        |
 | Message editing          | yes       | `channel_edit` maps to `chat.update`; requires `chat:write` scope; edits the bot's own messages only                                                                                                    |
-| Typing indicator         | limited   | Only in Slack AI Assistant threads via `assistant.threads.setStatus`; top-level and non-threaded chats get no indicator                                                                                 |
+| Typing indicator         | limited   | Threads and DMs only; top-level channel messages get no indicator. Agent mode uses Slack's agent session status (see [Agent mode](#agent-mode))                                                         |
 | Channel-name resolution  | yes       |                                                                                                                                                                                                         |
 | Self identity            | yes       |                                                                                                                                                                                                         |
 | History                  | yes       | Limit 200 messages                                                                                                                                                                                      |
