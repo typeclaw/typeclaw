@@ -20,6 +20,7 @@ import {
 import { describeError } from '../../describe-error'
 import type { GithubAuthContext } from './auth'
 import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
+import { classifyGithubLookupFailure } from './lookup-failure'
 
 // After a 401/403/404 the repo is skipped for this long, so a missing
 // permission costs one warning per window instead of one failed call per review.
@@ -87,7 +88,8 @@ export function createGithubReviewCheckPublisher(deps: {
     const text = await response.text().catch(() => '')
     // GitHub reports primary and secondary rate limits as 403 (or 429); those
     // clear on their own, so they must be retried rather than cached as denials.
-    if (isRateLimited(response, text)) {
+    const failure = classifyGithubLookupFailure(response, text)
+    if (failure === 'rate-limit') {
       const until = rateLimitResetAt(response, now())
       rateLimitedUntil.set(key.repo, until)
       deps.logger.warn(
@@ -95,7 +97,7 @@ export function createGithubReviewCheckPublisher(deps: {
       )
       return { kind: 'transient' }
     }
-    if (response.status === 401 || response.status === 403 || response.status === 404) {
+    if (failure === 'denied') {
       deniedUntil.set(key.repo, now() + REVIEW_CHECK_DENIAL_TTL_MS)
       deps.logger.warn(
         `[github] review check skipped for ${key.repo}: GitHub returned ${response.status}. ` +
@@ -222,16 +224,6 @@ export function createReviewCheckLeaseStore(agentDir: string): ReviewCheckLeaseS
 }
 
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 60_000
-
-function isRateLimited(response: Response, text: string): boolean {
-  if (response.status === 429) return true
-  if (response.status !== 403) return false
-  return (
-    response.headers.has('retry-after') ||
-    response.headers.get('x-ratelimit-remaining') === '0' ||
-    /rate limit/i.test(text)
-  )
-}
 
 function rateLimitResetAt(response: Response, now: number): number {
   const retryAfter = Number(response.headers.get('retry-after'))

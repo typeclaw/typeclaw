@@ -44,6 +44,44 @@ test('serializes separate instances without losing unrelated admissions', async 
   expect(await first.list()).toHaveLength(2)
 })
 
+test('recovered admission validates inside the lane before a concurrent close clears it', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  const reading = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+
+  // #when
+  const admission = first.record(entry, async () => {
+    reading.resolve()
+    await resume.promise
+  })
+  await reading.promise
+  const closed = second.clear(entry.repo, entry.prNumber)
+  resume.resolve()
+  await admission
+  await closed
+
+  // #then
+  expect(await first.list()).toEqual([])
+})
+
+test('recovered admission rejected after close cannot recreate pending work', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+  await store.clear(entry.repo, entry.prNumber)
+
+  // #when
+  const admission = store.record(entry, async () => {
+    throw new Error('assignment no longer current')
+  })
+
+  // #then
+  await expect(admission).rejects.toThrow('assignment no longer current')
+  expect(await store.list()).toEqual([])
+})
+
 test('late completion and old admission cannot erase a newer head', async () => {
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record(entry)
@@ -54,11 +92,189 @@ test('late completion and old admission cannot erase a newer head', async () => 
   expect(await store.list()).toEqual([newer])
 })
 
+test('retirement between pre-journal validation and recording consumes a recovered admission', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+
+  // #when: the router is waiting, but must not hold the store lane.
+  const admission = first.admit(
+    entry,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await resume.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+  await second.clear(entry.repo, entry.prNumber)
+  resume.resolve()
+
+  // #then
+  expect(await admission).toBeUndefined()
+  expect(await first.list()).toEqual([])
+})
+
+test('pre-journal validation and concurrent live recording do not invert router and store lanes', async () => {
+  // #given: a live route owns its target lane while recovery validates.
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const targetLane = Promise.withResolvers<void>()
+  const admission = store.admit(
+    entry,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await targetLane.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+
+  // #when: the live route can still obtain the file lane and release its target.
+  await store.record({ ...entry, prNumber: 8, prId: 800 })
+  targetLane.resolve()
+
+  // #then
+  expect(await admission).toBe('enqueued')
+  expect(await store.list()).toHaveLength(2)
+})
+
+test.each(['assignment', 'request'])('withdrawal preserves an in-flight %s before its first record', async (source) => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const routing = Promise.withResolvers<void>()
+  const resume = Promise.withResolvers<void>()
+  const review = { ...entry, ...(source === 'assignment' ? { assignmentTriggered: true as const } : {}) }
+  const admission = store.admit(
+    review,
+    async () => true,
+    async (record) => {
+      routing.resolve()
+      await resume.promise
+      await record()
+      return 'enqueued'
+    },
+  )
+  await routing.promise
+
+  // #when: another obligation's withdrawal arrives before pending work is written.
+  const cleared = await store.clear(
+    entry.repo,
+    entry.prNumber,
+    undefined,
+    source === 'assignment' ? async () => true : undefined,
+    source === 'request' ? async () => true : undefined,
+  )
+  resume.resolve()
+
+  // #then
+  expect(cleared).toBe(false)
+  expect(await admission).toBe('enqueued')
+  expect(await store.list()).toEqual([review])
+})
+
 test('same-head sibling admissions preserve the obligation admission time', async () => {
   const store = await loadPendingReviewStore(agentDir, logger)
   await store.record(entry)
   await store.record({ ...entry, admittedAt: 200 })
   expect(await store.list()).toEqual([entry])
+})
+
+test('assignment admission upgrades the same obligation and survives reload and request admission', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+
+  // #when
+  await store.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+  const reloaded = await loadPendingReviewStore(agentDir, logger)
+  await reloaded.record({ ...entry, admittedAt: 300 })
+
+  // #then
+  expect(await reloaded.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+})
+
+test('an old completion snapshot cannot erase an assignment upgrade', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+
+  // #when
+  await store.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+  await store.clear(entry.repo, entry.prNumber, entry)
+
+  // #then
+  expect(await store.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+})
+
+test.each(['review', 'rereview'] as const)('assignment provenance survives a replacement head for %s', async (kind) => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record({ ...entry, assignmentTriggered: true })
+  const newer = { ...entry, kind, headSha: 'head-two', admittedAt: 200 }
+
+  // #when
+  await store.record(newer)
+
+  // #then
+  expect(await store.list()).toEqual([{ ...newer, assignmentTriggered: true }])
+  expect(await store.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(false)
+})
+
+test.each(['cleared', 'different-pr'] as const)(
+  'assignment provenance does not leak into %s work',
+  async (replacement) => {
+    // #given
+    const store = await loadPendingReviewStore(agentDir, logger)
+    await store.record({ ...entry, assignmentTriggered: true })
+    if (replacement === 'cleared') await store.clear(entry.repo, entry.prNumber)
+    const newer = { ...entry, prId: replacement === 'different-pr' ? 701 : entry.prId, admittedAt: 200 }
+
+    // #when
+    await store.record(newer)
+
+    // #then
+    expect(await store.list()).toEqual([newer])
+    expect(await store.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(true)
+  },
+)
+
+test('a legacy record advancing its head gains no assignment provenance', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  await store.record(entry)
+  const reloaded = await loadPendingReviewStore(agentDir, logger)
+  const newer = { ...entry, headSha: 'head-two', admittedAt: 200 }
+
+  // #when
+  await reloaded.record(newer)
+
+  // #then
+  expect(await reloaded.list()).toEqual([newer])
+  expect(await reloaded.clear(entry.repo, entry.prNumber, undefined, async () => true)).toBe(true)
+})
+
+test('withdrawal sees another instance assignment admission but closure still clears it', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  await first.record(entry)
+  await second.record({ ...entry, admittedAt: 200, assignmentTriggered: true })
+
+  // #when
+  const cleared = await first.clear(entry.repo, entry.prNumber, undefined, async () => true)
+
+  // #then
+  expect(cleared).toBe(false)
+  expect(await first.list()).toEqual([{ ...entry, assignmentTriggered: true }])
+  expect(await second.clear(entry.repo, entry.prNumber)).toBe(true)
+  expect(await first.list()).toEqual([])
 })
 
 test('same-head requester replacement is not cleared by an older snapshot on the same clock', async () => {
@@ -68,6 +284,46 @@ test('same-head requester replacement is not cleared by an older snapshot on the
   await store.record(requested)
   await store.clear(entry.repo, entry.prNumber, entry)
   expect(await store.list()).toEqual([requested])
+})
+
+test('withdrawal serializes its current assignment read before a newer admission', async () => {
+  // #given
+  const first = await loadPendingReviewStore(agentDir, logger)
+  const second = await loadPendingReviewStore(agentDir, logger)
+  await first.record({ ...entry, assignmentTriggered: true })
+  const reading = Promise.withResolvers<void>()
+  const assigned = Promise.withResolvers<boolean>()
+  const newer = { ...entry, headSha: 'head-two', admittedAt: 200, assignmentTriggered: true as const }
+
+  // #when
+  const cleared = first.clear(entry.repo, entry.prNumber, undefined, async () => {
+    reading.resolve()
+    return assigned.promise
+  })
+  await reading.promise
+  const admitted = second.record(newer)
+  assigned.resolve(false)
+  await admitted
+
+  // #then
+  expect(await cleared).toBe(true)
+  expect(await first.list()).toEqual([newer])
+})
+
+test('an unavailable current assignment read leaves pending work intact for redelivery', async () => {
+  // #given
+  const store = await loadPendingReviewStore(agentDir, logger)
+  const assigned = { ...entry, assignmentTriggered: true as const }
+  await store.record(assigned)
+
+  // #when
+  const clear = store.clear(entry.repo, entry.prNumber, undefined, async () => {
+    throw new Error('GitHub unavailable')
+  })
+
+  // #then
+  await expect(clear).rejects.toThrow('GitHub unavailable')
+  expect(await store.list()).toEqual([assigned])
 })
 
 test('ignores malformed rows and tolerates a corrupted file', async () => {

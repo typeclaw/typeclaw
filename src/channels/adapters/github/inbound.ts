@@ -44,12 +44,12 @@ export type GithubWebhookHandlerOptions = {
   // eventAllowlist (the outer "process this webhook?" gate) — this is the inner
   // "does an admitted pull_request event become a review-trigger inbound?" gate.
   reviewOn?: () => GithubReviewOn
-  route: (message: InboundMessage) => Promise<RouteReceipt>
+  route: (message: InboundMessage, validateAdmission?: () => Promise<boolean>) => Promise<RouteReceipt>
   logger: GithubInboundLogger
   // Optional: resolves whether the bot is a member of the given team. When
   // omitted, team-reviewer requests are silently dropped (the v1 fallback
   // behavior). The adapter wires this in production; tests inject a fake.
-  isBotInTeam?: (input: { org: string; slug: string; login: string }) => Promise<boolean>
+  isBotInTeam?: (input: { org: string; slug: string; login: string; requireCurrent?: true }) => Promise<boolean>
   // App-auth only: mints a repo-scoped token used to drop the decoy reviewer
   // once the bot's own review lands. Omitted under PAT auth (no decoy exists).
   authToken?: (context?: GithubAuthContext) => Promise<string>
@@ -69,7 +69,13 @@ export type GithubWebhookHandlerOptions = {
     | { kind: 'no-live-session' }
   >
   clearReconcileCooldown?: (workspace: string, prId: number) => Promise<'cleared' | 'not-initialized'>
-  clearPendingReview?: (workspace: string, prNumber: number) => Promise<void>
+  isCurrentlyAssigned?: (workspace: string, prNumber: number) => Promise<boolean>
+  // False means another current review obligation preserved the work.
+  clearPendingReview?: (
+    workspace: string,
+    prNumber: number,
+    reason?: 'review-request-removed' | 'assignment-removed',
+  ) => Promise<boolean | void>
   reviewSubmitted?: (review: { repo: string; prNumber: number; headSha: string; submittedAt: number }) => Promise<void>
 }
 
@@ -79,6 +85,9 @@ type ReplyReviewRoundResolution =
   | { kind: 'round'; round: GithubReviewFollowupRound }
   | { kind: 'clear' }
   | { kind: 'unknown'; expiresAt: number }
+
+const recoveringDeliveries = new WeakMap<DeliveryDedup, Set<string>>()
+class GithubDeliveryRecoveryInFlightError extends Error {}
 
 export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions): (req: Request) => Promise<Response> {
   return async (req: Request): Promise<Response> => {
@@ -95,7 +104,13 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
     const payload = parseJson(body)
     if (payload === null) return ok()
     // The HTTP request is only transport; event handling is the shared core.
-    await processVerifiedGithubDelivery(options, { event, delivery, payload })
+    try {
+      await processVerifiedGithubDelivery(options, { event, delivery, payload })
+    } catch (error) {
+      if (error instanceof GithubDeliveryRecoveryInFlightError)
+        return new Response('delivery recovery in progress', { status: 503 })
+      throw error
+    }
     return ok()
   }
 }
@@ -110,6 +125,28 @@ export function createGithubWebhookHandler(options: GithubWebhookHandlerOptions)
 // later/duplicate live delivery collapse to one route. HMAC is the caller's job:
 // the live handler verifies the body; the sweep trusts the authenticated API.
 export async function processVerifiedGithubDelivery(
+  options: GithubWebhookHandlerOptions,
+  input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
+): Promise<void> {
+  const { delivery } = input
+  let recovering = recoveringDeliveries.get(options.dedup)
+  if (delivery !== '' && recovering?.has(delivery)) throw new GithubDeliveryRecoveryInFlightError()
+  if (input.recovered !== true || delivery === '') return processGithubDelivery(options, input)
+  if (recovering === undefined) {
+    recovering = new Set()
+    recoveringDeliveries.set(options.dedup, recovering)
+  }
+  // Ownership is not proof of admission. A same-GUID redelivery must stay
+  // retryable until this attempt either admits work or definitively consumes it.
+  recovering.add(delivery)
+  try {
+    await processGithubDelivery(options, input)
+  } finally {
+    recovering.delete(delivery)
+  }
+}
+
+async function processGithubDelivery(
   options: GithubWebhookHandlerOptions,
   input: { event: string; delivery: string; payload: Record<string, unknown>; recovered?: true },
 ): Promise<void> {
@@ -154,20 +191,36 @@ export async function processVerifiedGithubDelivery(
       ))
     }
   }
-  let staleRecoveredRemoval = false
+  let staleRecoveredRequest = false
   // A recovered removal can arrive after a newer re-request was admitted. Applying it
   // would cancel that request's check run and erase its pending replay entry.
-  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'review_request_removed') {
+  if (
+    input.recovered === true &&
+    eventAllowed &&
+    event === 'pull_request' &&
+    (action === 'review_request_removed' || action === 'review_requested')
+  ) {
     const repository = readRepository(payload)
     const prNumber = readNumber(readRecord(payload.pull_request), 'number')
     if (repository !== null && prNumber !== null) {
-      staleRecoveredRemoval = await recoveredReviewerIsRequestedAgain(
+      const currentlyRequested = await recoveredReviewerIsCurrentlyRequested(
         options,
         repository,
         prNumber,
         payload,
         `${repository.owner}/${repository.name}`,
       )
+      staleRecoveredRequest = action === 'review_request_removed' ? currentlyRequested : !currentlyRequested
+    }
+  }
+  let staleRecoveredAssignment = false
+  if (input.recovered === true && eventAllowed && event === 'pull_request' && action === 'assigned') {
+    if (repository !== null && prNumber !== null) {
+      if (options.isCurrentlyAssigned === undefined) throw new Error('recovered assignment check unavailable')
+      staleRecoveredAssignment = !(await options.isCurrentlyAssigned(
+        `${repository.owner}/${repository.name}`,
+        prNumber,
+      ))
     }
   }
   const isSynchronize = event === 'pull_request' && action === 'synchronize'
@@ -178,7 +231,7 @@ export async function processVerifiedGithubDelivery(
     }
     // Reserve the delivery id synchronously before routing awaits so a live
     // webhook and the recovery sweep can never both route the same event. A
-    // recovered draft's retryable freshness read is the sole earlier await; a
+    // recovered event's retryable freshness reads happen before this reservation; a
     // concurrent live delivery reserves here first and wins this dedup check.
     // Synchronize uses its own synchronous,
     // releasable head-SHA reservation so a failed redelivery can retry. JS is
@@ -188,7 +241,7 @@ export async function processVerifiedGithubDelivery(
     options.dedup.add(delivery)
   }
 
-  if (!eventAllowed || staleRecoveredDraft || staleRecoveredRemoval) return
+  if (!eventAllowed || staleRecoveredDraft || staleRecoveredRequest || staleRecoveredAssignment) return
 
   // This control event must run before the self-author drop: a maintainer can
   // draft the bot's PR, and the bot can draft its own PR. Either action must
@@ -233,7 +286,13 @@ export async function processVerifiedGithubDelivery(
     return
   }
 
-  const teamIsBotMember = await resolveTeamMembership(event, payload, options)
+  let teamIsBotMember: boolean | undefined
+  try {
+    teamIsBotMember = await resolveTeamMembership(event, payload, options, input.recovered === true)
+  } catch (error) {
+    options.dedup.delete(delivery)
+    throw error
+  }
   const reviewCommentParent = await resolveReviewCommentParent(event, payload, selfId, selfLogin, options)
   const replyReviewRound = await resolveReplyReviewRound(event, payload, selfLogin, reviewCommentParent, options)
   const classified = classifyGithubInbound(event, payload, selfLogin, {
@@ -243,13 +302,30 @@ export async function processVerifiedGithubDelivery(
     ...(reviewCommentParent !== null ? { reviewCommentParent } : {}),
   })
   if (classified === null) return
-  if (event === 'pull_request' && action === 'review_request_removed') {
+  if (event === 'pull_request' && (action === 'review_request_removed' || action === 'unassigned')) {
     const prNumber = readNumber(readRecord(payload.pull_request), 'number')
     if (prNumber !== null) {
       // Withdrawn work must not survive in the pending log, or the next boot's
       // pending replay reviews a PR nobody asked for anymore.
-      await options.clearPendingReview?.(classified.workspace, prNumber)
-      void githubReviewChecks.cancelPullRequest(classified.workspace, prNumber, 'the review request was removed')
+      let cleared: boolean | void
+      try {
+        cleared = await options.clearPendingReview?.(
+          classified.workspace,
+          prNumber,
+          action === 'unassigned' ? 'assignment-removed' : 'review-request-removed',
+        )
+      } catch (error) {
+        // Current-assignee verification can fail transiently. Let the same
+        // delivery retry rather than permanently consuming the withdrawal.
+        options.dedup.delete(delivery)
+        throw error
+      }
+      if (cleared === false) return
+      void githubReviewChecks.cancelPullRequest(
+        classified.workspace,
+        prNumber,
+        action === 'unassigned' ? 'the review assignment was removed' : 'the review request was removed',
+      )
     }
   }
 
@@ -266,23 +342,52 @@ export async function processVerifiedGithubDelivery(
           }
         : classified
 
-  // GitHub transport acknowledgment is not a durable admission receipt.
-  void Promise.resolve()
-    .then(() =>
-      options.route(
-        withApprovalPolicy(
-          {
-            ...routed,
-            receiptId: delivery,
-            accountIdentity: selfId === null ? undefined : `github:${selfId}`,
-          },
-          options.allowApprove?.() ?? true,
-        ),
+  // Live transport acknowledgment stays detached. Recovery must await admission
+  // so transient failures release the GUID and never enter the recovered log.
+  const admission = Promise.resolve().then(() =>
+    options.route(
+      withApprovalPolicy(
+        {
+          ...routed,
+          receiptId: delivery,
+          accountIdentity: selfId === null ? undefined : `github:${selfId}`,
+        },
+        options.allowApprove?.() ?? true,
       ),
-    )
-    .catch((error: unknown) => {
+      input.recovered === true &&
+        event === 'pull_request' &&
+        (action === 'assigned' || action === 'review_requested') &&
+        repository !== null &&
+        prNumber !== null
+        ? async () => {
+            if (action === 'review_requested') {
+              const requested = await recoveredReviewerIsCurrentlyRequested(
+                options,
+                repository,
+                prNumber,
+                payload,
+                routed.workspace,
+              )
+              return requested && (await resolveTeamMembership(event, payload, options, true)) !== false
+            }
+            if (options.isCurrentlyAssigned === undefined) throw new Error('recovered assignment check unavailable')
+            return options.isCurrentlyAssigned(routed.workspace, prNumber)
+          }
+        : undefined,
+    ),
+  )
+  if (input.recovered === true) {
+    try {
+      await admission
+    } catch (error) {
+      options.dedup.delete(delivery)
+      throw error
+    }
+  } else {
+    void admission.catch((error: unknown) => {
       options.logger.error(`[github] route failed: ${describeError(error)}`)
     })
+  }
 }
 
 export const PR_APPROVAL_DISABLED_NOTE =
@@ -405,21 +510,31 @@ async function recoveredPullRequestIsStillDraft(
   }
 }
 
-async function recoveredReviewerIsRequestedAgain(
+async function recoveredReviewerIsCurrentlyRequested(
   options: GithubWebhookHandlerOptions,
   repository: { owner: string; name: string },
   prNumber: number,
   payload: Record<string, unknown>,
   workspace: string,
 ): Promise<boolean> {
-  const removedLogin = readUser(payload.requested_reviewer)?.login ?? null
-  const removedTeam = readReviewerTeam(payload.requested_team)?.slug ?? null
-  if (removedLogin === null && removedTeam === null) return false
+  const requestedLogin = readUser(payload.requested_reviewer)?.login ?? null
+  const requestedTeam = readReviewerTeam(payload.requested_team)?.slug ?? null
+  if (requestedLogin === null && requestedTeam === null) return false
   if (options.authToken === undefined) {
-    throw new Error(`recovered review request removal check unavailable for ${workspace}#${prNumber}: auth unavailable`)
+    throw new Error(`recovered review request check unavailable for ${workspace}#${prNumber}: auth unavailable`)
   }
   try {
     const token = await options.authToken({ repoSlug: workspace })
+    if (payload.action === 'review_requested') {
+      const response = await (options.fetchImpl ?? fetch)(
+        `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}`,
+        { headers: githubJsonHeaders(token) },
+      )
+      if (!response.ok) throw new Error(`pull request fetch returned ${response.status}`)
+      const state = readString(readRecord(await response.json()), 'state')
+      if (state !== 'open' && state !== 'closed') throw new Error('pull request response missing state')
+      if (state !== 'open') return false
+    }
     const response = await (options.fetchImpl ?? fetch)(
       `${GITHUB_API_BASE}/repos/${repository.owner}/${repository.name}/pulls/${prNumber}/requested_reviewers`,
       { headers: githubJsonHeaders(token) },
@@ -431,17 +546,17 @@ async function recoveredReviewerIsRequestedAgain(
     if (!Array.isArray(current?.users) || !Array.isArray(current?.teams)) {
       throw new Error('requested reviewers response missing users or teams')
     }
-    const requestedAgain =
-      (removedLogin !== null && current.users.some((user) => readUser(user)?.login === removedLogin)) ||
-      (removedTeam !== null && current.teams.some((team) => readReviewerTeam(team)?.slug === removedTeam))
-    if (requestedAgain) {
+    const currentlyRequested =
+      (requestedLogin !== null && current.users.some((user) => readUser(user)?.login === requestedLogin)) ||
+      (requestedTeam !== null && current.teams.some((team) => readReviewerTeam(team)?.slug === requestedTeam))
+    if (currentlyRequested && payload.action === 'review_request_removed') {
       options.logger.info(
         `[github] recovered review request removal skipped for ${workspace}#${prNumber}: reviewer was requested again`,
       )
     }
-    return requestedAgain
+    return currentlyRequested
   } catch (err) {
-    throw new Error(`recovered review request removal check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
+    throw new Error(`recovered review request check failed for ${workspace}#${prNumber}: ${describeError(err)}`)
   }
 }
 
@@ -959,8 +1074,13 @@ export function classifyGithubInbound(
     if (number === null || id === null) return null
     const action = readString(payload, 'action')
     const reviewOn = options?.reviewOn ?? 'review_requested'
-    if (action === 'review_requested' || action === 'review_request_removed') {
-      // `off` disables the dedicated review trigger: these two actions exist
+    if (
+      action === 'review_requested' ||
+      action === 'review_request_removed' ||
+      action === 'assigned' ||
+      action === 'unassigned'
+    ) {
+      // `off` disables the dedicated review trigger: these actions exist
       // only to drive review-request behavior here, so under `off` they wake no
       // session rather than falling through to awareness-only context.
       if (reviewOn === 'off') return null
@@ -1082,7 +1202,7 @@ export function classifyGithubInbound(
 }
 
 type ReviewRequestInput = {
-  action: 'review_requested' | 'review_request_removed'
+  action: 'review_requested' | 'review_request_removed' | 'assigned' | 'unassigned'
   payload: Record<string, unknown>
   pr: Record<string, unknown>
   number: number
@@ -1171,16 +1291,19 @@ function mentionsLogin(text: string, login: string): boolean {
 function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null {
   const { action, payload, pr, number, base, selfLogin, authType, teamIsBotMember } = input
   if (selfLogin === null) return null
+  if (action === 'assigned' && isSelfPr(readUser(pr.user), selfLogin, authType)) return null
   const decoyLogin = resolveDecoyReviewerLogin(selfLogin, authType)
   const sender = readUser(payload.sender)
   if (sender === null) return null
   // Self-loop guard: if the bot (or its decoy) requested/un-requested the
-  // review, drop the event. The bot adding itself as a reviewer would
+  // review or assigned itself, drop the event. The bot adding itself as a reviewer would
   // otherwise wake a fresh session every time it self-assigns.
   if (sender.login === selfLogin || (decoyLogin !== null && sender.login === decoyLogin)) return null
 
-  const requestedUser = readUser(payload.requested_reviewer)
-  const requestedTeam = readReviewerTeam(payload.requested_team)
+  const assignment = action === 'assigned' || action === 'unassigned'
+  const removed = action === 'review_request_removed' || action === 'unassigned'
+  const requestedUser = readUser(assignment ? payload.assignee : payload.requested_reviewer)
+  const requestedTeam = assignment ? null : readReviewerTeam(payload.requested_team)
 
   const isMeAsUser =
     requestedUser !== null &&
@@ -1193,17 +1316,20 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
   const baseRef = readString(readRecord(pr.base), 'ref')
   const branchSegment = head !== null && baseRef !== null ? ` Branch: ${head} → ${baseRef}.` : ''
   const verbed =
-    action === 'review_requested'
-      ? isMyTeam
-        ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
-        : `requested your review on PR #${number}: "${title}".`
-      : isMyTeam
-        ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
-        : `removed your review request on PR #${number}: "${title}".`
-  const closing =
-    action === 'review_requested'
-      ? ' Please review the changes line-by-line and post your feedback.'
-      : ' You can stop any in-progress review.'
+    action === 'assigned'
+      ? `assigned you to review PR #${number}: "${title}".`
+      : action === 'unassigned'
+        ? `removed your review assignment on PR #${number}: "${title}".`
+        : action === 'review_requested'
+          ? isMyTeam
+            ? `requested a review from team @${requestedTeam?.slug} (you're a member of) on PR #${number}: "${title}".`
+            : `requested your review on PR #${number}: "${title}".`
+          : isMyTeam
+            ? `removed the review request for team @${requestedTeam?.slug} on PR #${number}: "${title}".`
+            : `removed your review request on PR #${number}: "${title}".`
+  const closing = !removed
+    ? ' Please review the changes line-by-line and post your feedback.'
+    : ' You can stop any in-progress review.'
   const text = `@${sender.login} ${verbed}${branchSegment}${closing}`
 
   // Synthesize a stable per-event externalMessageId. The PR's `updated_at`
@@ -1220,7 +1346,7 @@ function classifyReviewRequest(input: ReviewRequestInput): InboundMessage | null
     thread: null,
     text,
     externalMessageId,
-    ...(action === 'review_requested' ? pendingReviewMetadata(pr, prId) : {}),
+    ...(!removed ? pendingReviewMetadata(pr, prId) : {}),
     authorId: String(sender.id),
     authorName: sender.login,
     authorIsBot: sender.type === 'Bot',
@@ -1395,6 +1521,7 @@ async function resolveTeamMembership(
   event: string,
   payload: Record<string, unknown>,
   options: GithubWebhookHandlerOptions,
+  requireCurrent = false,
 ): Promise<boolean | undefined> {
   if (event !== 'pull_request') return undefined
   const action = readString(payload, 'action')
@@ -1410,8 +1537,14 @@ async function resolveTeamMembership(
   const org = team.org ?? readRepository(payload)?.owner ?? null
   if (org === null) return false
   try {
-    return await options.isBotInTeam({ org, slug: team.slug, login: selfLogin })
+    return await options.isBotInTeam({
+      org,
+      slug: team.slug,
+      login: selfLogin,
+      ...(requireCurrent ? { requireCurrent: true as const } : {}),
+    })
   } catch (err) {
+    if (requireCurrent) throw err
     options.logger.warn(`[github] team membership lookup failed: ${describeError(err)}`)
     return false
   }

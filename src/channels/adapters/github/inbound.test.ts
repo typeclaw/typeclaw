@@ -382,6 +382,42 @@ describe('classifyGithubInbound', () => {
   })
 
   describe('pull_request.review_request_removed', () => {
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw[bot]'],
+      ['app', 'typeclaw[bot]', 'typeclaw'],
+    ] as const)(
+      'classifies removal under %s auth independently of %s assigned as %s',
+      (authType, selfLogin, assigneeLogin) => {
+        // #given
+        const payload = reviewRequestRemovedPayload({
+          reviewerLogin: authType === 'app' ? 'typeclaw' : selfLogin,
+        })
+        ;(payload.pull_request as Record<string, unknown>).assignees = [
+          { login: 'someone-else', id: 10, type: 'User' },
+          { login: assigneeLogin, id: 99, type: 'User' },
+        ]
+
+        // #when
+        const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+
+        // #then
+        expect(msg?.text).toContain('You can stop any in-progress review.')
+      },
+    )
+
+    it('still emits a cleanup signal when only another user remains assigned', () => {
+      // #given
+      const payload = reviewRequestRemovedPayload({ reviewerLogin: 'typeclaw-bot' })
+      ;(payload.pull_request as Record<string, unknown>).assignees = [{ login: 'someone-else', id: 10, type: 'User' }]
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+
+      // #then
+      expect(msg?.text).toContain('You can stop any in-progress review.')
+    })
+
     it('emits a cleanup signal when the bot is un-requested', () => {
       const msg = classifyGithubInbound(
         'pull_request',
@@ -456,6 +492,142 @@ describe('classifyGithubInbound', () => {
       ;(payload.sender as Record<string, unknown>).login = 'typeclaw'
       const msg = classifyGithubInbound('pull_request', payload, 'typeclaw[bot]', { authType: 'app' })
       expect(msg).toBe(null)
+    })
+  })
+
+  describe('pull_request.assigned', () => {
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw'],
+    ] as const)('engages %s when assigned to its review identity', (authType, selfLogin, assigneeLogin) => {
+      // #given
+      const payload = assignedPayload(assigneeLogin)
+      const requested = reviewRequestedPayload({ reviewerLogin: assigneeLogin })
+      requested.pull_request = payload.pull_request
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+      const review = classifyGithubInbound('pull_request', requested, selfLogin, { authType })
+
+      // #then
+      expect(msg?.chat).toBe('pr:7')
+      expect(msg?.thread).toBe(null)
+      expect(msg?.isBotMention).toBe(true)
+      expect(msg?.authorName).toBe('alice')
+      expect(msg?.text).toContain('@alice assigned you to review PR #7')
+      expect(msg?.text).toContain('feat-branch → main')
+      expect(msg?.text).toContain('Please review the changes line-by-line')
+      expect(msg?.eventKind).toBe('pull_request:assigned')
+      expect(msg?.externalMessageId).toBe('pr-700-assigned-2026-01-01T00:00:00Z')
+      expect(msg?.externalMessageId).not.toBe(review?.externalMessageId)
+      expect(msg?.githubPendingReview).toEqual({ prId: 700, headSha: 'head-one', kind: 'review' })
+      expect(msg?.githubPendingReview).toEqual(review?.githubPendingReview)
+    })
+
+    it.each(['pat', 'app'] as const)('ignores assignments to another user under %s auth', (authType) => {
+      // #given
+      const payload = assignedPayload('someone-else')
+      // A review request field on an assignment must never select the target.
+      payload.requested_reviewer = { login: 'typeclaw-bot', id: 99, type: 'User' }
+      payload.requested_team = { slug: 'reviewers', id: 5000 }
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot', {
+        authType,
+        teamIsBotMember: true,
+      })
+
+      // #then
+      expect(msg).toBe(null)
+    })
+
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw[bot]'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw'],
+    ] as const)('drops %s self-assignment by %s to %s from %s', (authType, selfLogin, assigneeLogin, senderLogin) => {
+      // #given
+      const payload = assignedPayload(assigneeLogin)
+      payload.sender = { login: senderLogin, id: 99, type: 'User' }
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+
+      // #then
+      expect(msg).toBe(null)
+    })
+
+    it.each([
+      ['pat', 'typeclaw-bot', 'typeclaw-bot', 'typeclaw-bot'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw[bot]'],
+      ['app', 'typeclaw[bot]', 'typeclaw', 'typeclaw'],
+    ] as const)(
+      'drops a human assignment under %s auth with self %s and assignee %s on a PR authored by %s',
+      (authType, selfLogin, assigneeLogin, openerLogin) => {
+        // #given
+        const payload = assignedPayload(assigneeLogin)
+        ;(payload.pull_request as Record<string, unknown>).user = { login: openerLogin, id: 99, type: 'User' }
+
+        // #when
+        const msg = classifyGithubInbound('pull_request', payload, selfLogin, { authType })
+
+        // #then
+        expect(msg).toBe(null)
+      },
+    )
+
+    it('does not derive a decoy under PAT auth', () => {
+      // #given
+      const payload = assignedPayload('typeclaw')
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw[bot]', { authType: 'pat' })
+
+      // #then
+      expect(msg).toBe(null)
+    })
+
+    it.each(['review_requested', 'opened', 'off'] as const)('honors review.on %s', (reviewOn) => {
+      // #given
+      const payload = assignedPayload('typeclaw-bot')
+
+      // #when
+      const msg = classifyGithubInbound('pull_request', payload, 'typeclaw-bot', { reviewOn })
+
+      // #then
+      if (reviewOn === 'off') expect(msg).toBe(null)
+      else expect(msg?.githubPendingReview).toEqual({ prId: 700, headSha: 'head-one', kind: 'review' })
+    })
+
+    it('ignores an assignment without an assignee or known self login', () => {
+      // #given
+      const payload = assignedPayload('typeclaw-bot')
+      const withoutAssignee = { ...payload, assignee: undefined }
+
+      // #when
+      const unknownSelf = classifyGithubInbound('pull_request', payload, null)
+      const unknownAssignee = classifyGithubInbound('pull_request', withoutAssignee, 'typeclaw-bot')
+
+      // #then
+      expect(unknownSelf).toBe(null)
+      expect(unknownAssignee).toBe(null)
+    })
+
+    it('treats unusual assignee and sender logins as literal data', () => {
+      // #given
+      const unusualLogin = 'typeclaw-bot.*[리뷰]$(echo injected)'
+      const payload = assignedPayload(unusualLogin)
+      payload.sender = { login: 'reviewer[검토];$(echo injected)', id: 10, type: 'User' }
+
+      // #when
+      const unrelated = classifyGithubInbound('pull_request', payload, 'typeclaw-bot')
+      const exact = classifyGithubInbound('pull_request', payload, unusualLogin)
+
+      // #then
+      expect(unrelated).toBe(null)
+      expect(exact?.isBotMention).toBe(true)
+      expect(exact?.authorName).toBe('reviewer[검토];$(echo injected)')
+      expect(exact?.text).toContain('@reviewer[검토];$(echo injected) assigned you to review')
     })
   })
 
@@ -945,6 +1117,124 @@ describe('createGithubWebhookHandler — review.on wiring', () => {
     expect(routed[0]?.isBotMention).toBe(true)
     expect(routed[0]?.text).toContain('Please review the changes line-by-line')
   })
+})
+
+describe('createGithubWebhookHandler — pull_request.assigned', () => {
+  it('retries the same removal delivery after current assignment verification fails', async () => {
+    // #given
+    const routed: InboundMessage[] = []
+    let reads = 0
+    const handler = createGithubWebhookHandler({
+      webhookSecret: 'secret',
+      dedup: createDeliveryDedup(),
+      allowlist: () => [...DEFAULT_GITHUB_EVENT_ALLOWLIST],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      logger,
+      clearPendingReview: async () => {
+        if (++reads === 1) throw new Error('GitHub pending assignees 503')
+        return true
+      },
+      route: async (message) => {
+        routed.push(message)
+        return { kind: 'observed' }
+      },
+    })
+    const request = () =>
+      signedRequest(
+        JSON.stringify(reviewRequestRemovedPayload({ reviewerLogin: 'typeclaw-bot' })),
+        'pull_request',
+        'retry-removal',
+      )
+
+    // #when
+    await expect(handler(request())).rejects.toThrow('GitHub pending assignees 503')
+    await handler(request())
+    await handler(request())
+
+    // #then
+    expect(reads).toBe(2)
+    expect(routed).toHaveLength(1)
+    expect(routed[0]?.text).toContain('You can stop any in-progress review.')
+  })
+
+  it.each([
+    ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+    ['app', 'typeclaw[bot]', 'typeclaw[bot]'],
+    ['app', 'typeclaw[bot]', 'typeclaw'],
+  ] as const)(
+    'preserves admitted assignment work under %s auth for %s via %s',
+    async (authType, selfLogin, reviewerLogin) => {
+      // #given
+      const routed: InboundMessage[] = []
+      const withdrawals: unknown[][] = []
+      const handler = createGithubWebhookHandler({
+        webhookSecret: 'secret',
+        dedup: createDeliveryDedup(),
+        allowlist: () => [...DEFAULT_GITHUB_EVENT_ALLOWLIST],
+        selfId: () => '99',
+        selfLogin: () => selfLogin,
+        authType: () => authType,
+        logger,
+        clearPendingReview: async (...args) => {
+          withdrawals.push(args)
+          return false
+        },
+        route: async (msg) => {
+          routed.push(msg)
+          return { kind: 'observed' }
+        },
+      })
+
+      // #when
+      await handler(
+        signedRequest(
+          JSON.stringify(reviewRequestRemovedPayload({ reviewerLogin })),
+          'pull_request',
+          'assigned-removal',
+        ),
+      )
+
+      // #then
+      expect(withdrawals).toEqual([['acme/project', 7, 'review-request-removed']])
+      expect(routed).toHaveLength(0)
+    },
+  )
+
+  it.each([
+    ['pat', 'typeclaw-bot', 'typeclaw-bot'],
+    ['app', 'typeclaw[bot]', 'typeclaw'],
+  ] as const)(
+    'routes a signed %s assignment through the default allowlist',
+    async (authType, selfLogin, assigneeLogin) => {
+      // #given
+      const routed: InboundMessage[] = []
+      const handler = createGithubWebhookHandler({
+        webhookSecret: 'secret',
+        dedup: createDeliveryDedup(),
+        allowlist: () => [...DEFAULT_GITHUB_EVENT_ALLOWLIST],
+        selfId: () => '99',
+        selfLogin: () => selfLogin,
+        authType: () => authType,
+        logger,
+        route: async (msg) => {
+          routed.push(msg)
+          return { kind: 'observed' as const }
+        },
+      })
+
+      // #when
+      const response = await handler(
+        signedRequest(JSON.stringify(assignedPayload(assigneeLogin)), 'pull_request', `assigned-${authType}`),
+      )
+
+      // #then
+      expect(response.status).toBe(200)
+      expect(routed).toHaveLength(1)
+      expect(routed[0]?.isBotMention).toBe(true)
+      expect(routed[0]?.githubPendingReview).toEqual({ prId: 700, headSha: 'head-one', kind: 'review' })
+    },
+  )
 })
 
 describe('createGithubWebhookHandler — pull_request.opened lands as context', () => {
@@ -2949,6 +3239,18 @@ function reviewRequestedPayload(options: {
     repository: repo(),
     pull_request,
     requested_reviewer: { login: options.reviewerLogin, id: 42, type: 'User' },
+    sender: { login: 'alice', id: 10, type: 'User' },
+  }
+}
+
+function assignedPayload(assigneeLogin: string): Record<string, unknown> {
+  const pull_request = pullRequestForReview('2026-01-01T00:00:00Z')
+  pull_request.head = { ref: 'feat-branch', sha: 'head-one' }
+  return {
+    action: 'assigned',
+    repository: repo(),
+    pull_request,
+    assignee: { login: assigneeLogin, id: 42, type: 'User' },
     sender: { login: 'alice', id: 10, type: 'User' },
   }
 }

@@ -58,7 +58,7 @@ private key conversationally or read the resulting secret store.
 
 ## Scope events to pull-request activity
 
-The default GitHub event allowlist already covers reviews. If you want to narrow it to just the review path, the relevant events are `pull_request.review_requested`, `pull_request.review_request_removed`, `pull_request_review.submitted`, and `pull_request_review_comment.created` — keep `review_request_removed` so the agent still sees when a review request is withdrawn. Tell the agent to tighten `channels.github.eventAllowlist`, or adjust it and run `typeclaw reload`. See the [`github` adapter reference](/docs/reference/github) for the full event list.
+The default GitHub event allowlist already covers reviews. If you want to narrow it to just the review path, the relevant events are `pull_request.review_requested`, `pull_request.assigned`, `pull_request.unassigned`, `pull_request.review_request_removed`, `pull_request_review.submitted`, and `pull_request_review_comment.created` — keep `assigned` so assigning the PR to the agent still wakes it, and keep `unassigned` and `review_request_removed` so withdrawing both requests stops the review in either order. Tell the agent to tighten `channels.github.eventAllowlist`, or adjust it and run `typeclaw reload`. See the [`github` adapter reference](/docs/reference/github) for the full event list.
 
 <Callout type="info" title="App permissions">
   Grant the permissions in the [GitHub App permissions table](/docs/reference/github#app-permissions). For this recipe,
@@ -82,10 +82,10 @@ So for an App whose bot actor is `my-app[bot]`, create a real GitHub user accoun
 
 This is exactly how `@typeey` works: the App's bot actor is `typeey[bot]`, so the decoy account is the real user [`@typeey`](https://github.com/typeey). Requesting `@typeey` on a PR is what wakes the agent.
 
-<Callout type="warn" title="The decoy is the only review trigger">
-  Requesting the decoy (or the bot's team) is the **only** thing that fires a review under App auth. There is no "review
-  every opened PR" behavior — a `pull_request.opened` event lands as awareness-only context. The wake path is
-  `review_requested`, not the assignee `assigned` field.
+<Callout type="warn" title="Request or assign the decoy to trigger a review">
+  Under App auth, a review fires when you request the decoy (or the bot's team) as a reviewer, or assign the PR to the
+  decoy. With the default `review.on: "review_requested"` there is no "review every opened PR" behavior. A
+  `pull_request.opened` event lands as awareness-only context. The wake paths are `review_requested` and `assigned`.
 </Callout>
 
 <Callout type="info" title="When the slug login was taken">

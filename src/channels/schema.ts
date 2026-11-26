@@ -190,6 +190,8 @@ export const DEFAULT_GITHUB_EVENT_ALLOWLIST = [
   'pull_request.converted_to_draft',
   'pull_request.ready_for_review',
   'pull_request.review_requested',
+  'pull_request.assigned',
+  'pull_request.unassigned',
   'pull_request.review_request_removed',
   'pull_request.synchronize',
   'discussion.created',
@@ -254,6 +256,39 @@ const GITHUB_EVENT_ALLOWLIST_V4 = [
   'pull_request_review.submitted',
 ] as const
 
+//   - v5: added converted_to_draft (the default just before assigned was added).
+const GITHUB_EVENT_ALLOWLIST_V5 = [
+  'issue_comment.created',
+  'pull_request_review_comment.created',
+  'discussion_comment.created',
+  'issues.opened',
+  'pull_request.opened',
+  'pull_request.converted_to_draft',
+  'pull_request.ready_for_review',
+  'pull_request.review_requested',
+  'pull_request.review_request_removed',
+  'pull_request.synchronize',
+  'discussion.created',
+  'pull_request_review.submitted',
+] as const
+
+//   - v6: added assigned (the default just before unassigned was added).
+const GITHUB_EVENT_ALLOWLIST_V6 = [
+  'issue_comment.created',
+  'pull_request_review_comment.created',
+  'discussion_comment.created',
+  'issues.opened',
+  'pull_request.opened',
+  'pull_request.converted_to_draft',
+  'pull_request.ready_for_review',
+  'pull_request.review_requested',
+  'pull_request.assigned',
+  'pull_request.review_request_removed',
+  'pull_request.synchronize',
+  'discussion.created',
+  'pull_request_review.submitted',
+] as const
+
 // Every event-allowlist that `channel add` / `init` has ever seeded verbatim
 // into typeclaw.json, oldest first, current default last. The legacy-shape
 // migration uses this to tell a seeded default (safe to strip so the config
@@ -266,6 +301,8 @@ export const SEEDED_GITHUB_EVENT_ALLOWLISTS: readonly (readonly string[])[] = [
   GITHUB_EVENT_ALLOWLIST_V2,
   GITHUB_EVENT_ALLOWLIST_V3,
   GITHUB_EVENT_ALLOWLIST_V4,
+  GITHUB_EVENT_ALLOWLIST_V5,
+  GITHUB_EVENT_ALLOWLIST_V6,
   DEFAULT_GITHUB_EVENT_ALLOWLIST,
 ]
 
@@ -273,7 +310,7 @@ export const SEEDED_GITHUB_EVENT_ALLOWLISTS: readonly (readonly string[])[] = [
 // event values are GitHub's bare PR action names (the `pull_request.` event
 // prefix is implied by this field living under the review config); `off` is the
 // disable sentinel, matching the `engagement.stickiness: 'off'` convention:
-//   - 'review_requested' — review only when the bot is requested (default)
+//   - 'review_requested' — review only when the bot is requested or assigned (default)
 //   - 'opened'           — review every non-draft PR as soon as it opens; a draft
 //                          PR wakes no session and is reviewed once it turns ready
 //                          (ready_for_review) or the bot is explicitly requested

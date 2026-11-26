@@ -95,6 +95,69 @@ function baseOptions(
 }
 
 describe('recoverFailedGithubDeliveries', () => {
+  test('admission-time failure leaves both GUID logs retryable until one review is enqueued', async () => {
+    // #given
+    const dedup = createDeliveryDedup()
+    const recoveredLog = createRecoveredGuidLog(LOOKBACK_MS, () => NOW)
+    const payload = {
+      action: 'assigned',
+      repository: { name: 'widgets', owner: { login: 'acme' } },
+      pull_request: {
+        number: 17,
+        id: 1700,
+        state: 'open',
+        title: 'A change',
+        user: { login: 'alice', id: 10, type: 'User' },
+        head: { sha: 'head-one', ref: 'feature' },
+        base: { ref: 'main' },
+      },
+      assignee: { login: 'typeclaw-bot', id: 99, type: 'User' },
+      sender: { login: 'alice', id: 10, type: 'User' },
+    }
+    const api = fakeDeliveriesApi({
+      byHook: { 1: [{ id: 11, guid: 'retry-admission', event: 'pull_request', statusCode: 502, payload }] },
+    })
+    let reads = 0
+    let enqueued = 0
+    const handlerOptions: GithubWebhookHandlerOptions = {
+      webhookSecret: 'unused-by-recovery',
+      dedup,
+      allowlist: () => ['pull_request.assigned'],
+      selfId: () => '99',
+      selfLogin: () => 'typeclaw-bot',
+      isCurrentlyAssigned: async () => {
+        if (++reads === 2) throw new Error('GitHub pending assignees 503')
+        return true
+      },
+      route: async (_message, validateAdmission) => {
+        await validateAdmission?.()
+        enqueued++
+        return { kind: 'observed' }
+      },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    }
+    const options = baseOptions({
+      routed: [],
+      fetchImpl: api.fetch,
+      recoveredLog,
+      alreadySeen: (guid) => dedup.has(guid),
+      process: (input) => processVerifiedGithubDelivery(handlerOptions, input),
+    })
+
+    // #when
+    expect((await recoverFailedGithubDeliveries(options)).recovered).toBe(0)
+
+    // #then
+    expect(dedup.has('retry-admission')).toBe(false)
+    expect(recoveredLog.has('retry-admission')).toBe(false)
+    expect(enqueued).toBe(0)
+    expect((await recoverFailedGithubDeliveries(options)).recovered).toBe(1)
+    expect(dedup.has('retry-admission')).toBe(true)
+    expect(recoveredLog.has('retry-admission')).toBe(true)
+    expect((await recoverFailedGithubDeliveries(options)).recovered).toBe(0)
+    expect(enqueued).toBe(1)
+  })
+
   test('routes a failed delivery once, feeding the original event + payload through process', async () => {
     const routed: Routed[] = []
     const { fetch: fetchImpl } = fakeDeliveriesApi({

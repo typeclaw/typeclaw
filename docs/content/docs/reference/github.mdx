@@ -228,7 +228,7 @@ These extend the [shared base config](/docs/reference/channel-adapters) for `cha
 | ---------------- | ----------------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `webhookUrl`     | string                                    | —                    | Public URL for webhook delivery; tunnel used when omitted                                                        |
 | `webhookPort`    | number                                    | `8975`               | Container-side port the webhook server listens on                                                                |
-| `eventAllowlist` | string[]                                  | (12 defaults)        | Events that trigger the adapter                                                                                  |
+| `eventAllowlist` | string[]                                  | (13 defaults)        | Events that trigger the adapter                                                                                  |
 | `repos`          | string[]                                  | `[]`                 | `owner/name` pairs; hooks auto-registered on start; members may push branches to them (see below)                |
 | `review.on`      | `'review_requested' \| 'opened' \| 'off'` | `'review_requested'` | When to fire a review                                                                                            |
 | `review.approve` | boolean                                   | `true`               | `false` downgrades APPROVE verdicts to COMMENT; a re-review that clears the bot's own block dismisses it instead |
@@ -245,6 +245,8 @@ pull_request.opened
 pull_request.converted_to_draft
 pull_request.ready_for_review
 pull_request.review_requested
+pull_request.assigned
+pull_request.unassigned
 pull_request.review_request_removed
 pull_request.synchronize
 discussion.created
@@ -268,11 +270,46 @@ pull_request_review.submitted
 
 ## Review behavior
 
-Reviews fire on the event named in `review.on` (default `review_requested`).
+With `review.on: "review_requested"` (the default), an explicit review request
+or PR assignment starts a review.
 
-- **PAT mode**: the bot is requested by its GitHub login.
-- **App mode**: request the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer.
+- **PAT mode**: request the bot as a reviewer or assign the PR to its exact GitHub login.
+- **App mode**: request or assign the [decoy user account](/docs/internals/github-decoy-reviewer); the App itself can't be a reviewer or assignee.
 - Team-reviewer requests are honored when the bot is a member of the requested team.
+
+`pull_request.assigned` uses the same review engagement, pending-review log,
+and review-check path as `pull_request.review_requested`. Assignments to other
+users are ignored. Assignments sent by the bot or its App decoy are dropped to
+prevent self-review loops. Assignees on issues do not trigger PR reviews.
+
+`review.on: "opened"` additionally reviews non-draft PRs when they open or
+become ready; explicit requests and assignments still work. `review.on: "off"`
+disables all dedicated review triggers, including assignments.
+
+The default `eventAllowlist` includes `pull_request.assigned` and
+`pull_request.unassigned`. If you maintain a custom list, include both to enable
+assignment reviews and their withdrawal. Restart after adding
+it if the previous list had no `pull_request.*` events, so the repository hook
+subscribes to `pull_request`.
+
+Withdrawing a reviewer request preserves work only when an admitted assignment
+still applies. Unassigning the bot or its App decoy checks current assignees and
+requested users and teams through GitHub's API. When both requests have been
+withdrawn, either order clears pending work, cancels its check, and tells the
+agent to stop; it cannot replay on restart. Failed current-state reads remain
+retryable. Recovered assignment and reviewer-request deliveries also require the
+PR to be currently open before starting work.
+
+Assignment reviews depend on the `pull_request.assigned` webhook delivery
+reaching the adapter. Once a delivery is admitted, the pending-review log covers
+restarts like any other trigger. Before admission there's no catch-up: the
+[missed review catch-up](#missed-review-catch-up) scan only looks at requested
+users and teams, because the open PR listing shows current assignees but not
+who assigned them or which event did it. Without that, the scan can't apply the
+self-assignment and decoy checks above. If a delivery is lost and the failed
+delivery sweep can't redeliver it (a manually managed hook, for example), the PR
+stays assigned without a review. To retrigger it, unassign the bot and assign it
+again, or request its review.
 
 ### Draft transitions
 

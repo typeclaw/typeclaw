@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
+import { z } from 'zod'
+
 import { githubReviewChecks } from '@/channels/github-review-check'
 import { observeVerifiedDismissals } from '@/channels/github-review-turn-ledger'
 import type { GithubTokenBridge } from '@/channels/github-token-bridge'
@@ -18,12 +20,18 @@ import { describeError } from '../../describe-error'
 import { canonicalGithubRepo } from '../../github-repo'
 import { withOutboundAccount } from '../outbound-account'
 import { buildAuthStrategy, type GithubAuthContext } from './auth'
+import { GITHUB_API_BASE, githubJsonHeaders } from './auth-pat'
 import { createGithubChannelNameResolver } from './channel-resolver'
 import { createDeliveryDedup } from './dedup'
 import { findPermissionGaps } from './event-permissions'
 import { createGithubFetchAttachmentCallback } from './fetch-attachment'
 import { createChatWorkspaceIndex, createGithubHistoryCallback } from './history'
-import { createGithubWebhookHandler, processVerifiedGithubDelivery, type GithubWebhookHandlerOptions } from './inbound'
+import {
+  createGithubWebhookHandler,
+  processVerifiedGithubDelivery,
+  resolveBotMentionLogins,
+  type GithubWebhookHandlerOptions,
+} from './inbound'
 import { readGithubLastAlive, writeGithubLastAlive } from './last-alive'
 import { applyManagedPath, buildManagedPath, resolveAgentId } from './managed-path'
 import { createGithubMembershipResolver } from './membership'
@@ -289,35 +297,81 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
   const typing = async (): Promise<void> => {}
   const dedup = createDeliveryDedup()
   const isBotInTeam = createTeamMembershipChecker({ token: authToken, fetchImpl })
+  const isCurrentlyAssigned = async (workspace: string, prNumber: number): Promise<boolean> => {
+    const token = await authToken({ repoSlug: workspace })
+    const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}`, {
+      headers: githubJsonHeaders(token),
+    })
+    if (!response.ok) throw new Error(`GitHub pending assignees ${response.status}`)
+    const current = z
+      .object({ state: z.enum(['open', 'closed']), assignees: z.array(z.object({ login: z.string() })) })
+      .parse(await response.json())
+    const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
+    return current.state === 'open' && current.assignees.some((assignee) => logins.includes(assignee.login))
+  }
+  const isCurrentlyRequested = async (workspace: string, prNumber: number): Promise<boolean> => {
+    const token = await authToken({ repoSlug: workspace })
+    const response = await fetchImpl(`${GITHUB_API_BASE}/repos/${workspace}/pulls/${prNumber}/requested_reviewers`, {
+      headers: githubJsonHeaders(token),
+    })
+    if (!response.ok) throw new Error(`GitHub pending reviewers ${response.status}`)
+    const current = z
+      .object({
+        users: z.array(z.object({ login: z.string() })),
+        teams: z.array(z.object({ slug: z.string() })),
+      })
+      .parse(await response.json())
+    const logins = resolveBotMentionLogins(selfLogin, options.secrets.auth.type)
+    if (current.users.some((user) => logins.includes(user.login))) return true
+    for (const team of current.teams) {
+      if (
+        selfLogin !== null &&
+        (await isBotInTeam({ org: workspace.split('/')[0]!, slug: team.slug, login: selfLogin, requireCurrent: true }))
+      )
+        return true
+    }
+    return false
+  }
   // Shared inbound entry. Both the live webhook handler and the startup
   // reconciliation pass route through this so a replayed PR takes the exact
   // same path a real delivery would.
-  const routeInbound = async (message: InboundMessage): Promise<RouteReceipt> => {
+  const routeInbound = async (
+    message: InboundMessage,
+    validateAdmission?: () => Promise<boolean>,
+  ): Promise<RouteReceipt> => {
     rememberWorkspace(message.workspace, message.chat)
     const store = pendingReviewStore
     const pending = message.githubPendingReview
     const prNumber = /^pr:(\d+)$/.exec(message.chat)?.[1]
-    // The webhook handler schedules this outside its acknowledgment path.
-    const receipt = await options.router.route(
-      {
-        ...message,
-        accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
-        eventKind: message.eventKind ?? 'review-followup',
-        revision: message.revision ?? 'original',
-      },
-      store !== null && pending !== undefined && prNumber !== undefined
-        ? () =>
-            store.record({
-              repo: message.workspace,
-              prNumber: Number(prNumber),
-              ...pending,
-              admittedAt: Date.now(),
-              authorId: message.authorId,
-              authorName: message.authorName,
-              authorIsBot: message.authorIsBot,
-            })
-        : undefined,
-    )
+    const pendingEntry =
+      pending !== undefined && prNumber !== undefined
+        ? {
+            repo: message.workspace,
+            prNumber: Number(prNumber),
+            ...pending,
+            admittedAt: Date.now(),
+            authorId: message.authorId,
+            authorName: message.authorName,
+            authorIsBot: message.authorIsBot,
+            ...(message.eventKind === 'pull_request:assigned' ? { assignmentTriggered: true as const } : {}),
+          }
+        : undefined
+    const route = (onAdmitted?: () => Promise<void>) =>
+      options.router.route(
+        {
+          ...message,
+          accountIdentity: message.accountIdentity ?? (selfId === null ? undefined : `github:${selfId}`),
+          eventKind: message.eventKind ?? 'review-followup',
+          revision: message.revision ?? 'original',
+        },
+        onAdmitted,
+      )
+    // Recovered validation may fail transiently: it must precede the router's
+    // journal, and finish before the sweep records this delivery as recovered.
+    const receipt =
+      store !== null && pendingEntry !== undefined && validateAdmission !== undefined
+        ? ((await store.admit(pendingEntry, validateAdmission, route)) ?? { kind: 'denied' as const })
+        : await route(store !== null && pendingEntry !== undefined ? () => store.record(pendingEntry) : undefined)
     // Only newly accepted work runs in this process. The router also invokes the admission
     // callback for an open duplicate, such as a redelivered trigger from a process that died.
     if (receipt.kind === 'accepted' && pending !== undefined && prNumber !== undefined)
@@ -338,10 +392,16 @@ export function createGithubAdapter(options: GithubAdapterOptions): GithubAdapte
     fetchImpl,
     logger,
     route: routeInbound,
+    isCurrentlyAssigned,
     abortGithubPrTurn: options.router.abortGithubPrTurn,
-    clearPendingReview: async (workspace, prNumber) => {
-      await pendingReviewStore?.clear(workspace, prNumber)
-    },
+    clearPendingReview: async (workspace, prNumber, reason) =>
+      pendingReviewStore?.clear(
+        workspace,
+        prNumber,
+        undefined,
+        reason !== undefined ? () => isCurrentlyAssigned(workspace, prNumber) : undefined,
+        reason === 'assignment-removed' ? () => isCurrentlyRequested(workspace, prNumber) : undefined,
+      ),
     reviewSubmitted: async (review) => {
       if (pendingReviewStore !== null) await completePendingReview(pendingReviewStore, review, authToken, fetchImpl)
     },
@@ -886,6 +946,7 @@ const REVIEW_TRIGGER_EVENT_KINDS: ReadonlySet<string> = new Set([
   'pull_request:opened',
   'pull_request:ready_for_review',
   'pull_request:review_requested',
+  'pull_request:assigned',
   'pull_request:synchronize:review-followup',
   'pull_request:reconcile',
   'pull_request:reconcile:rereview',
