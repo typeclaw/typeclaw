@@ -17,6 +17,7 @@ import { noopPermissionService } from '@/permissions'
 import { createHookBus, type ChannelMessageObservedEvent } from '@/plugin'
 
 import {
+  createAgentSessionStoppedHandler,
   createOutboundCallback,
   createSlackBotAdapter,
   createSlackHistoryCallback,
@@ -3281,6 +3282,97 @@ describe('createThreadCommandHandler', () => {
     const kinds = [a.kind, b.kind].sort()
     expect(kinds).toEqual(['duplicate', 'executed'])
     expect(executions).toBe(1)
+  })
+})
+
+describe('createAgentSessionStoppedHandler', () => {
+  type Result = Awaited<ReturnType<ChannelRouter['executeCommand']>>
+
+  function setup(result: Result) {
+    const routerCalls: Array<{ key: ChannelKey; name: string; invokerId: string }> = []
+    const handler = createAgentSessionStoppedHandler({
+      router: {
+        executeCommand: async (key, name, options) => {
+          routerCalls.push({ key, name, invokerId: options.invokerId })
+          return result
+        },
+      },
+      teamId: () => 'T-acme',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    })
+    return { handler, routerCalls }
+  }
+
+  test('a click stops the exact session thread as the clicking user', async () => {
+    const { handler, routerCalls } = setup({ kind: 'handled', name: 'stop' })
+
+    await handler(
+      { type: 'agent_session_stopped', channel: 'C-general', thread_ts: '1700.0001', user: 'U-alice' },
+      'Ev1',
+    )
+
+    expect(routerCalls).toEqual([
+      {
+        key: { adapter: 'slack-bot', workspace: 'T-acme', chat: 'C-general', thread: '1700.0001' },
+        name: 'stop',
+        invokerId: 'U-alice',
+      },
+    ])
+  })
+
+  test('a DM click targets the flat DM session, not the status anchor message', async () => {
+    const { handler, routerCalls } = setup({ kind: 'handled', name: 'stop' })
+
+    await handler({ type: 'agent_session_stopped', channel: 'D-alice', thread_ts: '1700.0001', user: 'U-alice' }, 'Ev1')
+
+    expect(routerCalls[0]!.key).toEqual({ adapter: 'slack-bot', workspace: '@dm', chat: 'D-alice', thread: null })
+  })
+
+  test('an event without a thread is dropped without running /stop', async () => {
+    const { handler, routerCalls } = setup({ kind: 'handled', name: 'stop' })
+
+    await handler({ type: 'agent_session_stopped', channel: 'C-general', user: 'U-alice' }, 'Ev1')
+
+    expect(routerCalls).toHaveLength(0)
+  })
+
+  test('a Slack retry of the same click under a new envelope does not stop a newer turn', async () => {
+    // given an adapter whose stop handler sees deliveries through the real listener wiring
+    const listener = new FakeSlackBotListener()
+    const stops: string[] = []
+    const router = lifecycleRouter()
+    router.executeCommand = async (key) => {
+      stops.push(String(key.thread))
+      return { kind: 'handled', name: 'stop' }
+    }
+    const adapter = createSlackBotAdapter({
+      router,
+      configRef: () => channelsSchema.parse({ 'slack-bot': {} })['slack-bot']!,
+      token: 'xoxb-test',
+      appToken: 'xapp-test',
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      fetchImpl: (async () => new Response('{"ok":true}')) as unknown as typeof fetch,
+      createClient: () =>
+        ({
+          login: async () => {},
+          testAuth: async () => ({ user_id: 'U0123456789', team_id: 'T0123456789' }),
+        }) as unknown as SlackBotClient,
+      createListener: () => listener as unknown as SlackBotListener,
+    })
+    await adapter.start()
+    const event = { type: 'agent_session_stopped', channel: 'C-general', thread_ts: '1700.0001', user: 'U-alice' }
+    const deliver = (envelopeId: string): void =>
+      listener.emit('slack_event', { ack: () => {}, envelope_id: envelopeId, body: { event_id: 'Ev-click' }, event })
+
+    // when the click lands, a fresh turn starts in the thread, and Slack retries the click
+    deliver('env-1')
+    await adapter.stop()
+    await adapter.start()
+    deliver('env-2')
+    await adapter.stop()
+
+    // then only the original click ran /stop
+    expect(stops).toEqual(['1700.0001'])
   })
 })
 
