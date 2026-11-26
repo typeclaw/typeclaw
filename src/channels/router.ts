@@ -682,6 +682,16 @@ export const SESSION_IDLE_TIMEOUT_MS = 30_000
 //   total turns to pressure the since-human counter (a single bot reflex
 //   replying to its own mention 5x in 2s).
 //
+// A ring needs us to keep answering, so once a prompt carrying peer-bot input
+// finishes without a send the since-human streak restarts from the peer
+// inbounds that arrived after that prompt started: the exchange already broke.
+// The drain settles this right before composing the next batch, because it
+// coalesces several inbounds into one prompt and queues handoffs that arrive
+// mid-prompt.
+// Without this, a channel where bots hand work to each other (no human for
+// hours, our replies mostly silent) stayed tripped forever and every addressed
+// handoff arrived carrying a "stay silent" notice.
+//
 // The model receives a non-fatal warning prepended into composeTurnPrompt
 // when tripped; the LLM decides whether to keep replying. Hard interrupt
 // is intentionally not part of v1 (would require pi-coding-agent abort
@@ -1497,13 +1507,19 @@ type LiveSession = {
   // batch overwrites unconditionally.
   pendingQuoteCandidate: QuoteAnchorCandidate | null
   // Loop-guard state. See PEER_BOT_TURNS_WINDOW_MS / MAX_* constants
-  // above. Updated in route() on every engaged peer-bot inbound, reset on
-  // any human inbound. The two axes (window ring buffer + since-human
-  // counter) are independent — either tripping sets `loopGuardActive`
-  // until the next human posts. The active flag is read by
-  // composeTurnPrompt() and prepended to the user-turn text.
+  // above. Counted in route() on every engaged peer-bot inbound, reset on
+  // any human inbound, and settled by the drain before each fresh batch.
+  // The two axes (window ring buffer + since-human counter) are
+  // independent — either at its limit sets `loopGuardActive`. The active
+  // flag is read by composeTurnPrompt() and prepended to the user-turn text.
   recentEngagedPeerBotTurns: { authorId: string; ts: number }[]
   consecutiveEngagedPeerBotTurns: number
+  // `successfulChannelSends` when the latest prompt carrying peer-bot input
+  // started; null once settled or reset by a human.
+  sendsAtPeerBotTurnStart: number | null
+  // Engaged peer-bot inbounds since that prompt started: the streak a silent
+  // outcome keeps.
+  peerBotInboundsSinceTurnStart: number
   loopGuardActive: boolean
   // Set in route() from the same membership+participants the engagement
   // decision used, so the prompt nudge and sticky suppression agree on
@@ -3553,6 +3569,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         pendingQuoteCandidate: null,
         recentEngagedPeerBotTurns: [],
         consecutiveEngagedPeerBotTurns: 0,
+        sendsAtPeerBotTurnStart: null,
+        peerBotInboundsSinceTurnStart: 0,
         loopGuardActive: false,
         multiHumanGroup: false,
         createdFromColdStart: isColdStart,
@@ -6140,6 +6158,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const requesterOrigin = live.originRef.current
         const liveRole = permissions.describe(live.originRef.current).role
 
+        if (batch.length > 0) settleLoopGuard(live)
         const text = composeTurnPrompt(observed, batch, {
           adapter: live.key.adapter,
           loopGuardActive: live.loopGuardActive,
@@ -6168,6 +6187,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const engageAddPromises = live.currentTurnEngageReactions
         live.turnSeq++
         live.successfulSendsAtTurnStart = successfulSendsBeforePrompt
+        if (batch.some((event) => event.authorIsBot)) {
+          live.sendsAtPeerBotTurnStart = successfulSendsBeforePrompt
+          live.peerBotInboundsSinceTurnStart = 0
+        }
         // Only a prompt made of nothing but the nudge is a continuation turn: fresh
         // input or another wakeup sharing the prompt is not continuation spend.
         live.todoContinuationTurnSeq =
@@ -7196,22 +7219,37 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     if (!event.authorIsBot) {
       live.recentEngagedPeerBotTurns.length = 0
       live.consecutiveEngagedPeerBotTurns = 0
+      live.sendsAtPeerBotTurnStart = null
+      live.peerBotInboundsSinceTurnStart = 0
       live.loopGuardActive = false
       return
     }
-    const t = now()
     live.consecutiveEngagedPeerBotTurns++
-    live.recentEngagedPeerBotTurns.push({ authorId: event.authorId, ts: t })
-    const cutoff = t - PEER_BOT_TURNS_WINDOW_MS
+    live.peerBotInboundsSinceTurnStart++
+    live.recentEngagedPeerBotTurns.push({ authorId: event.authorId, ts: now() })
+    refreshLoopGuardActive(live)
+  }
+
+  // Runs in the drain before a fresh batch is composed, after the previous
+  // prompt (and any retries) finished, so its send outcome is final.
+  const settleLoopGuard = (live: LiveSession): void => {
+    if (live.sendsAtPeerBotTurnStart !== null) {
+      if (live.successfulChannelSends === live.sendsAtPeerBotTurnStart) {
+        live.consecutiveEngagedPeerBotTurns = live.peerBotInboundsSinceTurnStart
+      }
+      live.sendsAtPeerBotTurnStart = null
+    }
+    refreshLoopGuardActive(live)
+  }
+
+  const refreshLoopGuardActive = (live: LiveSession): void => {
+    const cutoff = now() - PEER_BOT_TURNS_WINDOW_MS
     while (live.recentEngagedPeerBotTurns.length > 0 && live.recentEngagedPeerBotTurns[0]!.ts < cutoff) {
       live.recentEngagedPeerBotTurns.shift()
     }
-    if (
+    live.loopGuardActive =
       live.consecutiveEngagedPeerBotTurns >= MAX_CONSECUTIVE_PEER_BOT_TURNS_SINCE_HUMAN ||
       live.recentEngagedPeerBotTurns.length >= MAX_PEER_BOT_TURNS_IN_WINDOW
-    ) {
-      live.loopGuardActive = true
-    }
   }
 
   const hasBotParticipated = (live: LiveSession): boolean => {
@@ -10901,7 +10939,8 @@ export function composeTurnPrompt(
       `Peer bots have engaged you ${MAX_CONSECUTIVE_PEER_BOT_TURNS_SINCE_HUMAN}+ times in a row with no human input (or ${MAX_PEER_BOT_TURNS_IN_WINDOW}+ times in`,
       `the last ${PEER_BOT_TURNS_WINDOW_MS / 1000}s). If the current message clearly needs a reply, send one and ignore`,
       'this notice; if continuing would add noise, reply `NO_REPLY` to stay silent this',
-      'turn. Clears automatically once a human posts again.',
+      'turn. Clears once a human posts again. Staying silent breaks a slow streak, but this',
+      `notice persists while peer bots keep engaging you ${MAX_PEER_BOT_TURNS_IN_WINDOW}+ times in ${PEER_BOT_TURNS_WINDOW_MS / 1000}s.`,
       '',
       '---',
       '',

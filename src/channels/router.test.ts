@@ -13607,10 +13607,13 @@ describe('ChannelRouter peer-bot loop guard', () => {
     const dir = await tempDir()
     const nowRef = { value: 1000 }
     const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
 
-    // when: 5 peer bots in a slow ring, each 90s apart so the 60s window stays empty
+    // when: 5 peer bots in a slow ring, each 90s apart so the 60s window stays
+    // empty, and we answer every one (a ring needs us to keep replying)
     for (let i = 0; i < 5; i++) {
       await router.route(botInbound({ externalMessageId: `b${i}`, authorId: `peer-${i}`, text: `bot ${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText(`reply ${i}`)
       await router.__testing!.flushDebounce(KEY)
       nowRef.value += 90_000
     }
@@ -13618,6 +13621,114 @@ describe('ChannelRouter peer-bot loop guard', () => {
     // then
     const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
     expect(lastPrompt).toContain('[SYSTEM MESSAGE — not from a human]')
+  })
+
+  test('slow peer-bot handoffs we stay silent on do not trip the since-human counter', async () => {
+    // given: a bot-to-bot workflow channel with no human for hours, where the
+    // peer bot keeps posting status and we mostly skip
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // when: 6 handoffs 90s apart, all answered with NO_REPLY
+    for (let i = 0; i < 6; i++) {
+      await router.route(botInbound({ externalMessageId: `b${i}`, authorId: 'peer-1', text: `report ${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('NO_REPLY')
+      await router.__testing!.flushDebounce(KEY)
+      nowRef.value += 90_000
+    }
+
+    // then: the newest handoff arrives without the stay-silent notice
+    const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
+    expect(lastPrompt).toContain('report 5')
+    expect(lastPrompt).not.toContain('Peer bots have engaged you')
+  })
+
+  test('slow ring with two coalesced peer messages per exchange still trips when we answer each batch', async () => {
+    // given
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+
+    // when: every 90s the peer sends a status and a result inside one debounce
+    // window, and we answer the combined prompt
+    for (let i = 0; i < 3; i++) {
+      await router.route(botInbound({ externalMessageId: `s${i}`, authorId: 'peer-1', text: `status ${i}` }))
+      await router.route(botInbound({ externalMessageId: `r${i}`, authorId: 'peer-1', text: `result ${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText(`reply ${i}`)
+      await router.__testing!.flushDebounce(KEY)
+      nowRef.value += 90_000
+    }
+
+    // then: 6 answered peer inbounds since the last human trip the guard
+    const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
+    expect(lastPrompt).toContain('result 2')
+    expect(lastPrompt).toContain('Peer bots have engaged you')
+  })
+
+  test('a tripped guard clears without a human once we stay silent', async () => {
+    // given: a slow answered ring that trips the guard on the 5th turn
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    for (let i = 0; i < 5; i++) {
+      await router.route(botInbound({ externalMessageId: `b${i}`, authorId: 'peer-1', text: `bot ${i}` }))
+      const answer = i < 4 ? `reply ${i}` : 'NO_REPLY'
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText(answer)
+      await router.__testing!.flushDebounce(KEY)
+      nowRef.value += 90_000
+    }
+    expect(sessions[0]!.prompts[sessions[0]!.prompts.length - 1]).toContain('Peer bots have engaged you')
+
+    // when: the next handoff lands outside the burst window, no human in between
+    await router.route(botInbound({ externalMessageId: 'b5', authorId: 'peer-1', text: 'next handoff' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then
+    const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
+    expect(lastPrompt).toContain('next handoff')
+    expect(lastPrompt).not.toContain('Peer bots have engaged you')
+  })
+
+  test('a handoff queued during the silent warned prompt arrives without the warning', async () => {
+    // given: a slow answered ring whose 5th prompt carries the warning
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    for (let i = 0; i < 4; i++) {
+      await router.route(botInbound({ externalMessageId: `b${i}`, authorId: 'peer-1', text: `bot ${i}` }))
+      sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText(`reply ${i}`)
+      await router.__testing!.flushDebounce(KEY)
+      nowRef.value += 90_000
+    }
+    let releaseWarnedPrompt: () => void = () => {}
+    const warnedPromptHeld = new Promise<void>((resolve) => {
+      releaseWarnedPrompt = resolve
+    })
+    await router.route(botInbound({ externalMessageId: 'b4', authorId: 'peer-1', text: 'bot 4' }))
+    sessions[0]!.onPrompt = async () => {
+      await warnedPromptHeld
+      sessions[0]!.setAssistantText('NO_REPLY')
+    }
+    const drain = router.__testing!.flushDebounce(KEY)
+    await waitFor(() => sessions[0]!.prompts.length === 5)
+    expect(sessions[0]!.prompts[4]).toContain('Peer bots have engaged you')
+
+    // when: the next handoff queues while the warned prompt is still running,
+    // then that prompt finishes silent
+    await router.route(botInbound({ externalMessageId: 'b5', authorId: 'peer-1', text: 'queued handoff' }))
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('reply 5')
+    releaseWarnedPrompt()
+    await drain
+    await router.__testing!.flushDebounce(KEY)
+
+    // then
+    const queuedPrompt = sessions[0]!.prompts.find((prompt) => prompt.includes('queued handoff'))!
+    expect(queuedPrompt).not.toContain('Peer bots have engaged you')
   })
 
   test('a human inbound clears the guard for the next prompt', async () => {

@@ -142,9 +142,10 @@ Distinct from the per-session [tool loop guard](/docs/internals/message-stream) 
 
 - Any human inbound resets the counters and clears `loopGuardActive`.
 - A peer-bot engage increments `consecutiveEngagedPeerBotTurns` and pushes onto a sliding `PEER_BOT_TURNS_WINDOW_MS` (60s) window.
-- Tripping `MAX_CONSECUTIVE_PEER_BOT_TURNS_SINCE_HUMAN` (5) **or** `MAX_PEER_BOT_TURNS_IN_WINDOW` (5 in 60s) sets `loopGuardActive`.
+- A ring needs us to keep answering, so once a prompt carrying peer-bot input finishes without a send (`successfulChannelSends` unchanged since that prompt started, `sendsAtPeerBotTurnStart`), the drain's `settleLoopGuard` restarts the consecutive run from the peer-bot inbounds that arrived after that prompt started (`peerBotInboundsSinceTurnStart`). It runs right before the next fresh batch is composed, because the drain coalesces several inbounds into one prompt and queues handoffs that arrive mid-prompt. Bot-to-bot workflow channels with no human for hours otherwise stayed tripped forever while we mostly stayed silent.
+- `loopGuardActive` is recomputed on every peer-bot engage and at each settle: tripping `MAX_CONSECUTIVE_PEER_BOT_TURNS_SINCE_HUMAN` (5) **or** `MAX_PEER_BOT_TURNS_IN_WINDOW` (5 in 60s) sets it.
 
-When active, `composeTurnPrompt` prepends a fenced `**[SYSTEM MESSAGE — not from a human]**` block telling the model it may reply `NO_REPLY` to stay silent. The notice lives in the user-turn suffix (not the system prompt) so it stays cache-neutral, and clears automatically once a human posts.
+When active, `composeTurnPrompt` prepends a fenced `**[SYSTEM MESSAGE — not from a human]**` block telling the model it may reply `NO_REPLY` to stay silent. The notice lives in the user-turn suffix (not the system prompt) so it stays cache-neutral. It clears on an engaged human inbound, or when a recompute finds neither threshold met: staying silent breaks a slow streak, but the notice persists while the burst window is still full.
 
 ## Group-chat nudge
 
