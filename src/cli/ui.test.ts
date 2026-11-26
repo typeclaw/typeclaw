@@ -596,6 +596,10 @@ describe('printSlackAppManifestSetup', () => {
     expect(SLACK_APP_MANIFEST.features.app_home.agent_tasks_enabled).toBe(false)
   })
 
+  test('manifest subscribes to agent_session_stopped so Slack shows the stop button', () => {
+    expect(SLACK_APP_MANIFEST.settings.event_subscriptions.bot_events).toContain('agent_session_stopped')
+  })
+
   test('manifest grants the `commands` scope so slash_commands envelopes can route', () => {
     expect(SLACK_APP_MANIFEST.oauth_config.scopes.bot).toContain('commands')
   })
