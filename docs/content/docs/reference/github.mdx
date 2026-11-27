@@ -73,16 +73,17 @@ PAT brokerage deliberately excludes shapes where the destination cannot be enfor
 
 Set these under **Settings → Developer settings → GitHub Apps → your app → Permissions & events → Repository permissions**. Rows are in the same alphabetical order as that page, and the labels match its wording. Leave everything not listed at **No access**.
 
-| Permission    | Access         | Needed for                                                                                                                       |
-| ------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Actions       | Read and write | Reading workflow runs and logs, and re-running them                                                                              |
-| Checks        | Read and write | The [`typeclaw/review` PR check](#review-check); without it the check is skipped and reviews still post                          |
-| Contents      | Read-only      | Reading files of a **private** repo (reviews fail with 403/404 without it). Raise to **Read and write** only if the agent pushes |
-| Discussions   | Read and write | Only if `eventAllowlist` includes discussion events                                                                              |
-| Issues        | Read and write | Issue events, comments, and reactions on issues and PRs                                                                          |
-| Metadata      | Read-only      | Mandatory; GitHub selects it automatically                                                                                       |
-| Pull requests | Read and write | PR events, reading diffs, posting reviews and review-comment replies                                                             |
-| Webhooks      | Read and write | Creating and managing the repository webhooks TypeClaw installs for you                                                          |
+| Permission      | Access         | Needed for                                                                                                                         |
+| --------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Actions         | Read and write | Reading workflow runs and logs, and re-running them                                                                                |
+| Checks          | Read and write | The [`typeclaw/review` PR check](#review-check); without it the check is skipped and reviews still post                            |
+| Commit statuses | Read-only      | Reading a PR's CI state (`gh pr checks`, PR watches) when a check reports as a commit status; without it those reads fail with 403 |
+| Contents        | Read-only      | Reading files of a **private** repo (reviews fail with 403/404 without it). Raise to **Read and write** only if the agent pushes   |
+| Discussions     | Read and write | Only if `eventAllowlist` includes discussion events                                                                                |
+| Issues          | Read and write | Issue events, comments, and reactions on issues and PRs                                                                            |
+| Metadata        | Read-only      | Mandatory; GitHub selects it automatically                                                                                         |
+| Pull requests   | Read and write | PR events, reading diffs, posting reviews and review-comment replies                                                               |
+| Webhooks        | Read and write | Creating and managing the repository webhooks TypeClaw installs for you                                                            |
 
 After changing permissions on an installed App, the install owner must accept the updated permissions on the install page before they take effect. At start, the adapter checks the installation against your `eventAllowlist` and logs a warning naming any missing permission; that preflight does not separately validate the **Contents** read access private-repo reviews need, so a reviewer missing it only fails at review time.
 
@@ -143,7 +144,8 @@ cat > "$DIR/register.html" <<EOF
       "issues": "write",
       "metadata": "read",
       "pull_requests": "write",
-      "repository_hooks": "write"
+      "repository_hooks": "write",
+      "statuses": "read"
     }
   }'>
 </form>

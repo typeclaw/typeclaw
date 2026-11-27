@@ -26,6 +26,7 @@ export const GITHUB_APP_MANIFEST_PERMISSIONS = {
   metadata: 'read',
   pull_requests: 'write',
   repository_hooks: 'write',
+  statuses: 'read',
 } as const
 
 // The required-permissions checklist shown verbatim during interactive GitHub
@@ -42,7 +43,7 @@ export function githubRequiredPermissionsNote(includeWebhookNote: boolean): stri
     : 'Webhooks read/write.'
   return [
     'Required permissions: Issues read/write, Pull requests read/write, Discussions read/write (if used),',
-    `Actions read/write, Metadata read, and ${webhooks}`,
+    `Actions read/write, Commit statuses read, Metadata read, and ${webhooks}`,
     'For the typeclaw/review PR check: Checks read/write (GitHub App) or Commit statuses read/write (PAT).',
   ].join('\n')
 }
