@@ -217,10 +217,71 @@ test.each([
     'rate limit exceeded',
   ],
   [Response.json({ data: { repository: null }, errors: [{ message: 'Resource not accessible' }] }), 'not accessible'],
+  [
+    Response.json({
+      data: { repository: { pullRequest: pr({ reviews: null }) } },
+      errors: [
+        {
+          type: 'FORBIDDEN',
+          path: ['repository', 'pullRequest', 'reviews'],
+          message: 'Resource not accessible by integration',
+        },
+      ],
+    }),
+    'not accessible by integration',
+  ],
+  [
+    Response.json({
+      data: { repository: { pullRequest: pr({ reviews: null }) } },
+      errors: [
+        {
+          type: 'FORBIDDEN',
+          path: ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'statusCheckRollup'],
+          message: 'Commit statuses denied',
+        },
+        { type: 'FORBIDDEN', path: ['repository', 'pullRequest', 'reviews'], message: 'Reviews denied' },
+      ],
+    }),
+    /GraphQL error: Reviews denied$/,
+  ],
   [new Response('invalid JSON'), 'invalid JSON'],
 ])('propagates GitHub failure %# instead of emitting a verdict', async (response, reason) => {
   const run = fixtureProbe(githubPrProbe, 'pullRequest')
   await expect(run(response)).rejects.toThrow(reason)
+})
+
+test('keeps reporting when the token cannot read commit statuses, without claiming green checks', async () => {
+  const deniedAt = (path: Array<string | number>, row: unknown) =>
+    Response.json({
+      data: { repository: { pullRequest: row } },
+      errors: [{ type: 'FORBIDDEN', path, message: 'Resource not accessible by integration' }],
+    })
+  const rollupPath = ['repository', 'pullRequest', 'commits', 'nodes', 0, 'commit', 'statusCheckRollup']
+  const approved = { reviews: connection(review('new', 'APPROVED', 'head-a', 4)) }
+  const hiddenStatus = (countsReadable: boolean) => {
+    const commits = JSON.parse(JSON.stringify(head('SUCCESS')))
+    const contexts = commits.nodes[0].commit.statusCheckRollup.contexts
+    contexts.nodes[1] = null
+    if (!countsReadable) contexts.statusContextCountsByState = null
+    return commits
+  }
+
+  const run = fixtureProbe(githubPrProbe, 'pullRequest')
+  const result = await run(
+    deniedAt([...rollupPath, 'contexts', 'nodes', 1], pr({ ...approved, commits: hiddenStatus(false) })),
+  )
+  expect(result.verdict).toBe('wake')
+  expect(result.summary).toContain('approved by @alice')
+  expect(result.summary).not.toContain('checks passed')
+  expect(
+    (await run(deniedAt([...rollupPath, 'contexts', 'nodes', 1], pr({ ...approved, commits: hiddenStatus(true) }))))
+      .summary,
+  ).toContain('checks passed on head-a')
+
+  const unreadableRollup = connection({ commit: { oid: 'head-a', statusCheckRollup: null } })
+  expect(
+    (await fixtureProbe(githubPrProbe, 'pullRequest')(deniedAt(rollupPath, pr({ commits: unreadableRollup })))).verdict,
+  ).toBe('quiet')
 })
 
 test('propagates token failures without polling', async () => {
