@@ -85,7 +85,13 @@ const inlineComment = authoredSchema.extend({ id: z.string(), publishedAt: times
 const stateCount = z.object({ state: z.string(), count: z.int().nonnegative() })
 const checkRollup = z.object({
   state: z.string(),
-  contexts: connection(check).extend({
+  // A null node is a context the token cannot read, such as a commit status without
+  // the Commit statuses permission; it is kept so it is never mistaken for a pass.
+  contexts: z.object({
+    nodes: z
+      .array(check.nullable())
+      .nullish()
+      .transform((nodes) => nodes ?? []),
     pageInfo: z.object({ hasNextPage: z.boolean() }),
     checkRunCount: z.int().nonnegative(),
     checkRunCountsByState: z.array(stateCount).nullable(),
@@ -133,16 +139,17 @@ function checksPassed(rollup: z.infer<typeof checkRollup> | null | undefined): b
   if (rollup?.state !== 'SUCCESS') return false
   const page = rollup.contexts
   if (page.nodes.length === 0) return false
+  const visible = page.nodes.filter((row) => row !== null)
   if (
-    !page.nodes.every((row) =>
+    !visible.every((row) =>
       row.__typename === 'StatusContext'
         ? row.state === 'SUCCESS'
         : row.status === 'COMPLETED' && row.conclusion !== null && passingConclusions.has(row.conclusion),
     )
   )
     return false
-  if (!page.pageInfo.hasNextPage) return true
-  // A green first page does not prove that the omitted checks have finished.
+  if (!page.pageInfo.hasNextPage && visible.length === page.nodes.length) return true
+  // A green first page does not prove that the omitted or unreadable checks have finished.
   // Only counts with a known non-failing terminal outcome can cover the rest.
   const passedRuns = page.checkRunCountsByState
     ?.filter(({ state }) => passingConclusions.has(state))
@@ -167,7 +174,7 @@ export const githubPrProbe: BundledProbe<GithubParams> = {
   parseParams: (raw) => githubParams.parse(raw),
   describe: (params) => `GitHub PR ${githubTarget(params)}`,
   async run(ctx) {
-    const pr = await githubQuery(ctx, query, 'pullRequest', snapshot)
+    const pr = await githubQuery(ctx, query, 'pullRequest', snapshot, ['statusCheckRollup'])
     const label = githubPrProbe.describe(ctx.params)
     const previous = stateSchema.nullable().parse(ctx.state ?? null)
     // Deduplication lasts only as long as this head, including while its checks are pending.
@@ -188,7 +195,7 @@ export const githubPrProbe: BundledProbe<GithubParams> = {
     const events: unknown[] = []
     const head = pr.commits.nodes.find(({ commit }) => commit.oid === pr.headRefOid)?.commit
     const rollup = head?.statusCheckRollup
-    const checks = rollup?.contexts.nodes ?? []
+    const checks = rollup?.contexts.nodes.filter((row) => row !== null) ?? []
     const failing = [...new Set(checks.flatMap(failedCheckName))].sort()
     const failureKey = JSON.stringify([pr.headRefOid, failing])
     if (failing.length > 0 && !failingSets.has(failureKey)) {

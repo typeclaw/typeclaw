@@ -27,7 +27,11 @@ export const githubTarget = ({ repo, number }: GithubParams): string => `${repo}
 
 class GithubProbeError extends Error {}
 
-const errorPayload = z.object({ message: z.string() })
+const errorPayload = z.object({
+  message: z.string(),
+  type: z.string().optional(),
+  path: z.array(z.union([z.string(), z.number()])).optional(),
+})
 const envelope = z.object({ errors: z.array(errorPayload).optional(), data: z.unknown() })
 
 export async function githubQuery<T>(
@@ -35,6 +39,7 @@ export async function githubQuery<T>(
   query: string,
   field: 'issue' | 'pullRequest',
   schema: z.ZodType<T>,
+  optionalFields: readonly string[] = [],
 ): Promise<T> {
   const target = githubTarget(ctx.params)
   const credential = await ctx.resolveTokenForRepo(ctx.params.repo).catch((cause: unknown) => {
@@ -68,8 +73,14 @@ export async function githubQuery<T>(
   const parsed = envelope.safeParse(json)
   if (!parsed.success)
     throw new GithubProbeError(`GitHub watch ${target}: malformed GraphQL response`, { cause: parsed.error })
-  if (parsed.data.errors?.length) {
-    const messages = parsed.data.errors.map(({ message }) => oneLine(message)).join('; ')
+  // GitHub answers with partial data and a FORBIDDEN error when the token lacks the
+  // permission for one nested field. The caller names the fields it can do without.
+  const fatal = parsed.data.errors?.filter(
+    ({ type, path }) =>
+      type !== 'FORBIDDEN' || !path?.some((segment) => typeof segment === 'string' && optionalFields.includes(segment)),
+  )
+  if (fatal?.length) {
+    const messages = fatal.map(({ message }) => oneLine(message)).join('; ')
     throw new GithubProbeError(`GitHub watch ${target}: GraphQL error: ${messages.slice(0, 400)}`)
   }
   const data = z.object({ repository: z.object({ [field]: schema }) }).safeParse(parsed.data.data)
