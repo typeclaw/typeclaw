@@ -582,7 +582,8 @@ async function startAgentRuntime(
     stream,
     newestRunningChildSubagentStartedAt: (sessionId, watchTurnId) =>
       newestRunningBackgroundChildStartedAt(liveSubagentRegistry.list({ parentSessionId: sessionId }), watchTurnId),
-    cancelRunningSubagentsByWorkKey: (workKey, reason) => liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason),
+    cancelRunningSubagentsByWorkKey: (workKey, reason) =>
+      liveSubagentRegistry.cancelRunningByWorkKey(workKey, reason, stream),
     onReload: async () => {
       const { results } = await reloadAllNonDestructive()
       return formatChannelReloadSummary(results)

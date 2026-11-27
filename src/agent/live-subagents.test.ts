@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
+import { createStream } from '@/stream'
+
 import {
   LiveSubagentRegistry,
   MAX_EVENTS_PER_SUBAGENT,
@@ -364,8 +366,50 @@ describe('LiveSubagentRegistry', () => {
     expect(reg.get('bg_t1')?.completion).toEqual({
       ok: false,
       error: expect.stringContaining('pull request converted to draft'),
+      cancelled: true,
       durationMs: expect.any(Number),
     })
+  })
+
+  test('cancelRunningByWorkKey publishes the failed completion of a cancelled background child before aborting it', async () => {
+    const stream = createStream()
+    const published: unknown[] = []
+    stream.subscribe({ target: { kind: 'broadcast' } }, (msg) => {
+      published.push(msg.payload)
+    })
+    let publishedWhenAborted = -1
+    const reg = new LiveSubagentRegistry()
+    // given: a background reviewer and a foreground one under the same work key
+    reg.register(
+      makeLive({
+        workKey: 'reviewer:github:acme/widgets#42',
+        background: true,
+        channelKey: { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+        abort: async () => {
+          publishedWhenAborted = published.length
+        },
+      }),
+    )
+    reg.register(makeLive({ taskId: 'fg_t2', sessionId: 'ses_s2', workKey: 'reviewer:github:acme/widgets#42' }))
+
+    // when: the work is invalidated
+    await reg.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft', stream)
+
+    // then: only the background child's parent is told, before teardown starts
+    expect(published).toEqual([
+      {
+        kind: 'subagent.completed',
+        taskId: 'bg_t1',
+        subagent: 'explorer',
+        parentSessionId: 'ses_p1',
+        ok: false,
+        durationMs: expect.any(Number),
+        error: 'cancelled: pull request converted to draft',
+        cancelled: true,
+        channelKey: { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null },
+      },
+    ])
+    expect(publishedWhenAborted).toBe(1)
   })
 
   test('cancelRunningByWorkKey counts an abort failure and continues cancelling siblings', async () => {

@@ -374,6 +374,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
         sessionId: resolvedHandle.sessionId ?? '<pending>',
         subagentName,
         parentSessionId,
+        ...(channelKey !== undefined ? { channelKey } : {}),
         ...(spawnedByRole !== undefined ? { spawnedByRole } : {}),
         background,
         ...(backgroundResponse?.watchTurnId ? { watchTurnId: backgroundResponse.watchTurnId } : {}),

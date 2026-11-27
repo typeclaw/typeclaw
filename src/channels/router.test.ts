@@ -45,10 +45,12 @@ import {
   setReviewObserver,
 } from '@/channels/github-review-turn-ledger'
 import { RecoveryOutbox } from '@/channels/recovery-outbox'
+import { createSubagentCompletionBridge } from '@/channels/subagent-completion-bridge'
 import type { PermissionService } from '@/permissions'
 import { createPermissionService } from '@/permissions/permissions'
 import { rolesConfigSchema } from '@/permissions/schema'
 import { createHookBus, type HookBus, type SessionIdleEvent } from '@/plugin'
+import { createStream } from '@/stream'
 import { waitFor } from '@/test-helpers/wait-for'
 import { deliverChannelWakes } from '@/watches/channel'
 import { WakeDispatcher } from '@/watches/delivery'
@@ -16586,6 +16588,96 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     expect(reminderText).toContain('<system-reminder>')
     expect(reminderText).toContain('bg_rev')
     expect(reminderText).toContain('subagent_output')
+  })
+
+  for (const rolledOver of [false, true]) {
+    test(`a draft-cancelled reviewer wakes the ${rolledOver ? 'rolled-over successor' : 'idle'} GitHub session to close out, not to post a verdict`, async () => {
+      const dir = await tempDir()
+      const nowRef = { value: 1000 }
+      const stream = createStream()
+      const subagents = new LiveSubagentRegistry()
+      const { router, sessions } = makeRouter(dir, { nowRef })
+      const bridge = createSubagentCompletionBridge({ stream, router, logger: { info: () => {}, warn: () => {} } })
+      const key: ChannelKey = { adapter: 'github', workspace: 'acme/widgets', chat: 'pr:42', thread: null }
+      try {
+        // given: an idle GitHub PR session whose reviewer is still running
+        await router.route(inbound({ ...key, externalMessageId: 'review-start' }))
+        await router.__testing!.flushDebounce(key)
+        subagents.register({
+          taskId: 'bg_reviewer',
+          sessionId: 'ses_reviewer',
+          subagentName: 'reviewer',
+          parentSessionId: 'ses_fake_1',
+          channelKey: key,
+          workKey: 'reviewer:github:acme/widgets#42',
+          background: true,
+          startedAt: nowRef.value,
+          status: 'running',
+          abort: async () => {},
+        })
+        if (rolledOver) {
+          nowRef.value += SESSION_FRESHNESS_TTL_MS + 1
+          await router.route(inbound({ ...key, externalMessageId: 'later', text: 'still there?' }))
+          await router.__testing!.flushDebounce(key)
+          expect(sessions).toHaveLength(2)
+        }
+        const target = sessions[sessions.length - 1]!
+        const promptsBefore = target.prompts.length
+
+        // when: the PR is converted to draft
+        await subagents.cancelRunningByWorkKey(
+          'reviewer:github:acme/widgets#42',
+          'pull request converted to draft',
+          stream,
+        )
+
+        // then: the session is told to close the review out silently
+        await waitFor(() => target.prompts.length > promptsBefore)
+        const reminder = target.prompts[target.prompts.length - 1] ?? ''
+        expect(reminder).toContain('was cancelled')
+        expect(reminder).toContain('pull request converted to draft')
+        expect(reminder).toContain('skip_response')
+        expect(reminder).not.toContain('formal review')
+        expect(reminder).not.toContain('keep the item pending')
+      } finally {
+        bridge.stop()
+        await router.stop()
+      }
+    })
+  }
+
+  test('a cancellation that coalesces with a fresh inbound leaves the inbound answerable', async () => {
+    const dir = await tempDir()
+    const sent: string[] = []
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound('discord-bot', async (m) => {
+      sent.push(m.text ?? '')
+      return { ok: true }
+    })
+    await router.route(inbound({ externalMessageId: 'm1' }))
+    await router.__testing!.flushDebounce(KEY)
+    const promptsBefore = sessions[0]!.prompts.length
+
+    // when: a follow-up is still debouncing as the reviewer's cancellation arrives
+    await router.route(inbound({ externalMessageId: 'm2', text: '배포는 언제 해요?' }))
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'bg_rev',
+      subagent: 'reviewer',
+      ok: false,
+      error: 'cancelled: pull request converted to draft',
+      cancelled: true,
+      durationMs: 1,
+      channelKey: KEY,
+    })
+    sessions[0]!.onPrompt = () => sessions[0]!.setAssistantText('오늘 오후에 배포합니다.')
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: one turn carries both, and its answer to the follow-up is delivered
+    const turn = sessions[0]!.prompts.slice(promptsBefore)
+    expect(turn.some((p) => p.includes('배포는 언제 해요?') && p.includes('was cancelled'))).toBe(true)
+    expect(sent).toContain('오늘 오후에 배포합니다.')
+    await router.stop()
   })
 
   test('exact parentSessionId match is preferred over the channel-key fallback', async () => {
