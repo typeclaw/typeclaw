@@ -8,6 +8,7 @@ import { createSession, renderTurnRoleAnchor, renderTurnTimeAnchor, type AgentSe
 import { applyTurnThinkingLevel, getQuestionSignal, type QuestionSignal } from '@/agent/attention-escalation'
 import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
+import { SESSION_CHILD_STUCK_BACKSTOP_MS } from '@/agent/live-subagents'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
 import {
   type DetectedProviderError,
@@ -628,27 +629,7 @@ export const OUTBOUND_FLOOD_ERROR = 'outbound message denied: content looks like
  */
 export const SESSION_FRESHNESS_TTL_MS = 60 * 60 * 1000
 
-/**
- * Leak guard — NOT a freshness cap. A running background subagent pins its parent
- * channel session against idle GC and stale-rollover for as long as the child is
- * actually running, because the next inbound would otherwise start a fresh session
- * that has lost track of the in-flight task and spawns a DUPLICATE child, and — the
- * bug this backstop is sized around — a completion arriving after teardown has no
- * live session to deliver its system-reminder to and is silently dropped.
- *
- * The pin is bounded only so a genuinely stuck/wedged child cannot make the session
- * immortal. Subagent `timeoutMs` is optional (operator declares none), so a hung
- * child stays `status: 'running'` forever; without this ceiling its parent session
- * would leak indefinitely. Past this age the child is treated as stuck: GC/rollover
- * proceeds and the session falls back to completion-reroute.
- *
- * Sized as an ANOMALY threshold, deliberately far above any legitimate run (deep
- * operator work is minutes-to-an-hour, not hours), so it never fires for real work.
- * The prior 45m value was close enough to plausible deep work to turn a legitimate
- * long run into a routine drop — the reported 65m completion loss. 6h is clearly
- * "this child is wedged," not "this child is busy".
- */
-export const SESSION_CHILD_STUCK_BACKSTOP_MS = 6 * 60 * 60 * 1000
+export { SESSION_CHILD_STUCK_BACKSTOP_MS } from '@/agent/live-subagents'
 
 // Watchdog ceiling for ensureLive's full async chain (resolve names →
 // fetch membership → open session manager → persist mapping → prefetch
