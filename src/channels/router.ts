@@ -1391,6 +1391,11 @@ type LiveSession = {
   // user batch or wakeup, so the check's own retries inherit it. The answer
   // already landed before the check, so its failures stay in the operator log.
   completionCheckActive: boolean
+  // Whether the current turn is answering a chat message. Set by a fresh batch
+  // and cleared by independent reminder work (a wakeup, a todo continuation);
+  // retries keep it, so a retry of a chat answer keeps that answer's silence
+  // notices and a retry of independent work stays without them.
+  answeringChat: boolean
   // Stashed by `installChannelReplyTerminalHook` after a successful
   // `channel_reply` that omitted `continue_after_reply: true`. Read once
   // by `validateChannelTurn` to decide the continuation nudge. `turnSeq`-stamped
@@ -3611,6 +3616,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         completionCheckArmed: false,
         completionChecks: 0,
         completionCheckActive: false,
+        answeringChat: false,
         lastTerminalReplyCompletion: null,
         pendingTerminalReplyStop: null,
         continueReplyTurn: null,
@@ -6255,10 +6261,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const liveRole = permissions.describe(live.originRef.current).role
 
         if (batch.length > 0) settleLoopGuard(live)
+        if (batch.length > 0) live.answeringChat = true
+        else if (reminders.some((r) => r.kind !== 'retry' || r.todoContinuation === true || r.completionCheck === true))
+          live.answeringChat = false
         const text = composeTurnPrompt(observed, batch, {
           adapter: live.key.adapter,
           loopGuardActive: live.loopGuardActive,
           groupChatNudge: live.multiHumanGroup,
+          continuesChatResponse: batch.length === 0 && live.answeringChat,
           systemReminders: reminders.map((r) => r.text),
           role: liveRole,
         })
@@ -10996,6 +11006,9 @@ export function composeTurnPrompt(
     adapter?: AdapterId
     loopGuardActive: boolean
     groupChatNudge?: boolean
+    // A reminder-only retry of the chat response its logical turn began with
+    // (an empty-turn or truncation retry), which still answers that message.
+    continuesChatResponse?: boolean
     systemReminders?: readonly string[]
     now?: Date
     role?: string
@@ -11049,7 +11062,13 @@ export function composeTurnPrompt(
   // same shape across origins. The exception is scoped to that single
   // case: do NOT extend it to new notice types. Anything that is not
   // a true subagent-style completion ping uses framing 1.
-  if (state.loopGuardActive) {
+  // Both silence notices below are about whether to answer a chat message. An
+  // independent reminder-only turn (a subagent completion, a todo continuation)
+  // has none: it is the agent's own work coming back, and "prefer silence" there
+  // reads as permission to drop that work. A retry of the chat response still
+  // answers that message, so it keeps them.
+  const hasChatInput = batch.length > 0 || state.continuesChatResponse === true
+  if (hasChatInput && state.loopGuardActive) {
     parts.push(
       '---',
       '**[SYSTEM MESSAGE — not from a human]**',
@@ -11076,7 +11095,7 @@ export function composeTurnPrompt(
   // The gate gets us into the turn; the model decides whether to speak.
   // Cache-neutral (user-turn suffix), and skipped when the loop guard already
   // fired to avoid stacking two silence notices in one turn.
-  if (state.groupChatNudge === true && !state.loopGuardActive) {
+  if (hasChatInput && state.groupChatNudge === true && !state.loopGuardActive) {
     parts.push(
       '---',
       '**[SYSTEM MESSAGE — not from a human]**',

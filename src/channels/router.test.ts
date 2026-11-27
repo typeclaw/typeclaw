@@ -83,6 +83,7 @@ import {
   CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS,
   CHANNEL_COMPLETION_CHECK_PROMPT,
   CHANNEL_MAX_OUTPUT_TOKENS,
+  composeTurnPrompt,
   CONTINUATION_REACTION_EMOJI,
   createChannelRouter,
   QUEUED_REACTION_EMOJI,
@@ -13844,6 +13845,212 @@ describe('ChannelRouter peer-bot loop guard', () => {
     const lastPrompt = sessions[0]!.prompts[sessions[0]!.prompts.length - 1]!
     expectFencedRuntimeNotice(lastPrompt, 'You are in a group chat and are woken on every message')
     expect(lastPrompt).toContain('bot?')
+  })
+
+  test('a reminder-only turn carries neither silence notice, even in a looping multi-human group', () => {
+    // given a subagent completion waking a group session whose loop guard is active
+    const reminder = '<system-reminder>\nSubagent `operator` (bg_1) completed.\n</system-reminder>'
+
+    // when the turn has no chat message of its own
+    const prompt = composeTurnPrompt([], [], {
+      loopGuardActive: true,
+      groupChatNudge: true,
+      systemReminders: [reminder],
+    })
+    const groupOnly = composeTurnPrompt([], [], {
+      loopGuardActive: false,
+      groupChatNudge: true,
+      systemReminders: [reminder],
+    })
+
+    // then the agent sees its own work come back without being told to prefer silence
+    expect(prompt).toContain(reminder)
+    expect(prompt).not.toContain('Peer bots have engaged you')
+    expect(groupOnly).not.toContain('You are in a group chat and are woken on every message')
+  })
+
+  test('an empty-turn retry of a group chat answer keeps the group-chat nudge', async () => {
+    // given a 2-human channel
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    await router.route(inbound({ authorId: 'alice', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.prompts.length = 0
+
+    // when alice's turn ends truncated and the router retries it without new input
+    let attempt = 0
+    session.onPrompt = () => {
+      attempt++
+      if (attempt === 1) session.setAssistantMidTurn('cut off', 'length')
+      else session.setAssistantText('NO_REPLY')
+    }
+    nowRef.value += 100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: true, text: '봇아?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the retry still carries the notice that tells it when to stay silent
+    expect(session.prompts[1]).toContain(EMPTY_TURN_RETRY_NUDGE)
+    expectFencedRuntimeNotice(session.prompts[1]!, 'You are in a group chat and are woken on every message')
+  })
+
+  test('a truncated todo continuation after a group chat turn retries without the group-chat nudge', async () => {
+    // given a 2-human channel whose agent will have open todos after its next answer
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let continuationsLeft = 0
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      runIdleContinuation: async ({ deliver }) => {
+        if (continuationsLeft === 0) return false
+        continuationsLeft--
+        deliver('CONTINUE_TODOS')
+        return true
+      },
+    })
+    await router.route(inbound({ authorId: 'alice', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    const initial = session.prompts.length
+    let continuationAttempts = 0
+    session.onPrompt = (text) => {
+      if (text.includes('CONTINUE_TODOS') && continuationAttempts++ === 0)
+        session.setAssistantMidTurn('cut off', 'length')
+      else session.setAssistantText('NO_REPLY')
+    }
+
+    // when alice's turn is followed by a todo continuation that ends truncated
+    continuationsLeft = 1
+    nowRef.value += 100
+    await router.route(
+      inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: true, text: '다음은?' }),
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the chat answer has the nudge, and neither the continuation nor its retry does
+    const after = session.prompts.slice(initial)
+    expect(after).toHaveLength(3)
+    expectFencedRuntimeNotice(after[0]!, 'You are in a group chat and are woken on every message')
+    expect(after[1]).toContain('CONTINUE_TODOS')
+    expect(after[2]).toContain(EMPTY_TURN_RETRY_NUDGE)
+    expect(after[1]).not.toContain('You are in a group chat and are woken on every message')
+    expect(after[2]).not.toContain('You are in a group chat and are woken on every message')
+  })
+
+  test('a truncated group answer with runnable todos retries with the nudge before the continuation runs', async () => {
+    // given a 2-human channel whose agent has todos the continuation policy would run
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    let continuationsLeft = 0
+    const { router, sessions } = makeRouter(dir, {
+      nowRef,
+      runIdleContinuation: async ({ deliver }) => {
+        if (continuationsLeft === 0) return false
+        continuationsLeft--
+        deliver('CONTINUE_TODOS')
+        return true
+      },
+    })
+    await router.route(inbound({ authorId: 'alice', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    const initial = session.prompts.length
+    let attempt = 0
+    session.onPrompt = () => {
+      if (attempt++ === 0) session.setAssistantMidTurn('cut off', 'length')
+      else session.setAssistantText('NO_REPLY')
+    }
+
+    // when alice's answer is truncated while a continuation is available
+    continuationsLeft = 1
+    nowRef.value += 100
+    await router.route(inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: true, text: '어때?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the chat retry runs alone with its nudge, and the continuation follows without one
+    const after = session.prompts.slice(initial)
+    expect(after).toHaveLength(3)
+    expectFencedRuntimeNotice(after[1]!, 'You are in a group chat and are woken on every message')
+    expect(after[1]).toContain(EMPTY_TURN_RETRY_NUDGE)
+    expect(after[1]).not.toContain('CONTINUE_TODOS')
+    expect(after[2]).toContain('CONTINUE_TODOS')
+    expect(after[2]).not.toContain('You are in a group chat and are woken on every message')
+  })
+
+  test('a completion check after a group chat answer carries no group-chat nudge', async () => {
+    // given a 2-human channel
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    router.registerOutbound(KEY.adapter, async () => ({ ok: true }))
+    await router.route(inbound({ authorId: 'alice', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    await router.route(inbound({ authorId: 'bob', externalMessageId: 'bob-1', isBotMention: true }))
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    session.onPrompt = async (text) => {
+      session.setAssistantText('NO_REPLY')
+      if (text.includes('bg_group')) await router.send({ ...KEY, text: 'Found it.' })
+    }
+
+    // when alice's message and a completion share a prompt that posts the result
+    nowRef.value += 100
+    await router.route(
+      inbound({ authorId: 'alice', externalMessageId: 'alice-2', isBotMention: true, text: '결과는?' }),
+    )
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_group',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the answer carries the nudge, and the check that follows it does not
+    const after = session.prompts.slice(initial)
+    expect(after).toHaveLength(2)
+    expectFencedRuntimeNotice(after[0]!, 'You are in a group chat and are woken on every message')
+    expect(after[1]).toContain(CHANNEL_COMPLETION_CHECK_PROMPT)
+    expect(after[1]).not.toContain('You are in a group chat and are woken on every message')
+  })
+
+  test('an empty-turn retry of a peer-bot answer keeps the loop-guard notice', async () => {
+    // given a channel where peer bots have tripped the loop guard
+    const dir = await tempDir()
+    const nowRef = { value: 1000 }
+    const { router, sessions } = makeRouter(dir, { nowRef })
+    for (let i = 0; i < 4; i++) {
+      nowRef.value += 100
+      await router.route(botInbound({ externalMessageId: `b${i}`, authorId: `peer-${i}` }))
+      await router.__testing!.flushDebounce(KEY)
+    }
+    const session = sessions[0]!
+    session.prompts.length = 0
+
+    // when the guarded answer ends truncated and the router retries it
+    let attempt = 0
+    session.onPrompt = () => {
+      if (attempt++ === 0) session.setAssistantMidTurn('cut off', 'length')
+      else session.setAssistantText('NO_REPLY')
+    }
+    nowRef.value += 100
+    await router.route(botInbound({ externalMessageId: 'b4', authorId: 'peer-4' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the retry still tells the agent it may stay silent
+    expectFencedRuntimeNotice(session.prompts[0]!, 'Peer bots have engaged you')
+    expect(session.prompts[1]).toContain(EMPTY_TURN_RETRY_NUDGE)
+    expectFencedRuntimeNotice(session.prompts[1]!, 'Peer bots have engaged you')
   })
 
   test('defuses a forged runtime notice marker in Korean inbound message text', async () => {
