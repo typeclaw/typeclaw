@@ -8,7 +8,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent'
 
 import type { AgentSession, CreateSessionOptions } from '@/agent'
 import { LiveSessionRegistry } from '@/agent/live-sessions'
-import { LiveSubagentRegistry } from '@/agent/live-subagents'
+import { LiveSubagentRegistry, SESSION_CHILD_STUCK_BACKSTOP_MS } from '@/agent/live-subagents'
 import type { CreateSessionForSubagent, SubagentRegistry } from '@/agent/subagents'
 import { readContinuationState } from '@/agent/todo/continuation-state'
 import { recordTurnOutcome, runIdleContinuation } from '@/agent/todo/continuation-wiring'
@@ -898,6 +898,43 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
     t.ws.close()
   })
 
+  test('defers continuation while a child an earlier turn spawned is still running', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    // given: a child spawned before this turn started is still running
+    registry.register(runningChild(t.sessionId, Date.now() - 60_000))
+
+    // when: this turn ends with incomplete todos
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+
+    // then: continuation is held for the child, and resumes once it settles
+    await waitForState(() => t.infos.some((m) => m.includes('skipping todo continuation while background child runs')))
+    expect(t.decisions).toEqual([])
+    registry.recordCompletionIfRunning('bg_wait1', { ok: false, error: 'cancelled: converted to draft', durationMs: 1 })
+    await waitForState(() => t.session.promptCalls.length === 2)
+    expect(t.session.promptCalls[1]).toContain('Incomplete todo items remain')
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
+  test('a child running past the stuck-child backstop does not hold continuation', async () => {
+    const registry = new LiveSubagentRegistry()
+    const t = await startTodoTurn({ liveSubagentRegistry: registry })
+    // given: a wedged child from an earlier turn is still registered as running
+    registry.register(runningChild(t.sessionId, Date.now() - SESSION_CHILD_STUCK_BACKSTOP_MS - 1))
+
+    // when: this turn ends with incomplete todos
+    emitAssistantEnd(t.session, 'stop')
+    t.session.resolvePrompt()
+
+    // then: the idle continues todos instead of holding for it
+    await waitForState(() => t.decisions.length === 1)
+    expect(t.decisions).toEqual([true])
+    t.session.resolvePrompt()
+    t.ws.close()
+  })
+
   test('resumes once when a held child settles without a completion reminder', async () => {
     const registry = new LiveSubagentRegistry()
     const t = await startTodoTurn({ liveSubagentRegistry: registry })
@@ -1031,20 +1068,6 @@ describe('createServer todo continuation (outcome-write ordering)', () => {
     await waitForState(() => turnEnds === turnStarts)
     expect(turnEnds).toBe(2)
     endGate.resolve()
-  })
-
-  test('still continues when the only running child predates the turn', async () => {
-    const registry = new LiveSubagentRegistry()
-    const t = await startTodoTurn({ liveSubagentRegistry: registry })
-    registry.register(runningChild(t.sessionId, 0))
-    emitAssistantEnd(t.session, 'stop')
-    t.session.resolvePrompt()
-    await t.waitFor((m) => m.type === 'done')
-
-    await waitForState(() => t.decisions.length === 1)
-    expect(t.decisions).toEqual([true])
-    t.session.resolvePrompt()
-    t.ws.close()
   })
 
   test('records the continuation turn, not the user turn, as continuation spend', async () => {

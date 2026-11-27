@@ -22832,6 +22832,125 @@ describe('ChannelRouter background-child await suppression', () => {
     expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
   })
 
+  test("todo continuation waits on an EARLIER turn's running child, then resumes once it finishes", async () => {
+    const dir = await tempDir()
+    const logs: string[] = []
+    let continuationRuns = 0
+    const nowRef = { value: CHILD_STARTED_AT }
+    const child = { running: true }
+    const { router, sessions } = makeRouter(dir, {
+      logs,
+      nowRef,
+      newestRunningChildSubagentStartedAt: (sessionId) => (child.running ? runningChild(sessionId) : null),
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    const stopSilently = () => {
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+    }
+
+    // given: turn N spawned a child that is still running
+    await router.route(inbound({ isBotMention: true, text: 'PR 좀 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!, 'n')
+    await router.__testing!.flushDebounce(KEY)
+
+    // when: a later, unrelated turn ends while that child still runs
+    nowRef.value = CHILD_STARTED_AT + 1_000
+    logs.length = 0
+    sessions[0]!.onPrompt = stopSilently
+    await router.route(inbound({ text: '다른 얘기인데 오늘 회의 몇 시죠?' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the todo list is not nudged for work the child is still doing
+    expect(continuationRuns).toBe(0)
+    expect(logs.some((m) => m.includes('skipping todo continuation while background child runs'))).toBe(true)
+
+    // when: the child has finished and another turn ends
+    child.running = false
+    nowRef.value = CHILD_STARTED_AT + 2_000
+    await router.route(inbound({ text: '고마워요' }))
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: todo continuation runs again
+    expect(continuationRuns).toBe(1)
+  })
+
+  test('a child cancelled during a watch-only drain wakes its held todos once, with no further inbound', async () => {
+    const dir = await tempDir()
+    let continuationRuns = 0
+    const registry = new LiveSubagentRegistry()
+    const parentSessionId = 'ses_fake_1'
+    registry.register({
+      taskId: 'bg_reviewer',
+      sessionId: 'ses_reviewer',
+      subagentName: 'reviewer',
+      parentSessionId,
+      background: true,
+      startedAt: CHILD_STARTED_AT,
+      status: 'running',
+      abort: async () => {},
+    })
+    const { router, sessions } = makeRouter(dir, {
+      nowRef: { value: CHILD_STARTED_AT },
+      newestRunningChildSubagentStartedAt: (sessionId, watchTurnId) =>
+        newestRunningBackgroundChildStartedAt(registry.list({ parentSessionId: sessionId }), watchTurnId),
+      runIdleContinuation: async () => {
+        continuationRuns++
+        return false
+      },
+    })
+    router.registerSelfIdentity(KEY.adapter, () => ({ id: 'bot' }))
+    router.registerOutbound('discord-bot', async () => ({ ok: true }))
+    const stopSilently = () => {
+      sessions[0]!.setAssistantText('NO_REPLY')
+      sessions[0]!.emit({ type: 'message_end', message: assistantMessage('NO_REPLY') })
+    }
+
+    // given: the session's todo continuation is held for its running reviewer
+    await router.route(inbound({ isBotMention: true, text: 'PR 42 리뷰해줘' }))
+    sessions[0]!.onPrompt = () => emptyStopAfterToolWork(sessions[0]!)
+    await router.__testing!.flushDebounce(KEY)
+    expect(continuationRuns).toBe(0)
+
+    // when: an unrelated watch turn runs, and the reviewer is cancelled mid-drain;
+    // the cancellation's failed completion arrives as the bridge delivers it
+    const prompts: string[] = []
+    sessions[0]!.onPrompt = async (text) => {
+      prompts.push(text)
+      if (prompts.length === 1) {
+        registry.recordCompletion('bg_reviewer', {
+          ok: false,
+          error: 'cancelled: pull request converted to draft',
+          durationMs: 1,
+        })
+        await router.injectSubagentCompletionReminder({
+          parentSessionId,
+          taskId: 'bg_reviewer',
+          subagent: 'reviewer',
+          ok: false,
+          error: 'cancelled: pull request converted to draft',
+          durationMs: 1,
+        })
+      }
+      stopSilently()
+    }
+    await deliverChannelWakes(
+      router,
+      { kind: 'channel', key: KEY, requester: { authorId: 'owner', authorAdapter: KEY.adapter } },
+      [{ watchId: 'build', key: 'run', description: 'Build', summary: 'Ready', final: true }],
+    )
+    await router.__testing!.flushDebounce(KEY)
+
+    // then: the cancellation wakes the session and the held todos continue once
+    expect(prompts.some((p) => p.includes('cancelled: pull request converted to draft'))).toBe(true)
+    expect(continuationRuns).toBe(1)
+    await router.stop()
+  })
+
   test('todo continuation parks for linked work but resumes when runnable work arrives', async () => {
     const dir = await tempDir()
     const origin = { kind: 'channel', ...KEY } as const

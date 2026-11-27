@@ -11,7 +11,11 @@ import {
 import { applyTurnThinkingLevel, getQuestionSignal, type QuestionSignal } from '@/agent/attention-escalation'
 import { runPluginDoctorChecks, runPluginDoctorFix } from '@/agent/doctor'
 import type { LiveSessionRegistry } from '@/agent/live-sessions'
-import { type LiveSubagentRegistry, newestRunningBackgroundChildStartedAt } from '@/agent/live-subagents'
+import {
+  type LiveSubagentRegistry,
+  newestRunningBackgroundChildStartedAt,
+  SESSION_CHILD_STUCK_BACKSTOP_MS,
+} from '@/agent/live-subagents'
 import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
@@ -236,13 +240,13 @@ type SessionState = {
   todoOutcomeWrite: Promise<boolean>
   todoContinuation: { recordTurnOutcome: typeof recordTurnOutcome; runIdleContinuation: typeof runIdleContinuation }
   // Start time of the newest background child this session spawned that is
-  // still running, or null. Todo continuation waits for a child spawned during
-  // the turn: its completion, not a nudge, is what resumes that work.
+  // still running, or null. Todo continuation waits while any such child runs,
+  // whichever turn spawned it: its completion, not a nudge, resumes that work.
   newestRunningChildStartedAt: () => number | null
-  // Start of the turn whose todo continuation is held for a running child, or
-  // null. Lets a settlement that publishes no completion reminder (a work-key
-  // cancellation) still resume the session once.
-  heldForChildSince: number | null
+  // Whether todo continuation is held for a running child. Lets a settlement
+  // that publishes no completion reminder (a work-key cancellation) still
+  // resume the session once.
+  heldForChild: boolean
   unsubChildSettle: Unsubscribe | null
   // Whether todo continuation started the turn in flight. Its outcome is then
   // charged to the continuation budget.
@@ -616,7 +620,7 @@ export function createServer({
                   : newestRunningBackgroundChildStartedAt(
                       liveSubagentRegistry.list({ parentSessionId: sessionFileId }),
                     ),
-              heldForChildSince: null,
+              heldForChild: false,
               unsubChildSettle: null,
               continuationTurn: false,
               lastUsage: null,
@@ -637,7 +641,7 @@ export function createServer({
             }
             if (agentDir !== undefined && liveSubagentRegistry !== undefined) {
               state.unsubChildSettle = liveSubagentRegistry.subscribe((parentSessionId) => {
-                if (parentSessionId !== sessionFileId || state.heldForChildSince === null) return
+                if (parentSessionId !== sessionFileId || !state.heldForChild) return
                 // Deferred past the settling code: a child that completes publishes
                 // its completion reminder synchronously after settling, which queues
                 // the turn that resumes the work. Only a settlement that publishes
@@ -977,7 +981,7 @@ export function createServer({
           // Before any await: a child settling during teardown must not resume a
           // closing session's todos.
           state?.unsubChildSettle?.()
-          if (state) state.heldForChildSince = null
+          if (state) state.heldForChild = false
           try {
             state?.unsubBroadcast?.()
             state?.unsubPrompts?.()
@@ -1290,8 +1294,7 @@ async function drain(
     while (state.drainQueue.length > 0) {
       const item = state.drainQueue.shift()
       if (!item) break
-      const turnStartedAt = Date.now()
-      state.heldForChildSince = null
+      state.heldForChild = false
       state.continuationTurn = item.source === TODO_CONTINUATION_SOURCE
       pushQueueState(ws, state)
       send(ws, { type: 'prompt_started', messageId: item.streamMessageId, text: item.text })
@@ -1386,12 +1389,13 @@ async function drain(
       if (state.drainQueue.length === 0) {
         if (!(await awaitLatestTodoOutcomeWrite(state))) {
           logger.warn(`[server] ${state.sessionFileId}: skipping todo continuation after failed outcome write`)
-        } else if ((state.newestRunningChildStartedAt() ?? -Infinity) >= turnStartedAt) {
-          // The pending todo is usually the work this child was spawned for, so a
-          // nudge now would only make the model poll for a result it cannot have
-          // yet. The child's completion reminder resumes the session.
+        } else if (isHeldByRunningChild(state)) {
+          // The pending todo is usually the work a running child was spawned for,
+          // often by an earlier turn, so a nudge now would only make the model poll
+          // for a result it cannot have yet. The child's completion reminder
+          // resumes the session.
           logger.info(`[server] ${state.sessionFileId}: skipping todo continuation while background child runs`)
-          state.heldForChildSince = turnStartedAt
+          state.heldForChild = true
         } else if (state.drainQueue.length === 0) {
           await maybeContinueTodos(state, agentDir, logger)
         }
@@ -1455,14 +1459,20 @@ async function resumeTodosAfterChildSettled(
   logger: ServerLogger,
   stream: Stream | undefined,
 ): Promise<void> {
-  const heldSince = state.heldForChildSince
-  if (heldSince === null || ws.readyState !== WebSocket.OPEN) return
+  if (!state.heldForChild || ws.readyState !== WebSocket.OPEN) return
   if (state.draining || state.drainQueue.length > 0) return
-  if ((state.newestRunningChildStartedAt() ?? -Infinity) >= heldSince) return
-  state.heldForChildSince = null
+  if (isHeldByRunningChild(state)) return
+  state.heldForChild = false
   await maybeContinueTodos(state, agentDir, logger)
   if (ws.readyState !== WebSocket.OPEN) return
   if (state.drainQueue.length > 0) void drain(ws, state, agentDir, logger, stream)
+}
+
+// Bounded by the stuck-child backstop: a wedged child with no timeout must not
+// hold todo continuation on every later turn.
+function isHeldByRunningChild(state: SessionState): boolean {
+  const startedAt = state.newestRunningChildStartedAt()
+  return startedAt !== null && Date.now() - startedAt <= SESSION_CHILD_STUCK_BACKSTOP_MS
 }
 
 function describeErr(err: unknown): string {
