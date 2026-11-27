@@ -52,6 +52,38 @@ describe.skipIf(process.platform === 'win32')('persistent Bun kernel', () => {
     expect(result.text).not.toContain('omitted intermediate')
   })
 
+  // End-to-end smoke test: stdout chunking decides whether the host sees the
+  // overflow frame while the cap is full, so the cell test owns the
+  // deterministic regression.
+  test('Promise.all over more tool calls than the cap completes and keeps bindings', async () => {
+    const instance = kernel()
+    const total = CODEMODE_LIMITS.concurrency + 4
+    const capReached = Promise.withResolvers<void>()
+    let started = 0
+    let inFlight = 0
+    let maxInFlight = 0
+    await instance.run('const kept = "before"', { dispatch })
+    const result = await instance.run(
+      `const r = await Promise.all(Array.from({length:${total}}, (_, i) => tool.read({path:String(i)}))); print(r.length)`,
+      {
+        dispatch: async ({ args }) => {
+          started += 1
+          inFlight += 1
+          maxInFlight = Math.max(maxInFlight, inFlight)
+          if (started === CODEMODE_LIMITS.concurrency) capReached.resolve()
+          await capReached.promise
+          inFlight -= 1
+          return args
+        },
+      },
+    )
+    expect(result.isError).toBe(false)
+    expect(result.text.trim()).toBe(String(total))
+    expect(maxInFlight).toBe(CODEMODE_LIMITS.concurrency)
+    const after = await instance.run('print(kept)', { dispatch })
+    expect(after.text.trim()).toBe('before')
+  })
+
   test('text() extracts only the text parts of a tool result and caps them', async () => {
     const instance = kernel()
     const result = await instance.run('const r = await tool.read({path:"x"}); print(text(r)); print(text(r, 5))', {

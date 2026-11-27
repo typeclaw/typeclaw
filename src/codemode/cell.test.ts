@@ -38,33 +38,37 @@ describe('codemode cell request leases', () => {
     expect(calls).toBe(1)
   })
 
-  test('concurrency is bounded independently of the child parallel helper', async () => {
+  test('calls past the concurrency cap wait for a free slot instead of failing', async () => {
+    // given more calls than the cap, each held until released
+    const total = CODEMODE_LIMITS.concurrency + 2
+    const started = Array.from({ length: total }, () => Promise.withResolvers<void>())
+    const releases = Array.from({ length: total }, () => Promise.withResolvers<void>())
     let calls = 0
-    const release = Promise.withResolvers<void>()
+    const results: string[] = []
     const cell = new CodemodeCell(async () => {
-      calls += 1
-      await release.promise
-      return null
+      const index = calls++
+      started[index]!.resolve()
+      await releases[index]!.promise
+      return index
     }, new AbortController().signal)
-    for (let id = 0; id < CODEMODE_LIMITS.concurrency; id++) {
-      cell.receive({ type: 'tool-call', cellId: cell.id, id: String(id), name: 'read', args: {} }, () => {})
+
+    // when every call arrives at once
+    for (let id = 0; id < total; id++) {
+      cell.receive({ type: 'tool-call', cellId: cell.id, id: String(id), name: 'read', args: {} }, (frame) => {
+        if (frame.type === 'tool-result') results.push(frame.id)
+      })
     }
-    expect(() =>
-      cell.receive(
-        {
-          type: 'tool-call',
-          cellId: cell.id,
-          id: 'extra',
-          name: 'read',
-          args: {},
-        },
-        () => {},
-      ),
-    ).toThrow(CodemodeError)
+    await Promise.all(started.slice(0, CODEMODE_LIMITS.concurrency).map((turn) => turn.promise))
+
+    // then only the cap dispatches until a slot frees, and every call still completes
     expect(calls).toBe(CODEMODE_LIMITS.concurrency)
-    release.resolve()
+    releases[0]!.resolve()
+    await started[CODEMODE_LIMITS.concurrency]!.promise
+    expect(calls).toBe(CODEMODE_LIMITS.concurrency + 1)
+    for (const release of releases) release.resolve()
     cell.receive({ type: 'done', cellId: cell.id }, () => {})
     await cell.completed.promise
+    expect(results).toHaveLength(total)
   })
 
   test('a completed cell cannot start another tool', async () => {
