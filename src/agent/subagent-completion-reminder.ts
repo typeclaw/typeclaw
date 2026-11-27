@@ -16,9 +16,17 @@ export type CompletionReminderArgs = {
   durationMs: number
   error?: string
   hasRecoverableOutput?: boolean
+  cancelled?: boolean
   channel?: boolean
   adapter?: string
 }
+
+// A cancelled child is not a failure to recover: its work was invalidated (a
+// drafted PR, for one), so retrying it or posting its result would be wrong.
+const CANCELLED_CHANNEL_NUDGE =
+  'This reminder is a system message, not a user inbound: post nothing about the cancellation. ' +
+  'If this turn has nothing else to answer or deliver, end it with `skip_response`; otherwise ' +
+  'handle the rest of the turn as usual.'
 
 const CHANNEL_REPLY_NUDGE =
   'This reminder is a system message, not a user inbound — but you are in a channel session, ' +
@@ -45,6 +53,16 @@ const GITHUB_REVIEW_NUDGE =
 
 export function renderSubagentCompletionReminder(args: CompletionReminderArgs): string {
   const durationStr = formatReminderDuration(args.durationMs)
+  if (args.cancelled === true) {
+    return (
+      `<system-reminder>\n` +
+      `Subagent \`${args.subagent}\` (${args.taskId}) was cancelled after ${durationStr}: ${args.error ?? 'cancelled'}. ` +
+      `Its work no longer applies. Mark any todo item for it cancelled via todo_write, and do not post its ` +
+      `result or start the work again until a new request asks for it.` +
+      `${args.channel === true ? ` ${CANCELLED_CHANNEL_NUDGE}` : ''}\n` +
+      `</system-reminder>`
+    )
+  }
   const githubTail = args.channel === true && args.adapter === 'github' ? ` ${GITHUB_REVIEW_NUDGE}` : ''
   const channelTail = args.channel === true ? ` ${CHANNEL_REPLY_NUDGE}${githubTail}` : ''
   if (args.ok) {
@@ -99,6 +117,9 @@ export type SubagentCompletedPayload = {
   // subagent_output; the body stays in the registry retrieval path, off the
   // broadcast bus, to keep large/sensitive output out of every subscriber.
   hasRecoverableOutput?: boolean
+  // The child was cancelled because its work was invalidated, not because it
+  // failed; the reminder tells the parent to close it out instead of recovering.
+  cancelled?: boolean
   // Present when the parent was a channel session. Lets the router fall back
   // to the live successor session for the same channel key when the parent
   // rolled over after 60 minutes idle (SESSION_FRESHNESS_TTL_MS) or was
@@ -121,6 +142,7 @@ export function parseSubagentCompletedPayload(payload: unknown): SubagentComplet
     durationMs?: unknown
     error?: unknown
     hasRecoverableOutput?: unknown
+    cancelled?: unknown
     channelKey?: unknown
   }
   if (p.kind !== 'subagent.completed') return null
@@ -134,6 +156,7 @@ export function parseSubagentCompletedPayload(payload: unknown): SubagentComplet
     durationMs: typeof p.durationMs === 'number' ? p.durationMs : 0,
     ...(typeof p.error === 'string' ? { error: p.error } : {}),
     ...(p.hasRecoverableOutput === true ? { hasRecoverableOutput: true } : {}),
+    ...(p.cancelled === true ? { cancelled: true } : {}),
     ...(channelKey !== null ? { channelKey } : {}),
   }
 }

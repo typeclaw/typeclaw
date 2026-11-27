@@ -304,6 +304,34 @@ describe('runSubagentDrain — termination', () => {
     expect(prompts[0]).toContain('FAILED')
     expect(prompts[0]).toContain('boom')
   })
+
+  test('delivers a close-out, not a failure, for a child cancelled by work key while the parent waits', async () => {
+    const { drain, reg } = makeDrain()
+    reg.register({
+      taskId: 'bg_rev',
+      sessionId: 'ses_bg_rev',
+      subagentName: 'reviewer',
+      parentSessionId: PARENT,
+      workKey: 'reviewer:github:acme/widgets#42',
+      background: true,
+      startedAt: 0,
+      status: 'running',
+      abort: noopAbort,
+    })
+    const watch = beginSubagentDrainWatch(drain)
+    const prompts: string[] = []
+    const run = runSubagentDrain(watch, { drain, prompt: async (t) => void prompts.push(t) })
+
+    // when: the waiting child is cancelled by its work key
+    await reg.cancelRunningByWorkKey('reviewer:github:acme/widgets#42', 'pull request converted to draft', drain.stream)
+    await run
+
+    // then: the drain closes it out instead of asking for recovery
+    expect(prompts.length).toBe(1)
+    expect(prompts[0]).toContain('was cancelled')
+    expect(prompts[0]).not.toContain('FAILED')
+    expect(prompts[0]).not.toContain('keep the item pending')
+  })
 })
 
 describe('runSubagentDrain — maxChildWaitMs (wedged-child ceiling)', () => {

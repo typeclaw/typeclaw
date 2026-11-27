@@ -1,4 +1,7 @@
+import type { Stream } from '@/stream'
+
 import type { AgentSession } from './index'
+import type { SubagentCompletedChannelKey } from './subagent-completion-reminder'
 
 export type SubagentProgressEvent =
   | { kind: 'started'; ts: number }
@@ -11,6 +14,8 @@ export type SubagentCompletion = {
   ok: boolean
   finalMessage?: string
   error?: string
+  // Settled by work-key cancellation: its work was invalidated, not failed.
+  cancelled?: boolean
   durationMs: number
 }
 
@@ -19,6 +24,9 @@ export type LiveSubagent = {
   sessionId: string
   subagentName: string
   parentSessionId?: string
+  // The spawning channel conversation, so a completion published on the child's
+  // behalf can still reach a live successor after the parent session rolls over.
+  channelKey?: SubagentCompletedChannelKey
   // From the accepted channel obligation, not inferred from the current speaker.
   watchTurnId?: string
   workKey?: string
@@ -265,6 +273,7 @@ export class LiveSubagentRegistry {
   async cancelRunningByWorkKey(
     workKey: string,
     reason: string,
+    stream?: Stream,
   ): Promise<{ matched: number; cancelled: number; failures: number }> {
     const pending = this.pendingWorkKeyRegistrations.get(workKey)
     if (pending !== undefined) {
@@ -286,10 +295,26 @@ export class LiveSubagentRegistry {
 
     const settledAt = Date.now()
     for (const entry of matched) {
-      this.recordCompletionIfRunning(entry.taskId, {
-        ok: false,
-        error: `cancelled: ${reason}`,
-        durationMs: Math.max(0, settledAt - entry.startedAt),
+      const error = `cancelled: ${reason}`
+      const durationMs = Math.max(0, settledAt - entry.startedAt)
+      if (!this.recordCompletionIfRunning(entry.taskId, { ok: false, error, cancelled: true, durationMs })) continue
+      // Winning the settlement suppresses the child's own completion broadcast,
+      // so publish this one: the parent learns of the cancellation through the
+      // same reminder as any other failure, before an idle observer runs.
+      if (stream === undefined || entry.background !== true || entry.parentSessionId === undefined) continue
+      stream.publish({
+        target: { kind: 'broadcast' },
+        payload: {
+          kind: 'subagent.completed',
+          taskId: entry.taskId,
+          subagent: entry.subagentName,
+          parentSessionId: entry.parentSessionId,
+          ok: false,
+          durationMs,
+          error,
+          cancelled: true,
+          ...(entry.channelKey !== undefined ? { channelKey: entry.channelKey } : {}),
+        },
       })
     }
     for (const entry of matched) entry.releaseCoalesceKey?.()

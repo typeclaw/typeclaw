@@ -47,6 +47,26 @@ describe('renderSubagentCompletionReminder', () => {
     expect(text).toContain('unknown error')
   })
 
+  test('cancelled renders a close-out instead of recovery or a review verdict', () => {
+    const cancelled = renderSubagentCompletionReminder({
+      subagent: 'reviewer',
+      taskId: 'bg_rev',
+      ok: false,
+      durationMs: 30_000,
+      error: 'cancelled: pull request converted to draft',
+      cancelled: true,
+      channel: true,
+      adapter: 'github',
+    })
+    expect(cancelled).toContain('was cancelled')
+    expect(cancelled).toContain('pull request converted to draft')
+    expect(cancelled).toContain('cancelled via todo_write')
+    expect(cancelled).toContain('skip_response')
+    expect(cancelled).not.toContain('FAILED')
+    expect(cancelled).not.toContain('keep the item pending')
+    expect(cancelled).not.toContain('formal review')
+  })
+
   test('ok=false with hasRecoverableOutput steers the parent to recover, not redo, the work', () => {
     const recoverable = renderSubagentCompletionReminder({
       subagent: 'researcher',
@@ -233,6 +253,20 @@ describe('parseSubagentCompletedPayload', () => {
     })
     expect(parsed?.ok).toBe(false)
     expect(parsed?.error).toBe('provider rate limit')
+  })
+
+  test('cancelled payload keeps its cancellation flag', () => {
+    const parsed = parseSubagentCompletedPayload({
+      kind: 'subagent.completed',
+      taskId: 'bg_rev',
+      subagent: 'reviewer',
+      parentSessionId: 'ses_abc',
+      ok: false,
+      durationMs: 1_500,
+      error: 'cancelled: pull request converted to draft',
+      cancelled: true,
+    })
+    expect(parsed?.cancelled).toBe(true)
   })
 
   test('failed-completion payload preserves recoverability metadata but drops output bodies', () => {

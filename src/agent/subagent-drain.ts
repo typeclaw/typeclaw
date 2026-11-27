@@ -183,6 +183,7 @@ function collectPendingReminders(drain: SubagentBackgroundDrain, delivered: Set<
       durationMs: completion?.durationMs ?? 0,
       ...(completion?.error !== undefined ? { error: completion.error } : {}),
       ...(hasRecoverableOutput ? { hasRecoverableOutput: true } : {}),
+      ...(completion?.cancelled === true ? { cancelled: true } : {}),
     })
     pending.push({ taskId: child.taskId, text })
   }
