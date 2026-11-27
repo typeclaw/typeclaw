@@ -115,6 +115,7 @@ import {
   SESSION_FRESHNESS_TTL_MS,
   OBSERVED_MESSAGE_MAX_CHARS,
   SESSION_IDLE_MS,
+  ENSURE_LIVE_TIMEOUT_MS,
   SESSION_CHILD_STUCK_BACKSTOP_MS,
   sliceHeadTail,
   StaleLiveSessionError,
@@ -2803,16 +2804,14 @@ describe('ChannelRouter ensureLive watchdog', () => {
     })
     // The watchdog wraps the WHOLE ensureLive chain (ensureLoaded + name/
     // membership resolution + factory), not just the factory. The first call's
-    // factory hangs forever, so it times out at ANY finite budget — but the
-    // second, success-path call must finish that whole chain before the watchdog
-    // fires. A 50ms budget lost that race under parallel contention (the
-    // recurring flake: the success-path call timed out too). 5s is still far
-    // under the 30s test timeout, keeps the first timeout fast enough, and gives
-    // the success path enough headroom to never lose to contention.
+    // factory hangs forever, so a short budget always times it out; contention
+    // can only delay that, never prevent it. The retry must not race the same
+    // short budget (it lost that race under parallel load), so the test raises
+    // the budget before retrying instead of picking one wall-clock value for both.
     const router = createChannelRouter({
       agentDir: dir,
       configForAdapter: () => baseConfig,
-      ensureLiveTimeoutMs: 5_000,
+      ensureLiveTimeoutMs: 50,
       logger: {
         info: (m) => logs.push(`info:${m}`),
         warn: (m) => logs.push(`warn:${m}`),
@@ -2841,6 +2840,7 @@ describe('ChannelRouter ensureLive watchdog', () => {
     // Gate the retry on the first creation actually reaching the factory and
     // hanging, so the hang can't race onto the SECOND call.
     await firstCreation
+    router.__testing!.setEnsureLiveTimeoutMs(ENSURE_LIVE_TIMEOUT_MS)
     await router.route(inbound({ externalMessageId: 'm2' }))
     await router.__testing!.flushDebounce(KEY)
 

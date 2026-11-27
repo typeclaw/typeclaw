@@ -1990,6 +1990,7 @@ export type ChannelRouter = {
   __testing?: {
     getRecoveryAccountingSnapshot: (key: ChannelKey) => Record<string, unknown> | undefined
     flushDebounce: (key: ChannelKey) => Promise<void>
+    setEnsureLiveTimeoutMs: (ms: number) => void
     fireTypingHeartbeat: (key: ChannelKey, phase?: 'tick' | 'stop') => Promise<void>
     fireTypingInterval: (key: ChannelKey) => Promise<void>
     fireTypingTick: (key: ChannelKey, epoch: number) => Promise<void>
@@ -2213,7 +2214,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   const recoveryOutbox =
     options.recoveryOutbox ?? new RecoveryOutbox(options.agentDir, { epoch: backgroundObligations.epoch })
   void ready.catch((error) => logger.error(`[channels] inbound journal initialization failed: ${describeError(error)}`))
-  const ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
+  let ensureLiveTimeoutMs = options.ensureLiveTimeoutMs ?? ENSURE_LIVE_TIMEOUT_MS
   const handoffRetryRetentionMs = options.handoffRetryRetentionMs ?? RELOAD_HANDOFF_RETENTION_MS
   const handoffRetryItemLimit = options.handoffRetryItemLimit ?? MAX_PENDING_RELOAD_HANDOFF_ITEMS_PER_KEY
   const handoffRetryByteLimit = options.handoffRetryByteLimit ?? MAX_PENDING_RELOAD_HANDOFF_BYTES_PER_KEY
@@ -10801,6 +10802,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       githubReviewRoundFor: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.githubReviewRound,
       pendingReminderCount: (key: ChannelKey) => liveSessions.get(channelKeyId(key))?.pendingSystemReminders.length,
       creationTokenCount: () => latestCreationTokens.size,
+      setEnsureLiveTimeoutMs: (ms: number) => {
+        ensureLiveTimeoutMs = ms
+      },
       flushDebounce: async (key: ChannelKey) => {
         const keyId = channelKeyId(key)
         let live = liveSessions.get(keyId)
