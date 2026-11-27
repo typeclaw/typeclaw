@@ -42,7 +42,7 @@ CLI: `typeclaw channel add slack-bot` (interactive), `typeclaw channel set slack
 
 ## Agent mode
 
-An app created from the TypeClaw manifest is a Slack **agent** (`features.agent_view`): Slack labels it AGENT instead of APP and adds it to the top-bar agent entry point. At start the adapter checks whether the bot token holds `assistant:write`, which Slack grants only to agents, and logs `agent mode on` or `agent mode off`.
+An app created from the TypeClaw manifest is a Slack **agent** (`features.agent_view`): Slack labels it AGENT instead of APP and adds it to the top-bar agent entry point. At start the adapter checks whether the bot token holds `assistant:write` and logs `agent mode on` or `agent mode off`. Slack grants that scope to apps declared as agents and also to apps on its older Assistant view, so the log reflects the token's scope, not whether the manifest uses `agent_view`.
 
 In agent mode the typing indicator becomes Slack's agent session status (`agents.sessions.setStatus`): `processing` while the agent works, which shows Slack's "Working…" UX, and `active` when the turn ends. If Slack refuses the session call (for example, an app still on Slack's older Assistant view, which also holds `assistant:write`), the adapter falls back to the plain typing status in channel threads. In a DM it shows no status instead, because the plain status would open a thread in Slack's agent view that the reply is not posted in. Without `assistant:write`, typing uses `assistant.threads.setStatus`.
 
@@ -50,12 +50,7 @@ Routing is the same in both modes: a DM is one session, and channel threads stay
 
 While an agent session is working, Slack shows a stop button (the manifest subscribes to `agent_session_stopped`). Clicking it runs `/stop` with the same `session.control` permission check, for that thread in a channel or for the conversation in a DM; a stopped turn's session returns to `active`.
 
-To turn an existing app into an agent, open **[api.slack.com/apps](https://api.slack.com/apps) → your app → App Manifest**:
-
-- **Plain app** (no `assistant_view` or `agent_view` in its manifest): add the `features.agent_view` block and the `assistant:write` scope from the [manifest](/docs/guides/add-a-channel).
-- **App already using Slack's older Assistant view** (`features.assistant_view`): this switch is one-way. Slack cannot move the app back to the Assistant view, and users must hard-refresh Slack to see the change. Following Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/), replace `assistant_view` with `agent_view` and rename `assistant_description` to `agent_description`.
-
-In both cases, also set `features.app_home.agent_tasks_enabled: false` and add the `agent_session_stopped` bot event from the manifest. Slack turns the agent Tasks tab on by default, and TypeClaw does not handle Slack-scheduled tasks. Then reinstall the app to grant the new scope and run `typeclaw restart`. Slack may require a paid plan for some agent features.
+Apps created before the manifest declared agent mode run as plain apps. To upgrade one, follow [Make your Slack app an agent](/docs/guides/migrate-slack-to-agent). Slack may require a paid plan for some agent features.
 
 ## Own-reaction cleanup
 
