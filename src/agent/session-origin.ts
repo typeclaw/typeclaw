@@ -894,13 +894,7 @@ function renderParticipants(
     const addressing = renderParticipantAddressing(p, platformInfo)
     lines.push(`- ${addressing} — last message: ${ago}, total: ${p.messageCount}`)
   }
-  lines.push(
-    '',
-    'This list is **bounded**: only the 10 most recent authors from the last',
-    '7 days. It is **not** the full guild member list or an audit log.',
-    '',
-    ...renderParticipantsTrailing(platformInfo),
-  )
+  lines.push('', ...renderParticipantsTrailing(platformInfo))
   return lines.join('\n')
 }
 
