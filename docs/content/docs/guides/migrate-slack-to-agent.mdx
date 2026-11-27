@@ -1,0 +1,126 @@
+---
+title: Make your Slack app an agent
+description: Upgrade a Slack app created before agent mode so Slack labels it AGENT and shows its Working status and stop button
+icon: Bot
+---
+
+import { Callout } from 'fumadocs-ui/components/callout'
+import { Steps, Step } from 'fumadocs-ui/components/steps'
+
+TypeClaw's Slack manifest now declares the app a Slack **agent**. An agent app gets:
+
+- the AGENT label instead of APP, and an entry in Slack's top-bar agent launcher
+- Slack's "Working…" status while the agent is on a turn
+- a stop button on that status, which runs `/stop` for the turn
+
+Apps created from the manifest before this change are plain Slack apps. They keep working exactly as before, without these extras. Slack doesn't let TypeClaw edit your app's settings with the bot token, so you upgrade it yourself in a few minutes. This guide covers [Slack bot](/docs/reference/slack-bot) apps only; the Slack user-account adapter can't be an agent.
+
+## Check whether you need this
+
+Open **[api.slack.com/apps](https://api.slack.com/apps)** → your app → **App Manifest**. The app is already set up if its manifest has both:
+
+- `features.agent_view`
+- `agent_session_stopped` under `settings.event_subscriptions.bot_events`
+
+If the manifest has `features.agent_view` but not `agent_session_stopped` (an app created from an earlier version of the TypeClaw manifest), add only that event under **Event Subscriptions → Subscribe to bot events** and save; no reinstall is needed. Otherwise, follow the steps below.
+
+The adapter's startup log line (`typeclaw logs | grep 'agent mode'`) is not a reliable shortcut here. It reports only whether the bot token holds `assistant:write`, and an app on Slack's older Assistant view holds that scope too, so it can log `agent mode on` while still needing the manifest change. Use the log in [Verify](#verify) instead.
+
+## Upgrade the app
+
+<Steps>
+
+<Step>
+
+### Open the app manifest
+
+Go to **[api.slack.com/apps](https://api.slack.com/apps)**, pick the app TypeClaw uses, and open **App Manifest** in the sidebar. The editor shows YAML or JSON; either works.
+
+</Step>
+
+<Step>
+
+### Edit the manifest
+
+Change only the parts below and leave everything else as it is, including any name, slash commands, or scopes you customized.
+
+**Plain app** (its manifest has neither `assistant_view` nor `agent_view`): merge these into the matching sections.
+
+```yaml
+features:
+  app_home:
+    agent_tasks_enabled: false
+  agent_view:
+    agent_description: Your TypeClaw agent. Message it here or mention it in a channel.
+oauth_config:
+  scopes:
+    bot:
+      - assistant:write
+settings:
+  event_subscriptions:
+    bot_events:
+      - agent_session_stopped
+```
+
+Add the scope and the event to the existing lists; don't replace the lists.
+
+**App on Slack's older Assistant view** (its manifest has `features.assistant_view`):
+
+<Callout type="warn" title="This switch is one-way">
+  Slack can't move an app back to the Assistant view once it uses `agent_view`, and your users must hard-refresh Slack
+  to see the change. See Slack's [migration guide](https://docs.slack.dev/ai/migrating-to-agent-messaging/).
+</Callout>
+
+Rename `assistant_view` to `agent_view` and `assistant_description` to `agent_description`. Then apply the rest of the plain-app snippet: `agent_tasks_enabled: false` and the `agent_session_stopped` event. The app already has `assistant:write`.
+
+`agent_tasks_enabled: false` hides Slack's agent Tasks tab, which Slack turns on by default. TypeClaw schedules its own work with [cron](/docs/guides/first-cron) and doesn't handle Slack-scheduled tasks.
+
+Click **Save Changes**.
+
+</Step>
+
+<Step>
+
+### Reinstall the app if Slack asks
+
+A new scope only takes effect after a reinstall, so a **plain app** needs one for `assistant:write`. Slack shows a banner asking for it; otherwise open **Install App** and click **Reinstall to Workspace**, then approve.
+
+An **Assistant-view app** already has `assistant:write`, and Slack applies new bot events without a reinstall when the scopes they need are already installed. Reinstall it only if Slack shows the banner.
+
+If Slack shows a different **Bot User OAuth Token** after a reinstall, store it with `typeclaw channel set slack-bot`.
+
+</Step>
+
+<Step>
+
+### Restart the agent
+
+```sh
+typeclaw restart
+```
+
+The adapter checks the bot token's scopes only at start, so the change needs a restart, not just a reload.
+
+</Step>
+
+</Steps>
+
+## Verify
+
+- `typeclaw logs | grep 'agent mode'` shows `[slack-bot] agent mode on` from the latest start, meaning the active bot token holds `assistant:write`.
+- The bot's profile in Slack shows AGENT instead of APP.
+- Send the agent a message in a DM, or in a thread of a channel the bot has joined. While it works on the turn, Slack shows "Working…" with a stop button. Clicking it stops the turn if you're allowed to use `/stop` there.
+
+Slack only shows the session status in channels the bot is a member of. TypeClaw can answer a mention in a channel it hasn't joined, so a reply there without "Working…" doesn't mean the upgrade failed.
+
+## Troubleshooting
+
+**Still `agent mode off` after a restart.** First look in the latest startup logs for `agent mode probe failed`. That warning means the adapter couldn't reach Slack to read the token's scopes, for example on a network error or timeout, and it runs as a plain app until the next start. Fix the error it names and restart; reinstalling won't help. Without that warning, the active bot token lacks the scope: check **OAuth & Permissions → Bot Token Scopes** for `assistant:write`, reinstall, store a new token with `typeclaw channel set slack-bot` if Slack issued one, and restart.
+
+**No Working status.** Make sure you're testing in a DM or in a channel the bot has joined; Slack shows the status only where the bot is a member. If the logs also show `agent session status failed`, Slack refused the agent status call. In channel threads the adapter falls back to the plain typing status; in a DM it shows no status, because in Slack's agent view the plain status would open a thread the reply isn't posted in. Check that the manifest has `agent_view` rather than `assistant_view`. Slack may also require a paid plan for some agent features.
+
+**Status shows but there's no stop button.** The manifest is missing the `agent_session_stopped` bot event. Add it under **Event Subscriptions → Subscribe to bot events** and save.
+
+**Tasks tab appeared in the app.** Set `features.app_home.agent_tasks_enabled: false` and save.
+
+For what agent mode changes at runtime, see [Agent mode](/docs/reference/slack-bot#agent-mode) in the Slack bot reference.
