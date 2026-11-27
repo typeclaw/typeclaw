@@ -102,7 +102,7 @@ export function createSpawnSubagentTool(options: CreateSpawnSubagentToolOptions)
       }),
       prompt: Type.String({
         description:
-          'The full task description for the subagent. Use the [CONTEXT]/[GOAL]/[REQUEST] structure described in the system prompt. The subagent does not see the parent conversation; everything it needs must be in this string.',
+          'The full task description for the subagent. Use the [CONTEXT]/[GOAL]/[REQUEST] structure described in the system prompt. The subagent does not see the parent conversation; everything it needs must be in this string, including what the user asked for and the end state they want. Add no limits that neither the user nor your instructions set.',
       }),
       description: Type.Optional(
         Type.String({
