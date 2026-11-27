@@ -25,7 +25,13 @@ import {
 import { InboundJournal } from './inbound-journal'
 import { RecoveryDispatcher } from './recovery-dispatcher'
 import { RecoveryOutbox } from './recovery-outbox'
-import { createChannelRouter, SESSION_FRESHNESS_TTL_MS, SESSION_IDLE_MS, TURN_FAILED_REACTION_EMOJI } from './router'
+import {
+  CHANNEL_COMPLETION_CHECK_PROMPT,
+  createChannelRouter,
+  SESSION_FRESHNESS_TTL_MS,
+  SESSION_IDLE_MS,
+  TURN_FAILED_REACTION_EMOJI,
+} from './router'
 import { defaultHistoryConfig } from './schema'
 import type { ChannelKey, InboundMessage, OutboundCallback } from './types'
 
@@ -461,9 +467,16 @@ class ParentSession {
     getBranch: () => (this.leaf ? [this.leaf] : []),
     appendMessage: () => 'appended',
   }
+  // A model that already delivered its result ends a completion check silent.
+  completionChecks: string[] = []
   prompt = async (text: string) => {
-    this.prompts.push(text)
     this.agent.controller = new AbortController()
+    if (text.includes(CHANNEL_COMPLETION_CHECK_PROMPT)) {
+      this.completionChecks.push(text)
+      this.finish('NO_REPLY')
+      return
+    }
+    this.prompts.push(text)
     await this.onPrompt(text)
   }
   abort = async () => {
