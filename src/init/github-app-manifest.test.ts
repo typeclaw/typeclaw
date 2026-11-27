@@ -86,7 +86,11 @@ describe('startGithubAppManifestSession', () => {
       expect(manifest.public).toBe(false)
       expect(manifest.hook_attributes).toBeUndefined()
       expect(manifest.redirect_url).toBe(new URL('/callback', session.url).toString())
-      expect(manifest.default_permissions).toMatchObject({ repository_hooks: 'write', checks: 'write' })
+      expect(manifest.default_permissions).toMatchObject({
+        repository_hooks: 'write',
+        checks: 'write',
+        statuses: 'read',
+      })
     } finally {
       session.stop()
     }
