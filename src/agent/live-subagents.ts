@@ -62,7 +62,8 @@ export const MAX_EVENTS_PER_SUBAGENT = 100
  * actually running, because the next inbound would otherwise start a fresh session
  * that has lost track of the in-flight task and spawns a DUPLICATE child, and — the
  * bug this backstop is sized around — a completion arriving after teardown has no
- * live session to deliver its system-reminder to and is silently dropped.
+ * live session to deliver its system-reminder to and is silently dropped. Todo
+ * continuation is held for a running child on both idle paths under the same bound.
  *
  * The pin is bounded only so a genuinely stuck/wedged child cannot make the session
  * immortal. Subagent `timeoutMs` is optional (operator declares none), so a hung

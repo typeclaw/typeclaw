@@ -6,9 +6,9 @@ import { type SessionEntry, SessionManager } from '@earendil-works/pi-coding-age
 
 import { createSession, renderTurnRoleAnchor, renderTurnTimeAnchor, type AgentSession } from '@/agent'
 import { applyTurnThinkingLevel, getQuestionSignal, type QuestionSignal } from '@/agent/attention-escalation'
+import { SESSION_CHILD_STUCK_BACKSTOP_MS } from '@/agent/live-subagents'
 import { resolveFallbackChain } from '@/agent/model-fallback'
 import { applyModelRuntimeOverrides } from '@/agent/model-overrides'
-import { SESSION_CHILD_STUCK_BACKSTOP_MS } from '@/agent/live-subagents'
 import { forgetSharedLoopGuardTool } from '@/agent/plugin-tools'
 import {
   type DetectedProviderError,
@@ -2623,8 +2623,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
   //
   // Turn-scoped, unlike the GC pin, which is deliberately session-scoped. Only
   // the logical turn that spawned the child is waiting on it; a later inbound is
-  // unrelated work whose own recovery, todo continuation and staged fallback must
-  // still run. Session scope would let one long-running child silence every
+  // unrelated work whose own recovery and staged fallback must still run. Todo
+  // continuation passes `-Infinity` instead: the todo list outlives the turn that
+  // wrote it, so its continuation waits on every running child of the session. Session scope would let one long-running child silence every
   // subsequent turn, and a wedged child would strand them with nothing to revisit
   // them after the backstop expires.
   const isAwaitingBackgroundChild = (
@@ -4592,7 +4593,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
     } else if (live.userStoppedTurnSeq === live.turnSeq) {
       logger.info(`[channels] ${live.keyId}: skipping todo continuation after user stop`)
-    } else if (isAwaitingBackgroundChild(live, 'todo-continuation')) {
+    } else if (isAwaitingBackgroundChild(live, 'todo-continuation', -Infinity)) {
+      // The pending todo is often the follow-up for a child an EARLIER turn
+      // spawned; that child's completion reminder resumes the work.
       logger.info(`[channels] ${live.keyId}: skipping todo continuation while background child runs`)
     } else {
       await maybeContinueTodosChannel(live, actor)
