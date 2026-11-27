@@ -508,6 +508,42 @@ export const EMPTY_STOP_AFTER_TOOL_WORK_NUDGE = [
 // retry budget (2) because the turn ALREADY delivered a user-facing reply — this
 // is a one-shot correction offer, not recovery from no output.
 export const MAX_WILLINGNESS_NUDGES = 1
+// At most this many completion checks between two real user messages. One per
+// delegated result normally; the bound only stops a chain where each check
+// spawns another child whose completion asks for another check.
+export const MAX_COMPLETION_CHECKS_PER_USER_TURN = 2
+// Queued after a turn that consumed a subagent completion, once the session is
+// otherwise idle. Agents treat a delegate's report as the answer: they relay a
+// partial result, or hand the step they could do themselves to another agent
+// or person, and end the turn. This is the check a goal loop runs before it
+// lets an agent stop, scoped to the conversation it serves.
+export const CHANNEL_COMPLETION_CHECK_PROMPT = [
+  '---',
+  '**[SYSTEM MESSAGE — not from a human]**',
+  '',
+  'A delegated result came back in this conversation. Before you end, check it against what was',
+  'asked of you here: the request is the job, and the report is input for your next step, not the',
+  'answer to pass on. You may end only as one of:',
+  '- done: what was asked has happened, or the report fully answers the question, and you have',
+  '  told them;',
+  '- waiting: work you started is still running and will wake you, or the next step needs something',
+  '  only another person or agent can give (a permission, a decision, a credential you lack) and you',
+  '  have asked them for exactly that;',
+  '- blocked: the remaining step still fails after you tried a different approach yourself, and you',
+  '  have said what you tried and what would get past it.',
+  'If the delegate stopped at something you can do or decide yourself (a call it left to you, a step',
+  'it lacked access for, a lookup it got wrong), do it now, or delegate again with what it found and a',
+  'changed approach. Handing such a step to someone else is not waiting, and cancelling a todo because',
+  'a delegate stopped does not finish it.',
+  'Post only if you have a new result or new findings since your last message; a report you already',
+  'posted stands, so do not restate it. With nothing new to post, end with `skip_response`. Never force',
+  'past a permission, credential, or site protection, and never repeat an action that must not run',
+  'twice (a send, a purchase, a publish, a deploy) without first checking whether it already took',
+  'effect.',
+  '',
+  'Do not acknowledge or reply to this notice.',
+  '---',
+].join('\n')
 // Injected when a reply that ended the turn (terminal-reply abort) promised to
 // keep working but omitted `continue_after_reply: true`. Reminder-only, SYSTEM MESSAGE
 // framing so persona-rich models do not reply to the notice itself.
@@ -853,6 +889,16 @@ type PendingSystemReminder = ({ kind: 'retry'; turnId: string } | { kind: 'wakeu
   // Set on a todo-continuation nudge, so the turn that consumes it is charged
   // to the continuation budget and other reminder turns are not.
   todoContinuation?: true
+  // Set on a subagent's completion wake, so the turn that consumes it is
+  // followed by one completion check (CHANNEL_COMPLETION_CHECK_PROMPT).
+  subagentCompletion?: true
+  // Set on the completion check itself, so it yields to work queued after it
+  // and its turn is charged to the check budget only when it runs.
+  completionCheck?: true
+  // Set on a retry queued while a completion check is active. It carries the
+  // check's operator-only failures through a reload handoff, independently of
+  // coverage, and restores them without charging another check attempt.
+  completionCheckRetry?: true
   // Set on a retry handed to a reload successor: a reminder-only retry never runs
   // beginWakeupTurn, so the successor restores the logical turn's provenance here.
   backgroundWake?: boolean
@@ -992,6 +1038,7 @@ function selectTurnReminders(pending: PendingSystemReminder[], trigger: QueuedIn
 const retryReminder = (live: LiveSession, text: string): PendingSystemReminder => ({
   text,
   kind: 'retry',
+  ...(live.completionCheckActive ? { completionCheckRetry: true as const } : {}),
   turnId: live.backgroundTurnId,
   actor: live.reminderActor ?? {
     authorId: live.currentTurnAuthorId ?? live.lastTurnAuthorId ?? undefined,
@@ -1333,6 +1380,17 @@ type LiveSession = {
   // user batch starts (batch.length > 0), NOT on the reminder-only iteration the
   // nudge itself queues — same anti-reloop discipline as the empty-turn budget.
   willingnessNudges: number
+  // Armed by a turn that consumed a subagent completion; the drain's idle tail
+  // spends it on one completion-check turn.
+  completionCheckArmed: boolean
+  // Completion checks run since the last real user batch, bounded by
+  // MAX_COMPLETION_CHECKS_PER_USER_TURN. Reset only on a real user batch, never
+  // on a wakeup, so a spawn-complete-check chain cannot loop.
+  completionChecks: number
+  // True from the turn that consumes a completion check until the next real
+  // user batch or wakeup, so the check's own retries inherit it. The answer
+  // already landed before the check, so its failures stay in the operator log.
+  completionCheckActive: boolean
   // Stashed by `installChannelReplyTerminalHook` after a successful
   // `channel_reply` that omitted `continue_after_reply: true`. Read once
   // by `validateChannelTurn` to decide the continuation nudge. `turnSeq`-stamped
@@ -1977,6 +2035,9 @@ export type ChannelRouter = {
     // (a continuation re-prompt queued after a willingness-ack strand) at the
     // channels layer, without coupling to todo-file persistence formats.
     injectContinuationReminder: (key: ChannelKey, text: string) => void
+    // Queues a completion check as the idle tail would, without draining, so a
+    // test can place it alongside work that arrives before the next selection.
+    queueCompletionCheck: (key: ChannelKey) => void
     // Returns a shallow copy of `live.originRef.current` for the live
     // session matching `key`, or undefined when no live session exists.
     // Exists so tests can assert on the per-turn origin that tool.before
@@ -3547,6 +3608,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         toolLeakRetries: 0,
         emptyStopAfterToolWorkArmed: false,
         willingnessNudges: 0,
+        completionCheckArmed: false,
+        completionChecks: 0,
+        completionCheckActive: false,
         lastTerminalReplyCompletion: null,
         pendingTerminalReplyStop: null,
         continueReplyTurn: null,
@@ -4517,6 +4581,24 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     await decision
   }
 
+  // A delegated result is where a channel turn most often ends on a report
+  // instead of the outcome: the agent relays a partial result, or hands the
+  // step it could do itself to someone else. The cron consumer runs the same
+  // kind of check after every run; here it follows each turn that consumed a
+  // subagent completion, once nothing else is queued.
+  const queueCompletionCheck = (live: LiveSession): void => {
+    if (!live.completionCheckArmed) return
+    live.completionCheckArmed = false
+    if (live.destroyed || live.userStoppedTurnSeq === live.turnSeq) return
+    // Newer input or another wake runs first: a user batch drops queued retries,
+    // and a completion among them re-arms. Skipping here keeps the budget unspent.
+    if (hasOrdinaryContinuation(live)) return
+    // A child this turn started wakes the session itself, and its completion re-arms.
+    if (isAwaitingBackgroundChild(live, 'completion-check')) return
+    if (live.completionChecks >= MAX_COMPLETION_CHECKS_PER_USER_TURN) return
+    live.pendingSystemReminders.push({ ...retryReminder(live, CHANNEL_COMPLETION_CHECK_PROMPT), completionCheck: true })
+  }
+
   const runOrdinaryTodoIdle = async (live: LiveSession, actor?: ReminderActor): Promise<void> => {
     if (!(await awaitLatestTodoOutcomeWrite(live))) {
       logger.warn(`[channels] ${live.keyId}: skipping todo continuation after failed outcome write`)
@@ -4549,8 +4631,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
 
   const postEmptyTurnFallback = async (live: LiveSession, cause: string): Promise<void> => {
     live.emptyTurnFallbackTurn = live.turnSeq
-    if (live.backgroundWakeLogicalTurn) {
-      logger.warn(`[channels] ${live.keyId} empty_turn_fallback_suppressed reason=background_wake_turn cause=${cause}`)
+    if (live.backgroundWakeLogicalTurn || live.completionCheckActive) {
+      const reason = live.backgroundWakeLogicalTurn ? 'background_wake_turn' : 'completion_check'
+      logger.warn(`[channels] ${live.keyId} empty_turn_fallback_suppressed reason=${reason} cause=${cause}`)
       void dropContinuationReactions(live)
       return
     }
@@ -5339,9 +5422,10 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     // Only a turn answering a user errors out in the channel. A turn opened by
     // background work stays silent; the `LLM call failed` line plus this record
     // carry the failure to the operator, and turn-end settles its coverage.
-    if (live.backgroundWakeLogicalTurn) {
+    if (live.backgroundWakeLogicalTurn || live.completionCheckActive) {
+      const reason = live.backgroundWakeLogicalTurn ? 'background_wake_turn' : 'completion_check'
       logger.warn(
-        `[channels] ${live.keyId}: provider_error_notice_suppressed reason=background_wake_turn notice="${pending.safeMessage}"`,
+        `[channels] ${live.keyId}: provider_error_notice_suppressed reason=${reason} notice="${pending.safeMessage}"`,
       )
       return
     }
@@ -5521,6 +5605,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     live.toolLeakRetries = 0
     live.emptyStopAfterToolWorkArmed = false
     live.willingnessNudges = 0
+    live.completionCheckActive = false
     live.abortReasonThisTurn = null
     live.userStoppedTurnSeq = null
     live.nextPromptMaxTokens = undefined
@@ -5649,6 +5734,15 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
               (reminder.backgroundRetry?.obligationIds.length ?? 0) > 0
             )
           })
+          // A queued completion check yields to anything that arrived after it:
+          // user input supersedes it, and a newer completion re-arms it once its
+          // own turn posts. It is charged only when a turn consumes it.
+          if (
+            live.pendingSystemReminders.some((r) => r.completionCheck) &&
+            (live.promptQueue.length > 0 || live.pendingSystemReminders.some((r) => !r.completionCheck && !r.watch))
+          ) {
+            live.pendingSystemReminders = live.pendingSystemReminders.filter((r) => !r.completionCheck)
+          }
           if (live.promptQueue.length === 0 && live.pendingSystemReminders.length === 0) return undefined
           const { queued, watch, actor } = selectTurnReminders(
             live.pendingSystemReminders,
@@ -6033,6 +6127,8 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           live.toolLeakRetries = 0
           live.emptyStopAfterToolWorkArmed = false
           live.willingnessNudges = 0
+          live.completionChecks = 0
+          live.completionCheckActive = false
           live.logicalTurnStartedAt = now()
           const latestStampedCloseout = batch.findLast((item) => item.githubReviewThreadCloseout !== undefined)
           const resolvedAt = live.githubReviewThreadResolvedAt
@@ -6193,6 +6289,17 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         }
         // Only a prompt made of nothing but the nudge is a continuation turn: fresh
         // input or another wakeup sharing the prompt is not continuation spend.
+        const consumedSubagentCompletion = reminders.some(
+          (reminder) => reminder.subagentCompletion === true && !reminder.watch,
+        )
+        if (reminders.some((reminder) => reminder.completionCheckRetry === true)) live.completionCheckActive = true
+        if (reminders.some((reminder) => reminder.completionCheck === true)) {
+          live.completionChecks++
+          live.completionCheckActive = true
+          logger.info(
+            `[channels] ${live.keyId} completion_check attempt=${live.completionChecks}/${MAX_COMPLETION_CHECKS_PER_USER_TURN}`,
+          )
+        }
         live.todoContinuationTurnSeq =
           batch.length === 0 &&
           reminders.length > 0 &&
@@ -6463,6 +6570,9 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
             sentReplyThisTurn &&
             live.emptyTurnFallbackTurn !== live.turnSeq &&
             assistantLeafStopReason(live.session) !== 'error'
+          // Only a turn whose own reply carried the delegated result can have
+          // relayed it as the answer; silence or a runtime notice handed nothing on.
+          if (consumedSubagentCompletion && usableReplyThisTurn) live.completionCheckArmed = true
           if (usableReplyThisTurn) {
             flushPendingReactions(live)
             void dropSilentAckReactions(live)
@@ -6536,6 +6646,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           }
           continue
         }
+        queueCompletionCheck(live)
         await runOrdinaryTodoIdle(live)
         if (!isAwaitingBackgroundChild(live, 'staged-fallback')) {
           await resolveStagedFallback(live)
@@ -9938,6 +10049,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       return { kind: 'delivered', keyId: live.keyId }
     live.pendingSystemReminders.push({
       ...wakeupReminder(text),
+      subagentCompletion: true,
       actor: args.actor,
       watch: args.watch,
       ...(args.backgroundObligationId ? { backgroundObligationId: args.backgroundObligationId } : {}),
@@ -10102,6 +10214,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
                 adapter: row.target.adapter,
               }),
             ),
+            subagentCompletion: true,
             ...completionOwnership(current),
           },
         ]
@@ -10796,6 +10909,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
           lastTurnAuthorId: live.lastTurnAuthorId,
           lastTurnAuthorIds: Array.from(live.lastTurnAuthorIds),
         }
+      },
+      queueCompletionCheck: (key: ChannelKey): void => {
+        const live = liveSessions.get(channelKeyId(key))
+        if (!live) return
+        live.pendingSystemReminders.push({
+          ...retryReminder(live, CHANNEL_COMPLETION_CHECK_PROMPT),
+          completionCheck: true,
+        })
       },
       injectContinuationReminder: (key: ChannelKey, text: string): void => {
         const live = liveSessions.get(channelKeyId(key))

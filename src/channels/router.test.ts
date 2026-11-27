@@ -81,6 +81,7 @@ import { RecoveryDispatcher } from './recovery-dispatcher'
 import type { CreateChannelRouterOptions } from './router'
 import {
   CHANNEL_EMPTY_TURN_RETRY_MAX_OUTPUT_TOKENS,
+  CHANNEL_COMPLETION_CHECK_PROMPT,
   CHANNEL_MAX_OUTPUT_TOKENS,
   CONTINUATION_REACTION_EMOJI,
   createChannelRouter,
@@ -96,6 +97,7 @@ import {
   stripTrailingLeakedToolCall,
   HISTORY_ATTACHMENT_LIMIT,
   MAX_CHANNEL_SENDS_PER_TURN,
+  MAX_COMPLETION_CHECKS_PER_USER_TURN,
   MAX_EMPTY_TURN_RETRIES,
   MAX_POLICY_DENIED_CHANNEL_SENDS_PER_TURN,
   MAX_TYPING_HEARTBEAT_MS,
@@ -146,6 +148,10 @@ import { channelKeyId, fallbackChannelAccountIdentity } from './types'
 
 class FakeSession {
   public prompts: string[] = []
+  // A model that already delivered its result ends a completion check silent;
+  // tests of the check itself set `answerCompletionChecks` to script it.
+  public completionChecks: string[] = []
+  public answerCompletionChecks = false
   public aborted = 0
   public disposed = 0
   public thinkingLevels: string[] = []
@@ -199,6 +205,11 @@ class FakeSession {
       prompt: async (text) => {
         this.agent.controller = new AbortController()
         this.emit({ type: 'agent_start' })
+        if (!this.answerCompletionChecks && text.includes(CHANNEL_COMPLETION_CHECK_PROMPT)) {
+          this.completionChecks.push(text)
+          this.setAssistantText('NO_REPLY')
+          return
+        }
         this.prompts.push(text)
         await this.onPrompt?.(text)
       },
@@ -16431,6 +16442,254 @@ describe('ChannelRouter injectSubagentCompletionReminder', () => {
     expect(text).toContain('channel_reply')
   })
 
+  test('a turn that posted a subagent result is followed by one completion check, and a silent check posts nothing', async () => {
+    // given an agent that relays the delegated result and stays silent on the check
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    const sentBefore = sent.length
+    session.onPrompt = async (text) => {
+      session.setAssistantText('NO_REPLY')
+      if (text.includes('bg_partial')) await router.send({ ...KEY, text: 'The operator could not finish.' })
+    }
+
+    // when the subagent's completion wakes it
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_partial',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then exactly one check follows, and it adds nothing to the chat
+    expect(session.prompts.slice(initial)).toEqual([
+      expect.stringContaining('bg_partial'),
+      expect.stringContaining(CHANNEL_COMPLETION_CHECK_PROMPT),
+    ])
+    expect(sent.slice(sentBefore)).toEqual(['The operator could not finish.'])
+  })
+
+  test('a completion turn that posts nothing gets no completion check', async () => {
+    // given an agent that stays silent on a completion
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    session.onPrompt = () => session.setAssistantText('NO_REPLY')
+
+    // when the completion arrives
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'scout',
+      taskId: 'bg_quiet',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the completion turn is the only one
+    expect(session.prompts.slice(initial)).toEqual([expect.stringContaining('bg_quiet')])
+  })
+
+  test('completion checks stop at the per-message bound when each check spawns another child', async () => {
+    // given an agent that relays every result and answers every check by delegating again
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound(KEY.adapter, async () => ({ ok: true }))
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    let spawned = 0
+    session.onPrompt = async (text) => {
+      session.setAssistantText('NO_REPLY')
+      if (!text.includes(CHANNEL_COMPLETION_CHECK_PROMPT)) {
+        await router.send({ ...KEY, text: `result ${spawned}` })
+        return
+      }
+      spawned++
+      void router.injectSubagentCompletionReminder({
+        parentSessionId: 'ses_fake_1',
+        subagent: 'operator',
+        taskId: `bg_retry_${spawned}`,
+        ok: true,
+        durationMs: 1,
+      })
+    }
+
+    // when the first completion arrives
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_first',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the chain ends after the bound, with the last completion left unchecked
+    const checks = session.prompts.filter((p) => p.includes(CHANNEL_COMPLETION_CHECK_PROMPT))
+    expect(checks).toHaveLength(MAX_COMPLETION_CHECKS_PER_USER_TURN)
+    expect(session.prompts.at(-1)).toContain(`bg_retry_${MAX_COMPLETION_CHECKS_PER_USER_TURN}`)
+  })
+
+  test('a user message queued behind a completion runs instead of the completion check', async () => {
+    // given a completion turn that posts while the user writes again
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound(KEY.adapter, async () => ({ ok: true }))
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    session.onPrompt = async (text) => {
+      session.setAssistantText('NO_REPLY')
+      if (!text.includes('bg_superseded')) return
+      await router.send({ ...KEY, text: 'Here is what the operator found.' })
+      await router.route(inbound({ externalMessageId: 'm2', text: 'never mind' }))
+    }
+
+    // when the completion arrives
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_superseded',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the user's message is the next and last turn, with no check in it
+    const after = session.prompts.slice(initial)
+    expect(after).toEqual([expect.stringContaining('bg_superseded'), expect.stringContaining('never mind')])
+    expect(after[1]).not.toContain(CHANNEL_COMPLETION_CHECK_PROMPT)
+  })
+
+  test('a check that exhausts its empty-turn retries after a coalesced answer posts no fallback', async () => {
+    // given a user message and a completion that share one prompt, answered in the chat
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const sentBefore = sent.length
+    let checkTurns = 0
+    session.onPrompt = async (text) => {
+      if (text.includes('bg_shared')) {
+        session.setAssistantText('NO_REPLY')
+        await router.send({ ...KEY, text: 'Here is the answer.' })
+        return
+      }
+      // the check and each of its retries end empty
+      checkTurns++
+      session.setAssistantMidTurn('cut off', 'length')
+    }
+
+    // when both arrive before the drain runs
+    await router.route(inbound({ externalMessageId: 'm2', text: 'and?' }))
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_shared',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the check ran its retries, and the chat holds only the answer
+    expect(checkTurns).toBe(MAX_EMPTY_TURN_RETRIES + 1)
+    expect(sent.slice(sentBefore)).toEqual(['Here is the answer.'])
+  })
+
+  test('a coalesced message and completion whose only output is the empty-turn fallback get no check', async () => {
+    // given a user message and a completion that share one prompt, and a model that keeps ending empty
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    const sent: string[] = []
+    router.registerOutbound(KEY.adapter, async (m) => {
+      sent.push(m.text!)
+      return { ok: true }
+    })
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    session.onPrompt = () => session.setAssistantMidTurn('cut off', 'length')
+
+    // when both arrive before the drain runs and every retry ends empty
+    await router.route(inbound({ externalMessageId: 'm2', text: 'hello?' }))
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_coalesced',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the runtime fallback is the only output, and no check follows it
+    expect(session.prompts[initial]).toContain('bg_coalesced')
+    expect(session.prompts).toHaveLength(initial + MAX_EMPTY_TURN_RETRIES + 1)
+    expect(sent).toContain(EMPTY_TURN_FALLBACK_TEXT)
+    expect(session.prompts.some((p) => p.includes(CHANNEL_COMPLETION_CHECK_PROMPT))).toBe(false)
+  })
+
+  test('a completion that arrives after a check is queued runs before the check', async () => {
+    // given an idle session with a completion check queued
+    const dir = await tempDir()
+    const { router, sessions } = makeRouter(dir)
+    router.registerOutbound(KEY.adapter, async () => ({ ok: true }))
+    await router.route(inbound())
+    await router.__testing!.flushDebounce(KEY)
+    const session = sessions[0]!
+    session.answerCompletionChecks = true
+    const initial = session.prompts.length
+    session.onPrompt = async (text) => {
+      session.setAssistantText('NO_REPLY')
+      if (text.includes('bg_newer')) await router.send({ ...KEY, text: 'The newer result.' })
+    }
+    router.__testing!.queueCompletionCheck(KEY)
+
+    // when a completion arrives before the check is selected
+    await router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      subagent: 'operator',
+      taskId: 'bg_newer',
+      ok: true,
+      durationMs: 1,
+    })
+    await router.__testing!.flushDebounce(KEY)
+
+    // then the completion runs on its own, and the check follows it
+    expect(session.prompts.slice(initial)).toEqual([
+      expect.stringContaining('bg_newer'),
+      expect.stringContaining(CHANNEL_COMPLETION_CHECK_PROMPT),
+    ])
+    expect(session.prompts[initial]).not.toContain(CHANNEL_COMPLETION_CHECK_PROMPT)
+  })
+
   test('reminder queued during a same-turn user inbound coalesces into the SAME drain iteration (prepended into the prompt body)', async () => {
     // The drain loop splices `pendingSystemReminders` alongside the
     // promptQueue at the top of each iteration, so a reminder pushed
@@ -24349,6 +24608,65 @@ describe('ChannelRouter durable background response coverage', () => {
       outcome: { kind: 'intentionally-suppressed' },
     })
     expect(await new RecoveryOutbox(f.dir, { epoch: 'inspection' }).list()).toEqual([])
+    await rm(f.dir, { recursive: true, force: true })
+  })
+
+  test('a completion-check retry moved by reload stays silent when the successor hits a provider error', async () => {
+    // given: a coalesced message and completion answered in the chat, then a check that ended empty
+    let created = 0
+    let successor: FakeSession | undefined
+    const f = await fixture(KEY, (session) => {
+      created++
+      if (created > 1) {
+        successor = session
+        session.onPrompt = () => {
+          session.emit({
+            type: 'message_end',
+            message: { role: 'assistant', stopReason: 'error', errorMessage: 'server_is_overloaded' },
+          })
+          session.setAssistantMidTurn('', 'error')
+        }
+      }
+    })
+    await f.accept('reload-check')
+    const first = f.sessions[0]!
+    first.answerCompletionChecks = true
+    const retryEntered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    first.onPrompt = async (text) => {
+      if (text.includes('reload-check')) {
+        await reply(first, f.router, KEY, 'Here is the answer.')
+        return
+      }
+      if (text.includes(CHANNEL_COMPLETION_CHECK_PROMPT)) {
+        first.setAssistantMidTurn('cut off', 'length')
+        return
+      }
+      retryEntered.resolve()
+      await release.promise
+      first.setAssistantText('NO_REPLY')
+    }
+    await f.router.route(inbound({ externalMessageId: 'm2', text: 'and?' }))
+    await f.router.injectSubagentCompletionReminder({
+      parentSessionId: 'ses_fake_1',
+      taskId: 'reload-check',
+      subagent: 'explorer',
+      ok: true,
+      durationMs: 20,
+    })
+    void f.router.__testing!.flushDebounce(KEY)
+    await retryEntered.promise
+    f.router.__testing!.injectContinuationReminder(KEY, EMPTY_TURN_RETRY_NUDGE)
+
+    // when: a reload hands the check's queued retry to a successor whose provider call fails
+    await f.router.tearDownAllLive()
+    release.resolve()
+    await f.router.__testing!.flushDebounce(KEY)
+    await waitFor(() => successor?.prompts.length === 1)
+    await f.router.__testing!.flushDebounce(KEY)
+
+    // then: only the original answer reached the chat
+    expect(f.sent).toEqual(['Here is the answer.'])
     await rm(f.dir, { recursive: true, force: true })
   })
 
