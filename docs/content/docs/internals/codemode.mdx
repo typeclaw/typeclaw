@@ -63,7 +63,7 @@ The container-stage kernel is a child process, never an in-process `eval` in the
 
 The current role-scoped agent-messenger visibility is unchanged. Codemode inherits the actual shared resolver; it does not introduce a separate credential policy.
 
-Codemode leaves the network namespace isolated. Network operations use wrapped tools such as `tool.bash` or `tool.web_fetch`. The bridge uses framed JSON lines on stdio, not loopback HTTP. The host validates each discriminated message before use, checks the active cell and unique call ID, and bounds framing, concurrency, and call count. Frames are untrusted; knowing the frame format grants no extra tool authority.
+Codemode leaves the network namespace isolated. Network operations use wrapped tools such as `tool.bash` or `tool.web_fetch`. The bridge uses framed JSON lines on stdio, not loopback HTTP. The host validates each discriminated message before use, checks the active cell and unique call ID, and bounds framing, concurrency, and call count. Tool calls past eight in flight wait for a free slot rather than failing the cell, so `Promise.all` over many tool calls works. Frames are untrusted; knowing the frame format grants no extra tool authority.
 
 `src/codemode/dispatch.ts` selects from the **final budget-wrapped tool definitions** passed to the session by `src/agent/index.ts`. It rechecks live active names, uses Pi's direct-call argument validator, and invokes that exact definition with the cell's cancellation signal. Permission hooks, live role resolution, security guards, file pinning, loop detection, result caps, and the bash sandbox therefore remain on the call path. Ordinary active plugin tools are supported.
 
