@@ -19,7 +19,7 @@ import {
 } from '@/agent/provider-error'
 import type { RestartHandoff } from '@/agent/restart-handoff'
 import type { ChannelParticipant, SessionOrigin } from '@/agent/session-origin'
-import { renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
+import { type CompletionReminderArgs, renderSubagentCompletionReminder } from '@/agent/subagent-completion-reminder'
 import { describeContinuationDecision } from '@/agent/todo/continuation'
 import { isContinuationSafeOutcome, type TurnOutcome } from '@/agent/todo/continuation-policy'
 import {
@@ -1908,6 +1908,7 @@ export type ChannelRouter = {
     ok: boolean
     durationMs: number
     error?: string
+    cancelled?: boolean
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
   }) => Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }>
   // Fan a LANDED formal review verdict out to the OTHER live sessions reviewing
@@ -10025,6 +10026,27 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     })
   }
 
+  // Live delivery and the reload handoff both render through here, so an outcome
+  // flag cannot be forwarded on one path and dropped on the other.
+  const renderChannelCompletionReminder = (
+    args: Pick<
+      CompletionReminderArgs,
+      'subagent' | 'taskId' | 'ok' | 'durationMs' | 'error' | 'hasRecoverableOutput' | 'cancelled'
+    >,
+    adapter: string,
+  ): string =>
+    renderSubagentCompletionReminder({
+      subagent: args.subagent,
+      taskId: args.taskId,
+      ok: args.ok,
+      durationMs: args.durationMs,
+      ...(args.error !== undefined ? { error: args.error } : {}),
+      ...(args.hasRecoverableOutput === true ? { hasRecoverableOutput: true } : {}),
+      ...(args.cancelled === true ? { cancelled: true } : {}),
+      channel: true,
+      adapter,
+    })
+
   const deliverCompletionReminder = (
     live: LiveSession,
     args: {
@@ -10035,22 +10057,14 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
       durationMs: number
       error?: string
       hasRecoverableOutput?: boolean
+      cancelled?: boolean
       backgroundObligationId?: string
       actor?: ReminderActor
       watch?: WatchRequester
     },
   ): { kind: 'delivered'; keyId: string } => {
     const adapter = live.keyId.split(':', 1)[0] ?? ''
-    const text = renderSubagentCompletionReminder({
-      subagent: args.subagent,
-      taskId: args.taskId,
-      ok: args.ok,
-      durationMs: args.durationMs,
-      ...(args.error !== undefined ? { error: args.error } : {}),
-      ...(args.hasRecoverableOutput === true ? { hasRecoverableOutput: true } : {}),
-      channel: true,
-      adapter,
-    })
+    const text = renderChannelCompletionReminder(args, adapter)
     if (
       args.backgroundObligationId &&
       (live.backgroundCoverage.includes(args.backgroundObligationId) ||
@@ -10134,6 +10148,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
     durationMs: number
     error?: string
     hasRecoverableOutput?: boolean
+    cancelled?: boolean
     channelKey?: { adapter: string; workspace: string; chat: string; thread: string | null }
   }): Promise<{ kind: 'delivered'; keyId: string } | { kind: 'no-live-session' }> => {
     // Completion admission is independent of the presence or health of a parent.
@@ -10212,18 +10227,7 @@ export function createChannelRouter(options: CreateChannelRouterOptions): Channe
         const reminders: PendingSystemReminder[] = [
           ...pending.reminders,
           {
-            ...wakeupReminder(
-              renderSubagentCompletionReminder({
-                subagent: args.subagent,
-                taskId: args.taskId,
-                ok: args.ok,
-                durationMs: args.durationMs,
-                ...(args.error !== undefined ? { error: args.error } : {}),
-                ...(args.hasRecoverableOutput === true ? { hasRecoverableOutput: true } : {}),
-                channel: true,
-                adapter: row.target.adapter,
-              }),
-            ),
+            ...wakeupReminder(renderChannelCompletionReminder(args, row.target.adapter)),
             subagentCompletion: true,
             ...completionOwnership(current),
           },

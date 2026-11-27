@@ -770,14 +770,18 @@ async function debtFixture(
         accountIdentity: state.account,
         triggeringAuthorId: 'human',
       }),
-    complete: (taskId: string, parentSessionId = 'parent-1') =>
+    complete: (
+      taskId: string,
+      parentSessionId = 'parent-1',
+      outcome: { ok: boolean; error?: string; cancelled?: boolean } = { ok: true },
+    ) =>
       router.injectSubagentCompletionReminder({
         parentSessionId,
         channelKey: key,
         taskId,
         subagent: 'explorer',
-        ok: true,
         durationMs: 20,
+        ...outcome,
       }),
     // The model spawns a background child for this request and ends its turn waiting on it.
     deferToChild: (session: ParentSession, taskId: string, during?: () => Promise<void>) => {
@@ -1260,6 +1264,40 @@ test("the original parent's completion waits on the handoff of a successor that 
     }
     expect(await f.outbox.list()).toEqual([])
     expect(await f.reboot()).toBe(0)
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test('a cancelled completion held in a reload handoff reaches the successor as a close-out', async () => {
+  const f = await debtFixture({ failCreationAttempts: [3] })
+  try {
+    await f.consumeThenDefer('Please research the incident.')
+    f.state.successorSessionId = 'parent-2'
+    await f.router.tearDownAllLive()
+    await f.route('Any progress?')
+    await f.flush()
+    // given: the successor's own reload cannot recreate a session, so coverage waits in the handoff
+    await f.router.tearDownAllLive()
+    expect(f.router.liveCount()).toBe(0)
+    f.running.delete('parent-1')
+
+    // when: the child is cancelled while the handoff holds its coverage
+    const cancelled = { ok: false, error: 'cancelled: pull request converted to draft', cancelled: true }
+    expect((await f.complete('child-b', 'parent-1', cancelled)).kind).toBe('delivered')
+    f.state.onSessionCreated = (successor) => {
+      successor.onPrompt = async () => f.reply(successor, 'Noted.', 'parent-2')
+    }
+    await f.router.tearDownAllLive()
+    await f.flush()
+
+    // then: the adopting successor is told to close the work out, not to recover it
+    const reminder = f.sessions.at(-1)!.prompts[0] ?? ''
+    expect(reminder).toContain('child-b')
+    expect(reminder).toContain('was cancelled')
+    expect(reminder).toContain('skip_response')
+    expect(reminder).not.toContain('FAILED')
+    expect(reminder).not.toContain('keep the item pending')
   } finally {
     await f.cleanup()
   }
