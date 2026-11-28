@@ -54,18 +54,19 @@ export class CdpConnection {
     sessionId: string,
     predicate: (params: unknown) => boolean,
     timeoutMs: number,
-  ): Promise<boolean> {
+  ): Promise<unknown> {
+    // Resolves with the matching event's params, or undefined once the timeout passes.
     return new Promise((resolve) => {
       const listener: EventListener = {
         method,
         sessionId,
         onEvent: (params) => {
           if (!predicate(params)) return
-          finish(true)
+          finish(params ?? {})
         },
       }
-      const timer = setTimeout(() => finish(false), timeoutMs)
-      const finish = (value: boolean): void => {
+      const timer = setTimeout(() => finish(undefined), timeoutMs)
+      const finish = (value: unknown): void => {
         clearTimeout(timer)
         this.listeners.delete(listener)
         resolve(value)
