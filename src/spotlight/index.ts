@@ -23,7 +23,7 @@ export type SpotlightExclusionOutcome =
 export type HelperRun = {
   stdout: string
   exitCode: number | null
-  signalCode: string | null
+  signalCode: string | number | null
   timedOut: boolean
 }
 

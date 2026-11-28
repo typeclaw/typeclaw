@@ -11,7 +11,7 @@ export type ReadabilityChildOutcome =
   | { kind: 'error'; message: string }
   | { kind: 'memory'; childRssBytes: number | null; availableBytes: number | null }
   | { kind: 'aborted' }
-  | { kind: 'crashed'; exitCode: number | null; signalCode: string | null }
+  | { kind: 'crashed'; exitCode: number | null; signalCode: string | number | null }
 
 type StopReason = Extract<ReadabilityChildOutcome, { kind: 'memory' | 'aborted' }>
 
