@@ -127,7 +127,7 @@ Read the `typeclaw-plugins` skill before authoring the plugin code — it covers
 
 ## Editing the root `package.json`
 
-The root `package.json` is **operator-owned**: its direct dependencies become commands on your sandbox PATH, and the host installs them. Your write tools refuse it. When the root needs a change, tell the operator the exact edit, then to run `bun install` in the agent folder on the host. A restart installs only when startup finds a root `dependencies` entry missing, so it can skip `devDependencies`, version bumps, and workspace edits. This covers only the root file; `packages/<name>/package.json` and any project under `workspace/` stay yours.
+The root `package.json` is **operator-owned**: its direct dependencies become commands on your sandbox PATH, and the host installs them. Your write tools refuse it. When the root needs a change, tell the operator the exact edit, then to run `typeclaw restart`: startup reinstalls whenever the agent package's manifests changed since the last start. This covers only the root file; `packages/<name>/package.json` and any project under `workspace/` stay yours.
 
 What the operator typically adds there:
 
@@ -148,12 +148,12 @@ What the operator typically adds there:
 3. **Write `package.json`** using the minimal template above. Set `name` to the directory name (they don't have to match, but matching avoids confusion).
 4. **Write `index.ts`** with the actual code.
 5. **Add tests** as `<file>.test.ts` next to the implementation if the logic is non-trivial.
-6. **Get the agent-root install** — only needed when you add dependencies or a new package. Ask the operator to run `bun install` in the agent folder on the host; that links new workspace packages, so there is no separate registration step. A restart alone is not enough here (see below).
+6. **Get the agent-root install** — only needed when you add dependencies or a new package. Ask the operator to run `typeclaw restart`; startup sees the changed manifests and reinstalls, which links new workspace packages, so there is no separate registration step.
 7. **Commit.** Per `typeclaw-git`, commit the new package immediately with the decision context — why this is reusable, what it solves.
 
 ## `bun install` and the monorepo
 
-The agent-root `bun install` runs **on the host**, never from inside a `packages/<name>/` directory. Your bash sees the agent root, `packages/`, and `node_modules/` read-only, so an install there from bash fails. `typeclaw start` (and so a restart) runs it only when its startup check finds a root dependency missing, so a change that only touches a workspace package's own dependencies or adds a new workspace package needs the operator to run `bun install` in the agent folder on the host. The root install:
+The agent-root `bun install` runs **on the host**, never from inside a `packages/<name>/` directory. Your bash sees the agent root, `packages/`, and `node_modules/` read-only, so an install there from bash fails. `typeclaw start` (and so `typeclaw restart`) runs it when a root dependency is missing or when the root or any workspace `package.json` (or `bun.lock`) changed since the last start, with install scripts and the folder's `bunfig.toml` disabled. Ask the operator to run `typeclaw restart` rather than a plain `bun install`, which skips those safeguards. The root install:
 
 - Resolves all workspace packages and creates symlinks
 - Hoists shared dependencies to the root `node_modules/`
@@ -161,7 +161,7 @@ The agent-root `bun install` runs **on the host**, never from inside a `packages
 
 Per-package `node_modules/` is gitignored (`packages/*/node_modules/` in `.gitignore`), but those directories rarely have anything in them after a hoist — bun puts most things at the root.
 
-If you see `Cannot find module 'my-utility'` after creating a new workspace package, the fix is the agent-root install: ask the operator to run `bun install` in the agent folder on the host. There is no separate "register the workspace" step.
+If you see `Cannot find module 'my-utility'` after creating a new workspace package, the fix is the agent-root install: ask the operator to run `typeclaw restart`. There is no separate "register the workspace" step.
 
 None of this applies to a project checkout under `workspace/` (or `mounts/`, `/tmp`). That is a separate repo, not part of this monorepo: run `bun install`, `bun add`, and its build steps there yourself as the work needs.
 

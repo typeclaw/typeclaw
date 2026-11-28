@@ -43,6 +43,7 @@ import { ensureDepsInstalled, type EnsureDepsResult } from '@/init/ensure-deps'
 import { readEnvFile } from '@/init/env-file'
 import { buildGitignore, GITIGNORE_FILE } from '@/init/gitignore'
 import { localSourceFingerprint, readLocalSourceStamp, writeLocalSourceStamp } from '@/init/local-source-stamp'
+import { agentManifestInputs, agentManifestsChanged, writeAgentManifestStamp } from '@/init/manifest-stamp'
 import { refreshPackageJson } from '@/init/packagejson'
 import { reconcilePluginDeps } from '@/init/reconcile-plugin-deps'
 import { runBunUpdate, type UpdateRunner } from '@/init/run-bun-install'
@@ -614,7 +615,7 @@ async function runStart({
     // the drift detector below sees the newly-written deps as missing and
     // installs them in the same pass. This makes the plugin list a single
     // source of truth: the user edits typeclaw.json and never touches
-    // package.json. The agent cannot abuse this to install arbitrary host code —
+    // package.json. The agent cannot abuse this to load arbitrary plugin code —
     // the security plugin's `pluginAddition` guard gates writes to the plugins
     // field at owner/trusted trust, so by the time this host-side step runs the
     // field is trustworthy by construction.
@@ -645,14 +646,24 @@ async function runStart({
       pluginReconcile.changed ||
       outcomeRequiresForceInstall(upgrade) ||
       registeredWindowsLink
+    // A workspace-only change (a new package under packages/, a dependency of
+    // one) adds no missing root dependency, so a restart refreshes the install
+    // whenever the agent package's manifests changed since the last start.
+    const manifestInputsBefore = await agentManifestInputs(cwd)
+    const manifestsChanged = await agentManifestsChanged(cwd, manifestInputsBefore)
     const deps = await ensureDeps(cwd, {
       force: forceDepsReinstall,
-      ...(staleLocalFingerprint !== null && !forceDepsReinstall ? { refresh: true } : {}),
+      ...((staleLocalFingerprint !== null || manifestsChanged) && !forceDepsReinstall ? { refresh: true } : {}),
     })
     if (!deps.ok) {
       return { ok: false, reason: `dependency install failed: ${deps.reason}` }
     }
     if (staleLocalFingerprint !== null) await writeLocalSourceStamp(cwd, staleLocalFingerprint)
+    // Only an install that ran records the manifests it read. A skipped install
+    // or a manifest edited while Bun ran leaves the stamp as it was, so the next
+    // restart installs again.
+    if (deps.installed && (await agentManifestInputs(cwd)) === manifestInputsBefore)
+      await writeAgentManifestStamp(cwd, manifestInputsBefore)
     await commitSystemFile(cwd, DEPENDENCY_FILES, upgradeCommitMessage ?? 'Update dependencies')
     // Probe buildx up front so the Dockerfile we write matches the builder we
     // will use. buildx present -> emit the BuildKit Dockerfile and build with

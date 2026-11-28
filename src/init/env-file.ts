@@ -24,14 +24,18 @@ const ENV_FILE = '.env'
 // those would report an operator-declared variable as absent — which callers read
 // as "TypeClaw may manage this", e.g. migrating a deliberately pinned directory.
 export function readEnvFile(cwd: string): Map<string, string> {
-  const out = new Map<string, string>()
   let raw: string
   try {
     raw = readFileSync(join(cwd, ENV_FILE), 'utf8')
   } catch (err) {
-    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return out
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') return new Map()
     throw err
   }
+  return parseEnvText(raw)
+}
+
+export function parseEnvText(raw: string): Map<string, string> {
+  const out = new Map<string, string>()
   const lines = raw.split(/\r?\n/)
   for (const [index, rawLine] of lines.entries()) {
     const parsed = parseEnvLine(rawLine, index)

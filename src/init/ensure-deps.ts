@@ -1,8 +1,15 @@
 import { existsSync, realpathSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, rename, rm } from 'node:fs/promises'
 import { dirname, join, parse as parsePath } from 'node:path'
 
-import { type InstallRunner, runBunInstall } from './run-bun-install'
+import {
+  COPYFILE_INSTALL_MARKER,
+  type InstallResult,
+  type InstallRunner,
+  markIndependentInstall,
+  recoverHiddenOperatorDotenv,
+  runBunInstall,
+} from './run-bun-install'
 
 const PACKAGE_FILE = 'package.json'
 const NODE_MODULES = 'node_modules'
@@ -57,19 +64,39 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
   const { cwd } = options
   const install = options.install ?? runBunInstall
   const detect = options.detect ?? detectMissingDeps
+  // A crashed host Bun run can leave the operator's .env in credential staging,
+  // and an interrupted rebuild can leave the last working tree aside; put both
+  // back before anything reads the folder.
+  recoverHiddenOperatorDotenv(cwd)
+  await recoverInterruptedRebuild(cwd)
+  // A tree installed before the copyfile backend can share inodes with the
+  // host Bun cache, and the agent can write node_modules, so it is rebuilt once
+  // from empty and marked only after the new tree is verified.
+  const rebuild = needsCopyfileRebuild(cwd)
   const force = options.force ?? false
   const refresh = options.refresh ?? false
 
-  const missing = force ? [] : await detect(cwd)
-  if (!force && !refresh && missing.length === 0) return { ok: true, installed: false }
+  const missing = force || rebuild ? [] : await detect(cwd)
+  if (!force && !rebuild && !refresh && missing.length === 0) return { ok: true, installed: false }
+  const buildsFromEmpty = rebuild || !existsSync(join(cwd, NODE_MODULES))
 
-  const runInstall = () => install(cwd, { force })
-  const result =
-    !force && missing.length === 0
-      ? await queueWarmRefresh(runInstall, options.maxQueueWaitMs ?? WARM_REFRESH_MAX_WAIT_MS)
-      : await runInstall()
-  if (!result.ok) return { ok: false, reason: result.reason, missing }
+  const installAndVerify = async (): Promise<EnsureDepsResult> => {
+    const result =
+      !force && !rebuild && missing.length === 0
+        ? await queueWarmRefresh(() => install(cwd, { force }), options.maxQueueWaitMs ?? WARM_REFRESH_MAX_WAIT_MS)
+        : await install(cwd, { force })
+    if (!result.ok) return { ok: false, reason: result.reason, missing }
+    const verified = await verifyInstalled(cwd, detect)
+    if (verified.ok && buildsFromEmpty) await markIndependentInstall(cwd)
+    return verified
+  }
+  return rebuild ? await rebuildFromEmpty(cwd, installAndVerify) : await installAndVerify()
+}
 
+async function verifyInstalled(
+  cwd: string,
+  detect: (cwd: string) => Promise<readonly string[]>,
+): Promise<EnsureDepsResult> {
   // Re-probe: `bun install` returns 0 even when a file:-linked dep's own
   // package.json is unreachable (it silently no-ops on the target). Without
   // this check, we'd proceed to `docker run` with a known-broken
@@ -113,6 +140,48 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
 // nothing even though the dep is correctly installed and reachable from
 // the parent — that was the original false-positive that aborted
 // `typeclaw start`.
+// Moves the old tree aside so the install builds every package fresh and
+// nothing stale (a package no longer in the graph, a leftover hardlink)
+// survives. The old tree is dropped only after the new one is verified;
+// a failed install or verification puts it back.
+async function rebuildFromEmpty(cwd: string, run: () => Promise<EnsureDepsResult>): Promise<EnsureDepsResult> {
+  const nodeModules = join(cwd, NODE_MODULES)
+  const legacy = legacyTreePath(cwd)
+  await rename(nodeModules, legacy)
+  const result = await run()
+  if (result.ok) {
+    await rm(legacy, { recursive: true, force: true })
+    return result
+  }
+  await rm(nodeModules, { recursive: true, force: true })
+  await rename(legacy, nodeModules)
+  return result
+}
+
+// A backup next to an unmarked tree means a rebuild stopped before verifying
+// its replacement, so the partial tree is discarded and the backup restored. A
+// marked tree means the rebuild finished and only the cleanup was missed.
+async function recoverInterruptedRebuild(cwd: string): Promise<void> {
+  const legacy = legacyTreePath(cwd)
+  if (!existsSync(legacy)) return
+  const nodeModules = join(cwd, NODE_MODULES)
+  if (existsSync(join(nodeModules, COPYFILE_INSTALL_MARKER))) {
+    await rm(legacy, { recursive: true, force: true })
+    return
+  }
+  await rm(nodeModules, { recursive: true, force: true })
+  await rename(legacy, nodeModules)
+}
+
+function legacyTreePath(cwd: string): string {
+  return join(cwd, `${NODE_MODULES}.typeclaw-legacy`)
+}
+
+function needsCopyfileRebuild(cwd: string): boolean {
+  const nodeModules = join(cwd, NODE_MODULES)
+  return existsSync(nodeModules) && !existsSync(join(nodeModules, COPYFILE_INSTALL_MARKER))
+}
+
 export async function detectMissingDeps(cwd: string): Promise<readonly string[]> {
   const rootDeps = await readDeclaredDeps(join(cwd, PACKAGE_FILE))
   if (rootDeps.length === 0) return []

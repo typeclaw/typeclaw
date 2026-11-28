@@ -75,7 +75,7 @@ const BYPASS_ROLE_HINT = {
   [SECURITY_PERMISSIONS.bypassCronPromotion]:
     'owner and trusted have it by default (medium tier); member and guest do not. Same shape as rolePromotion but deferred: a new cron job (or a changed scheduledByRole) fires at schedule-time as the stamped role. The operator-review window between write and execution is the trusted-tier defense.',
   [SECURITY_PERMISSIONS.bypassPluginAddition]:
-    'owner and trusted have it by default (medium tier); member and guest do not. Same shape as cronPromotion but for host-side install: a new (or version-bumped) plugins[] entry is materialized into package.json and installed by the next host `typeclaw start`, running npm lifecycle scripts as the operator. The operator-review window between the typeclaw.json write and the next start is the trusted-tier defense.',
+    'owner and trusted have it by default (medium tier); member and guest do not. Same shape as cronPromotion but for plugin code: a new (or version-bumped) plugins[] entry is materialized into package.json, installed by the next host `typeclaw start`, and loaded into the runtime process, which holds every credential the agent uses. The operator-review window between the typeclaw.json write and the next start is the trusted-tier defense.',
   [SECURITY_PERMISSIONS.bypassNoticeTarget]:
     "owner and trusted have it by default (medium tier); member and guest do not. `lastWords.notice` routes the operator's unexpected-death alert, so enabling, retargeting, or disabling it from a lower-trust session is blocked. Every typeclaw.json change is force-committed by auto-backup for operator review.",
 } as const satisfies Record<PerGuardSecurityPermission, string>
