@@ -110,6 +110,7 @@ import type { WatchWakeDelivery } from '@/watches/types'
 import { bootChannelRestartGreeting, bootBackgroundObligations } from './background-handoff-boot'
 import { BUNDLED_PLUGINS } from './bundled-plugins'
 import { buildChannelSessionFactory } from './channel-session-factory'
+import { installAgentDependencies } from './dependency-install'
 import { installFatalGuard } from './fatal-guard'
 import { installLlmFetchObserver } from './llm-fetch-observer'
 import { createPluginRuntime, type PluginRuntime, type PluginSubagentEntry } from './plugin-runtime'
@@ -406,6 +407,11 @@ async function startAgentRuntime(
   const pluginRegistry = pluginsLoaded.registry
   const pluginHooks = pluginsLoaded.hooks
   const dependencyBinLogger = createPluginLogger('typeclaw')
+  // Only a container has the sandbox and the platform the scripts must run on.
+  if (containerName !== undefined) {
+    const dependencyInstall = await installAgentDependencies({ agentDir: cwd, permissions: pluginsLoaded.permissions })
+    if (!dependencyInstall.ok) dependencyBinLogger.warn(`[dependency-install] ${dependencyInstall.reason}`)
+  }
   const bootDependencyBins = await validateDependencyBins(cwd)
   logDependencyBinProblems(bootDependencyBins, dependencyBinLogger)
   registerDependencyBinDoctorCheck(pluginRegistry, cwd, dependencyBinLogger)
