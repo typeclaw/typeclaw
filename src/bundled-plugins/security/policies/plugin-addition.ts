@@ -12,10 +12,10 @@ import type { SecurityBlock } from '../policy'
 export const GUARD_PLUGIN_ADDITION = 'pluginAddition'
 // Classified `medium` (silent-attack axis), same tier and rationale as
 // `rolePromotion` and `cronPromotion`. Adding (or version-bumping) a plugin in
-// typeclaw.json is a deferred host-code-execution grant: the entry is
-// materialized into package.json by `reconcilePluginDeps` and installed by the
-// next host `typeclaw start`, at which point npm lifecycle scripts run as the
-// operator on the host. `plugins` is restart-required and typeclaw.json is
+// typeclaw.json is a deferred runtime-code-execution grant: the entry is
+// materialized into package.json by `reconcilePluginDeps`, installed by the
+// next host `typeclaw start` (lifecycle scripts disabled), and imported into
+// the runtime process, which holds the agent's credentials. `plugins` is restart-required and typeclaw.json is
 // force-committed by auto-backup, so the operator sees the change in `git log`
 // and backup commits BEFORE any install fires — an operator-reviewable window
 // between the privileged write and the privileged execution. Owner and trusted
@@ -24,7 +24,7 @@ export const GUARD_PLUGIN_ADDITION = 'pluginAddition'
 // What counts as a plugin addition (any of):
 //   1. A new entry appeared in `plugins[]` (by package name).
 //   2. An existing entry's pinned version spec changed (`foo@1` -> `foo@2`):
-//      a different package version is a different body of host code, the same
+//      a different package version is a different body of plugin code, the same
 //      shape as cron's body-changed finding.
 //
 // What does NOT count (allowed without ack):
@@ -219,8 +219,8 @@ function buildBlockReason(tool: string, targetPath: string, findings: readonly P
     }
   }
   return [
-    `Guard \`${GUARD_PLUGIN_ADDITION}\` blocked ${tool} on ${sanitizeForReason(targetPath)}: this change introduces a deferred host-code-execution grant — ${lines.join('; ')}.`,
-    "Plugin entries in typeclaw.json#plugins are materialized into package.json and installed by the next host `typeclaw start`, where npm lifecycle scripts run as the operator on the host. Even an `owner` operating from TUI must not silently add plugins on behalf of a channel message: the canonical attack is a prompt-injected agent writing a malicious package name into plugins[] so the operator's next start runs its postinstall.",
+    `Guard \`${GUARD_PLUGIN_ADDITION}\` blocked ${tool} on ${sanitizeForReason(targetPath)}: this change introduces a deferred runtime-code-execution grant — ${lines.join('; ')}.`,
+    "Plugin entries in typeclaw.json#plugins are materialized into package.json, installed by the next host `typeclaw start`, and loaded into the runtime process, which holds the agent's credentials. Even an `owner` operating from TUI must not silently add plugins on behalf of a channel message: the canonical attack is a prompt-injected agent writing a malicious package name into plugins[] so the next start loads its code into the runtime.",
     'This cannot be acknowledged away from an under-privileged session. The operator must make the change from a session that already resolves to `owner`/`trusted` (TUI, or a role granted `security.bypass.medium`), or claim the role out-of-band via `typeclaw role claim`.',
   ].join(' ')
 }
