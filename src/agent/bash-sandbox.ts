@@ -1,7 +1,7 @@
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import type { GetGithubSelf } from '@/channels/github-token-bridge'
-import { config, getConfig, getSandboxWritablePathSpecs } from '@/config/config'
+import { config, getConfig, getSandboxWritablePathSpecs, pluginPackageName, withDefaultPlugins } from '@/config/config'
 import type { PermissionService } from '@/permissions/permissions'
 import {
   buildSandboxedCommand,
@@ -19,6 +19,7 @@ import {
   resolvePrivilegedSandboxRuntime,
   resolveProcSelfExe,
   resolveProtectedZones,
+  resolveRuntimeDependencyZones,
   resolveSandboxSymlinks,
   resolveWritableZones,
   SandboxDegradedProcError,
@@ -118,6 +119,15 @@ export type BashSandboxRequest = {
   readonly network?: SandboxNetwork
 }
 
+// The packages the runtime imports from node_modules: typeclaw itself and every
+// npm plugin it loads. Local plugins under packages/ are the agent's own code.
+function runtimePackageNames(): string[] {
+  const npmPlugins = withDefaultPlugins(getConfig().plugins).filter(
+    (entry) => !entry.startsWith('./') && !entry.startsWith('../') && !isAbsolute(entry),
+  )
+  return ['typeclaw', ...npmPlugins.map(pluginPackageName)]
+}
+
 // Shared preparation for model bash and codemode. The caller owns verification
 // immediately before spawn and cleanup after the process has exited.
 export async function prepareBashSandbox(options: BashSandboxRequest): Promise<PreparedBashSandbox> {
@@ -191,8 +201,11 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
         `[TypeClaw config guard] This command was not run: ${hiddenReadOnly.join(', ')} would have to be bound read-only inside a path hidden from this command, which would expose it. Retry the command once the agent can coordinate config writes with host typeclaw commands again.`,
       )
     }
+    const runtimeDependencyDirs = writableRoot
+      ? await resolveRuntimeDependencyZones(agentDir, runtimePackageNames())
+      : []
     const protectedZones = {
-      dirs: baseProtectedZones.dirs,
+      dirs: [...baseProtectedZones.dirs, ...runtimeDependencyDirs],
       files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles, ...readOnlyFiles])],
     }
     const writableDirSet = new Set(writable.dirs)

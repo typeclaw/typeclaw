@@ -33,6 +33,7 @@ export {
 } from './hidden-paths'
 export {
   resolveProtectedZones,
+  resolveRuntimeDependencyZones,
   resolveWritableZones,
   isGitControlPath,
   subtractMasked,

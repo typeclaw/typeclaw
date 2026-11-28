@@ -50,7 +50,7 @@ export function withDefaultPlugins(plugins: readonly string[]): string[] {
   return [...defaults, ...plugins]
 }
 
-function pluginPackageName(entry: string): string {
+export function pluginPackageName(entry: string): string {
   if (entry.startsWith('@')) {
     const slash = entry.indexOf('/')
     const at = slash === -1 ? -1 : entry.indexOf('@', slash + 1)
