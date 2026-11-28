@@ -29,6 +29,7 @@ import { boundedExec } from './bounded-exec'
 import { buildChannelChecks } from './channel-checks'
 import { agentFileOwnership, type FileOwnershipDeps } from './file-ownership'
 import { buildOperationalIncidentChecks } from './operational-incidents'
+import { spotlightExclusion } from './spotlight'
 import type { DoctorCheck } from './types'
 
 export function buildStaticChecks(opts: { dockerExec?: DockerExec } & FileOwnershipDeps = {}): DoctorCheck[] {
@@ -45,6 +46,7 @@ export function buildStaticChecks(opts: { dockerExec?: DockerExec } & FileOwners
     agentFolderInitialized(),
     hostOnly(agentFolderDockerfileTemplate()),
     hostOnly(agentFolderGitignoreTemplate()),
+    hostOnly(spotlightExclusion()),
     agentFolderNodeModules(),
     agentFolderGitRepo(),
     hostOnly(agentFileOwnership(opts)),
