@@ -1,8 +1,14 @@
 import { existsSync, realpathSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, rename, rm } from 'node:fs/promises'
 import { dirname, join, parse as parsePath } from 'node:path'
 
-import { type InstallRunner, runBunInstall } from './run-bun-install'
+import {
+  COPYFILE_INSTALL_MARKER,
+  type InstallResult,
+  type InstallRunner,
+  recoverHiddenOperatorDotenv,
+  runBunInstall,
+} from './run-bun-install'
 
 const PACKAGE_FILE = 'package.json'
 const NODE_MODULES = 'node_modules'
@@ -57,15 +63,24 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
   const { cwd } = options
   const install = options.install ?? runBunInstall
   const detect = options.detect ?? detectMissingDeps
+  // A crashed host Bun run can leave the operator's .env in credential staging;
+  // put it back before anything reads the folder.
+  recoverHiddenOperatorDotenv(cwd)
+  // A tree installed before the copyfile backend can share inodes with the
+  // host Bun cache, and the agent can write node_modules, so it is rebuilt once
+  // from empty and marked only after the new tree is verified.
+  const rebuild = needsCopyfileRebuild(cwd)
   const force = options.force ?? false
   const refresh = options.refresh ?? false
 
-  const missing = force ? [] : await detect(cwd)
-  if (!force && !refresh && missing.length === 0) return { ok: true, installed: false }
+  const missing = force || rebuild ? [] : await detect(cwd)
+  if (!force && !rebuild && !refresh && missing.length === 0) return { ok: true, installed: false }
 
-  const runInstall = () => install(cwd, { force })
+  const runInstall = rebuild
+    ? () => rebuildFromEmpty(cwd, () => install(cwd, { force }))
+    : () => install(cwd, { force })
   const result =
-    !force && missing.length === 0
+    !force && !rebuild && missing.length === 0
       ? await queueWarmRefresh(runInstall, options.maxQueueWaitMs ?? WARM_REFRESH_MAX_WAIT_MS)
       : await runInstall()
   if (!result.ok) return { ok: false, reason: result.reason, missing }
@@ -113,6 +128,29 @@ export async function ensureDepsInstalled(options: EnsureDepsOptions): Promise<E
 // nothing even though the dep is correctly installed and reachable from
 // the parent — that was the original false-positive that aborted
 // `typeclaw start`.
+// Moves the old tree aside so the install builds every package fresh and
+// nothing stale (a package no longer in the graph, a leftover hardlink)
+// survives; a failed install puts the old tree back.
+async function rebuildFromEmpty(cwd: string, run: () => Promise<InstallResult>): Promise<InstallResult> {
+  const nodeModules = join(cwd, NODE_MODULES)
+  const legacy = join(cwd, `${NODE_MODULES}.typeclaw-legacy`)
+  await rm(legacy, { recursive: true, force: true })
+  await rename(nodeModules, legacy)
+  const result = await run()
+  if (result.ok) {
+    await rm(legacy, { recursive: true, force: true })
+    return result
+  }
+  await rm(nodeModules, { recursive: true, force: true })
+  await rename(legacy, nodeModules)
+  return result
+}
+
+function needsCopyfileRebuild(cwd: string): boolean {
+  const nodeModules = join(cwd, NODE_MODULES)
+  return existsSync(nodeModules) && !existsSync(join(nodeModules, COPYFILE_INSTALL_MARKER))
+}
+
 export async function detectMissingDeps(cwd: string): Promise<readonly string[]> {
   const rootDeps = await readDeclaredDeps(join(cwd, PACKAGE_FILE))
   if (rootDeps.length === 0) return []

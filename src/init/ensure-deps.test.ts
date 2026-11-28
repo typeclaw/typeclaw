@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { link, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { detectMissingDeps, ensureDepsInstalled } from './ensure-deps'
-import { type InstallResult, runBunInstall, runBunUpdate } from './run-bun-install'
+import { COPYFILE_INSTALL_MARKER, type InstallResult, runBunInstall, runBunUpdate } from './run-bun-install'
 
 let root: string
 
@@ -217,6 +218,7 @@ describe('ensureDepsInstalled', () => {
     // regression that breaks fs-level detection fails this test.
     await writePackageJson(root, { name: 'agent', dependencies: { typeclaw: '^0.1.0' } })
     await installFakeDep('typeclaw', { dependencies: { zod: '^4' } })
+    await writeFile(join(root, 'node_modules', COPYFILE_INSTALL_MARKER), '')
 
     let installed = 0
     const result = await ensureDepsInstalled({
@@ -254,6 +256,51 @@ describe('ensureDepsInstalled', () => {
     expect(detectCalls).toBe(1)
     expect(installOptsSeen).toEqual([{ force: true }])
     expect(result).toMatchObject({ ok: true, installed: true })
+  })
+
+  test('rebuilds a legacy tree from empty, dropping stale entries and shared inodes, once', async () => {
+    // given: a pre-copyfile tree with a stale package and a file hardlinked to an outside cache copy
+    const cache = await mkdtemp(join(tmpdir(), 'typeclaw-ensure-deps-cache-'))
+    try {
+      await writePackageJson(root, { name: 'agent', dependencies: { dep: 'file:./dep' } })
+      await mkdir(join(root, 'dep'), { recursive: true })
+      await writeFile(join(root, 'dep', 'package.json'), JSON.stringify({ name: 'dep', version: '1.0.0' }))
+      await writeFile(join(cache, 'index.js'), 'cache copy')
+      await mkdir(join(root, 'node_modules', 'stale'), { recursive: true })
+      await link(join(cache, 'index.js'), join(root, 'node_modules', 'stale', 'index.js'))
+
+      // when: two starts in a row
+      const first = await ensureDepsInstalled({ cwd: root })
+      const second = await ensureDepsInstalled({
+        cwd: root,
+        install: async () => ({ ok: false, reason: 'unexpected' }),
+      })
+
+      // then: the tree was rebuilt and verified once, and the outside copy is untouched
+      expect(first).toMatchObject({ ok: true, installed: true })
+      expect(second).toMatchObject({ ok: true, installed: false })
+      expect(existsSync(join(root, 'node_modules', COPYFILE_INSTALL_MARKER))).toBe(true)
+      expect(existsSync(join(root, 'node_modules', 'stale'))).toBe(false)
+      expect(existsSync(join(root, 'node_modules.typeclaw-legacy'))).toBe(false)
+      expect(await readFile(join(cache, 'index.js'), 'utf8')).toBe('cache copy')
+      expect((await stat(join(cache, 'index.js'))).nlink).toBe(1)
+    } finally {
+      await rm(cache, { recursive: true, force: true })
+    }
+  })
+
+  test('puts the legacy tree back when the rebuild install fails', async () => {
+    await mkdir(join(root, 'node_modules', 'kept'), { recursive: true })
+    await writeFile(join(root, 'node_modules', 'kept', 'index.js'), 'old')
+
+    const result = await ensureDepsInstalled({
+      cwd: root,
+      detect: async () => [],
+      install: async () => ({ ok: false, reason: 'registry unreachable' }),
+    })
+
+    expect(result).toMatchObject({ ok: false, reason: 'registry unreachable' })
+    expect(await readFile(join(root, 'node_modules', 'kept', 'index.js'), 'utf8')).toBe('old')
   })
 
   test('force=false (default) does not pass force to the install runner', async () => {
