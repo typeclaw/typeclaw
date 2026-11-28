@@ -4,6 +4,8 @@ import { isAbsolute, join } from 'node:path'
 
 import { splitPluginEntrySpec } from '@/plugin'
 
+import { runBunPmViewVersion } from './run-bun-install'
+
 const PACKAGE_FILE = 'package.json'
 
 const NOOP: ReconcilePluginDepsResult = { changed: false, files: [], skipped: [] }
@@ -201,21 +203,17 @@ function sortKeys(obj: Record<string, string>): Record<string, string> {
   return out
 }
 
-async function resolveLatestFromRegistry(packageName: string): Promise<string | null> {
-  const bun = (globalThis as { Bun?: { spawn: typeof Bun.spawn } }).Bun
-  if (!bun) throw new Error(`cannot resolve latest version for ${packageName}: bun runtime not available`)
-  const proc = bun.spawn({
-    cmd: ['bun', 'pm', 'view', packageName, 'version'],
-    stdout: 'pipe',
-    stderr: 'pipe',
-  })
-  const code = await proc.exited
-  if (code !== 0) {
-    const stderr = (await new Response(proc.stderr).text()).trim()
+export async function resolveLatestFromRegistry(
+  packageName: string,
+  opts?: Parameters<typeof runBunPmViewVersion>[1],
+): Promise<string | null> {
+  const result = await runBunPmViewVersion(packageName, opts)
+  if (!result.ok) {
+    const stderr = result.stderr.trim()
     if (isPackageNotFound(stderr)) return null
-    throw new Error(`failed to resolve latest version for ${packageName}: ${stderr || `exit ${code}`}`)
+    throw new Error(`failed to resolve latest version for ${packageName}: ${stderr || `exit ${result.code}`}`)
   }
-  const version = (await new Response(proc.stdout).text()).trim().replace(/^["']|["']$/g, '')
+  const version = result.stdout.trim().replace(/^["']|["']$/g, '')
   if (version.length === 0) throw new Error(`registry returned no version for ${packageName}`)
   return version
 }

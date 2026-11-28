@@ -53,7 +53,7 @@ import { buildGitignore, GITIGNORE_FILE } from './gitignore'
 import { buildHatchingPrompt } from './hatching'
 import type { OAuthLoginRunner, OAuthLoginResult } from './oauth-login'
 import { GITKEEP_FILE, PACKAGES_DIR, PUBLIC_DIR } from './paths'
-import { type InstallResult, type InstallRunner, runBunInstall } from './run-bun-install'
+import { type InstallResult, type InstallRunner, markIndependentInstall, runBunInstall } from './run-bun-install'
 import { credentialStagingDir, publishConfigWithCredential, type PublishSeams } from './staged-write'
 import { linkWindowsDevTypeclaw, type RunBunLink } from './windows-dev-link'
 
@@ -500,6 +500,7 @@ export async function runInit({
   const install = await installRunner(cwd)
   emit({ step: 'install', phase: 'done', result: install })
   if (!install.ok) throw new Error(`Dependency install failed: ${install.reason}`)
+  await markIndependentInstall(cwd)
 
   emit({ step: 'dockerfile', phase: 'start' })
   const docker = await writeDockerAssets(cwd)

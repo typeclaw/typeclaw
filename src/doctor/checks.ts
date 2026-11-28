@@ -230,7 +230,10 @@ function agentFolderNodeModules(): DoctorCheck {
         status: 'error',
         message: `${missing.length} package(s) missing from node_modules`,
         details: missing.map((m) => `missing: ${m}`),
-        fix: { description: 'Run `bun install` inside the agent folder.' },
+        fix: {
+          description:
+            'Run `typeclaw restart`: startup installs missing dependencies without running agent-folder scripts or config.',
+        },
       }
     },
   }

@@ -171,7 +171,7 @@ export function registerDependencyBinDoctorCheck(
           details: problems,
           fix: {
             description:
-              'On the host stage, run `bun install` in the agent folder and fix malformed dependency manifests, then restart TypeClaw.',
+              'Fix malformed dependency manifests, then run `typeclaw restart`: startup reinstalls the agent folder without running its install scripts or config, so it cannot produce a binary that only a dependency postinstall builds.',
           },
         }
       },
