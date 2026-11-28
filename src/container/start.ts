@@ -614,7 +614,7 @@ async function runStart({
     // the drift detector below sees the newly-written deps as missing and
     // installs them in the same pass. This makes the plugin list a single
     // source of truth: the user edits typeclaw.json and never touches
-    // package.json. The agent cannot abuse this to install arbitrary host code —
+    // package.json. The agent cannot abuse this to load arbitrary plugin code —
     // the security plugin's `pluginAddition` guard gates writes to the plugins
     // field at owner/trusted trust, so by the time this host-side step runs the
     // field is trustworthy by construction.
