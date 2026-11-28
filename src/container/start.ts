@@ -56,6 +56,7 @@ import {
 import { SecretsBackend } from '@/secrets/storage'
 import { isWindows } from '@/shared'
 import { hostLocaleIsCjk } from '@/shared/host-locale'
+import { ensureSpotlightExclusion, spotlightWarning, type SpotlightExclusionOutcome } from '@/spotlight'
 import { reconcileTypevault } from '@/typevault/lifecycle'
 
 import { type AgentOperationLease, type WithAgentOperationLock, withAgentOperationLock } from './agent-operation-lock'
@@ -271,6 +272,8 @@ export type StartOptions = {
   operationLease?: AgentOperationLease
   buildCacheStateDir?: string
   acquireBuildCache?: typeof acquireManagedBuildCache | null
+  // Test seam for the macOS Spotlight Privacy-list exclusion of the agent folder.
+  excludeFromSpotlight?: (cwd: string) => Promise<SpotlightExclusionOutcome>
 }
 
 export type HostDaemonStatus =
@@ -344,6 +347,7 @@ async function runStart({
   archiveLogs = archiveContainerLogs,
   buildCacheStateDir,
   acquireBuildCache = acquireManagedBuildCache,
+  excludeFromSpotlight = (dir) => ensureSpotlightExclusion(dir, { platform }),
 }: StartOptions): Promise<StartResult> {
   try {
     const containerName = containerNameFromCwd(cwd)
@@ -486,6 +490,14 @@ async function runStart({
     if (githubCliWarning !== null) {
       if (streamOutput) process.stderr.write(githubCliWarning)
       else onWarning?.(githubCliWarning.trim())
+    }
+    // Never fatal: a missing or broken private Spotlight API only costs the
+    // operator a warning with the manual Privacy-list fix. Dispatch on the
+    // callback so standalone start/restart render it after their spinner.
+    const spotlightNotice = spotlightWarning(cwd, await excludeFromSpotlight(cwd))
+    if (spotlightNotice !== null) {
+      if (onWarning !== undefined) onWarning(spotlightNotice)
+      else if (streamOutput) process.stderr.write(`${spotlightNotice}\n`)
     }
 
     if (agentMessengerPolicy.migrate) {

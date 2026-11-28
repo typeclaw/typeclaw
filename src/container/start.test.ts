@@ -2727,6 +2727,89 @@ process.exit(0)`,
     expect(warnings).toEqual([expect.stringContaining('Could not refresh GitHub CLI credentials')])
   })
 
+  test('excludes the agent folder from Spotlight without warning when it succeeds', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const warnings: string[] = []
+    const excluded: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      excludeFromSpotlight: async (dir) => {
+        excluded.push(dir)
+        return { kind: 'excluded', changed: true }
+      },
+    })
+
+    expect(result.ok).toBe(true)
+    expect(excluded).toEqual([root])
+    expect(warnings).toEqual([])
+  })
+
+  test('still starts and warns with the manual fix when the Spotlight exclusion API is unavailable', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec, calls } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const warnings: string[] = []
+
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      streamOutput: false,
+      onWarning: (warning) => warnings.push(warning),
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: noEnsureDeps,
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+      excludeFromSpotlight: async () => ({ kind: 'unavailable', detail: 'symbol not found' }),
+    })
+
+    expect(result.ok).toBe(true)
+    expect(calls.some((call) => call.args[0] === 'run')).toBe(true)
+    expect(warnings).toEqual([expect.stringContaining('Search Privacy')])
+    expect(warnings[0]).toContain(root)
+  })
+
+  test('hands the Spotlight warning to the collector instead of stderr while streaming', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const warnings: string[] = []
+
+    try {
+      const result = await start({
+        cwd: root,
+        preferredHostPort: 8973,
+        streamOutput: true,
+        onWarning: (warning) => warnings.push(warning),
+        exec,
+        allocatePort: deterministicAllocator,
+        ensureDeps: noEnsureDeps,
+        autoUpgrade: noAutoUpgrade,
+        ...bypassVerify,
+        excludeFromSpotlight: async () => ({ kind: 'failed', detail: 'Spotlight did not respond in time' }),
+      })
+
+      expect(result.ok).toBe(true)
+      expect(warnings).toEqual([expect.stringContaining('Search Privacy')])
+      const written = stderr.mock.calls.map(([chunk]) => String(chunk)).join('')
+      expect(written).not.toContain('Search Privacy')
+    } finally {
+      stderr.mockRestore()
+    }
+  })
+
   test('returns warnings instead of writing them while a parent renderer owns the terminal', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })
