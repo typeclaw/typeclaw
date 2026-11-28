@@ -10,6 +10,7 @@ import { ensureGitIdentity, resolveGitIdentity } from '@/git/resolve-identity'
 import { startDaemon, type Daemon } from '@/hostd/daemon'
 import { buildDockerfile, BUN_BASE_IMAGE, ENTRYPOINT_SHIM_LABEL, entrypointShimHash } from '@/init/dockerfile'
 import { buildGitignore } from '@/init/gitignore'
+import { agentManifestsChanged, writeAgentManifestStamp } from '@/init/manifest-stamp'
 import { SESSION_TMP_ROOT } from '@/sandbox/session-tmp'
 import { isWindows } from '@/shared'
 
@@ -4532,6 +4533,134 @@ process.exit(0)`,
     expect(written.dependencies['typeclaw-plugin-foo']).toBeUndefined()
   })
 
+  test('a workspace manifest change since the last start makes ensureDeps refresh once', async () => {
+    // given: a recorded start, then a new workspace package
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.3.4' })
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await writeAgentManifestStamp(root)
+    await mkdir(join(root, 'packages', 'tool'), { recursive: true })
+    await writeFile(join(root, 'packages', 'tool', 'package.json'), JSON.stringify({ name: 'tool' }))
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const ensureCalls: Array<{ force?: boolean; refresh?: boolean } | undefined> = []
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: async (_cwd, opts) => {
+        ensureCalls.push(opts)
+        return { ok: true, installed: true }
+      },
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: this start refreshed, and recorded the manifests so the next one does not
+    expect(result.ok).toBe(true)
+    expect(ensureCalls).toEqual([{ force: false, refresh: true }])
+    expect(await agentManifestsChanged(root)).toBe(false)
+  })
+
+  test('a manifest edited during the first install, with no stamp yet, is refreshed on the next start', async () => {
+    // given: an installed tree with no stamp, and a first install during which a workspace manifest changes
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.3.4' })
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await mkdir(join(root, 'packages', 'tool'), { recursive: true })
+    await writeFile(join(root, 'packages', 'tool', 'package.json'), JSON.stringify({ name: 'tool' }))
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+    const ensureCalls: Array<{ force?: boolean; refresh?: boolean } | undefined> = []
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: async (_cwd, opts) => {
+        ensureCalls.push(opts)
+        await writeFile(
+          join(root, 'packages', 'tool', 'package.json'),
+          JSON.stringify({ name: 'tool', dependencies: { zod: '^4' } }),
+        )
+        return { ok: true, installed: true }
+      },
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the unverified tree was refreshed, and the next start refreshes again
+    expect(result.ok).toBe(true)
+    expect(ensureCalls).toEqual([{ force: false, refresh: true }])
+    expect(await agentManifestsChanged(root)).toBe(true)
+  })
+
+  test('a start whose install is skipped leaves a changed manifest unrecorded for the next start', async () => {
+    // given: a recorded start, then a workspace edit, and an install that does nothing
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.3.4' })
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await mkdir(join(root, 'packages', 'tool'), { recursive: true })
+    await writeFile(join(root, 'packages', 'tool', 'package.json'), JSON.stringify({ name: 'tool' }))
+    await writeAgentManifestStamp(root)
+    await writeFile(
+      join(root, 'packages', 'tool', 'package.json'),
+      JSON.stringify({ name: 'tool', dependencies: { zod: '^4' } }),
+    )
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: async () => ({ ok: true, installed: false }),
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: nothing installed the edit, so it still counts as a change
+    expect(result.ok).toBe(true)
+    expect(await agentManifestsChanged(root)).toBe(true)
+  })
+
+  test('a manifest edited while the install runs leaves the stamp stale for the next start', async () => {
+    // given: a recorded start, and an install during which a workspace manifest changes
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.3.4' })
+    await mkdir(join(root, 'node_modules'), { recursive: true })
+    await mkdir(join(root, 'packages', 'tool'), { recursive: true })
+    await writeFile(join(root, 'packages', 'tool', 'package.json'), JSON.stringify({ name: 'tool' }))
+    await writeAgentManifestStamp(root)
+    await writeFile(join(root, 'packages', 'tool', 'package.json'), JSON.stringify({ name: 'tool', version: '1.0.0' }))
+    const { exec } = fakeDockerExec({ imageExists: true, container: { exists: false } })
+
+    // when
+    const result = await start({
+      cwd: root,
+      preferredHostPort: 8973,
+      exec,
+      allocatePort: deterministicAllocator,
+      ensureDeps: async () => {
+        await writeFile(
+          join(root, 'packages', 'tool', 'package.json'),
+          JSON.stringify({ name: 'tool', dependencies: { zod: '^4' } }),
+        )
+        return { ok: true, installed: true }
+      },
+      autoUpgrade: noAutoUpgrade,
+      ...bypassVerify,
+    })
+
+    // then: the edit Bun may have missed still counts as a change
+    expect(result.ok).toBe(true)
+    expect(await agentManifestsChanged(root)).toBe(true)
+  })
+
   test('forceBuild + registry typeclaw dep -> ensureDeps called with force=false', async () => {
     // given: agent is on a published registry version (the normal user case);
     // the force-reinstall would be expensive AND meaningless because bun's
@@ -4614,7 +4743,7 @@ process.exit(0)`,
           allocatePort: deterministicAllocator,
           ensureDeps: async (_cwd, opts) => {
             ensureCalls.push(opts)
-            return { ok: true, installed: false }
+            return { ok: true, installed: opts?.refresh === true || opts?.force === true }
           },
           autoUpgrade: noAutoUpgrade,
           ...bypassVerify,
