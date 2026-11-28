@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { z } from 'zod'
 
 import type { BrowserEngineId, BrowserExtensionId } from '@/browser/registry'
-import { FILL_SECRET_TOOL } from '@/bundled-plugins/managed-browser'
+import { FILL_SECRET_TOOL, PASSKEY_TOOL } from '@/bundled-plugins/managed-browser'
 import { bashTool, findTool, grepTool, lsTool, readTool, type Subagent, writeTool } from '@/plugin'
 
 const BUNDLED_PLUGINS_DIR = join(import.meta.dir, '..')
@@ -78,6 +78,7 @@ TypeVault is enabled: this agent keeps logins and other credentials in its vault
 
 - **Filling.** Fill the username from the vault too, not just the password: focus each field and call \`${FILL_SECRET_TOOL}\` with a field reference, e.g. \`typevault://github/bot#username\`, then \`typevault://github/bot#password\` with \`submit: true\`. When the task names no entry, run \`typevault ls\` to find the one for the site.
 - **Missing credential.** When the vault has no entry for the site, do not ask for the value and do not hand the login to a human to type. Stop and report under Blockers the entry name to request (e.g. \`typevault://example.com/alice\`) and its preset (\`password\`), so the main agent can have the user store it with \`vault_request\` and spawn you again.
+- **Passkeys.** Focus the site's passkey button with your driver without clicking it, then call \`${PASSKEY_TOOL}\`: \`action: "use"\` with the entry (e.g. \`typevault://github/bot\`) on the "Sign in with a passkey" button, or \`action: "register"\` with the entry to save it in on the "Create a passkey" button of an account you are signed in to. It presses the button and answers the site itself.
 - **New login.** On a sign-up, generate the password in bash and store it without printing it, e.g. \`head -c 18 /dev/urandom | base64 | typevault set typevault://example.com/alice --preset password --field username=alice --stdin\`, then fill it from the vault.
 - **Password change.** Never write a new password into the working entry before the site accepts it: \`set\` overwrites it at once, and a rejected or interrupted change would leave the vault without the password the site still wants. Store the candidate in a separate entry (e.g. \`typevault://example.com/alice-next\`, same command as above), fill the current password from the working entry and the new one from the candidate, and only after the site confirms the change run \`typevault rm typevault://example.com/alice\` then \`typevault mv typevault://example.com/alice-next typevault://example.com/alice\`. If it fails or the outcome is unclear, keep the working entry, leave the candidate, and report both entry names.
 - If \`typevault\` says you have no grant, your role cannot use the vault; report that under Blockers.
@@ -117,7 +118,7 @@ export function createBrowserSubagent(
     tools: [readTool, grepTool, findTool, lsTool, bashTool, writeTool],
     // Lets a login finish inside this subagent instead of bouncing the
     // focused tab back to the parent for every secret field.
-    pluginTools: [FILL_SECRET_TOOL],
+    pluginTools: [FILL_SECRET_TOOL, PASSKEY_TOOL],
     payloadSchema: browserPayloadSchema,
     visibility: 'public',
     rosterDescription:
