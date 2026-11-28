@@ -4085,7 +4085,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     expect(owner.indexOf('--bind /agent /agent')).toBeLessThan(owner.indexOf('--ro-bind-data 3 /agent/.env'))
   })
 
-  test('the entire root dependency tree renders read-only for trusted and confined role policies', async () => {
+  test('the root dependency tree is writable for root-writable roles and never for confined roles', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-protected-dependencies-'))
     await mkdir(path.join(agentDir, 'node_modules'))
     try {
@@ -4106,13 +4106,12 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       })
       const trusted = buildSandboxedCommand('printf safe > ordinary.txt', trustedPolicy).argv.join(' ')
       const confined = buildSandboxedCommand('printf safe > workspace/output.txt', confinedPolicy).argv.join(' ')
-      const protectedNodeModules = `--ro-bind ${path.join(agentDir, 'node_modules')} ${path.join(agentDir, 'node_modules')}`
+      const nodeModules = path.join(agentDir, 'node_modules')
 
       expect(trusted).toContain(`--bind ${agentDir} ${agentDir}`)
-      expect(trusted).toContain(protectedNodeModules)
-      expect(trusted.indexOf(`--bind ${agentDir} ${agentDir}`)).toBeLessThan(trusted.indexOf(protectedNodeModules))
+      expect(trusted).not.toContain(`--ro-bind ${nodeModules} ${nodeModules}`)
       expect(confined).not.toContain(`--bind ${agentDir} ${agentDir}`)
-      expect(confined).toContain(protectedNodeModules)
+      expect(confined).not.toContain(`--bind ${nodeModules} ${nodeModules}`)
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }

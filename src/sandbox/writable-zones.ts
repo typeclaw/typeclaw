@@ -71,9 +71,9 @@ const FORBIDDEN_WRITABLE_ROOTS = [
 // `echo … > cron.json` from bash and defeat the guard entirely. Keeping them off
 // this list forces every mutation of a guarded file through the one guarded path
 // (the write/edit tool), so a managed file has exactly one mutation boundary.
-// `package.json` is operator-owned because direct dependencies define the
-// executable surface exposed in the model sandbox. It must not receive an RW
-// rebind that would let model-driven bash expand its own PATH capabilities.
+// `package.json` stays off this list: confined roles do not reshape the agent
+// package. Root-writable roles edit it, `bun.lock`, and node_modules through
+// their full agent-root bind.
 const WRITABLE_ROOT_FILES = ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'USER.md'] as const
 
 // SECURITY: the symlink rejection is load-bearing. An RW bind follows symlinks,
@@ -168,14 +168,19 @@ function dedupe(values: string[]): string[] {
 // We also resolve the effective core.hooksPath from the real (about-to-be-RO)
 // config: if it already points at a writable location (e.g. workspace/hooks),
 // the .git/hooks RO-bind alone would not cover it, so that dir is protected too.
+//
+// node_modules is deliberately NOT protected. The agent package is the agent's
+// to grow: root-writable roles run `bun add`/`bun install` there. Those roles
+// can already load their own code into the runtime through a local plugin under
+// packages/, so a read-only dependency tree guarded nothing they lacked, and
+// confined roles never get a writable bind over it (their root stays read-only
+// and node_modules is a forbidden writable path). Host installs never run its
+// lifecycle scripts (src/init/run-bun-install.ts).
 export async function resolveProtectedZones(agentDir: string): Promise<ProtectedZones> {
-  const dirs: string[] = []
-  const nodeModules = await resolveExistingProtectedDir(join(agentDir, 'node_modules'))
-  if (nodeModules !== undefined) dirs.push(nodeModules)
   const layout = await resolveGitControlLayout(agentDir)
-  if (layout === undefined) return { dirs, files: [] }
+  if (layout === undefined) return { dirs: [], files: [] }
 
-  dirs.push(await ensureProtectedDir(layout.defaultHooksDir))
+  const dirs = [await ensureProtectedDir(layout.defaultHooksDir)]
   const files: string[] = []
   for (const configFile of layout.configFiles) files.push(await ensureProtectedFile(configFile))
   if (layout.gitEntryFile !== undefined) files.push(layout.gitEntryFile)
@@ -186,14 +191,6 @@ export async function resolveProtectedZones(agentDir: string): Promise<Protected
   }
 
   return { dirs: dedupe(dirs), files: dedupe(files) }
-}
-
-async function resolveExistingProtectedDir(target: string): Promise<string | undefined> {
-  const stats = await lstatOrUndefined(target)
-  if (stats === undefined) return undefined
-  if (stats.isSymbolicLink()) throw new Error(`sandbox: refusing to protect symlinked path ${target}`)
-  if (!stats.isDirectory()) throw new Error(`sandbox: protected directory is not a directory ${target}`)
-  return target
 }
 
 export async function isGitControlPath(agentDir: string, candidate: string): Promise<boolean> {

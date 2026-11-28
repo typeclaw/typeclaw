@@ -253,12 +253,12 @@ describe('resolveWritableZones', () => {
 })
 
 describe('resolveProtectedZones', () => {
-  test('protects an existing node_modules directory without requiring a Git repository', async () => {
+  test('leaves an installed node_modules writable so the agent can install into its own package', async () => {
     await mkdir(join(agentDir, 'node_modules'))
 
     const { dirs, files } = await resolveProtectedZones(agentDir)
 
-    expect(dirs).toEqual([join(agentDir, 'node_modules')])
+    expect(dirs).toEqual([])
     expect(files).toEqual([])
   })
 
@@ -266,17 +266,6 @@ describe('resolveProtectedZones', () => {
     await resolveProtectedZones(agentDir)
 
     expect(existsSync(join(agentDir, 'node_modules'))).toBe(false)
-  })
-
-  test('rejects a symlinked node_modules instead of leaving executable dependencies writable', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'typeclaw-node-modules-outside-'))
-    try {
-      await symlink(outside, join(agentDir, 'node_modules'))
-
-      await expect(resolveProtectedZones(agentDir)).rejects.toThrow(/symlink/i)
-    } finally {
-      await rm(outside, { recursive: true, force: true })
-    }
   })
 
   test('re-protects .git/hooks and .git/config when present', async () => {
