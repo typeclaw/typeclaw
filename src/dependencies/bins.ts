@@ -20,7 +20,6 @@ export type DependencyBinIssue = {
 export type DependencyBinDiscovery = {
   declarations: DependencyBinDeclaration[]
   issues: DependencyBinIssue[]
-  protectedFiles: string[]
 }
 
 export type DependencyBinValidation = DependencyBinDiscovery & {
@@ -32,38 +31,19 @@ const PACKAGE_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i
 const BIN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 export async function discoverDependencyBins(agentDir: string): Promise<DependencyBinDiscovery> {
-  const rootManifestPath = join(agentDir, 'package.json')
-  const resolvedRootManifest = await realpath(rootManifestPath).catch(() => undefined)
-  const rootManifest = await readManifest(rootManifestPath)
-  if (!rootManifest.ok) {
-    return {
-      declarations: [],
-      issues: [{ message: rootManifest.message }],
-      protectedFiles: resolvedRootManifest === undefined ? [] : [resolvedRootManifest],
-    }
-  }
+  const rootManifest = await readManifest(join(agentDir, 'package.json'))
+  if (!rootManifest.ok) return { declarations: [], issues: [{ message: rootManifest.message }] }
   if (!isRecord(rootManifest.value)) {
-    return {
-      declarations: [],
-      issues: [{ message: 'agent package.json must contain an object' }],
-      protectedFiles: [resolvedRootManifest ?? rootManifestPath],
-    }
+    return { declarations: [], issues: [{ message: 'agent package.json must contain an object' }] }
   }
   const dependencies = rootManifest.value.dependencies
-  if (dependencies === undefined) {
-    return { declarations: [], issues: [], protectedFiles: [resolvedRootManifest ?? rootManifestPath] }
-  }
+  if (dependencies === undefined) return { declarations: [], issues: [] }
   if (!isRecord(dependencies)) {
-    return {
-      declarations: [],
-      issues: [{ message: 'agent package.json dependencies must be an object' }],
-      protectedFiles: [resolvedRootManifest ?? rootManifestPath],
-    }
+    return { declarations: [], issues: [{ message: 'agent package.json dependencies must be an object' }] }
   }
 
   const declarations: DependencyBinDeclaration[] = []
   const issues: DependencyBinIssue[] = []
-  const protectedFiles = [resolvedRootManifest ?? rootManifestPath]
   const agentRoot = await realpath(agentDir).catch(() => undefined)
   const nodeModulesRoot = await realpath(join(agentDir, 'node_modules')).catch(() => undefined)
   for (const packageName of Object.keys(dependencies).sort()) {
@@ -121,7 +101,6 @@ export async function discoverDependencyBins(agentDir: string): Promise<Dependen
   return {
     declarations: declarations.filter((entry) => !ambiguousBins.has(entry.bin)),
     issues,
-    protectedFiles: [...new Set(protectedFiles)],
   }
 }
 
@@ -171,7 +150,7 @@ export function registerDependencyBinDoctorCheck(
           details: problems,
           fix: {
             description:
-              'On the host stage, run `bun install` in the agent folder and fix malformed dependency manifests, then restart TypeClaw.',
+              'Run `bun install` at the agent root (from agent bash or on the host) and fix malformed dependency manifests.',
           },
         }
       },

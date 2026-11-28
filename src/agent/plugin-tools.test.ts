@@ -4405,11 +4405,11 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       ['bind', '/tmp'],
       ['ro-bind', '/tmp/typeclaw-dependency-bin'],
     ])
-    expect(protectedFiles).toEqual(expect.arrayContaining([await realpath(path.join(agentDir, 'package.json'))]))
+    expect(protectedFiles).not.toContain(await realpath(path.join(agentDir, 'package.json')))
     await rm(agentDir, { recursive: true, force: true })
   })
 
-  test('adds a structured operator-install hint when a direct dependency bin exits 127', async () => {
+  test('adds a structured install hint when a direct dependency bin exits 127', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-hint-'))
     await writeFile(
       path.join(agentDir, 'package.json'),
@@ -4446,7 +4446,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
 
     expect(result.content).toContainEqual({
       type: 'text',
-      text: '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=operator-install]',
+      text: '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=install]',
     })
     await rm(agentDir, { recursive: true, force: true })
   })
