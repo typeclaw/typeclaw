@@ -4085,7 +4085,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
     expect(owner.indexOf('--bind /agent /agent')).toBeLessThan(owner.indexOf('--ro-bind-data 3 /agent/.env'))
   })
 
-  test('the entire root dependency tree renders read-only for trusted and confined role policies', async () => {
+  test('the root dependency tree is writable for root-writable roles and never for confined roles', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-protected-dependencies-'))
     await mkdir(path.join(agentDir, 'node_modules'))
     try {
@@ -4106,13 +4106,12 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       })
       const trusted = buildSandboxedCommand('printf safe > ordinary.txt', trustedPolicy).argv.join(' ')
       const confined = buildSandboxedCommand('printf safe > workspace/output.txt', confinedPolicy).argv.join(' ')
-      const protectedNodeModules = `--ro-bind ${path.join(agentDir, 'node_modules')} ${path.join(agentDir, 'node_modules')}`
+      const nodeModules = path.join(agentDir, 'node_modules')
 
       expect(trusted).toContain(`--bind ${agentDir} ${agentDir}`)
-      expect(trusted).toContain(protectedNodeModules)
-      expect(trusted.indexOf(`--bind ${agentDir} ${agentDir}`)).toBeLessThan(trusted.indexOf(protectedNodeModules))
+      expect(trusted).not.toContain(`--ro-bind ${nodeModules} ${nodeModules}`)
       expect(confined).not.toContain(`--bind ${agentDir} ${agentDir}`)
-      expect(confined).toContain(protectedNodeModules)
+      expect(confined).not.toContain(`--bind ${nodeModules} ${nodeModules}`)
     } finally {
       await rm(agentDir, { recursive: true, force: true })
     }
@@ -4406,11 +4405,11 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
       ['bind', '/tmp'],
       ['ro-bind', '/tmp/typeclaw-dependency-bin'],
     ])
-    expect(protectedFiles).toEqual(expect.arrayContaining([await realpath(path.join(agentDir, 'package.json'))]))
+    expect(protectedFiles).not.toContain(await realpath(path.join(agentDir, 'package.json')))
     await rm(agentDir, { recursive: true, force: true })
   })
 
-  test('adds a structured operator-install hint when a direct dependency bin exits 127', async () => {
+  test('adds a structured install hint when a direct dependency bin exits 127', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-dependency-hint-'))
     await writeFile(
       path.join(agentDir, 'package.json'),
@@ -4447,7 +4446,7 @@ describe('wrapBuiltinToolDefinition bash sandbox (role-derived path hiding)', ()
 
     expect(result.content).toContainEqual({
       type: 'text',
-      text: '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=operator-install]',
+      text: '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=install]',
     })
     await rm(agentDir, { recursive: true, force: true })
   })
@@ -9357,4 +9356,63 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
       expect(loadConfigSync(agentDir).alias).toEqual(['atlas'])
     })
   })
+})
+
+describe('wrapBuiltinToolDefinition agent package manifest', () => {
+  const owner: SessionOrigin = { kind: 'tui', sessionId: 'manifest-owner' }
+  const member: SessionOrigin = { kind: 'subagent', subagent: 'x', parentSessionId: 'p', spawnedByRole: 'member' }
+
+  function fakeFileTool(name: 'write' | 'edit', calls: string[]) {
+    return {
+      name,
+      label: name,
+      description: '',
+      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      async execute(_id: string, params: { path: string; content: string }) {
+        calls.push(params.path)
+        return { content: [{ type: 'text' as const, text: 'changed' }], details: {} }
+      },
+    }
+  }
+
+  test.skipIf(lacksInodeAnchoring).each(['write', 'edit'] as const)(
+    '%s changes the root package.json only for a root-writable role',
+    async (name) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-manifest-write-'))
+      try {
+        await writeFile(path.join(agentDir, 'package.json'), '{}')
+        await symlink(path.join(agentDir, 'package.json'), path.join(agentDir, 'manifest-link.json'))
+        const calls: string[] = []
+        const wrap = (origin: SessionOrigin) =>
+          wrapBuiltinToolDefinition(fakeFileTool(name, calls), {
+            agentDir,
+            sessionId: `manifest-${name}`,
+            hooks: createHookBus(),
+            getOrigin: () => origin,
+            permissions: createPermissionService(),
+          })
+        const call = (origin: SessionOrigin, target: string) =>
+          wrap(origin).execute('c', { path: target, content: '{}' } as never, undefined, undefined, {} as never)
+
+        // owner: allowed
+        await call(owner, 'package.json')
+        expect(calls).toHaveLength(1)
+
+        // member: denied, by lexical path and through a symlink to the manifest
+        await expect(call(member, 'package.json')).rejects.toThrow(
+          /can only be changed by a role that can write the agent root/,
+        )
+        await expect(call(member, 'manifest-link.json')).rejects.toThrow(
+          /can only be changed by a role that can write the agent root/,
+        )
+        expect(calls).toHaveLength(1)
+
+        // member: other files are unaffected by this check
+        await call(member, 'workspace-note.json')
+        expect(calls).toHaveLength(2)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
 })

@@ -125,7 +125,7 @@ describe('reconcileDependencyBinWrappers', () => {
     expect(await readFile(join(dir, 'opensoma'), 'utf8')).toContain('node_modules/opensoma/cli.js')
   })
 
-  test('renders the structured operator-install hint for a known unavailable dependency bin', async () => {
+  test('renders the structured install hint for a known unavailable dependency bin', async () => {
     const root = await mkdtemp(join(tmpdir(), 'typeclaw-dependency-bins-'))
     await writeRootDependencies(root, { opensoma: '^1.0.0' })
     await writePackage(root, 'opensoma', { opensoma: 'missing.js' })
@@ -136,7 +136,7 @@ describe('reconcileDependencyBinWrappers', () => {
     })
 
     expect(dependencyBinUnavailableHint('opensoma session list', reconciliation)).toBe(
-      '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=operator-install]',
+      '[typeclaw:capability-unavailable capability=dependency-bin dependency=opensoma bin=opensoma action=install]',
     )
   })
 

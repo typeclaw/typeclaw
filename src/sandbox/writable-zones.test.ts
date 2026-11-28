@@ -4,8 +4,15 @@ import { lstat, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/pro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { COPYFILE_INSTALL_MARKER } from '@/init/run-bun-install'
+
 import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
-import { resolveProtectedZones, resolveWritableZones, subtractMasked } from './writable-zones'
+import {
+  resolveProtectedZones,
+  resolveRuntimeDependencyZones,
+  resolveWritableZones,
+  subtractMasked,
+} from './writable-zones'
 
 let agentDir: string
 
@@ -252,13 +259,50 @@ describe('resolveWritableZones', () => {
   })
 })
 
+describe('resolveRuntimeDependencyZones', () => {
+  async function installPackage(dir: string, name: string, dependencies: Record<string, string> = {}): Promise<void> {
+    await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0', dependencies }))
+  }
+
+  test('keeps a tree without the copyfile marker read-only as a whole', async () => {
+    await installPackage(join(agentDir, 'node_modules', 'typeclaw'), 'typeclaw')
+
+    expect(await resolveRuntimeDependencyZones(agentDir, ['typeclaw'])).toEqual([join(agentDir, 'node_modules')])
+  })
+
+  test('protects only the dependency closure of the runtime packages in a copyfile tree', async () => {
+    // given: typeclaw -> zod (hoisted) and -> ws (nested), a plugin, and an agent-installed CLI
+    const nodeModules = join(agentDir, 'node_modules')
+    await mkdir(nodeModules, { recursive: true })
+    await writeFile(join(nodeModules, COPYFILE_INSTALL_MARKER), '')
+    await installPackage(join(nodeModules, 'typeclaw'), 'typeclaw', { zod: '^4', ws: '^8' })
+    await installPackage(join(nodeModules, 'typeclaw', 'node_modules', 'ws'), 'ws')
+    await installPackage(join(nodeModules, 'zod'), 'zod')
+    await installPackage(join(nodeModules, '@acme', 'plugin'), '@acme/plugin', { zod: '^4' })
+    await installPackage(join(nodeModules, 'agent-cli'), 'agent-cli')
+
+    // when
+    const dirs = await resolveRuntimeDependencyZones(agentDir, ['typeclaw', '@acme/plugin'])
+
+    // then: nested deps are covered by their parent bind, and the agent's CLI stays writable
+    expect(dirs.sort()).toEqual(
+      [join(nodeModules, '@acme', 'plugin'), join(nodeModules, 'typeclaw'), join(nodeModules, 'zod')].sort(),
+    )
+  })
+
+  test('returns nothing when node_modules is absent', async () => {
+    expect(await resolveRuntimeDependencyZones(agentDir, ['typeclaw'])).toEqual([])
+  })
+})
+
 describe('resolveProtectedZones', () => {
-  test('protects an existing node_modules directory without requiring a Git repository', async () => {
+  test('leaves an installed node_modules writable so the agent can install into its own package', async () => {
     await mkdir(join(agentDir, 'node_modules'))
 
     const { dirs, files } = await resolveProtectedZones(agentDir)
 
-    expect(dirs).toEqual([join(agentDir, 'node_modules')])
+    expect(dirs).toEqual([])
     expect(files).toEqual([])
   })
 
@@ -266,17 +310,6 @@ describe('resolveProtectedZones', () => {
     await resolveProtectedZones(agentDir)
 
     expect(existsSync(join(agentDir, 'node_modules'))).toBe(false)
-  })
-
-  test('rejects a symlinked node_modules instead of leaving executable dependencies writable', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'typeclaw-node-modules-outside-'))
-    try {
-      await symlink(outside, join(agentDir, 'node_modules'))
-
-      await expect(resolveProtectedZones(agentDir)).rejects.toThrow(/symlink/i)
-    } finally {
-      await rm(outside, { recursive: true, force: true })
-    }
   })
 
   test('re-protects .git/hooks and .git/config when present', async () => {

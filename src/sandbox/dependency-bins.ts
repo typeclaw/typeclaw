@@ -14,7 +14,6 @@ export type DependencyBinReconciliation = {
   resolutions: ResolvedDependencyBin[]
   unavailable: Extract<ResolvedDependencyBin, { kind: 'unavailable' }>[]
   issues: DependencyBinIssue[]
-  protectedFiles: string[]
 }
 
 const reconciliationLocks = new Map<string, Promise<void>>()
@@ -87,7 +86,6 @@ async function reconcileDependencyBinWrappersUnlocked(
     resolutions: validation.resolutions,
     unavailable: validation.unavailable,
     issues: validation.issues,
-    protectedFiles: validation.protectedFiles,
   }
 }
 
@@ -98,7 +96,7 @@ export function dependencyBinUnavailableHint(
   const unavailable = reconciliation.unavailable.find((entry) => commandInvokesBin(command, entry.declaration.bin))
   if (unavailable === undefined) return undefined
   const declaration = unavailable.declaration
-  return `[typeclaw:capability-unavailable capability=dependency-bin dependency=${declaration.package} bin=${declaration.bin} action=operator-install]`
+  return `[typeclaw:capability-unavailable capability=dependency-bin dependency=${declaration.package} bin=${declaration.bin} action=install]`
 }
 
 async function ensureWrapperDir(dir: string): Promise<void> {

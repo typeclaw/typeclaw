@@ -3,6 +3,8 @@ import { lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import path, { isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
+import { COPYFILE_INSTALL_MARKER } from '@/init/run-bun-install'
+
 import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from './canonical-secrets'
 
 const execFileAsync = promisify(execFile)
@@ -71,9 +73,9 @@ const FORBIDDEN_WRITABLE_ROOTS = [
 // `echo … > cron.json` from bash and defeat the guard entirely. Keeping them off
 // this list forces every mutation of a guarded file through the one guarded path
 // (the write/edit tool), so a managed file has exactly one mutation boundary.
-// `package.json` is operator-owned because direct dependencies define the
-// executable surface exposed in the model sandbox. It must not receive an RW
-// rebind that would let model-driven bash expand its own PATH capabilities.
+// `package.json` stays off this list: confined roles do not reshape the agent
+// package. Root-writable roles edit it, `bun.lock`, and node_modules through
+// their full agent-root bind.
 const WRITABLE_ROOT_FILES = ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'USER.md'] as const
 
 // SECURITY: the symlink rejection is load-bearing. An RW bind follows symlinks,
@@ -168,14 +170,15 @@ function dedupe(values: string[]): string[] {
 // We also resolve the effective core.hooksPath from the real (about-to-be-RO)
 // config: if it already points at a writable location (e.g. workspace/hooks),
 // the .git/hooks RO-bind alone would not cover it, so that dir is protected too.
+//
+// node_modules is protected separately, by resolveRuntimeDependencyZones: the
+// agent package is the agent's to grow, so only the code the runtime imports
+// stays read-only.
 export async function resolveProtectedZones(agentDir: string): Promise<ProtectedZones> {
-  const dirs: string[] = []
-  const nodeModules = await resolveExistingProtectedDir(join(agentDir, 'node_modules'))
-  if (nodeModules !== undefined) dirs.push(nodeModules)
   const layout = await resolveGitControlLayout(agentDir)
-  if (layout === undefined) return { dirs, files: [] }
+  if (layout === undefined) return { dirs: [], files: [] }
 
-  dirs.push(await ensureProtectedDir(layout.defaultHooksDir))
+  const dirs = [await ensureProtectedDir(layout.defaultHooksDir)]
   const files: string[] = []
   for (const configFile of layout.configFiles) files.push(await ensureProtectedFile(configFile))
   if (layout.gitEntryFile !== undefined) files.push(layout.gitEntryFile)
@@ -188,12 +191,57 @@ export async function resolveProtectedZones(agentDir: string): Promise<Protected
   return { dirs: dedupe(dirs), files: dedupe(files) }
 }
 
-async function resolveExistingProtectedDir(target: string): Promise<string | undefined> {
-  const stats = await lstatOrUndefined(target)
-  if (stats === undefined) return undefined
-  if (stats.isSymbolicLink()) throw new Error(`sandbox: refusing to protect symlinked path ${target}`)
-  if (!stats.isDirectory()) throw new Error(`sandbox: protected directory is not a directory ${target}`)
-  return target
+// node_modules for a root-writable role. The agent package is the agent's to
+// grow, so `bun add`/`bun install` can write the tree, except the dependency
+// closure of `runtimePackages` (typeclaw and its npm plugins): the runtime and
+// its credential brokers import that code with credentials in hand, so it stays
+// read-only. A tree without the copyfile marker may still share inodes with the
+// host Bun cache, so it stays read-only whole until `typeclaw start` rebuilds
+// it (src/init/ensure-deps.ts). Confined roles never get a writable bind here.
+export async function resolveRuntimeDependencyZones(
+  agentDir: string,
+  runtimePackages: readonly string[],
+): Promise<string[]> {
+  const nodeModules = join(agentDir, 'node_modules')
+  const stats = await lstatOrUndefined(nodeModules)
+  if (stats === undefined) return []
+  if (!stats.isDirectory() || !(await isRealEntry(join(nodeModules, COPYFILE_INSTALL_MARKER), 'file'))) {
+    return [nodeModules]
+  }
+  const [realAgentDir, realNodeModules] = await Promise.all([realpath(agentDir), realpath(nodeModules)])
+  const closure = new Set<string>()
+  const pending = runtimePackages.map((name) => ({ name, from: realAgentDir }))
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const dir = await resolveInstalledPackage(next.from, next.name, realAgentDir)
+    if (dir === undefined || closure.has(dir) || !isInside(realNodeModules, dir)) continue
+    closure.add(dir)
+    for (const name of await readDependencyNames(join(dir, 'package.json'))) pending.push({ name, from: dir })
+  }
+  const sorted = [...closure].sort()
+  const outermost = sorted.filter((dir, index) => !sorted.slice(0, index).some((parent) => isInside(parent, dir)))
+  // Bind at the lexical path bwrap sees under the agent-root bind.
+  return outermost.map((dir) => join(nodeModules, path.relative(realNodeModules, dir)))
+}
+
+async function resolveInstalledPackage(from: string, name: string, realAgentDir: string): Promise<string | undefined> {
+  const stop = path.dirname(realAgentDir)
+  for (let dir = from; dir !== stop && dir !== path.dirname(dir); dir = path.dirname(dir)) {
+    const candidate = join(dir, 'node_modules', ...name.split('/'))
+    if (await isRealEntry(join(candidate, 'package.json'), 'file')) return await realpath(candidate)
+  }
+  return undefined
+}
+
+async function readDependencyNames(manifestPath: string): Promise<string[]> {
+  try {
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>
+    return ['dependencies', 'optionalDependencies', 'peerDependencies'].flatMap((field) => {
+      const value = manifest[field]
+      return value !== null && typeof value === 'object' ? Object.keys(value) : []
+    })
+  } catch {
+    return []
+  }
 }
 
 export async function isGitControlPath(agentDir: string, candidate: string): Promise<boolean> {

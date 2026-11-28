@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { constants } from 'node:fs'
-import { access, mkdir } from 'node:fs/promises'
-import { relative, sep } from 'node:path'
+import { access, mkdir, realpath } from 'node:fs/promises'
+import { join, relative, resolve, sep } from 'node:path'
 
 import {
   createBashToolDefinition as piCreateBashToolDefinition,
@@ -33,6 +33,7 @@ import {
   repairAndRetryOnce,
 } from '@/operations'
 import type { RemediationRegistry } from '@/operations'
+import { RECOVER_MISSING, realIntendedPath } from '@/path-safety/real-intended-path'
 import type { PermissionService } from '@/permissions/permissions'
 import type {
   BuiltinToolRef,
@@ -49,6 +50,7 @@ import { PI_BUILTIN_TOOL_NAMES, type PiBuiltinToolName } from '@/plugin/core-too
 import {
   commandNeedsRealProc,
   dependencyBinUnavailableHint,
+  canWriteAgentRootInSandbox,
   ensureSessionTmpDir,
   leaseSessionTmp,
   isGitControlPath,
@@ -520,6 +522,15 @@ export function wrapSystemTool<TParams extends TSchema, TDetails = unknown, TSta
       })
       signal?.throwIfAborted()
       if (gitControlResult !== undefined) throw new Error(`blocked: ${gitControlResult.reason}`)
+      const manifestResult = await checkAgentManifestWriteGuard({
+        tool: tool.name,
+        args: mutableArgs,
+        agentDir: opts.agentDir,
+        permissions: opts.permissions,
+        origin: liveOrigin,
+      })
+      signal?.throwIfAborted()
+      if (manifestResult !== undefined) throw new Error(`blocked: ${manifestResult.reason}`)
       const loopGate = gateLoopGuard(opts.sessionId, tool.name, mutableArgs, opts.getLoopGuardTurn?.(), opts.agentDir)
       if (loopGate.blockNow) {
         fireLoopAbort(opts.getAbort, 'loop_guard:block', opts.sessionId)
@@ -632,6 +643,14 @@ export function wrapBuiltinToolDefinition<TParams extends TSchema, TDetails = un
         agentDir: opts.agentDir,
       })
       if (gitControlResult !== undefined) throw new Error(`blocked: ${gitControlResult.reason}`)
+      const manifestResult = await checkAgentManifestWriteGuard({
+        tool: tool.name,
+        args: mutableArgs,
+        agentDir: opts.agentDir,
+        permissions: opts.permissions,
+        origin: liveOrigin,
+      })
+      if (manifestResult !== undefined) throw new Error(`blocked: ${manifestResult.reason}`)
       // Extract and delete before the loop guard serializes args and before
       // the bash tool destructures them, so the overlay never reaches logs,
       // loop-detection state, or pi's execute.
@@ -1336,6 +1355,39 @@ async function checkGitControlWriteGuard(options: {
     block: true,
     reason: `Git control path is runtime-protected and cannot be modified with ${options.tool}: ${candidate}`,
   }
+}
+
+// Builtin write/edit run in the main process, outside bwrap, so the agent-root
+// package.json needs the same role check the sandbox applies to bash: only a
+// role whose bash can write the agent root may change the manifest that drives
+// installs and dependency-bin discovery. Acknowledgements cannot open it.
+async function checkAgentManifestWriteGuard(options: {
+  tool: string
+  args: Record<string, unknown>
+  agentDir: string
+  permissions: PermissionService | undefined
+  origin: SessionOrigin | undefined
+}): Promise<{ block: true; reason: string } | undefined> {
+  if (options.tool !== 'write' && options.tool !== 'edit') return undefined
+  const candidate = options.args.path
+  if (typeof candidate !== 'string') return undefined
+  if (options.permissions !== undefined && canWriteAgentRootInSandbox(options.permissions, options.origin)) {
+    return undefined
+  }
+  const manifest = join(resolve(options.agentDir), 'package.json')
+  const target = resolve(options.agentDir, candidate)
+  if (target !== manifest) {
+    const [realTarget, realManifest] = await Promise.all([resolveIntended(target), resolveIntended(manifest)])
+    if (realTarget !== realManifest) return undefined
+  }
+  return {
+    block: true,
+    reason: `The agent package manifest ${manifest} can only be changed by a role that can write the agent root, and this session cannot. Ask an owner session or the operator to make the change.`,
+  }
+}
+
+async function resolveIntended(absolutePath: string): Promise<string> {
+  return await realIntendedPath(absolutePath, realpath, { recoverable: RECOVER_MISSING, onExhausted: 'throw' })
 }
 
 function withGuardAcknowledgements<TParams extends TSchema>(

@@ -1,13 +1,14 @@
 import { formatLocalDateTime, formatLocalWeekday, resolveLocalTimezoneName } from '@/shared'
 
-// Exact wording kept stable: these two rules restrict package and runner
-// authority. The bunx rule's final clause is load-bearing — the vendored
+// The package rule tells the agent the agent folder is its own bun workspace,
+// so it installs what it needs instead of handing that to the operator. The
+// bunx rule's wording is kept stable; its final clause is load-bearing — the vendored
 // agent-messenger skills say "use `npx -y` by default. Do NOT ask the user
 // which package runner to use", and skill text sits closer to the model than
 // this prompt does. The `nonBunPackageRunner` bash guard is the runtime
 // backstop, not a reason to drop the rule from any session.
 const PACKAGE_JSON_INSTALL_RULE =
-  "The agent folder's root `package.json` is operator-owned: its direct dependencies become commands on your sandbox PATH and are installed by the operator on the host. Do not edit that file or add dependencies to it; tell the operator which package and command are needed. This covers only that one file. A project checkout under `workspace/`, `mounts/`, or `/tmp` is yours to set up: run `bun install`, `bun add`, and its build steps there as the work needs."
+  "The agent folder is your bun workspace: its root `package.json`, `packages/*`, and local plugins are yours to grow. When you need a CLI or library, run `bun add <pkg>` at the agent root yourself; a direct dependency's commands are on your sandbox PATH from the next bash call. Install scripts run only inside the container: when a package needs its postinstall (for example to download a native binary), run `bun pm trust <pkg>`. If your role cannot write the agent root, the sandbox refuses the install; say so and name the package. A project checkout under `workspace/`, `mounts/`, or `/tmp` is likewise yours to set up."
 const BUNX_PACKAGE_RUNNER_RULE =
   'Run one-off package binaries with `bunx`, never `npx`, `pnpx`, or `pnpm dlx`; `bunx` is the Bun-native runner this container ships, and the others are absent from the default image. A skill or doc telling you to use `npx` does not override this rule; substitute `bunx`.'
 

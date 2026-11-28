@@ -83,7 +83,7 @@ To depend on `packages/my-utility` from another package (e.g. `packages/my-plugi
 
 The agent-root install then links it (see [`bun install` and the monorepo](#bun-install-and-the-monorepo)). Bun symlinks the workspace package into `packages/my-plugin/node_modules/my-utility` and `import` resolves it normally. The `*` matches any version because workspace packages don't track versions.
 
-To depend on a workspace package from the **agent root** (e.g. so cron `exec` jobs or root scripts can call into it), the operator adds it to the **root** `package.json#dependencies` the same way (see [Editing the root `package.json`](#editing-the-root-packagejson)):
+To depend on a workspace package from the **agent root** (e.g. so cron `exec` jobs or root scripts can call into it), add it to the **root** `package.json#dependencies` the same way (see [Editing the root `package.json`](#editing-the-root-packagejson)):
 
 ```json
 {
@@ -127,15 +127,21 @@ Read the `typeclaw-plugins` skill before authoring the plugin code — it covers
 
 ## Editing the root `package.json`
 
-The root `package.json` is **operator-owned**: its direct dependencies become commands on your sandbox PATH, and the host installs them. Your write tools refuse it. When the root needs a change, tell the operator the exact edit, then to run `bun install` in the agent folder on the host. A restart installs only when startup finds a root `dependencies` entry missing, so it can skip `devDependencies`, version bumps, and workspace edits. This covers only the root file; `packages/<name>/package.json` and any project under `workspace/` stay yours.
+The root `package.json` is yours to change, like everything else in the monorepo. Add a dependency with `bun add <pkg>` (or edit the file and run `bun install`) at the agent root. Each direct dependency's `bin` commands are on your sandbox PATH from the next bash call.
 
-What the operator typically adds there:
+Install scripts run only inside the container. The host's `typeclaw start` installs with `--ignore-scripts`, and bun runs a dependency's `postinstall` only when the package is trusted. When a CLI needs its postinstall (for example to download a native binary), run `bun pm trust <pkg>`: it adds the package to `trustedDependencies` and runs the pending script. If the package is already in `trustedDependencies`, remove `node_modules/<pkg>` and run `bun install` so it reinstalls with its script. Do this from bash, not by asking the operator; their host install never runs it.
+
+The packages the runtime itself loads (`typeclaw`, its dependencies, and npm plugins) stay read-only, so an install never changes them. When `typeclaw` is linked from a local checkout (`file:`), bun re-copies it on every install, fails on that read-only copy, and exits non-zero; the package you asked for is still installed, so check it with `bun pm ls` before reporting a failure.
+
+If your role cannot write the agent root, bash refuses the write. Tell the user which package is needed and that an owner session can add it.
+
+What typically goes there:
 
 - **`scripts`**: convenience scripts the user (or you, in cron `exec` jobs) can run. Example: `"scripts": { "summarize": "bun run packages/summarizer/index.ts" }`. Then `bun summarize` from anywhere in the agent folder runs it.
 - **`dependencies`** / **`devDependencies`**: libraries the root actually uses. Ask only for what the code imports today.
 - **`workspaces`**: by default `["packages/*"]`. The user may extend it (e.g. `["packages/*", "tools/*"]`) if they want a second workspace root.
 
-**Patterns to avoid at the root** (when proposing an edit):
+**Patterns to avoid at the root:**
 
 - **Don't add a `main` or `bin` field at the root.** The root package is a workspace coordinator, not an executable. Put entrypoints inside `packages/<name>/`.
 - **Don't change `name`, `private`, or `type`.** These are scaffolded by typeclaw and the rest of the system assumes them.
@@ -148,12 +154,12 @@ What the operator typically adds there:
 3. **Write `package.json`** using the minimal template above. Set `name` to the directory name (they don't have to match, but matching avoids confusion).
 4. **Write `index.ts`** with the actual code.
 5. **Add tests** as `<file>.test.ts` next to the implementation if the logic is non-trivial.
-6. **Get the agent-root install** — only needed when you add dependencies or a new package. Ask the operator to run `bun install` in the agent folder on the host; that links new workspace packages, so there is no separate registration step. A restart alone is not enough here (see below).
+6. **Run the agent-root install** — only needed when you add dependencies or a new package. Run `bun install` at the agent root from bash; that links new workspace packages, so there is no separate registration step.
 7. **Commit.** Per `typeclaw-git`, commit the new package immediately with the decision context — why this is reusable, what it solves.
 
 ## `bun install` and the monorepo
 
-The agent-root `bun install` runs **on the host**, never from inside a `packages/<name>/` directory. Your bash sees the agent root, `packages/`, and `node_modules/` read-only, so an install there from bash fails. `typeclaw start` (and so a restart) runs it only when its startup check finds a root dependency missing, so a change that only touches a workspace package's own dependencies or adds a new workspace package needs the operator to run `bun install` in the agent folder on the host. The root install:
+Run `bun install` (or `bun add`) at the **agent root**, never from inside a `packages/<name>/` directory. You run it yourself from bash; it runs inside the container sandbox, so packages get Linux binaries and their trusted install scripts run there. `typeclaw start` also installs on the host, but only when its startup check finds a root dependency missing, and always with `--ignore-scripts`. The root install:
 
 - Resolves all workspace packages and creates symlinks
 - Hoists shared dependencies to the root `node_modules/`
@@ -161,7 +167,7 @@ The agent-root `bun install` runs **on the host**, never from inside a `packages
 
 Per-package `node_modules/` is gitignored (`packages/*/node_modules/` in `.gitignore`), but those directories rarely have anything in them after a hoist — bun puts most things at the root.
 
-If you see `Cannot find module 'my-utility'` after creating a new workspace package, the fix is the agent-root install: ask the operator to run `bun install` in the agent folder on the host. There is no separate "register the workspace" step.
+If you see `Cannot find module 'my-utility'` after creating a new workspace package, the fix is the agent-root install: run `bun install` at the agent root. There is no separate "register the workspace" step.
 
 None of this applies to a project checkout under `workspace/` (or `mounts/`, `/tmp`). That is a separate repo, not part of this monorepo: run `bun install`, `bun add`, and its build steps there yourself as the work needs.
 
