@@ -13,7 +13,7 @@ const observed = new Map<string, Set<string>>()
 // the agent's own key. Redacting by what the vault holds, rather than by what
 // a grant reports it handed out, covers derived grants, a bash command still
 // running when another tool finishes, and grants that expired or were revoked
-// before their history could be read. Public `text` fields are left alone.
+// before their history could be read. Public `text` fields, and a passkey's parts other than its private key, are left alone.
 // Cached until the vault's entries change.
 export async function vaultSecretValues(agentDir: string): Promise<readonly string[]> {
   const stamp = entriesStamp(agentDir)
@@ -28,6 +28,7 @@ export async function vaultSecretValues(agentDir: string): Promise<readonly stri
     for (const field of Object.values(entry.fields)) {
       if (field.type === 'text') continue
       if (field.type === 'oauth') for (const part of Object.values(field.value)) values.add(part)
+      else if (field.type === 'passkey') values.add(field.value.private_key)
       else values.add(field.value)
     }
   }
