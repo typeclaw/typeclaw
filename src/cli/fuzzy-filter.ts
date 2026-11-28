@@ -16,15 +16,26 @@ function isSubsequence(query: string, haystack: string): boolean {
   return i === query.length
 }
 
+// Words keep their inner "-", ".", "_" so "gpt4o" still abbreviates "gpt-4o",
+// while spaces, "/", "(", "·" and other separators end a word. Combining
+// marks (\p{M}) stay inside a word so scripts like Devanagari are not split at
+// their vowel signs.
+const WORD_SEPARATOR = /[^\p{L}\p{M}\p{N}._-]+/u
+
 // Splitting the query on whitespace lets "gpt 5.5" match "GPT-5.5 Turbo": each
-// token is matched independently as a subsequence, so the "-" inside "GPT-5.5"
-// no longer breaks the search the way a plain substring "gpt 5.5" would. Tokens
-// are order-independent so "turbo gpt" finds "GPT Turbo" too.
+// token is matched independently, so the "-" inside "GPT-5.5" no longer breaks
+// the search the way a plain substring "gpt 5.5" would. Tokens are
+// order-independent so "turbo gpt" finds "GPT Turbo" too. A token matches as a
+// substring anywhere, or as a subsequence of a single word; a subsequence over
+// the whole haystack would let "sonnet" match the GPT-5.4 mini option by
+// picking one letter from each word of its label and model ref:
+// "Plu[s]/Pr[o] · GPT-5.4 mi[n]i ope[n]ai-cod[e]x/gp[t]-5.4-mini".
 export function fuzzyMatch<Value>(search: string, option: Option<Value>): boolean {
   const tokens = search.toLowerCase().split(/\s+/).filter(Boolean)
   if (tokens.length === 0) return true
   const haystack = optionHaystack(option)
-  return tokens.every((token) => isSubsequence(token, haystack))
+  const words = haystack.split(WORD_SEPARATOR).filter(Boolean)
+  return tokens.every((token) => haystack.includes(token) || words.some((word) => isSubsequence(token, word)))
 }
 
 export const fuzzyFilter: FuzzyFilter<unknown> = fuzzyMatch
