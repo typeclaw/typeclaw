@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { isPackageNotFound, reconcilePluginDeps } from './reconcile-plugin-deps'
+import { isPackageNotFound, reconcilePluginDeps, resolveLatestFromRegistry } from './reconcile-plugin-deps'
 
 async function makeAgentDir(pkg: unknown): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'typeclaw-reconcile-'))
@@ -18,6 +18,80 @@ async function readPkg(dir: string): Promise<Record<string, unknown>> {
 const neverResolve = async (name: string): Promise<string> => {
   throw new Error(`unexpected registry resolution for ${name}`)
 }
+
+describe('reconcilePluginDeps registry lookup', () => {
+  test('pins an unpinned plugin from the operator registry on a cold start without leaking host values', async () => {
+    // given: an agent folder whose .npmrc names its own registry and asks for a host secret
+    const requests: { path: string; authorization: string | null }[] = []
+    const operatorRegistry = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const url = new URL(request.url)
+        requests.push({ path: url.pathname, authorization: request.headers.get('authorization') })
+        if (url.pathname !== '/probe-plugin') return new Response('{}', { status: 404 })
+        return Response.json({
+          name: 'probe-plugin',
+          'dist-tags': { latest: '2.3.4' },
+          versions: { '2.3.4': { name: 'probe-plugin', version: '2.3.4', dist: { tarball: `${url.origin}/x.tgz` } } },
+        })
+      },
+    })
+    const home = await mkdtemp(join(tmpdir(), 'typeclaw-reconcile-home-'))
+    const dir = await makeAgentDir({ name: 'agent', dependencies: {} })
+    try {
+      await writeFile(join(dir, '.npmrc'), 'registry=http://127.0.0.1:9/\n_authToken=${TC_PROBE_SECRET}\n')
+      const env = {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: home,
+        NPM_CONFIG_REGISTRY: `http://127.0.0.1:${operatorRegistry.port}/`,
+        TC_PROBE_SECRET: 'host-secret-value',
+      }
+
+      // when
+      const result = await reconcilePluginDeps({
+        cwd: dir,
+        plugins: ['probe-plugin'],
+        resolveLatest: (name) => resolveLatestFromRegistry(name, { env }),
+      })
+
+      // then: the operator registry answered, and no request carried the host value
+      expect(result.changed).toBe(true)
+      expect(((await readPkg(dir)).dependencies as Record<string, string>)['probe-plugin']).toBe('2.3.4')
+      expect(requests.map((request) => request.path)).toContain('/probe-plugin')
+      expect(requests.some((request) => request.authorization?.includes('host-secret-value'))).toBe(false)
+    } finally {
+      operatorRegistry.stop(true)
+      await rm(dir, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  test('runs the lookup outside the agent folder with only the install env allowlist', async () => {
+    const seen: { cwd?: string; env?: Record<string, string | undefined> }[] = []
+    const spawn = ((options: { cwd?: string; env?: Record<string, string | undefined> }) => {
+      seen.push(options)
+      const text = (value: string) =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(value))
+            controller.close()
+          },
+        })
+      return { exited: Promise.resolve(0), stdout: text('"1.0.0"\n'), stderr: text(''), kill() {} }
+    }) as unknown as typeof Bun.spawn
+
+    const version = await resolveLatestFromRegistry('probe-plugin', {
+      spawn,
+      env: { PATH: '/usr/bin', HOME: '/home/agent', OPENAI_API_KEY: 'host-secret-value' },
+    })
+
+    expect(version).toBe('1.0.0')
+    expect(seen[0]?.cwd).not.toBe(process.cwd())
+    expect(seen[0]?.env).toEqual({ PATH: '/usr/bin', HOME: '/home/agent' })
+  })
+})
 
 describe('reconcilePluginDeps', () => {
   test('adds a versioned npm plugin to dependencies and records provenance', async () => {
