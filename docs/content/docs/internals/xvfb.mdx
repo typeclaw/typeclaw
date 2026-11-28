@@ -54,6 +54,10 @@ Default 64MB `/dev/shm` is too small for Chrome's renderer; crashes surface as b
 
 Container Chrome uses SwiftShader (CPU WebGL). WebGL renderer reports `"ANGLE (Google, SwiftShader, ...)"` — a signal, but one weak-laptop users produce, so most WAFs don't block. Targets that DO block on software renderers need a real GPU host outside the container model.
 
+## Headed Chrome stays up with no tabs
+
+Headed Chrome exits (code 0) when its last window closes; headless does not. Sessions close their tabs when they end, and scripts close tabs they are done with, so the shared browser would otherwise restart whenever the last tab went away, losing every session-cookie login and cutting off connected scripts. Headed launches pass `--keep-alive-for-test`, which keeps the browser process alive with zero windows; new tabs open normally and SIGTERM still shuts it down.
+
 ## Overhead vs `--headless=new`
 
 ~50–100MB extra RAM, ~5–10% extra CPU, +400ms cold start. Invisible for single-session work; sizes up with batch concurrency.

@@ -48,7 +48,10 @@ export function chromeArgs(config: SandboxEntryConfig): string[] {
     '--disable-dev-shm-usage',
     '--window-size=1920,1080',
   ]
+  // Headed Chrome quits once its last window closes, and a session closing its
+  // last tab would restart the browser and drop every session-cookie login.
   if (config.headless) args.push('--headless=new')
+  else args.push('--keep-alive-for-test')
   if (config.extensionDirs.length > 0) {
     const list = config.extensionDirs.join(',')
     args.push(`--load-extension=${list}`, `--disable-extensions-except=${list}`)
