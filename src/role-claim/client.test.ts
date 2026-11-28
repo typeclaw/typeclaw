@@ -61,7 +61,7 @@ function serveRaceProneClaim(opts: ServeOptions): RaceServer {
 }
 
 function handleClientMessage(
-  ws: Parameters<NonNullable<Parameters<typeof Bun.serve>[0]['websocket']>['message']>[0] & {
+  ws: Parameters<NonNullable<NonNullable<Parameters<typeof Bun.serve>[0]['websocket']>['message']>>[0] & {
     data: { ready: boolean }
   },
   msg: ClientMessage,

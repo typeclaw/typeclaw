@@ -5,8 +5,15 @@ import { z } from 'zod'
 import { TYPECLAW_INTERNAL_BASH_ENV } from '@/agent/plugin-tools'
 import { fillSecretIntoFocusedField, type FillSecretOutcome } from '@/browser/fill-secret'
 import { type ManagedBrowser, startManagedBrowser } from '@/browser/managed-browser'
+import { answerPasskeyPrompt } from '@/browser/passkey'
 import { BROWSER_ENGINES, type BrowserConfig, needsManagedBrowser } from '@/browser/registry'
-import { readVaultValue } from '@/bundled-plugins/typevault/runtime'
+import {
+  planPasskeyRegistration,
+  readPasskeyForSignIn,
+  readVaultValue,
+  recordPasskeySignIn,
+  savePasskeyRegistration,
+} from '@/bundled-plugins/typevault/runtime'
 import { getConfig } from '@/config'
 import { readEnvFile } from '@/init/env-file'
 import type { PermissionService } from '@/permissions'
@@ -24,7 +31,8 @@ export default definePlugin({
     const config = getConfig()
     const browser = config.browser
     const skillsDirs = browserSkillDirs(browser)
-    if (!needsManagedBrowser(browser, isTypevaultLive(config.typevault.enabled, ctx.agentDir))) return { skillsDirs }
+    const vaultLive = isTypevaultLive(config.typevault.enabled, ctx.agentDir)
+    if (!needsManagedBrowser(browser, vaultLive)) return { skillsDirs }
 
     let managed: ManagedBrowser
     try {
@@ -38,14 +46,19 @@ export default definePlugin({
       browserEnvOverlay(browser, { ...managed, cdpUrl: managed.sessionCdpUrl(sessionId) }),
     )
     const fillGuard = fillSecretGuardHook(ctx.permissions)
+    const passkeyGuard = passkeyGuardHook(ctx.permissions)
 
     return {
       skillsDirs,
-      tools: { [FILL_SECRET_TOOL]: createFillSecretTool(managed.cdpUrl) },
+      tools: {
+        [FILL_SECRET_TOOL]: createFillSecretTool(managed.cdpUrl),
+        // Passkeys live only in the vault, so without one the tool could do nothing but fail.
+        ...(vaultLive ? { [PASSKEY_TOOL]: createPasskeyTool(managed.cdpUrl) } : {}),
+      },
       hooks: {
         'tool.before': async (event, hookCtx) => {
           await bashHook(event, hookCtx)
-          return fillGuard(event, hookCtx)
+          return (await fillGuard(event, hookCtx)) ?? passkeyGuard(event, hookCtx)
         },
         'session.end': (event) => managed.endSession(event.sessionId),
       },
@@ -155,6 +168,82 @@ export function createFillSecretTool(
         ...(args.url === undefined ? {} : { url: args.url }),
       })
       return text(describeOutcome(args.name, outcome))
+    },
+  })
+}
+
+export const PASSKEY_TOOL = 'browser_passkey'
+
+// Every passkey action reads or writes the vault through the session's grant, so it needs `vault.use` as well as
+// the shared browser, like a vault reference in `browser_fill_secret`.
+export function passkeyGuardHook(permissions: PermissionService): NonNullable<Hooks['tool.before']> {
+  return (event) => {
+    if (event.tool !== PASSKEY_TOOL) return
+    for (const permission of [CORE_PERMISSIONS.browserShared, CORE_PERMISSIONS.vaultUse]) {
+      if (!permissions.has(event.origin, permission)) {
+        return { block: true, reason: `${PASSKEY_TOOL} needs the ${permission} permission` }
+      }
+    }
+  }
+}
+
+export function createPasskeyTool(cdpUrl: string, answer: typeof answerPasskeyPrompt = answerPasskeyPrompt) {
+  return defineTool({
+    description: [
+      'Register or sign in with a passkey in a shared-browser tab, using a credential kept in the vault; the private key never enters your context.',
+      'First focus the site\'s passkey button with your browser driver without clicking it (the "Create a passkey" button for `register`, "Sign in with a passkey" for `use`), then call this: it presses the button and answers the site\'s passkey prompt.',
+      '`register` saves the new passkey to `name` (e.g. typevault://github/bot, or typevault://github/bot#work for a field other than `passkey`); `use` signs in with the passkey stored there.',
+      'Pass `url` (exact or prefix) when several tabs are open.',
+      'Chrome removes every virtual authenticator on a tab when any DevTools connection to it detaches, so this call also removes one your own browser driver added to that tab.',
+    ].join(' '),
+    parameters: z.object({
+      action: z.enum(['register', 'use']),
+      name: z.string().describe('Vault reference, e.g. typevault://github/bot'),
+      url: z.string().optional().describe('Exact URL or prefix of the target tab'),
+    }),
+    fileOperands: { nonFile: ['name', 'url'] },
+    execute: async (args, ctx) => {
+      if (!args.name.startsWith(VAULT_REF_PREFIX)) {
+        return text(`Not done: \`name\` must be a ${VAULT_REF_PREFIX} reference.`)
+      }
+      const tab = args.url === undefined ? {} : { url: args.url }
+      if (args.action === 'register') {
+        const planned = await planPasskeyRegistration(ctx.sessionId, args.name, 'register a passkey')
+        if (!planned.ok) return text(`Not registered: ${planned.reason}.`)
+        const outcome = await answer({ cdpUrl, ...tab })
+        if (outcome.status === 'refused') return text(`Not registered: ${outcome.reason}.`)
+        if (outcome.status === 'not-used') {
+          return text(
+            `Not registered: the page on ${outcome.url} did not ask to create a passkey; check that the focused button is the site's create-passkey button.`,
+          )
+        }
+        const saved = await savePasskeyRegistration(
+          ctx.sessionId,
+          planned.plan,
+          outcome.credential,
+          URL.parse(outcome.url)?.origin,
+        )
+        return text(
+          saved.ok
+            ? `Registered a passkey for ${outcome.credential.rp_id} and saved it as ${saved.name}.`
+            : `The site registered a passkey, but saving it failed: ${saved.reason}. Remove it from the site's account settings, since it can't be used again.`,
+        )
+      }
+      const read = await readPasskeyForSignIn(ctx.sessionId, args.name, 'sign in with a passkey')
+      if (!read.ok) return text(`Not signed in: ${read.reason}.`)
+      const outcome = await answer({ cdpUrl, ...tab, credential: read.signIn.passkey })
+      if (outcome.status === 'refused') return text(`Not signed in: ${outcome.reason}.`)
+      if (outcome.status === 'not-used') {
+        return text(
+          `Not signed in: the page on ${outcome.url} did not ask for the passkey; check that the focused button starts the site's passkey sign-in.`,
+        )
+      }
+      const recorded = await recordPasskeySignIn(ctx.sessionId, read.signIn, outcome.credential)
+      return text(
+        recorded.ok
+          ? `Gave the page on ${outcome.url} a passkey assertion. Check the page to confirm the site signed you in.`
+          : `Gave the page on ${outcome.url} a passkey assertion, but its sign count was not recorded: ${recorded.reason}. Check the page to confirm the site signed you in.`,
+      )
     },
   })
 }

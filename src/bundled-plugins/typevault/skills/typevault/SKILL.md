@@ -54,6 +54,8 @@ Post that line to the user verbatim, in the chat they asked from, for a vault ow
 
 Call `browser_fill_secret` with a vault reference as `name` (e.g. `typevault://github/bot#password`) after focusing the field. The value is typed into the page and never comes back to you.
 
+For a passkey, focus the site's passkey button with your browser driver without clicking it, then call `browser_passkey`: `action: "use"` with the entry on the sign-in button, or `action: "register"` with the entry to save it in on the create-passkey button. It presses the button and answers the site's prompt; the key stays between the runtime and the browser.
+
 ## Ask the user for a secret
 
 When a secret you need is not in the vault, call `vault_request` with the entry name, a preset (`api_key`, `password`, ...) and a reason. Send the user the returned link **and** match code, and tell them to check the code on the page before submitting. Never ask them to paste a secret into chat. The value is stored in your role's tier when they submit; check with `typevault ls`.

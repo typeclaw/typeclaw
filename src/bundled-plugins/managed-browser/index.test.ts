@@ -16,6 +16,8 @@ import {
   createFillSecretTool,
   FILL_SECRET_TOOL,
   fillSecretGuardHook,
+  PASSKEY_TOOL,
+  passkeyGuardHook,
   sharedBrowserBashHook,
 } from './index'
 
@@ -139,6 +141,40 @@ describe('browser_fill_secret permissions', () => {
     const member = guard({ roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }) })
     expect(await call(member, 'SHOP_ADDRESS', slack)).toBeUndefined()
     expect(await call(member, 'TYPECLAW_SECRET_STRIPE_KEY', slack)).toMatchObject({ block: true })
+  })
+})
+
+describe('browser_passkey permissions', () => {
+  const call = (roles: Parameters<typeof createPermissionService>[0], origin: SessionOrigin | undefined) =>
+    passkeyGuardHook(createPermissionService(roles))(
+      {
+        tool: PASSKEY_TOOL,
+        sessionId: 's',
+        callId: 'c',
+        args: { action: 'use', name: 'typevault://github/bot' },
+        origin,
+      },
+      hookContext,
+    )
+  const slack: SessionOrigin = {
+    kind: 'channel',
+    adapter: 'slack-bot',
+    workspace: 'T0123456789',
+    chat: 'C0123456789',
+    thread: null,
+    lastInboundAuthorId: 'alice',
+  }
+
+  test('lets a member, who holds the shared browser and the vault, use a passkey', async () => {
+    expect(await call({ roles: rolesConfigSchema.parse({ member: { match: ['slack:*'] } }) }, slack)).toBeUndefined()
+  })
+
+  test('blocks a browser-only role, which has no vault, and an unresolved origin', async () => {
+    const roles = rolesConfigSchema.parse({
+      shopper: { match: ['slack:*'], permissions: ['channel.respond', 'browser.shared'] },
+    })
+    expect(await call({ roles }, slack)).toMatchObject({ block: true })
+    expect(await call(undefined, undefined)).toMatchObject({ block: true })
   })
 })
 

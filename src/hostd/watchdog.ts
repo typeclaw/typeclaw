@@ -15,7 +15,7 @@
 // `shutdown` RPC or SIGTERM — so the parent exits with it and the next CLI call
 // respawns the pair, exactly as before the watchdog existed.
 
-export type WatchdogWorkerExit = { code: number | null; signal: string | null }
+export type WatchdogWorkerExit = { code: number | null; signal: string | number | null }
 
 export type WatchdogWorker = {
   pid: number
