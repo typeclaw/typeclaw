@@ -206,7 +206,7 @@ export async function prepareBashSandbox(options: BashSandboxRequest): Promise<P
       : []
     const protectedZones = {
       dirs: [...baseProtectedZones.dirs, ...runtimeDependencyDirs],
-      files: [...new Set([...baseProtectedZones.files, ...dependencyBins.protectedFiles, ...readOnlyFiles])],
+      files: [...new Set([...baseProtectedZones.files, ...readOnlyFiles])],
     }
     const writableDirSet = new Set(writable.dirs)
     const sandboxHome = DEFAULT_SANDBOX_ENV.HOME ?? '/tmp'
