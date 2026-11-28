@@ -86,20 +86,18 @@ describe('guard plugin', () => {
     }
   })
 
-  test('blocks the operator-owned package.json at the agent root', async () => {
+  test('lets the agent edit its own root package.json but not the installed dependency tree', async () => {
     const hook = await toolBeforeHook()
 
-    const result = await hook(
-      toolEvent('write', {
-        path: 'package.json',
-        content: '{}',
-        acknowledgeGuards: { guard: { nonWorkspaceWrite: true } },
-      }),
+    const manifest = await hook(toolEvent('write', { path: 'package.json', content: '{}' }), hookContext('/agent'))
+    const installed = await hook(
+      toolEvent('write', { path: 'node_modules/pkg/index.js', content: 'x' }),
       hookContext('/agent'),
     )
 
-    expect(result?.block).toBe(true)
-    expect(result?.reason).toContain('operator-owned package manifest')
+    expect(manifest).toBeUndefined()
+    expect(installed?.block).toBe(true)
+    expect(installed?.reason).toContain('nonWorkspaceWrite')
   })
 
   test('blocks MEMORY.md for tui origin now that it is off the root allowlist', async () => {

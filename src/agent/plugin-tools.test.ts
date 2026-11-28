@@ -9357,3 +9357,62 @@ reconcileLeftoverConfigWindowsSync(${JSON.stringify(agentDir)})`,
     })
   })
 })
+
+describe('wrapBuiltinToolDefinition agent package manifest', () => {
+  const owner: SessionOrigin = { kind: 'tui', sessionId: 'manifest-owner' }
+  const member: SessionOrigin = { kind: 'subagent', subagent: 'x', parentSessionId: 'p', spawnedByRole: 'member' }
+
+  function fakeFileTool(name: 'write' | 'edit', calls: string[]) {
+    return {
+      name,
+      label: name,
+      description: '',
+      parameters: Type.Object({ path: Type.String(), content: Type.String() }),
+      async execute(_id: string, params: { path: string; content: string }) {
+        calls.push(params.path)
+        return { content: [{ type: 'text' as const, text: 'changed' }], details: {} }
+      },
+    }
+  }
+
+  test.skipIf(lacksInodeAnchoring).each(['write', 'edit'] as const)(
+    '%s changes the root package.json only for a root-writable role',
+    async (name) => {
+      const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-manifest-write-'))
+      try {
+        await writeFile(path.join(agentDir, 'package.json'), '{}')
+        await symlink(path.join(agentDir, 'package.json'), path.join(agentDir, 'manifest-link.json'))
+        const calls: string[] = []
+        const wrap = (origin: SessionOrigin) =>
+          wrapBuiltinToolDefinition(fakeFileTool(name, calls), {
+            agentDir,
+            sessionId: `manifest-${name}`,
+            hooks: createHookBus(),
+            getOrigin: () => origin,
+            permissions: createPermissionService(),
+          })
+        const call = (origin: SessionOrigin, target: string) =>
+          wrap(origin).execute('c', { path: target, content: '{}' } as never, undefined, undefined, {} as never)
+
+        // owner: allowed
+        await call(owner, 'package.json')
+        expect(calls).toHaveLength(1)
+
+        // member: denied, by lexical path and through a symlink to the manifest
+        await expect(call(member, 'package.json')).rejects.toThrow(
+          /can only be changed by a role that can write the agent root/,
+        )
+        await expect(call(member, 'manifest-link.json')).rejects.toThrow(
+          /can only be changed by a role that can write the agent root/,
+        )
+        expect(calls).toHaveLength(1)
+
+        // member: other files are unaffected by this check
+        await call(member, 'workspace-note.json')
+        expect(calls).toHaveLength(2)
+      } finally {
+        await rm(agentDir, { recursive: true, force: true })
+      }
+    },
+  )
+})
