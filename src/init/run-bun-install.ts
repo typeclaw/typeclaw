@@ -9,6 +9,9 @@ export type InstallRunnerOptions = {
   force?: boolean
   timeoutMs?: number
   spawn?: typeof Bun.spawn
+  // The host environment the install would otherwise inherit. Test seam; the
+  // child only ever receives the hostInstallEnv() subset of it.
+  env?: Record<string, string | undefined>
 }
 
 // Signature for the function `runInit` uses to materialize the agent folder's
@@ -32,8 +35,9 @@ export async function runBunInstall(cwd: string, opts?: InstallRunnerOptions): P
     // before 1.3 — slightly slower for huge monorepos, indistinguishable
     // for an agent folder, and not affected by the bug.
     return await runTimedBunProcess({
-      cmd: opts?.force ? ['bun', 'install', '--linker=hoisted', '--force'] : ['bun', 'install', '--linker=hoisted'],
+      cmd: ['bun', 'install', '--linker=hoisted', '--ignore-scripts', ...(opts?.force ? ['--force'] : [])],
       cwd,
+      env: hostInstallEnv(opts?.env ?? process.env),
       timeoutMs: opts?.timeoutMs ?? INSTALL_TIMEOUT_MS,
       spawn: opts?.spawn ?? bun.spawn,
       timeoutReason: (seconds) => `bun install timed out after ${seconds}s`,
@@ -50,7 +54,7 @@ export async function runBunInstall(cwd: string, opts?: InstallRunnerOptions): P
 // install` would no-op when the existing lockfile entry already satisfies
 // an in-range spec — which is the exact regression auto-upgrade exists to
 // prevent).
-export type UpdateRunnerOptions = Pick<InstallRunnerOptions, 'timeoutMs' | 'spawn'>
+export type UpdateRunnerOptions = Pick<InstallRunnerOptions, 'timeoutMs' | 'spawn' | 'env'>
 
 export type UpdateRunner = (cwd: string, pkg: string, opts?: UpdateRunnerOptions) => Promise<InstallResult>
 
@@ -66,8 +70,9 @@ export async function runBunUpdate(cwd: string, pkg: string, opts?: UpdateRunner
     // `--linker=hoisted` for the same Bun 1.3.x deadlock reason as
     // runBunInstall above.
     return await runTimedBunProcess({
-      cmd: ['bun', 'update', pkg, '--latest', '--linker=hoisted'],
+      cmd: ['bun', 'update', pkg, '--latest', '--linker=hoisted', '--ignore-scripts'],
       cwd,
+      env: hostInstallEnv(opts?.env ?? process.env),
       timeoutMs: opts?.timeoutMs ?? INSTALL_TIMEOUT_MS,
       spawn: opts?.spawn ?? bun.spawn,
       timeoutReason: (seconds) => `bun update ${pkg} timed out after ${seconds}s`,
@@ -78,9 +83,70 @@ export async function runBunUpdate(cwd: string, pkg: string, opts?: UpdateRunner
   }
 }
 
+// The agent folder is agent-writable: its root and workspace manifests, and
+// its bunfig.toml and .npmrc. These installs run on the HOST as the operator,
+// so the agent must not reach host execution or host secrets through them.
+// `--ignore-scripts` stops every lifecycle script (root, workspace, and
+// dependency); the container finishes trusted dependency scripts inside the
+// sandbox. bunfig.toml and .npmrc expand `$VAR`/`${VAR}` from this env into
+// registry auth headers, so the child gets only what an install needs, never
+// the operator's shell secrets. Proxy variables stay because corporate
+// networks cannot install without them.
+const HOST_INSTALL_ENV_NAMES = new Set([
+  'PATH',
+  'PATHEXT',
+  'HOME',
+  'USER',
+  'USERNAME',
+  'LOGNAME',
+  'SHELL',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'SYSTEMROOT',
+  'SYSTEMDRIVE',
+  'WINDIR',
+  'COMSPEC',
+  'USERPROFILE',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'PROGRAMDATA',
+  'PROGRAMFILES',
+  'PROGRAMFILES(X86)',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'ALL_PROXY',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'BUN_INSTALL',
+  'BUN_INSTALL_CACHE_DIR',
+  'BUN_INSTALL_GLOBAL_DIR',
+  'BUN_CONFIG_REGISTRY',
+  'NPM_CONFIG_REGISTRY',
+  'XDG_CACHE_HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_DATA_HOME',
+])
+
+function hostInstallEnv(env: Record<string, string | undefined>): Record<string, string> {
+  const allowed: Record<string, string> = {}
+  for (const [name, value] of Object.entries(env)) {
+    if (value !== undefined && HOST_INSTALL_ENV_NAMES.has(name.toUpperCase())) allowed[name] = value
+  }
+  return allowed
+}
+
 async function runTimedBunProcess({
   cmd,
   cwd,
+  env,
   timeoutMs,
   spawn,
   timeoutReason,
@@ -88,12 +154,13 @@ async function runTimedBunProcess({
 }: {
   cmd: string[]
   cwd: string
+  env: Record<string, string>
   timeoutMs: number
   spawn: typeof Bun.spawn
   timeoutReason: (seconds: number) => string
   failureReason: (code: number, stderr: string) => string
 }): Promise<InstallResult> {
-  const proc = spawn({ cmd, cwd, stdout: 'pipe', stderr: 'pipe' })
+  const proc = spawn({ cmd, cwd, env, stdout: 'pipe', stderr: 'pipe' })
   let timedOut = false
   const timeout = setTimeout(() => {
     timedOut = true

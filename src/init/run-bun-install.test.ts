@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -64,6 +65,79 @@ describe('runBunInstall', () => {
       expect(result).toEqual({ ok: false, reason: 'stdout drain failed' })
       expect(killed()).toBe(true)
     } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('installs the agent folder without running any lifecycle script it declares', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'tc-bun-install-scripts-'))
+    try {
+      // given: root and workspace packages whose install scripts would run on the host
+      const marker = (name: string) => `bun -e "require('fs').writeFileSync('${join(cwd, name)}', '')"`
+      await writeFile(
+        join(cwd, 'package.json'),
+        JSON.stringify({
+          name: 'agent',
+          private: true,
+          workspaces: ['packages/*'],
+          dependencies: { tool: 'workspace:*' },
+          scripts: { preinstall: marker('root-preinstall'), postinstall: marker('root-postinstall') },
+        }),
+      )
+      await mkdir(join(cwd, 'packages', 'tool'), { recursive: true })
+      await writeFile(
+        join(cwd, 'packages', 'tool', 'package.json'),
+        JSON.stringify({ name: 'tool', version: '0.0.0', scripts: { postinstall: marker('workspace-postinstall') } }),
+      )
+
+      // when
+      const result = await runBunInstall(cwd)
+
+      // then: dependencies are installed, but nothing the folder declares executed
+      expect(result).toEqual({ ok: true })
+      expect(existsSync(join(cwd, 'node_modules', 'tool', 'package.json'))).toBe(true)
+      expect(existsSync(join(cwd, 'root-preinstall'))).toBe(false)
+      expect(existsSync(join(cwd, 'root-postinstall'))).toBe(false)
+      expect(existsSync(join(cwd, 'workspace-postinstall'))).toBe(false)
+    } finally {
+      await rm(cwd, { recursive: true, force: true })
+    }
+  })
+
+  test('does not expand host environment values into registry config the agent folder declares', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'tc-bun-install-registry-'))
+    const authorizations: (string | null)[] = []
+    const registry = Bun.serve({
+      port: 0,
+      fetch(request) {
+        authorizations.push(request.headers.get('authorization'))
+        return new Response('{}', { status: 404 })
+      },
+    })
+    try {
+      // given: bunfig.toml and .npmrc that send host env values to an agent-chosen registry
+      const url = `http://127.0.0.1:${registry.port}/`
+      await writeFile(
+        join(cwd, 'package.json'),
+        JSON.stringify({ name: 'agent', private: true, dependencies: { '@probe/pkg': '1.0.0', 'probe-pkg': '1.0.0' } }),
+      )
+      await writeFile(
+        join(cwd, 'bunfig.toml'),
+        `[install.scopes]\n"@probe" = { url = "${url}", token = "$TC_PROBE_SECRET" }\n`,
+      )
+      await writeFile(
+        join(cwd, '.npmrc'),
+        `registry=${url}\n//127.0.0.1:${registry.port}/:_authToken=\${TC_PROBE_SECRET}\n`,
+      )
+
+      // when
+      await runBunInstall(cwd, { env: { ...process.env, TC_PROBE_SECRET: 'host-secret-value' } })
+
+      // then: the registry was contacted without the host value
+      expect(authorizations.length).toBeGreaterThan(0)
+      expect(authorizations.some((value) => value?.includes('host-secret-value'))).toBe(false)
+    } finally {
+      registry.stop(true)
       await rm(cwd, { recursive: true, force: true })
     }
   })
